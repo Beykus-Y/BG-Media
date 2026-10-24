@@ -66,11 +66,15 @@ struct TempoTransition {
     float confidence = 0.0f;
 };
 
+// A low-frequency attack, not automatically a confirmed kick or a musical
+// downbeat. Callers should use confidence and nearestBeat/offsetFromBeat to
+// select musically significant events; nearestBeat is -1 when the attack is
+// outside the local beat-period window (for example a syncopated bass note).
 struct BassAccent {
     double time = 0.0;
     float strength = 0.0f;      // normalised low-frequency transient
     float lowBandRatio = 0.0f;  // share of linear energy below ~180 Hz at the accent
-    float confidence = 0.0f;
+    float confidence = 0.0f;    // heuristic score, not a probability
     int nearestBeat = -1;       // index into AnalysisResult::beats
     double offsetFromBeat = 0.0;
 };
@@ -114,8 +118,13 @@ struct AnalysisResult {
     // Dominant tempo. bpmCandidates contains the strongest alternatives,
     // including octave-related ones when the signal is ambiguous.
     double bpm = 0.0;
-    float bpmConfidence = 0.0f;
-    bool tempoStable = true;
+    float bpmConfidence = 0.0f;       // heuristic score, not a probability
+    float bpmLevelConfidence = 0.0f;  // confidence in the chosen metric level
+    float beatPhaseConfidence = 0.0f; // confidence in the generated beat grid
+    float downbeatConfidence = 0.0f;  // confidence in meter/downbeat phase
+    bool tempoStable = true;          // periodicity, not musical correctness
+    // Metric-level ambiguity: any 2:1, 3:1, 3:2 or 4:3 alternative remains
+    // plausible. Field name kept for cache/API compatibility.
     bool octaveAmbiguous = false;
     std::vector<double> bpmCandidates;
     std::vector<float> bpmCandidateScores;

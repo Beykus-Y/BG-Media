@@ -150,13 +150,20 @@ struct BuildContext {
 
         bassStrength.assign(analysis.beats.size(), 0.0f);
         for (const BassAccent& accent : analysis.bassAccents) {
+            // nearestBeat is the analyzer's deliberate low-frequency event
+            // classification. Do not re-snap an offbeat bass attack onto the
+            // nearest beat here: at fast tempos the old 0.16 s fallback put a
+            // BassDip on nearly every beat. The local interval bound keeps a
+            // genuinely beat-aligned accent while rejecting a subdivision.
             int index = accent.nearestBeat;
-            if (index < 0 || static_cast<std::size_t>(index) >= analysis.beats.size()) {
-                index = nearestBeatIndex(accent.time);
+            if (index < 0 || static_cast<std::size_t>(index) >= analysis.beats.size() ||
+                accent.confidence < 0.20f) {
+                continue;
             }
-            if (index >= 0 &&
-                std::abs(analysis.beats[static_cast<std::size_t>(index)].time -
-                         accent.time) < 0.16) {
+            const double interval = beatInterval(index);
+            const double tolerance = std::min(0.08, 0.25 * interval);
+            if (std::abs(analysis.beats[static_cast<std::size_t>(index)].time -
+                         accent.time) <= tolerance) {
                 bassStrength[static_cast<std::size_t>(index)] =
                     std::max(bassStrength[static_cast<std::size_t>(index)],
                              clampValue(accent.strength, 0.0f, 1.5f));
@@ -193,29 +200,6 @@ struct BuildContext {
                 barEnd[static_cast<std::size_t>(bar)] = duration;
             }
         }
-    }
-
-    [[nodiscard]] int nearestBeatIndex(double time) const {
-        if (analysis.beats.empty()) {
-            return -1;
-        }
-        const auto it = std::lower_bound(
-            analysis.beats.begin(), analysis.beats.end(), time,
-            [](const Beat& beat, double value) { return beat.time < value; });
-        int best = -1;
-        double bestError = 1e9;
-        if (it != analysis.beats.end()) {
-            best = static_cast<int>(it - analysis.beats.begin());
-            bestError = std::abs(it->time - time);
-        }
-        if (it != analysis.beats.begin()) {
-            const auto previous = it - 1;
-            const double error = std::abs(previous->time - time);
-            if (error < bestError) {
-                best = static_cast<int>(previous - analysis.beats.begin());
-            }
-        }
-        return best;
     }
 
     [[nodiscard]] double beatInterval(int index) const {

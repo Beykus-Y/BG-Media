@@ -81,6 +81,95 @@ double nearestBeat(const std::vector<bgmedia::Beat>& beats, double time) {
     return best;
 }
 
+struct BeatAgreement {
+    int matched = 0;
+    int detected = 0;
+    int reference = 0;
+    double precision = 0.0;
+    double recall = 0.0;
+    double fMeasure = 0.0;
+    double meanSignedError = 0.0;
+    double p95AbsoluteError = 0.0;
+};
+
+BeatAgreement scoreBeats(const std::vector<double>& truth,
+                         const std::vector<bgmedia::Beat>& detected,
+                         double tolerance, double fromTime, double toTime) {
+    BeatAgreement score;
+    std::vector<double> detectedTimes;
+    for (const auto& beat : detected) {
+        if (beat.time >= fromTime && beat.time <= toTime) {
+            detectedTimes.push_back(beat.time);
+        }
+    }
+    std::vector<double> referenceTimes;
+    for (double time : truth) {
+        if (time >= fromTime && time <= toTime) {
+            referenceTimes.push_back(time);
+        }
+    }
+    std::vector<bool> used(detectedTimes.size(), false);
+    std::vector<double> errors;
+    for (double expected : referenceTimes) {
+        int bestIndex = -1;
+        double bestError = tolerance + 1e-12;
+        for (std::size_t i = 0; i < detectedTimes.size(); ++i) {
+            if (used[i]) {
+                continue;
+            }
+            const double error = std::abs(detectedTimes[i] - expected);
+            if (error <= bestError) {
+                bestError = error;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        if (bestIndex >= 0) {
+            used[static_cast<std::size_t>(bestIndex)] = true;
+            ++score.matched;
+            errors.push_back(detectedTimes[static_cast<std::size_t>(bestIndex)] - expected);
+        }
+    }
+    score.detected = static_cast<int>(detectedTimes.size());
+    score.reference = static_cast<int>(referenceTimes.size());
+    score.precision = score.detected > 0
+                          ? static_cast<double>(score.matched) / score.detected
+                          : 0.0;
+    score.recall = score.reference > 0
+                       ? static_cast<double>(score.matched) / score.reference
+                       : 0.0;
+    score.fMeasure = score.precision + score.recall > 0.0
+                         ? 2.0 * score.precision * score.recall /
+                               (score.precision + score.recall)
+                         : 0.0;
+    if (!errors.empty()) {
+        double sum = 0.0;
+        std::vector<double> absolute;
+        absolute.reserve(errors.size());
+        for (double error : errors) {
+            sum += error;
+            absolute.push_back(std::abs(error));
+        }
+        score.meanSignedError = sum / static_cast<double>(errors.size());
+        std::sort(absolute.begin(), absolute.end());
+        const std::size_t index = static_cast<std::size_t>(
+            std::ceil(0.95 * static_cast<double>(absolute.size())) - 1.0);
+        score.p95AbsoluteError = absolute[std::min(index, absolute.size() - 1)];
+    }
+    return score;
+}
+
+BeatAgreement scoreDownbeats(const std::vector<double>& truth,
+                             const std::vector<bgmedia::Beat>& detected,
+                             double tolerance, double fromTime, double toTime) {
+    std::vector<bgmedia::Beat> downbeats;
+    for (const auto& beat : detected) {
+        if (beat.downbeat) {
+            downbeats.push_back(beat);
+        }
+    }
+    return scoreBeats(truth, downbeats, tolerance, fromTime, toTime);
+}
+
 } // namespace
 
 TEST_CASE(analysis.bpm_92) {
@@ -125,6 +214,136 @@ TEST_CASE(analysis.bpm_163) {
     const Alignment alignment = alignBeats(run.track.beatTimes, run.result.beats, 0.06, 1.0, 19.0);
     CHECK(alignment.total >= 30);
     CHECK(alignment.matched >= static_cast<int>(alignment.total * 0.88));
+}
+
+TEST_CASE(analysis.straight_tempo_corpus) {
+    using namespace bgmedia;
+    for (const double expectedBpm : {80.0, 92.0, 100.0, 123.0, 125.0, 163.0}) {
+        test::TrackOptions options;
+        options.bpm = expectedBpm;
+        options.duration = 18.0;
+        const auto run = analyzeTrack(test::makeClickTrack(options));
+        const double tolerance = std::max(1.5, expectedBpm * 0.02);
+        CHECK_NEAR(run.result.bpm, expectedBpm, tolerance);
+        const BeatAgreement agreement =
+            scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 17.0);
+        CHECK(agreement.reference >= 20);
+        CHECK(agreement.fMeasure > 0.95);
+        CHECK(agreement.meanSignedError < 0.02);
+        CHECK(run.result.bpmConfidence > 0.30f);
+        CHECK(run.result.bpmLevelConfidence >= 0.0f);
+        CHECK(run.result.bpmLevelConfidence <= 1.0f);
+    }
+}
+
+TEST_CASE(analysis.metric_level_offbeat_is_not_double_time) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeOffbeatTrack(100.0, 18.0));
+    CHECK_NEAR(run.result.bpm, 100.0, 2.0);
+    CHECK(std::abs(run.result.bpm - 200.0) > 5.0);
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(agreement.fMeasure > 0.95);
+    CHECK(agreement.meanSignedError < 0.02);
+    const BeatAgreement downbeats =
+        scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(downbeats.fMeasure > 0.85);
+}
+
+TEST_CASE(analysis.metric_level_ternary_is_not_tatum) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeTernaryTrack(66.2, 24.0));
+    CHECK_NEAR(run.result.bpm, 66.2, 1.8);
+    CHECK(std::abs(run.result.bpm - 198.6) > 5.0);
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 23.0);
+    CHECK(agreement.fMeasure > 0.95);
+    CHECK(agreement.meanSignedError < 0.02);
+    const BeatAgreement downbeats =
+        scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 23.0);
+    CHECK(downbeats.fMeasure > 0.85);
+    CHECK(run.result.octaveAmbiguous);
+}
+
+TEST_CASE(analysis.metric_level_halftime_is_not_double_time) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeHalfTimeTrack(80.0, 18.0));
+    CHECK_NEAR(run.result.bpm, 80.0, 1.8);
+    CHECK(std::abs(run.result.bpm - 160.0) > 5.0);
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(agreement.fMeasure > 0.95);
+    const BeatAgreement downbeats =
+        scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(downbeats.fMeasure > 0.85);
+}
+
+TEST_CASE(analysis.shuffle_and_dense_hats_keep_pulse) {
+    using namespace bgmedia;
+    const auto shuffle = analyzeTrack(test::makeShuffleTrack(80.0, 18.0));
+    CHECK_NEAR(shuffle.result.bpm, 80.0, 2.0);
+    CHECK(scoreBeats(shuffle.track.beatTimes, shuffle.result.beats, 0.07, 1.0, 17.0)
+              .fMeasure > 0.95);
+    const auto dense = analyzeTrack(test::makeDenseHatTrack(99.0, 18.0));
+    CHECK_NEAR(dense.result.bpm, 99.0, 2.0);
+    CHECK(scoreBeats(dense.track.beatTimes, dense.result.beats, 0.07, 1.0, 17.0)
+              .fMeasure > 0.95);
+}
+
+TEST_CASE(analysis.drift_tempo_keeps_pulse) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeDriftTrack(80.0, 18.0));
+    CHECK_NEAR(run.result.bpm, 80.0, 3.5);
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(agreement.fMeasure > 0.90);
+    CHECK(agreement.meanSignedError < 0.025);
+}
+
+TEST_CASE(analysis.onset_timestamp_is_not_systematically_early) {
+    using namespace bgmedia;
+    test::TrackOptions options;
+    options.bpm = 123.0;
+    options.duration = 18.0;
+    const auto run = analyzeTrack(test::makeClickTrack(options));
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 17.0);
+    CHECK(agreement.matched > 20);
+    CHECK(std::abs(agreement.meanSignedError) < 0.015);
+    CHECK(agreement.p95AbsoluteError < 0.025);
+}
+
+TEST_CASE(analysis.syncopated_bass_is_not_forced_onto_beat) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeSyncopatedBassTrack(100.0, 18.0));
+    CHECK_NEAR(run.result.bpm, 100.0, 2.0);
+    CHECK(run.result.bassAccents.size() >= 4);
+    int offbeat = 0;
+    for (const BassAccent& accent : run.result.bassAccents) {
+        CHECK(accent.confidence >= 0.0f);
+        CHECK(accent.confidence <= 1.0f);
+        CHECK(accent.strength >= 0.0f);
+        if (accent.nearestBeat < 0) {
+            ++offbeat;
+        }
+    }
+    CHECK(offbeat >= 1);
+}
+
+TEST_CASE(analysis.confidence_channels_are_heuristic_but_bounded) {
+    using namespace bgmedia;
+    test::TrackOptions options;
+    options.bpm = 92.0;
+    options.duration = 18.0;
+    const auto run = analyzeTrack(test::makeClickTrack(options));
+    CHECK(run.result.bpmConfidence >= 0.0f && run.result.bpmConfidence <= 1.0f);
+    CHECK(run.result.bpmLevelConfidence >= 0.0f &&
+          run.result.bpmLevelConfidence <= 1.0f);
+    CHECK(run.result.beatPhaseConfidence >= 0.0f &&
+          run.result.beatPhaseConfidence <= 1.0f);
+    CHECK(run.result.downbeatConfidence >= 0.0f &&
+          run.result.downbeatConfidence <= 1.0f);
+    CHECK(run.result.meterConfidence >= 0.0f && run.result.meterConfidence <= 1.0f);
 }
 
 TEST_CASE(analysis.tempo_change_reports_transition) {

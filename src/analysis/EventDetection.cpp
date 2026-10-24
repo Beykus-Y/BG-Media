@@ -180,11 +180,11 @@ std::vector<BassAccent> detectBassAccents(
             continue;
         }
 
-        const float offset = dsp::parabolicPeakOffset(
+        const float peakOffset = dsp::parabolicPeakOffset(
             lowEnv[static_cast<std::size_t>(i - 1)], value,
             lowEnv[static_cast<std::size_t>(i + 1)]);
-        const double frame = static_cast<double>(i) + offset;
-        const double time = frame / features.framesPerSecond + features.frameCenterOffset;
+        const double frame = static_cast<double>(i) + peakOffset;
+        const double time = frame / features.framesPerSecond + features.onsetTimeOffset;
         if (time < 0.0 || time > duration || insideSilence(silence, time, 0.03)) {
             continue;
         }
@@ -202,9 +202,28 @@ std::vector<BassAccent> detectBassAccents(
                 0.40 * ratioScore,
             0.0, 1.0));
 
-        const int beat = nearestBeatIndex(beats, accent.time, 0.11);
+        int beat = nearestBeatIndex(beats, accent.time, 0.11);
+        double offset = 0.0;
+        if (beat >= 0) {
+            offset = accent.time - beats[static_cast<std::size_t>(beat)].time;
+            // Distinguish a beat-aligned low attack from an offbeat bass
+            // event. This is deliberately relative to the local beat period;
+            // a fixed 110 ms window is wider than half a beat at 198 BPM.
+            const std::size_t index = static_cast<std::size_t>(beat);
+            double localPeriod = 0.5;
+            if (index + 1 < beats.size()) {
+                localPeriod = beats[index + 1].time - beats[index].time;
+            } else if (index > 0) {
+                localPeriod = beats[index].time - beats[index - 1].time;
+            }
+            if (std::abs(offset) > 0.28 * std::max(0.05, localPeriod)) {
+                // Keep the measurable offset for diagnostics/UI, but do not
+                // claim this low-frequency attack is beat-aligned.
+                beat = -1;
+            }
+        }
         accent.nearestBeat = beat;
-        accent.offsetFromBeat = beat >= 0 ? accent.time - beats[static_cast<std::size_t>(beat)].time : 0.0;
+        accent.offsetFromBeat = offset;
 
         if (!accents.empty() && accent.time - accents.back().time < minSpacing) {
             if (accent.strength > accents.back().strength) {

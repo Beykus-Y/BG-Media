@@ -113,6 +113,7 @@ AnalysisReport Analyzer::analyze(const PcmBuffer& pcm,
                 features.sharpEnv[i] = 0.0f;
                 features.lowEnv[i] = 0.0f;
                 features.lowRatio[i] = 0.0f;
+                features.lowEnergy[i] = 0.0f;
                 features.lowEnergyRatio[i] = 0.0f;
                 features.flux[i] = 0.0f;
                 features.lowFlux[i] = 0.0f;
@@ -125,13 +126,23 @@ AnalysisReport Analyzer::analyze(const PcmBuffer& pcm,
         // BPM. Weak broadband onsets are still retained through the 0.35*env
         // floor, so bass-light material remains analysable.
         std::vector<float> tempoEnvelope(features.env.size(), 0.0f);
+        // Separate low-frequency pulse evidence from the low-flux detector.
+        // Leakage from keys/snares can still produce low-band flux, but its
+        // share of linear low-frequency energy is much smaller than a kick or
+        // bass note. This envelope is used only for metric-level scoring; the
+        // broadband envelope still drives phase/beat tracking.
+        std::vector<float> pulseEnvelope(features.env.size(), 0.0f);
         for (std::size_t i = 0; i < features.env.size(); ++i) {
             tempoEnvelope[i] = std::max(features.lowEnv[i], 0.35f * features.env[i]);
+            const float lowShare =
+                std::clamp((features.lowEnergyRatio[i] - 0.15f) / 0.35f, 0.0f, 1.0f);
+            pulseEnvelope[i] = features.lowEnv[i] * lowShare;
         }
 
         report(progress, 0.66f, "estimating tempo");
-        TempoEstimate globalTempo = estimateTempo(tempoEnvelope, features.framesPerSecond,
-                                                  config_, silence.activeRatio);
+        TempoEstimate globalTempo = estimateTempo(
+            tempoEnvelope, features.framesPerSecond, config_, silence.activeRatio, 0.0,
+            &pulseEnvelope);
         if (cancelled()) {
             throw AnalysisCancelled{};
         }
@@ -139,13 +150,14 @@ AnalysisReport Analyzer::analyze(const PcmBuffer& pcm,
         report(progress, 0.74f, "analysing tempo changes");
         TempoStructure structure = estimateTempoStructure(
             tempoEnvelope, silence.active, features.framesPerSecond, pcm.duration(),
-            config_, globalTempo);
+            config_, globalTempo, &pulseEnvelope);
         if (cancelled()) {
             throw AnalysisCancelled{};
         }
 
         result.bpm = structure.bpm;
         result.bpmConfidence = structure.confidence;
+        result.bpmLevelConfidence = structure.levelConfidence;
         result.tempoStable = structure.stable;
         result.octaveAmbiguous = structure.octaveAmbiguous;
         result.tempoSegments = structure.segments;
@@ -165,6 +177,8 @@ AnalysisReport Analyzer::analyze(const PcmBuffer& pcm,
             result.onsets = std::move(beatResult.onsets);
             result.beatsPerBar = beatResult.beatsPerBar;
             result.meterConfidence = beatResult.meterConfidence;
+            result.beatPhaseConfidence = beatResult.beatPhaseConfidence;
+            result.downbeatConfidence = beatResult.downbeatConfidence;
 
             report(progress, 0.91f, "classifying bass accents");
             result.bassAccents = detectBassAccents(features, result.silences,

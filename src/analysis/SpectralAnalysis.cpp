@@ -199,6 +199,8 @@ SpectralFeatures computeSpectralFeatures(const PcmBuffer& pcm,
     out.melBands = melBands;
     out.framesPerSecond = fps;
     out.frameCenterOffset = centreOffset;
+    out.onsetTimeOffset =
+        centreOffset + 0.5 * static_cast<double>(fftSize - hopSize) / sampleRate;
 
     const int sampleCount = static_cast<int>(pcm.samples.size());
     const int frameCount = 1 + std::max(0, sampleCount - 1) / hopSize;
@@ -206,6 +208,7 @@ SpectralFeatures computeSpectralFeatures(const PcmBuffer& pcm,
     out.flux.assign(static_cast<std::size_t>(frameCount), 0.0f);
     out.lowFlux.assign(static_cast<std::size_t>(frameCount), 0.0f);
     out.lowRatio.assign(static_cast<std::size_t>(frameCount), 0.0f);
+    out.lowEnergy.assign(static_cast<std::size_t>(frameCount), 0.0f);
     out.lowEnergyRatio.assign(static_cast<std::size_t>(frameCount), 0.0f);
 
     const auto melFilters = buildMelFilters(melBands, fftSize, sampleRate, 30.0,
@@ -297,6 +300,8 @@ SpectralFeatures computeSpectralFeatures(const PcmBuffer& pcm,
 
         out.flux[static_cast<std::size_t>(frame)] = totalFlux;
         out.lowFlux[static_cast<std::size_t>(frame)] = lowFlux;
+        out.lowEnergy[static_cast<std::size_t>(frame)] =
+            static_cast<float>(frameLowEnergy);
         out.lowRatio[static_cast<std::size_t>(frame)] =
             totalFlux > 1e-9f ? dsp::clampf(lowFlux / totalFlux, 0.0f, 1.0f) : 0.0f;
         out.lowEnergyRatio[static_cast<std::size_t>(frame)] =

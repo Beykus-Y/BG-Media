@@ -1778,7 +1778,8 @@ void DesktopApp::Impl::drawRuler() {
 
     // Bar numbers replace time labels when zoomed close enough.
     const AnalysisResult* visibleAnalysis = activeAnalysis();
-    if (visibleAnalysis && span <= 24.0 && !visibleAnalysis->beats.empty()) {
+    if (visibleAnalysis && visibleAnalysis->meterConfidence >= 0.55f &&
+        span <= 24.0 && !visibleAnalysis->beats.empty()) {
         for (const Beat& beat : visibleAnalysis->beats) {
             if (!beat.downbeat || beat.time < viewStart || beat.time > viewEnd) {
                 continue;
@@ -1923,13 +1924,14 @@ void DesktopApp::Impl::drawEvents() {
                        static_cast<float>(x), rect.y + 13.0f);
     }
 
-    // Beats.
+    // Beats. When meter phase is weak, do not paint downbeats as facts.
+    const bool meterReliable = analysis.meterConfidence >= 0.55f;
     for (const Beat& beat : analysis.beats) {
         if (beat.time < viewStart || beat.time > viewEnd) {
             continue;
         }
         const float x = timeToX(beat.time, layout.plot);
-        if (beat.downbeat) {
+        if (meterReliable && beat.downbeat) {
             SDL_SetRenderDrawColor(renderer, 255, 91, 157,
                                    beat.extrapolated ? 120 : 235);
             SDL_RenderLine(renderer, x, beatY - 14.0f, x, beatY + 14.0f);
@@ -2091,23 +2093,34 @@ void DesktopApp::Impl::drawBpmPanel(const Rect& rect) {
         return;
     }
     const auto& analysis = track->analysis;
+    const bool meterReliable = analysis.meterConfidence >= 0.55f;
     if (motionLabBpm > 0) {
         labelRight("MOTION LAB " + std::to_string(motionLabBpm), rect.right() - 18.0f,
                    rect.y + 16.0f, 8, theme::pink, 0.8f);
     } else if (!analysis.tempoStable) {
-        labelRight("CHANGE SUSPECTED", rect.right() - 18.0f, rect.y + 16.0f, 8,
+        labelRight("PERIOD VARIES", rect.right() - 18.0f, rect.y + 16.0f, 8,
+                   theme::amber, 0.8f);
+    } else if (analysis.octaveAmbiguous) {
+        labelRight("METRIC AMBIGUOUS", rect.right() - 18.0f, rect.y + 16.0f, 8,
                    theme::amber, 0.8f);
     } else if (analysis.bpm > 0.0) {
-        labelRight(analysis.octaveAmbiguous ? "OCTAVE AMBIGUOUS" : "STABLE",
-                   rect.right() - 18.0f, rect.y + 16.0f, 8,
-                   analysis.octaveAmbiguous ? theme::amber : theme::accent, 0.8f);
+        labelRight("PERIOD STABLE", rect.right() - 18.0f, rect.y + 16.0f, 8,
+                   theme::muted, 0.8f);
     }
 
     if (!analysis.tempoStable) {
         text->draw("MIXED", rect.x + 18.0f, rect.y + 38.0f, 36, FontWeight::SemiBold,
                    theme::amber);
         body(formatNumber(analysis.bpm, 1) + " BPM weighted  ·  see tempo map",
-             rect.x + 18.0f, rect.y + 92.0f, 11, theme::muted);
+             rect.x + 18.0f, rect.y + 86.0f, 11, theme::muted);
+        body("Period confidence is heuristic, not a probability",
+             rect.x + 18.0f, rect.y + 101.0f, 9, theme::dim);
+        body("level " + formatNumber(analysis.bpmLevelConfidence * 100.0, 0) +
+                 "%  ·  phase " +
+                 formatNumber(analysis.beatPhaseConfidence * 100.0, 0) +
+                 "%  ·  downbeat " +
+                 formatNumber(analysis.downbeatConfidence * 100.0, 0) + "%",
+             rect.x + 18.0f, rect.y + 117.0f, 9, theme::dim);
     } else if (analysis.bpm > 0.0) {
         text->draw(formatNumber(analysis.bpm, 1), rect.x + 18.0f, rect.y + 30.0f, 56,
                    FontWeight::SemiBold, theme::text);
@@ -2116,8 +2129,36 @@ void DesktopApp::Impl::drawBpmPanel(const Rect& rect) {
         label("BPM", rect.x + 28.0f + numberWidth, rect.y + 62.0f, 11, theme::muted,
               1.0f);
         body("beat " + formatNumber(60.0 / analysis.bpm, 3) + " s  ·  " +
-                 std::to_string(analysis.beatsPerBar) + "/4 meter",
-             rect.x + 18.0f, rect.y + 92.0f, 11, theme::muted);
+                 (meterReliable
+                      ? std::to_string(analysis.beatsPerBar) + "/4 meter"
+                      : "meter uncertain"),
+             rect.x + 18.0f, rect.y + 82.0f, 11, theme::muted);
+        body("level " + formatNumber(analysis.bpmLevelConfidence * 100.0, 0) +
+                 "%  ·  phase " +
+                 formatNumber(analysis.beatPhaseConfidence * 100.0, 0) + "%",
+             rect.x + 18.0f, rect.y + 99.0f, 9,
+             analysis.octaveAmbiguous ? theme::amber : theme::dim);
+        if (analysis.octaveAmbiguous) {
+            std::string alternatives = "alt";
+            int shown = 0;
+            for (std::size_t i = 0;
+                 i < analysis.bpmCandidates.size() &&
+                 i < analysis.bpmCandidateScores.size() && shown < 2;
+                 ++i) {
+                if (std::abs(analysis.bpmCandidates[i] - analysis.bpm) < 0.5) {
+                    continue;
+                }
+                alternatives += "  " + formatNumber(analysis.bpmCandidates[i], 1) +
+                                " (" +
+                                formatNumber(analysis.bpmCandidateScores[i] * 100.0, 0) +
+                                "%)";
+                ++shown;
+            }
+            if (shown > 0) {
+                body(alternatives, rect.x + 18.0f, rect.y + 116.0f, 9,
+                     theme::alpha(theme::amber, 0.9f));
+            }
+        }
     } else {
         text->draw("--", rect.x + 18.0f, rect.y + 34.0f, 54, FontWeight::SemiBold,
                    theme::dim);
@@ -2126,9 +2167,9 @@ void DesktopApp::Impl::drawBpmPanel(const Rect& rect) {
     }
 
     const float barX = rect.x + 18.0f;
-    const float barY = rect.bottom() - 30.0f;
+    const float barY = rect.bottom() - 24.0f;
     const float barW = rect.w - 36.0f;
-    label("CONFIDENCE", barX, barY - 14.0f, 8, theme::dim, 1.2f);
+    label("HEURISTIC BPM SCORE", barX, barY - 14.0f, 8, theme::dim, 1.0f);
     labelRight(formatNumber(analysis.bpmConfidence * 100.0, 0) + "%", rect.right() - 18.0f,
                barY - 14.0f, 8, theme::muted, 0.6f);
     ui::fillRoundedRect(renderer, {barX, barY, barW, 4.0f}, 2.0f,
@@ -2153,7 +2194,7 @@ void DesktopApp::Impl::drawTempoPanel(const Rect& rect) {
                analysis.tempoStable ? theme::accent : theme::amber, 0.8f);
 
     if (analysis.octaveAmbiguous) {
-        label("OCTAVE AMBIGUITY - ALTERNATIVES EXPOSED", rect.x + 18.0f,
+        label("METRIC AMBIGUITY - ALTERNATIVES EXPOSED", rect.x + 18.0f,
               rect.y + 34.0f, 8, theme::alpha(theme::amber, 0.85f), 0.5f);
     }
 
@@ -2217,7 +2258,9 @@ void DesktopApp::Impl::drawSignalPanel(const Rect& rect) {
         SDL_Color color;
     } stats[] = {
         {"BEATS", std::to_string(analysis.beats.size()), theme::text},
-        {"BARS", std::to_string(bars), theme::text},
+        {"BARS", std::to_string(bars) +
+                     (analysis.meterConfidence >= 0.55f ? "" : "?"),
+         analysis.meterConfidence >= 0.55f ? theme::text : theme::amber},
         {"ONSETS", std::to_string(analysis.onsets.size()), theme::muted},
         {"BASS", std::to_string(analysis.bassAccents.size()), theme::amber},
     };
@@ -2663,9 +2706,13 @@ void DesktopApp::Impl::drawChoreography() {
     y += 39.0f;
     const auto [bar, beat] = currentBarBeat();
     const AnalysisResult* currentAnalysis = activeAnalysis();
-    body("Bar " + std::to_string(bar) + "   ·   Beat " + std::to_string(beat) +
-             (currentAnalysis ? "/" + std::to_string(currentAnalysis->beatsPerBar) : ""),
-         x, y, 13, theme::muted);
+    const bool meterReliable =
+        currentAnalysis && currentAnalysis->meterConfidence >= 0.55f;
+    body("Bar " + std::to_string(bar) + (meterReliable ? "" : "?") +
+             "   ·   Beat " + std::to_string(beat) +
+             (currentAnalysis ? "/" + std::to_string(currentAnalysis->beatsPerBar) : "") +
+             (meterReliable ? "" : " ?"),
+         x, y, 13, meterReliable ? theme::muted : theme::amber);
     y += 24.0f;
 
     label("INTENSITY", x, y, 8, theme::dim, 1.2f);

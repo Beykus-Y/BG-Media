@@ -12,8 +12,11 @@
 
 namespace bgmedia {
 
-inline constexpr std::uint32_t kAnalysisSchemaVersion = 1;
-inline constexpr std::uint32_t kAnalyzerVersion = 1;
-inline constexpr std::uint32_t kCacheFormatVersion = 1;
+// Schema 2 adds the split confidence fields and the metric-phase semantics.
+// Analyzer 2 invalidates every prior tempo/beat cache entry. Cache format 2
+// persists the new fields.
+inline constexpr std::uint32_t kAnalysisSchemaVersion = 2;
+inline constexpr std::uint32_t kAnalyzerVersion = 2;
+inline constexpr std::uint32_t kCacheFormatVersion = 2;
 
 } // namespace bgmedia

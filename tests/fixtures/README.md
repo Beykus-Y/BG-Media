@@ -14,6 +14,11 @@ Use `bgmedia_fixturegen` to write the same material for manual listening:
 build/windows/bin/bgmedia_fixturegen.exe fixtures
 ```
 
+In addition to the straight click tracks, the generated corpus includes
+`offbeat_100.wav`, `ternary_66.wav`, `halftime_80.wav`, `shuffle_80.wav`,
+`dense_hats_99.wav`, `syncopated_bass_100.wav` and `drift_80.wav`. These
+signals cover the metric-level regressions and are original synthetic audio.
+
 To regenerate the three encoded decoder fixtures from the generator output
 (requires ffmpeg):
 

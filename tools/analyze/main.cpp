@@ -182,6 +182,9 @@ void writeJson(std::ostream& out, const Options& options,
         << ",\n";
     out << "  \"bpm\": " << result.bpm << ",\n";
     out << "  \"bpmConfidence\": " << result.bpmConfidence << ",\n";
+    out << "  \"bpmLevelConfidence\": " << result.bpmLevelConfidence << ",\n";
+    out << "  \"beatPhaseConfidence\": " << result.beatPhaseConfidence << ",\n";
+    out << "  \"downbeatConfidence\": " << result.downbeatConfidence << ",\n";
     out << "  \"tempoStable\": " << (result.tempoStable ? "true" : "false") << ",\n";
     out << "  \"octaveAmbiguous\": " << (result.octaveAmbiguous ? "true" : "false")
         << ",\n";

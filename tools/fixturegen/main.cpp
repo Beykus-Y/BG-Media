@@ -91,6 +91,14 @@ int main(int argc, char** argv) {
     ok &= writeTrack(outputDirectory, "fully_silent.wav", makeFullySilentTrack(6.0));
     ok &= writeTrack(outputDirectory, "bass_accents.wav", makeBassAccentTrack());
     ok &= writeTrack(outputDirectory, "ambiguous.wav", makeAmbiguousTrack());
+    ok &= writeTrack(outputDirectory, "offbeat_100.wav", makeOffbeatTrack(100.0, 24.0));
+    ok &= writeTrack(outputDirectory, "ternary_66.wav", makeTernaryTrack(66.2, 24.0));
+    ok &= writeTrack(outputDirectory, "halftime_80.wav", makeHalfTimeTrack(80.0, 24.0));
+    ok &= writeTrack(outputDirectory, "shuffle_80.wav", makeShuffleTrack(80.0, 24.0));
+    ok &= writeTrack(outputDirectory, "dense_hats_99.wav", makeDenseHatTrack(99.0, 24.0));
+    ok &= writeTrack(outputDirectory, "syncopated_bass_100.wav",
+                     makeSyncopatedBassTrack(100.0, 24.0));
+    ok &= writeTrack(outputDirectory, "drift_80.wav", makeDriftTrack(80.0, 24.0));
 
     if (longTrack) {
         TrackOptions longOptions;

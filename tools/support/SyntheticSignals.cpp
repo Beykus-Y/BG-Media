@@ -96,6 +96,21 @@ void addBassNote(std::vector<float>& samples, std::uint32_t sampleRate, double s
     }
 }
 
+// Short tonal note used to keep synthetic mixes continuously active without
+// adding a strong low-frequency onset.
+void addTone(std::vector<float>& samples, std::uint32_t sampleRate, double start,
+             double duration, double frequency, float amplitude) {
+    const int begin = static_cast<int>(std::max(0.0, start * sampleRate));
+    const int length = static_cast<int>(duration * sampleRate);
+    for (int i = 0; i < length && begin + i < static_cast<int>(samples.size()); ++i) {
+        const double t = static_cast<double>(i) / sampleRate;
+        const double envelope = std::min(1.0, t / 0.005) * std::exp(-t * 2.2);
+        samples[static_cast<std::size_t>(begin + i)] +=
+            static_cast<float>(std::sin(2.0 * kPi * frequency * t) * envelope *
+                               amplitude);
+    }
+}
+
 // High-frequency noise swell: loud, but intentionally not a bass accent.
 void addBroadbandSwell(std::vector<float>& samples, std::uint32_t sampleRate,
                        double start, float amplitude, Noise& noise) {
@@ -314,6 +329,270 @@ SyntheticTrack makeAmbiguousTrack() {
     }
     finish(samples, duration);
     track.bpm = 0.0;
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeOffbeatTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x0FFBE7u);
+    const double chords[] = {220.0, 277.18, 329.63, 440.0};
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addKick(samples, kSampleRate, time, 0.72f, noise);
+            addBassNote(samples, kSampleRate, time, period * 1.2, 0.25f);
+        }
+        // The audible emphasis is on the "and"; the pulse remains at `time`.
+        const double offbeat = time + period * 0.5;
+        if (offbeat < duration - 0.05) {
+            addHat(samples, kSampleRate, offbeat, 0.28f, noise);
+            addBassNote(samples, kSampleRate, offbeat, period * 0.45, 0.18f);
+            track.swellTimes.push_back(offbeat);
+        }
+        const int chordIndex = (beatIndex / 4) % 4;
+        if (offbeat < duration - 0.05) {
+            const int begin = static_cast<int>(offbeat * kSampleRate);
+            const int length = static_cast<int>(period * 0.45 * kSampleRate);
+            for (int i = 0; i < length && begin + i < totalSamples; ++i) {
+                const double t = static_cast<double>(i) / kSampleRate;
+                const double envelope = std::min(1.0, t / 0.004) * std::exp(-t * 4.0);
+                samples[static_cast<std::size_t>(begin + i)] +=
+                    static_cast<float>(std::sin(2.0 * kPi * chords[chordIndex] * t) *
+                                       envelope * 0.12);
+            }
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeTernaryTrack(double pulseBpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = pulseBpm;
+    const double period = 60.0 / pulseBpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x7E2A11u);
+    const double chords[] = {220.0, 277.18, 329.63, 440.0};
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addBassNote(samples, kSampleRate, time, period * 1.8, 0.28f);
+        }
+        if (beatInBar == 0 || beatInBar == 2) {
+            addKick(samples, kSampleRate, time, 0.78f, noise);
+            track.kickTimes.push_back(time);
+        }
+        // Three triplet subdivisions per pulse: the tatum is 3x the pulse.
+        for (int sub = 0; sub < 3; ++sub) {
+            const double at = time + period * (static_cast<double>(sub) / 3.0);
+            if (at >= duration - 0.04) {
+                continue;
+            }
+            addHat(samples, kSampleRate, at, sub == 0 ? 0.16f : 0.12f, noise);
+            const int begin = static_cast<int>(at * kSampleRate);
+            const int length = static_cast<int>(period / 3.0 * 1.2 * kSampleRate);
+            const int chordIndex = (beatIndex / 4 + sub) % 4;
+            for (int i = 0; i < length && begin + i < totalSamples; ++i) {
+                const double t = static_cast<double>(i) / kSampleRate;
+                const double envelope = std::min(1.0, t / 0.004) * std::exp(-t * 4.0);
+                samples[static_cast<std::size_t>(begin + i)] +=
+                    static_cast<float>(std::sin(2.0 * kPi * chords[chordIndex] * t) *
+                                       envelope * 0.11);
+            }
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeHalfTimeTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x1A2B3Cu);
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addKick(samples, kSampleRate, time, 0.88f, noise);
+            addBassNote(samples, kSampleRate, time, period * 1.5, 0.22f);
+            track.kickTimes.push_back(time);
+        } else if (beatInBar == 2) {
+            addSnare(samples, kSampleRate, time, 0.34f, noise);
+        }
+        addHat(samples, kSampleRate, time, 0.08f, noise);
+        addHat(samples, kSampleRate, time + period * 0.5, 0.18f, noise);
+        addTone(samples, kSampleRate, time, period * 1.1, 220.0, 0.085f);
+        addTone(samples, kSampleRate, time, period * 1.1, 329.63, 0.045f);
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeShuffleTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x2B3C4Du);
+    const double chords[] = {220.0, 277.18, 329.63, 440.0};
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+        }
+        if (beatInBar == 0 || beatInBar == 2) {
+            addKick(samples, kSampleRate, time, beatInBar == 0 ? 0.9f : 0.7f, noise);
+            track.kickTimes.push_back(time);
+        }
+        if (beatInBar == 1 || beatInBar == 3) {
+            addSnare(samples, kSampleRate, time, 0.30f, noise);
+        }
+        for (const double offset : {0.0, 0.30, 0.50, 0.80}) {
+            const double at = time + period * offset;
+            if (at >= duration - 0.04) {
+                continue;
+            }
+            addHat(samples, kSampleRate, at, 0.14f, noise);
+            const int begin = static_cast<int>(at * kSampleRate);
+            const int length = static_cast<int>(period * 0.22 * kSampleRate);
+            const int chordIndex = (beatIndex + static_cast<int>(offset * 10.0)) % 4;
+            for (int i = 0; i < length && begin + i < totalSamples; ++i) {
+                const double t = static_cast<double>(i) / kSampleRate;
+                const double envelope = std::min(1.0, t / 0.004) * std::exp(-t * 5.0);
+                samples[static_cast<std::size_t>(begin + i)] +=
+                    static_cast<float>(std::sin(2.0 * kPi * chords[chordIndex] * t) *
+                                       envelope * 0.10);
+            }
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeDenseHatTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x3C4D5Eu);
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+        }
+        addKick(samples, kSampleRate, time, beatInBar == 0 ? 0.78f : 0.62f, noise);
+        track.kickTimes.push_back(time);
+        if (beatInBar == 1 || beatInBar == 3) {
+            addSnare(samples, kSampleRate, time, 0.30f, noise);
+        }
+        for (int sub = 0; sub < 4; ++sub) {
+            const double at = time + period * 0.25 * static_cast<double>(sub);
+            if (at >= duration - 0.04) {
+                continue;
+            }
+            addHat(samples, kSampleRate, at, sub == 0 ? 0.22f : 0.30f, noise);
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeSyncopatedBassTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x4D5E6Fu);
+
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addKick(samples, kSampleRate, time, 0.70f, noise);
+            addBassNote(samples, kSampleRate, time, period * 0.5, 0.22f);
+        }
+        addHat(samples, kSampleRate, time, 0.12f, noise);
+        addTone(samples, kSampleRate, time, period * 1.1, 220.0, 0.07f);
+        const double offbeat = time + period * 0.5;
+        if (offbeat < duration - 0.05) {
+            addHat(samples, kSampleRate, offbeat, 0.20f, noise);
+            addTone(samples, kSampleRate, offbeat, period * 0.55, 329.63, 0.06f);
+            addBassNote(samples, kSampleRate, offbeat, period * 0.32, 0.42f);
+            track.swellTimes.push_back(offbeat);
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeDriftTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x5E6F70u);
+    std::mt19937 rng(0xB6D1A2u);
+    std::normal_distribution<double> drift(0.0, 0.0035);
+    double tempo = bpm;
+    double time = 0.45;
+    int beatIndex = 0;
+    while (time < duration - 0.1) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+        }
+        addKick(samples, kSampleRate, time, beatInBar == 0 ? 0.85f : 0.65f, noise);
+        if (beatInBar == 1 || beatInBar == 3) {
+            addSnare(samples, kSampleRate, time, 0.32f, noise);
+        }
+        addHat(samples, kSampleRate, time, 0.12f, noise);
+        addHat(samples, kSampleRate, time + 30.0 / tempo, 0.09f, noise);
+        if (beatInBar == 0) {
+            addBassNote(samples, kSampleRate, time, 60.0 / tempo * 0.8, 0.20f);
+        }
+        tempo = std::clamp(tempo * (1.0 + drift(rng)), bpm * 0.94, bpm * 1.06);
+        time += 60.0 / tempo;
+        ++beatIndex;
+    }
+    finish(samples, duration);
     track.audio = monoAudio(std::move(samples));
     return track;
 }

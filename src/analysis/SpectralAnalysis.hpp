@@ -16,12 +16,20 @@ struct SpectralFeatures {
     int melBands = 0;
     double framesPerSecond = 0.0;
     double frameCenterOffset = 0.0;
+    // Timestamp assigned to an onset/beat detected in a frame. A spectral-flux
+    // rise appears in the first frame whose window overlaps the attack; the
+    // new-audio interval between the previous and current frame is the
+    // physically meaningful uncertainty interval, so its midpoint is the least
+    // biased timestamp. This is not a tuned correction constant: it follows
+    // directly from the STFT window and hop geometry.
+    double onsetTimeOffset = 0.0;
 
     // Per frame ------------------------------------------------
     std::vector<float> rms;        // raw window RMS
     std::vector<float> flux;       // positive log-band spectral flux
     std::vector<float> lowFlux;    // positive flux below ~180 Hz
     std::vector<float> lowRatio;   // lowFlux / flux
+    std::vector<float> lowEnergy;  // raw linear energy below ~180 Hz
     std::vector<float> lowEnergyRatio; // linear low-band energy share (not flux)
     std::vector<float> env;        // adaptive-normalised, smoothed onset strength
     std::vector<float> sharpEnv;   // same but unsmoothed (peak timing)

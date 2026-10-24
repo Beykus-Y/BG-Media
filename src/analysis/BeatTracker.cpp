@@ -23,11 +23,11 @@ bool inSilence(const std::vector<SilenceRegion>& silence, double time,
 }
 
 double frameTime(const SpectralFeatures& features, double frame) {
-    return frame / features.framesPerSecond + features.frameCenterOffset;
+    return frame / features.framesPerSecond + features.onsetTimeOffset;
 }
 
 int frameForTime(const SpectralFeatures& features, double time) {
-    return static_cast<int>(std::lround((time - features.frameCenterOffset) *
+    return static_cast<int>(std::lround((time - features.onsetTimeOffset) *
                                        features.framesPerSecond));
 }
 
@@ -115,6 +115,9 @@ struct DpBeat {
 std::vector<DpBeat> trackRegion(const std::vector<float>& env,
                                 const std::vector<double>& periodFrames,
                                 int regionStart, int regionEnd) {
+    // env is a beat evidence envelope: broadband onset strength plus a
+    // low-frequency pulse term. A pure broadband tracker can lock to offbeat
+    // hats; the pulse term keeps the grid on kick/bass events when available.
     std::vector<DpBeat> beats;
     const int n = regionEnd - regionStart;
     if (n <= 1) {
@@ -292,13 +295,27 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         }
     }
 
+    // A kick/bass pulse is a stronger cue for where the beat is than a
+    // subdivision onset. Filter low-band leakage from keys/snares by the share
+    // of linear energy below ~180 Hz, then combine it with the broadband onset
+    // envelope used by the DP tracker.
+    std::vector<float> pulseEnv(features.env.size(), 0.0f);
+    std::vector<float> beatEvidence(features.env.size(), 0.0f);
+    for (std::size_t i = 0; i < features.env.size(); ++i) {
+        const float lowShare =
+            std::clamp((features.lowEnergyRatio[i] - 0.15f) / 0.35f, 0.0f, 1.0f);
+        pulseEnv[i] = features.lowEnv[i] * lowShare;
+        beatEvidence[i] = features.env[i] + 0.85f * pulseEnv[i];
+    }
+
     const auto regions = activeRegions(active, frameCount);
     std::vector<DpBeat> raw;
     for (const auto& region : regions) {
         if (region.second - region.first < 3) {
             continue;
         }
-        auto part = trackRegion(features.env, periodFrames, region.first, region.second);
+        auto part =
+            trackRegion(beatEvidence, periodFrames, region.first, region.second);
         raw.insert(raw.end(), part.begin(), part.end());
     }
 
@@ -357,8 +374,145 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         return result;
     }
 
-    // Meter and downbeat phase. We evaluate 2, 3, 4 and the configured hint,
-    // and explicitly report low confidence for uniform pulses.
+    auto pulseAt = [&](double time) {
+        if (pulseEnv.empty()) {
+            return 0.0;
+        }
+        const double frame = (time - features.onsetTimeOffset) *
+                             features.framesPerSecond;
+        const int at = static_cast<int>(std::llround(frame));
+        double value = 0.0;
+        for (int d = -1; d <= 1; ++d) {
+            const int index = std::clamp(at + d, 0,
+                                         static_cast<int>(pulseEnv.size()) - 1);
+            value = std::max(value,
+                             static_cast<double>(pulseEnv[static_cast<std::size_t>(index)]));
+        }
+        return value;
+    };
+    auto lowEnergyAt = [&](double time) {
+        if (features.lowEnergy.empty()) {
+            return 0.0;
+        }
+        const int at = std::clamp(
+            static_cast<int>(std::llround((time - features.onsetTimeOffset) *
+                                          features.framesPerSecond)),
+            0, static_cast<int>(features.lowEnergy.size()) - 1);
+        // A downbeat bass note is sustained for much longer than a kick
+        // transient. Skip the attack itself and average the following ~0.18 s,
+        // before the next beat, so the measurement sees the note body rather
+        // than the broadband click of whichever instrument happened to hit.
+        const int start = at + std::max(1, static_cast<int>(
+                                                  std::lround(0.055 *
+                                                              features.framesPerSecond)));
+        const int span = std::max(1, static_cast<int>(
+                                         std::lround(0.18 * features.framesPerSecond)));
+        double sum = 0.0;
+        int count = 0;
+        for (int d = 0; d <= span; ++d) {
+            const int index = std::min(
+                start + d, static_cast<int>(features.lowEnergy.size()) - 1);
+            sum += features.lowEnergy[static_cast<std::size_t>(index)];
+            ++count;
+        }
+        return count > 0 ? sum / static_cast<double>(count) : 0.0;
+    };
+
+    // The DP cost is driven by broadband onsets and can still sit on the
+    // offbeat hi-hat layer when a track emphasises the "and". Refine the whole
+    // grid phase against the low-frequency pulse envelope. This is a phase
+    // correction only; the tempo/period comes from BG Beat. It is applied only
+    // when the pulse evidence improves materially, so four-on-the-floor and
+    // bass-light material keep their original phase.
+    if (!pulseEnv.empty() && tempo.bpm > 1.0 && beats.size() >= 4 &&
+        tempo.transitions.empty()) {
+        const double period = 60.0 / tempo.bpm;
+        auto averagePulse = [&](double shift) {
+            double sum = 0.0;
+            int count = 0;
+            for (const Beat& beat : beats) {
+                const double shifted = beat.time + shift;
+                if (shifted < 0.0 || shifted > duration) {
+                    continue;
+                }
+                sum += pulseAt(shifted);
+                ++count;
+            }
+            return count > 0 ? sum / static_cast<double>(count) : 0.0;
+        };
+        const double basePulse = averagePulse(0.0);
+        double bestShift = 0.0;
+        double bestPulse = basePulse;
+        constexpr int kPhaseSteps = 96;
+        for (int step = -kPhaseSteps; step <= kPhaseSteps; ++step) {
+            const double shift = period * 0.5 * static_cast<double>(step) / kPhaseSteps;
+            const double score = averagePulse(shift);
+            if (score > bestPulse * 1.0001 ||
+                (std::abs(score - bestPulse) < 1e-5 &&
+                 std::abs(shift) < std::abs(bestShift))) {
+                bestPulse = score;
+                bestShift = shift;
+            }
+        }
+        // Only rescue a grid that has essentially no low-frequency pulse
+        // support at all. If the current grid is already on kicks, a stronger
+        // syncopated bass in the next half-beat must not drag the beat away.
+        if (basePulse < 0.15 && bestPulse > basePulse * 1.12 &&
+            std::abs(bestShift) > 0.01) {
+            for (Beat& beat : beats) {
+                beat.time = std::clamp(beat.time + bestShift, 0.0, duration);
+                const Onset* onset = nearestOnset(result.onsets, beat.time, 0.055);
+                if (onset) {
+                    beat.time = onset->time;
+                    beat.strength = std::max(beat.strength, onset->strength);
+                    beat.confidence = std::max(beat.confidence, 0.55f);
+                    beat.extrapolated = false;
+                } else {
+                    beat.extrapolated = true;
+                }
+            }
+        }
+    }
+
+    // Extrapolated edge beats outside the first/last actual onset are useful
+    // for a continuous grid but should not create a phantom extra beat before
+    // the music starts or after it ends. This also keeps meter phase from
+    // shifting by a fake leading beat.
+    if (!result.onsets.empty()) {
+        const double firstOnset = result.onsets.front().time;
+        const double lastOnset = result.onsets.back().time;
+        beats.erase(
+            std::remove_if(beats.begin(), beats.end(), [&](const Beat& beat) {
+                return beat.extrapolated &&
+                       (beat.time < firstOnset - 0.05 ||
+                        beat.time > lastOnset + 0.05);
+            }),
+            beats.end());
+    }
+    if (beats.empty()) {
+        return result;
+    }
+
+    // Meter and downbeat phase. Build a grid index from elapsed musical time,
+    // not from the vector index: a missing beat at a silence seam must not
+    // shift every following bar by one. Meter is evaluated over 2, 3, 4 and
+    // the configured hint; no confidence is implied merely by choosing one.
+    std::vector<int> gridIndex(beats.size(), 0);
+    for (std::size_t i = 1; i < beats.size(); ++i) {
+        const double gap = beats[i].time - beats[i - 1].time;
+        const double bpm = bpmAtTime(tempo, beats[i].time, std::max(1.0, tempo.bpm));
+        const double period = 60.0 / std::max(1.0, bpm);
+        int steps = static_cast<int>(std::llround(gap / std::max(1e-6, period)));
+        steps = std::clamp(steps, 1, 16);
+        if (gap > 4.0 * period) {
+            // After a long absence, re-entry is a more useful bar anchor than
+            // pretending the missing bars were observed.
+            gridIndex[i] = 0;
+        } else {
+            gridIndex[i] = gridIndex[i - 1] + steps;
+        }
+    }
+
     std::vector<int> meters;
     for (int meter : {config.beatsPerBarHint, 4, 3, 2}) {
         if (meter >= 2 && meter <= 8 &&
@@ -367,36 +521,56 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         }
     }
 
+    double lowEnergyReference = 0.0;
+    for (const Beat& beat : beats) {
+        lowEnergyReference += lowEnergyAt(beat.time);
+    }
+    lowEnergyReference = beats.empty()
+                             ? 0.0
+                             : lowEnergyReference / static_cast<double>(beats.size());
+
     int bestMeter = config.beatsPerBarHint;
     int bestPhase = 0;
     double bestScore = -1.0;
     double secondScore = -1.0;
-
+    const int firstGridPhase = gridIndex.empty() ? 0 : gridIndex.front();
     for (int meter : meters) {
         for (int phase = 0; phase < meter; ++phase) {
-            double sum = 0.0;
-            double lowSum = 0.0;
+            double strengthSum = 0.0;
+            double pulseSum = 0.0;
+            double lowEnergySum = 0.0;
             int count = 0;
             for (std::size_t i = 0; i < beats.size(); ++i) {
-                if (static_cast<int>(i % static_cast<std::size_t>(meter)) != phase) {
+                if ((gridIndex[i] % meter + meter) % meter != phase) {
                     continue;
                 }
                 const Beat& beat = beats[i];
-                sum += beat.strength * (0.5 + 0.5 * beat.confidence);
-                const double frame = (beat.time - features.frameCenterOffset) *
-                                     features.framesPerSecond;
-                // Downbeats usually carry the strongest low-frequency
-                // transient. Using low-band onset strength here avoids
-                // mistaking a loud backbeat snare for the bar start.
-                lowSum += sampleCurve(features.lowEnv, frame);
+                strengthSum += beat.strength * (0.5 + 0.5 * beat.confidence);
+                pulseSum += pulseAt(beat.time);
+                lowEnergySum += lowEnergyAt(beat.time);
                 ++count;
             }
             if (count == 0) {
                 continue;
             }
-            const double score = 0.42 * (sum / static_cast<double>(count)) +
-                                 0.58 * (lowSum / static_cast<double>(count));
-            const double adjusted = score * (meter == config.beatsPerBarHint ? 1.03 : 1.0);
+            const double strengthMean = strengthSum / static_cast<double>(count);
+            const double pulseMean = pulseSum / static_cast<double>(count);
+            const double lowEnergyMean = lowEnergySum / static_cast<double>(count);
+            const double lowEnergyNormalized =
+                lowEnergyReference > 1e-9 ? lowEnergyMean / lowEnergyReference : 0.0;
+            // Low-frequency pulse/energy are the primary downbeat cues.
+            // Broadband strength remains a fallback for bass-light material.
+            const double score = 0.24 * strengthMean + 0.38 * pulseMean +
+                                 0.38 * lowEnergyNormalized;
+            double adjusted = score * (meter == config.beatsPerBarHint ? 1.02 : 1.0);
+            // Music normally establishes the meter on its first strong beat;
+            // this weak prior resolves otherwise indistinguishable phase
+            // candidates (e.g. a kick on 1 and 3 with no bass note). It is not
+            // a guarantee: the reported downbeat confidence still reflects how
+            // close the alternatives were.
+            if (phase == firstGridPhase % meter) {
+                adjusted *= 1.06;
+            }
             if (adjusted > bestScore) {
                 secondScore = bestScore;
                 bestScore = adjusted;
@@ -411,16 +585,30 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
     result.beatsPerBar = bestMeter;
     if (bestScore > 0.0) {
         const double separation = secondScore > 0.0
-                                      ? std::clamp((bestScore - secondScore) / bestScore, 0.0, 1.0)
+                                      ? std::clamp((bestScore - secondScore) / bestScore,
+                                                   0.0, 1.0)
                                       : 0.0;
         result.meterConfidence = static_cast<float>(
-            std::clamp(0.15 + 0.55 * separation + 0.30 * std::min(1.0, bestScore), 0.0, 1.0));
+            std::clamp(0.10 + 0.55 * separation + 0.35 * std::min(1.0, bestScore),
+                       0.0, 1.0));
+        result.downbeatConfidence = result.meterConfidence;
     }
+
+    double phaseConfidenceSum = 0.0;
+    int phaseConfidenceCount = 0;
+    for (const Beat& beat : beats) {
+        phaseConfidenceSum += beat.confidence;
+        ++phaseConfidenceCount;
+    }
+    result.beatPhaseConfidence = phaseConfidenceCount > 0
+                                     ? static_cast<float>(phaseConfidenceSum /
+                                                          phaseConfidenceCount)
+                                     : 0.0f;
 
     int bar = 0;
     bool seenDownbeat = false;
     for (std::size_t i = 0; i < beats.size(); ++i) {
-        int beatInBar = (static_cast<int>(i) - bestPhase) % bestMeter;
+        int beatInBar = (gridIndex[i] - bestPhase) % bestMeter;
         if (beatInBar < 0) {
             beatInBar += bestMeter;
         }

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,16 @@ struct PhaseScore {
     double grid = 0.0;
     int beatCount = 0;
     int hitCount = 0;
+};
+
+struct LowEvidence {
+    double phase = 0.0;
+    double hitRate = 0.0;
+    double coverage = 0.0;
+    double onMean = 0.0;
+    double offMean = 0.0;
+    double contrast = 0.0;
+    bool valid = false;
 };
 
 std::vector<OnsetPeak> extractOnsetPeaks(const std::vector<float>& env,
@@ -140,6 +151,91 @@ PhaseScore scorePhase(const std::vector<OnsetPeak>& peaks,
                  0.20 * score.onsetHitRate + 0.15 * contrast;
     score.hitCount = hitOnsets;
     return score;
+}
+
+LowEvidence scoreLowPhase(const std::vector<OnsetPeak>& peaks,
+                          const std::vector<float>& env, double phase, double lag,
+                          double toleranceFrames, double totalPeakStrength) {
+    LowEvidence evidence;
+    evidence.phase = phase;
+    const int n = static_cast<int>(env.size());
+    if (lag < 2.0 || n <= 0) {
+        return evidence;
+    }
+    const int beatCount = static_cast<int>(std::floor((n - 1 - phase) / lag)) + 1;
+    if (beatCount < 3) {
+        return evidence;
+    }
+
+    std::vector<std::uint8_t> seen(static_cast<std::size_t>(beatCount), 0);
+    double hitStrength = 0.0;
+    int uniqueHits = 0;
+    for (const OnsetPeak& peak : peaks) {
+        const int k = static_cast<int>(std::llround((peak.frame - phase) / lag));
+        if (k < 0 || k >= beatCount) {
+            continue;
+        }
+        const double predicted = phase + static_cast<double>(k) * lag;
+        if (std::abs(peak.frame - predicted) > toleranceFrames) {
+            continue;
+        }
+        hitStrength += peak.strength;
+        if (!seen[static_cast<std::size_t>(k)]) {
+            seen[static_cast<std::size_t>(k)] = 1;
+            ++uniqueHits;
+        }
+    }
+
+    double offEnergy = 0.0;
+    for (int k = 0; k < beatCount; ++k) {
+        const double offFrame = phase + (static_cast<double>(k) + 0.5) * lag;
+        if (offFrame >= 0.0 && offFrame < n - 1.0) {
+            const int lo = static_cast<int>(offFrame);
+            const int hi = std::min(n - 1, lo + 1);
+            const double frac = offFrame - static_cast<double>(lo);
+            offEnergy += env[static_cast<std::size_t>(lo)] * (1.0 - frac) +
+                         env[static_cast<std::size_t>(hi)] * frac;
+        }
+    }
+    evidence.hitRate = static_cast<double>(uniqueHits) / static_cast<double>(beatCount);
+    evidence.onMean = hitStrength / static_cast<double>(beatCount);
+    evidence.offMean = offEnergy / static_cast<double>(beatCount);
+    evidence.coverage = totalPeakStrength > 1e-9 ? hitStrength / totalPeakStrength : 0.0;
+    evidence.contrast = std::clamp(
+        (evidence.onMean - evidence.offMean) /
+            (evidence.onMean + evidence.offMean + 0.02),
+        0.0, 1.0);
+    evidence.valid = true;
+    return evidence;
+}
+
+LowEvidence bestLowPhase(const std::vector<OnsetPeak>& peaks,
+                         const std::vector<float>& env, double lag,
+                         double toleranceFrames, double totalPeakStrength,
+                         double hintPhase = std::numeric_limits<double>::quiet_NaN()) {
+    const int steps = std::clamp(static_cast<int>(std::lround(lag * 2.0)), 32, 160);
+    LowEvidence best;
+    auto tryPhase = [&](double phase) {
+        LowEvidence candidate =
+            scoreLowPhase(peaks, env, phase, lag, toleranceFrames, totalPeakStrength);
+        const double score = candidate.hitRate * 0.55 +
+                             candidate.contrast * 0.25 +
+                             candidate.coverage * 0.20;
+        const double bestScore = best.hitRate * 0.55 + best.contrast * 0.25 +
+                                 best.coverage * 0.20;
+        if (candidate.valid && (!best.valid || score > bestScore)) {
+            best = candidate;
+        }
+    };
+    if (std::isfinite(hintPhase)) {
+        for (int i = -4; i <= 4; ++i) {
+            tryPhase(hintPhase + static_cast<double>(i) * lag / 32.0);
+        }
+    }
+    for (int step = 0; step < steps; ++step) {
+        tryPhase(static_cast<double>(step) * lag / static_cast<double>(steps));
+    }
+    return best;
 }
 
 PhaseScore bestPhase(const std::vector<OnsetPeak>& peaks,
@@ -388,17 +484,26 @@ std::vector<WindowRange> segmentWindows(const std::vector<TempoWindow>& windows)
 }
 
 TempoEstimate estimateTempoRange(const std::vector<float>& env,
+                                 const std::vector<float>* lowEnv,
                                  const std::vector<std::uint8_t>& active,
                                  std::size_t beginFrame, std::size_t endFrame,
                                  double fps, const AnalysisConfig& config,
                                  double continuityBpm) {
     std::vector<float> slice;
+    std::vector<float> lowSlice;
     double activeCount = 0.0;
     if (endFrame > beginFrame) {
         slice.resize(endFrame - beginFrame);
+        if (lowEnv) {
+            lowSlice.resize(endFrame - beginFrame);
+        }
         for (std::size_t i = beginFrame; i < endFrame; ++i) {
             const bool isActive = active.empty() || active[i] != 0;
             slice[i - beginFrame] = isActive ? env[i] : 0.0f;
+            if (lowEnv) {
+                lowSlice[i - beginFrame] =
+                    isActive && i < lowEnv->size() ? (*lowEnv)[i] : 0.0f;
+            }
             if (isActive) {
                 activeCount += 1.0;
             }
@@ -406,14 +511,15 @@ TempoEstimate estimateTempoRange(const std::vector<float>& env,
     }
     const double activeFraction = slice.empty() ? 0.0
                                                 : activeCount / static_cast<double>(slice.size());
-    return estimateTempo(slice, fps, config, activeFraction, continuityBpm);
+    return estimateTempo(slice, fps, config, activeFraction, continuityBpm,
+                         lowEnv ? &lowSlice : nullptr);
 }
 
 } // namespace
 
 TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
                             const AnalysisConfig& config, double activeFraction,
-                            double continuityBpm) {
+                            double continuityBpm, const std::vector<float>* lowEnv) {
     TempoEstimate result;
     if (env.size() < 8 || fps <= 0.0) {
         return result;
@@ -429,6 +535,13 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
     }
     if (totalPeakStrength < 1e-6) {
         return result;
+    }
+
+    const std::vector<float>& lowReference = lowEnv ? *lowEnv : env;
+    const auto lowPeaks = extractOnsetPeaks(lowReference, 0.12f);
+    double totalLowPeakStrength = 0.0;
+    for (const OnsetPeak& peak : lowPeaks) {
+        totalLowPeakStrength += peak.strength;
     }
 
     const double minBpm = std::max(20.0, config.minBpm);
@@ -488,12 +601,15 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         bpmCandidates.push_back(bpm);
     };
 
+    // Generate a metric family around every autocorrelation peak. Besides the
+    // familiar 2:1 octave this explicitly represents ternary (3:1, 3:2) and
+    // related 4:3 levels. The old implementation stopped at 2:1, so a 12/8
+    // tatum could not be mapped back to its 66 BPM pulse.
     for (double bpm : baseBpms) {
-        addCandidate(bpm);
-        addCandidate(bpm * 0.5);
-        addCandidate(bpm * 2.0);
-        addCandidate(bpm * (2.0 / 3.0));
-        addCandidate(bpm * 1.5);
+        for (double ratio : {1.0, 0.5, 2.0, 2.0 / 3.0, 1.5, 1.0 / 3.0, 3.0,
+                             0.75, 4.0 / 3.0}) {
+            addCandidate(bpm * ratio);
+        }
     }
     if (bpmCandidates.empty()) {
         return result;
@@ -540,15 +656,49 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
 
         const double refinedLag = 60.0 * fps / refinedBpm;
         const double acScore = std::clamp(acAtLag(ac, refinedLag), 0.0, 1.2);
+        const double lowTolerance = std::max(2.0, 0.035 * fps);
+        LowEvidence low = bestLowPhase(lowPeaks, lowReference, refinedLag, lowTolerance,
+                                       totalLowPeakStrength, phase.phase);
         const double prior = std::exp(
-            -0.5 * std::pow(std::log2(refinedBpm / std::max(20.0, config.preferredBpm)) / 0.85, 2.0));
+            -0.5 * std::pow(std::log2(refinedBpm / std::max(20.0, config.preferredBpm)) /
+                               0.90,
+                            2.0));
+
+        // Coverage and onset-hit-rate both grow with grid density: a tatum
+        // grid has roughly twice/three times as many chances to touch an
+        // onset. Normalise them against the chance level of a random grid
+        // before combining them with pulse-band evidence.
+        const double chance = std::clamp(
+            2.0 * toleranceFrames * static_cast<double>(peaks.size()) /
+                std::max(1.0, static_cast<double>(env.size())),
+            0.0, 0.80);
+        const double precisionAdjusted =
+            std::clamp((phase.beatHitRate - chance) / std::max(1e-6, 1.0 - chance), 0.0, 1.0);
+        const double recallAdjusted =
+            std::clamp((phase.onsetHitRate - chance) / std::max(1e-6, 1.0 - chance), 0.0, 1.0);
+        const double contrast = std::clamp(
+            phase.onMean / (phase.onMean + phase.offMean + 0.02), 0.0, 1.0);
+        // Precision is already density-normalised by beat count. Recall,
+        // coverage and raw onset-hit-rate are intentionally not used here:
+        // they rise mechanically with a denser grid, which was the root cause
+        // of selecting a tatum instead of the musical pulse.
+        const double broadband = 0.75 * precisionAdjusted + 0.25 * contrast;
+        const double pulse = low.valid
+                                 ? 0.70 * low.hitRate + 0.30 * low.contrast
+                                 : 0.0;
+        const double evidence = 0.35 * broadband + 0.65 * pulse;
+
         double continuityFactor = 1.0;
         if (continuityBpm > 1.0) {
             const double ratio = refinedBpm / continuityBpm;
             const double octaveDistance = std::abs(std::log2(ratio));
-            const bool octave = std::abs(octaveDistance - 1.0) < 0.08 ||
-                                std::abs(octaveDistance - 2.0) < 0.1;
-            continuityFactor = octave ? 0.90 : 1.0 - 0.025 * std::min(1.0, octaveDistance);
+            const bool metricRelative =
+                std::abs(octaveDistance - 1.0) < 0.08 ||
+                std::abs(octaveDistance - 2.0) < 0.10 ||
+                std::abs(octaveDistance - 0.585) < 0.08 ||
+                std::abs(octaveDistance - 1.585) < 0.08;
+            continuityFactor =
+                metricRelative ? 0.90 : 1.0 - 0.025 * std::min(1.0, octaveDistance);
         }
 
         TempoCandidate candidate;
@@ -558,9 +708,14 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         candidate.coverage = phase.coverage;
         candidate.beatHitRate = phase.beatHitRate;
         candidate.onsetHitRate = phase.onsetHitRate;
+        candidate.precisionAdjusted = precisionAdjusted;
+        candidate.recallAdjusted = recallAdjusted;
+        candidate.pulseScore = pulse;
+        candidate.lowHitRate = low.valid ? low.hitRate : 0.0;
+        candidate.lowContrast = low.valid ? low.contrast : 0.0;
         candidate.prior = prior;
-        candidate.score = (0.60 * phase.grid + 0.40 * acScore) *
-                          (0.92 + 0.08 * prior) * continuityFactor;
+        candidate.score = (0.55 * evidence + 0.45 * std::clamp(acScore, 0.0, 1.0)) *
+                          (0.90 + 0.10 * prior) * continuityFactor;
         evaluated.push_back(candidate);
     }
 
@@ -586,36 +741,47 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         if (!duplicate) {
             unique.push_back(candidate);
         }
-        if (unique.size() >= 8) {
+        if (unique.size() >= 12) {
             break;
         }
     }
     evaluated = std::move(unique);
 
-    // A repeated backbeat or a constant hi-hat can make double-time score just
-    // as well as the true pulse. When octave candidates are within 3%, pick the
-    // one closer to the musical prior and keep the ambiguity explicit instead
-    // of hiding it. The full alternative list remains available to callers.
-    const double preferred = std::clamp(config.preferredBpm, 40.0, 300.0);
-    std::size_t selected = 0;
-    for (std::size_t i = 1; i < evaluated.size(); ++i) {
-        const double ratio = evaluated[i].bpm / evaluated.front().bpm;
-        const bool octave = std::abs(ratio - 0.5) < 0.06 ||
-                            std::abs(ratio - 2.0) < 0.12;
-        if (!octave || evaluated[i].score < evaluated.front().score * 0.97) {
-            continue;
+    auto metricRelated = [](double a, double b) {
+        if (a <= 0.0 || b <= 0.0) {
+            return false;
         }
-        result.octaveAmbiguous = true;
-        const double frontDistance = std::abs(std::log2(evaluated.front().bpm / preferred));
-        const double candidateDistance = std::abs(std::log2(evaluated[i].bpm / preferred));
-        if (candidateDistance + 0.01 < frontDistance) {
-            selected = i;
+        const double ratio = a / b;
+        for (double relation : {0.5, 2.0, 1.0 / 3.0, 3.0, 2.0 / 3.0, 1.5,
+                                0.75, 4.0 / 3.0}) {
+            if (std::abs(ratio - relation) <= relation * 0.055) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // If a candidate is a tatum/subdivision, its slower parent should have at
+    // least as much low-band pulse evidence. A real fast pulse has no such
+    // support gap. This is a metrical-level test, not a fixed BPM preference.
+    for (TempoCandidate& candidate : evaluated) {
+        double childPulse = 0.0;
+        bool hasChild = false;
+        for (const TempoCandidate& child : evaluated) {
+            const double ratio = child.bpm / candidate.bpm;
+            if ((std::abs(ratio - 2.0) < 0.10 || std::abs(ratio - 3.0) < 0.14) &&
+                child.pulseScore > 0.0) {
+                childPulse = std::max(childPulse, child.pulseScore);
+                hasChild = true;
+            }
+        }
+        if (hasChild) {
+            candidate.levelSupport =
+                std::max(0.0, candidate.pulseScore - childPulse);
+            candidate.score += 0.08 * candidate.levelSupport;
         }
     }
-    if (selected != 0) {
-        std::iter_swap(evaluated.begin(), evaluated.begin() + static_cast<std::ptrdiff_t>(selected));
-    }
-    std::sort(evaluated.begin() + 1, evaluated.end(),
+
+    std::sort(evaluated.begin(), evaluated.end(),
               [](const TempoCandidate& a, const TempoCandidate& b) {
                   return a.score > b.score;
               });
@@ -624,45 +790,62 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
     result.bpm = best.bpm;
 
     double secondScore = 0.0;
-    bool foundNonOctave = false;
+    bool foundNonMetric = false;
+    double bestMetricAlternative = 0.0;
+    bool foundMetricAlternative = false;
     for (std::size_t i = 1; i < evaluated.size(); ++i) {
-        const double ratio = evaluated[i].bpm / best.bpm;
-        const bool octave = std::abs(ratio - 0.5) < 0.06 ||
-                            std::abs(ratio - 2.0) < 0.12 ||
-                            std::abs(ratio - 1.0) < 0.04;
-        if (octave) {
-            result.octaveAmbiguous = true;
+        if (metricRelated(evaluated[i].bpm, best.bpm)) {
+            foundMetricAlternative = true;
+            bestMetricAlternative = std::max(bestMetricAlternative, evaluated[i].score);
+            // Two interpretations are materially close if the weaker one is
+            // within 20% of the stronger score. We expose that uncertainty
+            // instead of pretending the top item is certain.
+            if (evaluated[i].score >= best.score * 0.50) {
+                result.octaveAmbiguous = true;
+            }
             continue;
         }
-        if (!foundNonOctave) {
+        if (!foundNonMetric) {
             secondScore = evaluated[i].score;
-            foundNonOctave = true;
+            foundNonMetric = true;
         }
     }
     for (TempoCandidate& candidate : evaluated) {
-        const double ratio = candidate.bpm / best.bpm;
-        candidate.octaveRelatedToBest =
-            std::abs(ratio - 0.5) < 0.06 || std::abs(ratio - 2.0) < 0.12;
+        candidate.octaveRelatedToBest = metricRelated(candidate.bpm, best.bpm);
     }
 
-    const double separation = foundNonOctave
-                                  ? std::clamp((best.score - secondScore) /
-                                                   std::max(0.08, best.score),
-                                               0.0, 1.0)
-                                  : 1.0;
-    const double quality = std::clamp(0.60 * best.gridScore + 0.40 * best.acScore, 0.0, 1.0);
-    double confidence = std::clamp(0.15 + 0.62 * quality + 0.23 * separation, 0.0, 1.0);
-    confidence *= std::clamp(0.55 + 0.45 * activeFraction, 0.45, 1.0);
+    const double separation =
+        foundNonMetric ? std::clamp((best.score - secondScore) /
+                                        std::max(0.08, best.score),
+                                    0.0, 1.0)
+                       : 1.0;
+    const double levelSeparation =
+        foundMetricAlternative
+            ? std::clamp((best.score - bestMetricAlternative) /
+                             std::max(0.08, best.score),
+                         0.0, 1.0)
+            : 0.65;
+    result.levelConfidence = static_cast<float>(
+        std::clamp(0.20 + 0.65 * levelSeparation + 0.15 * best.pulseScore, 0.0, 1.0));
     if (result.octaveAmbiguous) {
-        confidence *= 0.88;
+        result.levelConfidence *= 0.80f;
     }
+
+    const double quality = std::clamp(
+        0.45 * best.gridScore + 0.25 * best.acScore + 0.30 * best.pulseScore, 0.0, 1.0);
+    double confidence =
+        std::clamp(0.10 + 0.55 * quality + 0.20 * separation +
+                       0.15 * result.levelConfidence,
+                   0.0, 1.0);
+    confidence *= std::clamp(0.55 + 0.45 * activeFraction, 0.45, 1.0);
     result.confidence = static_cast<float>(confidence);
 
     double bestScore = 1e-9;
     for (const TempoCandidate& candidate : evaluated) {
         bestScore = std::max(bestScore, candidate.score);
     }
-    for (std::size_t i = 0; i < evaluated.size() && i < 6; ++i) {
+    const std::size_t exposed = std::min<std::size_t>(evaluated.size(), 8);
+    for (std::size_t i = 0; i < exposed; ++i) {
         result.candidates.push_back(evaluated[i]);
     }
 
@@ -678,10 +861,12 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
                                       const std::vector<std::uint8_t>& active,
                                       double fps, double duration,
                                       const AnalysisConfig& config,
-                                      const TempoEstimate& global) {
+                                      const TempoEstimate& global,
+                                      const std::vector<float>* lowEnv) {
     TempoStructure structure;
     structure.bpm = global.bpm;
     structure.confidence = global.confidence;
+    structure.levelConfidence = global.levelConfidence;
     structure.octaveAmbiguous = global.octaveAmbiguous;
     for (const TempoCandidate& candidate : global.candidates) {
         structure.candidates.push_back(candidate.bpm);
@@ -750,11 +935,21 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
     for (int start : starts) {
         const int end = std::min(static_cast<int>(n), start + windowFrames);
         std::vector<float> slice(static_cast<std::size_t>(end - start), 0.0f);
+        std::vector<float> lowSlice;
+        if (lowEnv) {
+            lowSlice.assign(static_cast<std::size_t>(end - start), 0.0f);
+        }
         double activeCount = 0.0;
         for (int i = start; i < end; ++i) {
             const bool isActive = active.empty() || active[static_cast<std::size_t>(i)] != 0;
             slice[static_cast<std::size_t>(i - start)] =
                 isActive ? env[static_cast<std::size_t>(i)] : 0.0f;
+            if (lowEnv) {
+                lowSlice[static_cast<std::size_t>(i - start)] =
+                    isActive && static_cast<std::size_t>(i) < lowEnv->size()
+                        ? (*lowEnv)[static_cast<std::size_t>(i)]
+                        : 0.0f;
+            }
             if (isActive) {
                 activeCount += 1.0;
             }
@@ -772,7 +967,8 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
                     ? continuity
                     : 0.0;
             const TempoEstimate estimate =
-                estimateTempo(slice, fps, config, activeFraction, useContinuity);
+                estimateTempo(slice, fps, config, activeFraction, useContinuity,
+                              lowEnv ? &lowSlice : nullptr);
             window.bpm = estimate.bpm;
             window.confidence = estimate.confidence *
                                 static_cast<float>(std::clamp(activeFraction / 0.65, 0.5, 1.0));
@@ -852,8 +1048,8 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
         const double continuityBpm = i > 0 ? segments.back().bpm : 0.0;
         TempoEstimate local;
         if (endFrame > beginFrame) {
-            local = estimateTempoRange(env, active, beginFrame, endFrame, fps, config,
-                                       continuityBpm);
+            local = estimateTempoRange(env, lowEnv, active, beginFrame, endFrame, fps,
+                                       config, continuityBpm);
         }
 
         TempoSegment segment;

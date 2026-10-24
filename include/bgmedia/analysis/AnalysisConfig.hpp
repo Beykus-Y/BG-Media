@@ -9,8 +9,9 @@ namespace bgmedia {
 // represented here (or by kAnalyzerVersion) because fingerprint() is part of
 // the cache key.
 struct AnalysisConfig {
-    // Tempo search range. 55..200 covers the test corpus and most dance music
-    // while keeping half/double-octave search bounded.
+    // Tempo search range. 55..200 covers the test corpus and most dance music.
+    // The estimator also considers metric relatives (1/3, 1/2, 2/3, 3/4, 4/3,
+    // 3/2, 2, 3); preferredBpm is only a weak prior, never a hard target.
     double minBpm = 55.0;
     double maxBpm = 200.0;
     double preferredBpm = 120.0;

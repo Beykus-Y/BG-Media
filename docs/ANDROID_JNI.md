@@ -197,7 +197,7 @@ val cache = File(context.filesDir, "bg-media-analysis").apply { mkdirs() }
 ## 7. Кеш и производительность
 
 - Анализ выполняется в фоне (`Dispatchers.Default`/Executor), UI не блокируется.
-- 5-минутный трек на desktop: ~1.37 с (см. `MEASUREMENTS.md`); на телефоне
+- 5-минутный трек на desktop: ~1.53 с (см. `MEASUREMENTS.md`); на телефоне
   ожидаемо медленнее, поэтому кеш обязателен.
 - Кеш читается до анализа; повторное открытие трека — миллисекунды.
 - Не хранить спектрограмму в UI-модели Kotlin: для waveform/spectrogram

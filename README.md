@@ -14,6 +14,11 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 
 ![BG Motion legacy stepped](docs/images/desktop-motion-stepped.png)
 
+Честная метрическая неоднозначность на 12/8-стимуле: выбран пульс 66.3 BPM,
+но UI показывает альтернативы 99.2/198.9 и `meter uncertain`:
+
+![BG Beat metric ambiguity](docs/images/desktop-metric.png)
+
 Текущий этап — полностью рабочий музыкальный анализатор и Desktop-приложение.
 Телеграм-интеграции, сервера, видео и 3D-модели здесь намеренно нет.
 
@@ -23,8 +28,9 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
   перемотка, скорость 0.75×/1.00×/1.25×.
 - Waveform, спектрограмма, onset-события, карта ударов, downbeat/bar,
   басовые акценты и регионы тишины на общем timeline.
-- BPM с confidence, альтернативами и явной отметкой октавной
-  неоднозначности (половинный/двойной темп).
+- BPM с **эвристическим** confidence, альтернативами и явной отметкой
+  метрической неоднозначности (2:1, 3:1, 3:2, 4:3); уровень пульса оценивается
+  отдельно от его периодичности.
 - Смена темпа: стабильные сегменты + отдельные **неуверенные** переходы;
   приложение не выдаёт предполагаемую смену за измеренный BPM.
 - Курсор синхронизирован с реальным audible-временем с учётом задержки
@@ -44,10 +50,11 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 
 Измерения на синтетическом корпусе и 5-минутном треке:
 **[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)**.
-300-секундный трек анализируется ~**1.37 с** (медиана, ~**219× realtime**) на
+300-секундный трек анализируется ~**1.53 с** (медиана, ~**196× realtime**) на
 Ryzen 7 5700X. Точность BPM на 92/123/163 BPM — в пределах долей BPM;
-beat recall 1.00 при допуске 60 мс на стабильных треках (0.93 на переходе
-92→123, где часть ударов попадает в неуверенную transition-зону).
+beat recall 1.00 при допуске 60 мс, средняя ошибка времени 2–4 мс. Метрический
+уровень и downbeat проверяются отдельным regression-корпусом:
+[docs/BG_BEAT_AUDIT.md](docs/BG_BEAT_AUDIT.md).
 
 ## Быстрый старт: Windows
 
@@ -221,21 +228,26 @@ ctest --test-dir build/windows --output-on-failure
 build/windows/bin/bgmedia_tests.exe
 ```
 
-37 тестов, разбитые на CTest-группы:
+47 тестов, разбитые на CTest-группы:
 
 - `audio` — WAV PCM/float, 24-bit, truncated files, MP3/FLAC/WAV через
   miniaudio, downmix/hash;
-- `analysis` — 92/123/163 BPM, beat alignment, tempo change, silence,
-  fully silent, bass vs broadband swell, ambiguous rhythm, cancellation;
-- `cache` — roundtrip, corruption, version mismatch, key mismatch, atomic store;
+- `analysis` — straight 80/92/100/123/125/163 BPM, offbeat, 12/8 ternary
+  66 BPM, half-time, shuffle, dense hats, syncopated bass, drift, tempo
+  change, silence, bass vs broadband swell, ambiguous rhythm, cancellation,
+  onset timestamp bias;
+- `cache` — roundtrip, corruption, analyzer/format version mismatch, key
+  mismatch, atomic store;
 - `sync` — latency compensation, pause/seek/rate, clamping, monotonic smoothing;
 - `choreography` — cues, freezes, deterministic sampling, empty input;
 - `motion` — exact accent targets, continuous keyframes, 30/60/120 FPS and
   arbitrary-order determinism, easing/shortest-arc, pause/seek, tempo change,
-  fast-tempo amplitude adaptation, smooth vs stepped comparison.
+  fast-tempo amplitude adaptation, offbeat-bass BassDip guard, smooth vs
+  stepped comparison.
 
 Тестовые аудиофайлы — оригинальные синтетические сигналы; см.
-[tests/fixtures/README.md](tests/fixtures/README.md).
+[tests/fixtures/README.md](tests/fixtures/README.md). Подробный
+до/после-разбор BG Beat: [docs/BG_BEAT_AUDIT.md](docs/BG_BEAT_AUDIT.md).
 
 ## Структура репозитория
 
@@ -255,6 +267,7 @@ tests/                      CTest + синтетические фикстуры
 docs/ARCHITECTURE.md        архитектура и точки расширения (включая BG Video)
 docs/ANDROID_JNI.md         конкретный план Android/JNI
 docs/MOTION.md              BG Motion 2.0: keyframes, blending, accents, debug
+docs/BG_BEAT_AUDIT.md       исправление метрического уровня, downbeat, UI, кеша
 docs/MEASUREMENTS.md        реальные замеры
 docs/images/                скриншоты
 third_party/                KissFFT, miniaudio, stb_truetype, лицензии
@@ -301,18 +314,25 @@ auto report = analyzer.analyze(pcm, [](float p, const std::string& stage) {
 if (!report.ok()) { /* report.message */ }
 
 const auto& a = report.result;
-// a.bpm, a.bpmConfidence, a.beats, a.bassAccents, a.tempoSegments,
+// a.bpm, a.bpmConfidence, a.bpmLevelConfidence, a.beatPhaseConfidence,
+// a.downbeatConfidence, a.beats, a.bassAccents, a.tempoSegments,
 // a.tempoTransitions, a.silences, a.spectrogram
 ```
 
 ## Ограничения этапа
 
 - Моно-анализ; стерео-панорама не учитывается.
-- Темп-приор ~120 BPM может ошибаться на экзотических ритмах; альтернативы и
-  `octaveAmbiguous` всегда доступны.
+- `bpmConfidence`, `bpmLevelConfidence`, `beatPhaseConfidence` и
+  `downbeatConfidence` — эвристические scores, **не вероятности**. Они не
+  откалиброваны на большом размеченном корпусе.
+- Метрическая неоднозначность (2:1, 3:1, 3:2, 4:3) остаётся видимой; UI не
+  показывает `STABLE` как гарантию правильного музыкального темпа.
 - Смена темпа показывается как возможная (`TempoTransition`), а не как
   доказанный факт.
-- Meter/downbeat — эвристика; confidence низкая на равномерном пульсе.
+- Meter/downbeat — эвристика. При низкой `meterConfidence` UI скрывает
+  downbeat-акценты и пишет `meter uncertain`.
+- Реальные треки проверялись локально, но их эталонный BPM неизвестен; см.
+  `docs/BG_BEAT_AUDIT.md`.
 - Скорость в демо меняет питч (линейный resampler), это не time-stretch.
 - Задержка вывода оценивается по периодам устройства; есть ручной trim.
 - In-memory decoder ограничен 1 GiB; очень длинные файлы — следующий этап.

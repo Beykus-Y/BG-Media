@@ -52,6 +52,24 @@ struct TrackOptions {
 
 [[nodiscard]] SyntheticTrack makeAmbiguousTrack();
 
+// Regression corpus for metric-level and phase robustness. These are
+// deliberately not just click tracks: they encode offbeat, ternary, half-time,
+// shuffle, dense-hat and syncopated-bass patterns with known ground truth.
+[[nodiscard]] SyntheticTrack makeOffbeatTrack(double bpm = 100.0,
+                                              double duration = 18.0);
+[[nodiscard]] SyntheticTrack makeTernaryTrack(double pulseBpm = 66.2,
+                                              double duration = 24.0);
+[[nodiscard]] SyntheticTrack makeHalfTimeTrack(double bpm = 80.0,
+                                               double duration = 18.0);
+[[nodiscard]] SyntheticTrack makeShuffleTrack(double bpm = 80.0,
+                                              double duration = 18.0);
+[[nodiscard]] SyntheticTrack makeDenseHatTrack(double bpm = 99.0,
+                                               double duration = 18.0);
+[[nodiscard]] SyntheticTrack makeSyncopatedBassTrack(double bpm = 100.0,
+                                                     double duration = 18.0);
+[[nodiscard]] SyntheticTrack makeDriftTrack(double bpm = 80.0,
+                                            double duration = 18.0);
+
 // 16-bit RIFF/WAVE writer used by tests and the fixture generator.
 bool writeWav16(const std::filesystem::path& path, const AudioData& audio,
                 std::string* error = nullptr);

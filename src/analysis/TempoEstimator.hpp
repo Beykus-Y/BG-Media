@@ -15,6 +15,12 @@ struct TempoCandidate {
     double coverage = 0.0;
     double beatHitRate = 0.0;
     double onsetHitRate = 0.0;
+    double precisionAdjusted = 0.0;
+    double recallAdjusted = 0.0;
+    double pulseScore = 0.0;
+    double lowHitRate = 0.0;
+    double lowContrast = 0.0;
+    double levelSupport = 0.0;
     double prior = 0.0;
     bool octaveRelatedToBest = false;
 };
@@ -22,6 +28,9 @@ struct TempoCandidate {
 struct TempoEstimate {
     double bpm = 0.0;
     float confidence = 0.0f;
+    // Heuristic split of the old single confidence. These are scores, not
+    // calibrated probabilities.
+    float levelConfidence = 0.0f;
     bool octaveAmbiguous = false;
     std::vector<TempoCandidate> candidates; // sorted, strongest first
 };
@@ -38,6 +47,7 @@ struct TempoWindow {
 struct TempoStructure {
     double bpm = 0.0;
     float confidence = 0.0f;
+    float levelConfidence = 0.0f;
     bool stable = true;
     bool octaveAmbiguous = false;
     std::vector<TempoSegment> segments;
@@ -52,12 +62,14 @@ struct TempoStructure {
                                           double fps,
                                           const AnalysisConfig& config,
                                           double activeFraction,
-                                          double continuityBpm = 0.0);
+                                          double continuityBpm = 0.0,
+                                          const std::vector<float>* lowEnv = nullptr);
 
 [[nodiscard]] TempoStructure estimateTempoStructure(
     const std::vector<float>& env, const std::vector<std::uint8_t>& active,
     double fps, double duration, const AnalysisConfig& config,
-    const TempoEstimate& global);
+    const TempoEstimate& global,
+    const std::vector<float>* lowEnv = nullptr);
 
 [[nodiscard]] double bpmAtTime(const TempoStructure& structure, double time,
                                double fallback);

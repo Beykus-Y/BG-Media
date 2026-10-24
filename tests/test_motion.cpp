@@ -470,6 +470,57 @@ TEST_CASE(motion.playback_rate_and_clock_keep_media_time) {
     CHECK(samePose(frozen, sampler.sample(choreography, clock.position())));
 }
 
+TEST_CASE(motion.offbeat_bass_is_not_forced_into_bass_dip) {
+    using namespace bgmedia;
+    AnalysisResult analysis;
+    analysis.info.duration = 12.0;
+    analysis.info.sampleRate = 44100;
+    analysis.info.sourceChannels = 2;
+    analysis.bpm = 198.5;
+    analysis.beatsPerBar = 4;
+    const double period = 60.0 / 198.5;
+    for (int i = 0; i < 40; ++i) {
+        Beat beat;
+        beat.time = 0.45 + i * period;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = i % 4 == 0;
+        beat.strength = beat.downbeat ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        analysis.beats.push_back(beat);
+    }
+    for (int i = 0; i + 1 < 40; ++i) {
+        BassAccent offbeat;
+        offbeat.time = analysis.beats[static_cast<std::size_t>(i)].time + period * 0.5;
+        offbeat.strength = 0.8f;
+        offbeat.confidence = 0.9f;
+        offbeat.nearestBeat = -1;
+        offbeat.offsetFromBeat = period * 0.5;
+        analysis.bassAccents.push_back(offbeat);
+    }
+    BassAccent onBeat;
+    onBeat.time = analysis.beats[0].time;
+    onBeat.strength = 0.9f;
+    onBeat.confidence = 0.9f;
+    onBeat.nearestBeat = 0;
+    onBeat.offsetFromBeat = 0.0;
+    analysis.bassAccents.push_back(onBeat);
+
+    const Choreography choreography = ChoreographyBuilder{}.build(analysis);
+    int bassDips = 0;
+    int offbeatDips = 0;
+    for (const AccentTarget& target : choreography.accents) {
+        if (target.move == MoveKind::BassDip) {
+            ++bassDips;
+            if (target.beatIndex != 0) {
+                ++offbeatDips;
+            }
+        }
+    }
+    CHECK(bassDips == 1);
+    CHECK(offbeatDips == 0);
+}
+
 TEST_CASE(motion.stepped_sampler_still_available) {
     using namespace bgmedia;
     const AnalysisResult analysis = makeGrid(120.0, 8.0, 2);

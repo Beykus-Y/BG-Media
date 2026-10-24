@@ -193,17 +193,32 @@ bool finite(float value) { return std::isfinite(value); }
 
 bool validAnalysis(const AnalysisResult& result) {
     if (!finite(result.bpm) || !finite(result.bpmConfidence) ||
-        !finite(result.info.duration) || result.info.duration < 0.0) {
+        !finite(result.bpmLevelConfidence) || !finite(result.beatPhaseConfidence) ||
+        !finite(result.downbeatConfidence) || !finite(result.info.duration) ||
+        result.info.duration < 0.0) {
         return false;
     }
-    if (result.info.sampleRate == 0 || result.info.sourceChannels == 0) {
+    if (result.info.sampleRate == 0 || result.info.sourceChannels == 0 ||
+        result.bpmConfidence < 0.0f || result.bpmConfidence > 1.0f ||
+        result.bpmLevelConfidence < 0.0f || result.bpmLevelConfidence > 1.0f ||
+        result.beatPhaseConfidence < 0.0f || result.beatPhaseConfidence > 1.0f ||
+        result.downbeatConfidence < 0.0f || result.downbeatConfidence > 1.0f ||
+        result.meterConfidence < 0.0f || result.meterConfidence > 1.0f ||
+        result.beatsPerBar < 0 || result.beatsPerBar > 8) {
         return false;
     }
+    double previousBeatTime = -1e9;
     for (const Beat& beat : result.beats) {
         if (!finite(beat.time) || !finite(beat.strength) || !finite(beat.confidence) ||
-            beat.time < -0.25 || beat.time > result.info.duration + 0.25) {
+            beat.time < -0.25 || beat.time > result.info.duration + 0.25 ||
+            beat.time < previousBeatTime - 1e-6 ||
+            beat.beatInBar < 0 || beat.barIndex < -1) {
             return false;
         }
+        if (result.beatsPerBar > 0 && beat.beatInBar >= result.beatsPerBar) {
+            return false;
+        }
+        previousBeatTime = beat.time;
     }
     for (const Onset& onset : result.onsets) {
         if (!finite(onset.time) || onset.time < -0.25 ||
@@ -228,6 +243,9 @@ bool validAnalysis(const AnalysisResult& result) {
 void writeResult(Writer& w, const AnalysisResult& r) {
     w.f64(r.bpm);
     w.f32(r.bpmConfidence);
+    w.f32(r.bpmLevelConfidence);
+    w.f32(r.beatPhaseConfidence);
+    w.f32(r.downbeatConfidence);
     w.u8(r.tempoStable ? 1 : 0);
     w.u8(r.octaveAmbiguous ? 1 : 0);
     w.i32(r.beatsPerBar);
@@ -325,6 +343,9 @@ AnalysisResult readResult(Reader& r) {
     AnalysisResult result;
     result.bpm = r.f64();
     result.bpmConfidence = r.f32();
+    result.bpmLevelConfidence = r.f32();
+    result.beatPhaseConfidence = r.f32();
+    result.downbeatConfidence = r.f32();
     result.tempoStable = r.u8() != 0;
     result.octaveAmbiguous = r.u8() != 0;
     result.beatsPerBar = r.i32();

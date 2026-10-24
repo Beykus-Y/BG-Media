@@ -14,6 +14,8 @@ struct BeatTrackingResult {
     std::vector<Beat> beats;
     int beatsPerBar = 4;
     float meterConfidence = 0.0f;
+    float beatPhaseConfidence = 0.0f;
+    float downbeatConfidence = 0.0f;
 };
 
 // Extracts onset peaks from the sharp onset envelope. Silence regions are

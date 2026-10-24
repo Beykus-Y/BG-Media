@@ -43,6 +43,10 @@ Analyzed analyzeShortTrack() {
 void checkEquivalent(const bgmedia::AnalysisResult& a, const bgmedia::AnalysisResult& b) {
     CHECK_NEAR(a.bpm, b.bpm, 1e-9);
     CHECK_NEAR(a.bpmConfidence, b.bpmConfidence, 1e-9);
+    CHECK_NEAR(a.bpmLevelConfidence, b.bpmLevelConfidence, 1e-9);
+    CHECK_NEAR(a.beatPhaseConfidence, b.beatPhaseConfidence, 1e-9);
+    CHECK_NEAR(a.downbeatConfidence, b.downbeatConfidence, 1e-9);
+    CHECK_NEAR(a.meterConfidence, b.meterConfidence, 1e-9);
     CHECK(a.tempoStable == b.tempoStable);
     CHECK(a.octaveAmbiguous == b.octaveAmbiguous);
     CHECK(a.beatsPerBar == b.beatsPerBar);
@@ -124,6 +128,26 @@ TEST_CASE(cache.roundtrip_and_corruption) {
     }
     auto versionMiss = cache.load(analyzed.pcm, analyzed.config);
     CHECK(versionMiss.status == CacheStatus::Miss);
+
+    // The analyzer version is part of the cache contract. In particular the
+    // 540dd41 tempo estimator must not be reused after the BG Beat semantics
+    // changed for the metric-level fix.
+    REQUIRE(cache.store(analyzed.result, analyzed.pcm, analyzed.config, &error));
+    {
+        std::vector<std::uint8_t> bytes;
+        {
+            std::ifstream in(path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>());
+        }
+        REQUIRE(bytes.size() > 20);
+        bytes[16] = 1; // analyzer version field
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    auto analyzerVersionMiss = cache.load(analyzed.pcm, analyzed.config);
+    CHECK(analyzerVersionMiss.status == CacheStatus::Miss);
 
     std::filesystem::remove_all(directory, ec);
 }

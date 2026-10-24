@@ -113,22 +113,30 @@ presentation timestamp относительно той же audible media time, 
   `max(lowEnv, 0.35 * fullEnv)`. Это не даёт хай-хэтам «удвоить» BPM, но
   оставляет рабочим материал без баса.
 
-### 5.3 Темп
+### 5.3 Темп и метрический уровень
 
-1. Autocorrelation onset/pulse envelope.
-2. Кандидаты BPM из локальных максимумов + октавные варианты.
+1. Autocorrelation broadband onset/pulse envelope.
+2. Кандидаты BPM из локальных максимумов плюс семейство уровней:
+   `1/3, 1/2, 2/3, 3/4, 1, 4/3, 3/2, 2, 3`. Это важно для 12/8, half-time
+   и offbeat-материала; прежняя модель генерировала только 2:1.
 3. Для кандидата ищется фаза и считается:
-   - покрытие onset-энергии,
-   - доля «попаданий» в удары,
-   - доля объяснённых onset-пиков,
-   - контраст on-beat / off-beat.
-4. Если два октавных кандидата близки по score, выбирается ближайший к
-   музыкальному prior (по умолчанию 120 BPM), а неоднозначность остаётся
-   видимой: `octaveAmbiguous = true`, альтернативы попадают в
-   `bpmCandidates`. Это не скрытая эвристика: UI показывает предупреждение.
-5. Confidence — эвристическая оценка 0..1, не вероятность. Она снижается для
-   октавной неоднозначности, маленького active ratio и слабого разделения
-   кандидатов.
+   - precision попаданий предсказанных ударов в onsets с поправкой на
+     случайное совпадение (density normalization),
+   - on/off контраст,
+   - low-band pulse evidence: hit rate и контраст по отфильтрованному
+     `lowEnergyRatio` низкочастотному envelopes,
+   - autocorrelation поддержка.
+   Старые coverage/onset-hit-rate не входят в выбор уровня: они монотонно
+   растут с плотностью сетки и были основной причиной выбора tatum вместо
+   пульса.
+4. Кандидат-субгармоника получает поддержку, только если у более медленного
+   родительского уровня есть не меньшая low-band pulse evidence. Это не
+   жёсткая фиксация BPM: уровни оцениваются по музыкальной энергии.
+5. `bpmConfidence` — эвристическая оценка периодичности/BPM, не вероятность.
+   Для уровня есть отдельный `bpmLevelConfidence`; альтернативы остаются в
+   `bpmCandidates`. `octaveAmbiguous` теперь означает любую метрическую
+   неоднозначность (2:1, 3:1, 3:2, 4:3), а UI пишет `METRIC AMBIGUOUS`, не
+   `STABLE`.
 
 Для темпа с изменением:
 
@@ -143,15 +151,25 @@ presentation timestamp относительно той же audible media time, 
 
 ### 5.4 Beat tracking
 
-- Ellis-style dynamic programming по onset envelope;
+- Ellis-style dynamic programming по **beat evidence**:
+  broadband onset envelope + отфильтрованный low-frequency pulse;
 - локальный период берётся из tempo-структуры (может меняться);
 - анализ идёт по непрерывным не-тихим областям, поэтому в длинной тишине удары
   не выдумываются;
 - удары, найденные DP, привязываются к ближайшему onset-пику в пределах ~55 мс;
+- phase rescue применяется только когда текущая сетка почти не имеет low-band
+  поддержки (`basePulse < 0.15`), иначе сильный syncopated bass мог бы увести
+  beat на offbeat;
 - слабые доли, продолженные сеткой без прямого onset, помечаются
   `extrapolated=true` и имеют низкую confidence;
-- сильные/слабые доли: оценка meter 2/3/4 и фазы downbeat по low-band
-  акцентам; `meterConfidence` честно низкая на равномерном пульсе;
+- meter/downbeat: grid index накапливается по фактическому времени и локальному
+  периоду, а не по индексу вектора; один пропущенный удар больше не сдвигает
+  все следующие такты. Фаза оценивается по low-band pulse/energy, first-beat
+  используется как слабый tie-break; `meterConfidence`/`downbeatConfidence`
+  честно низкие при равномерном пульсе;
+- timestamps onset/beat используют середину нового аудиоинтервала STFT-кадра,
+  а не центр окна: это устраняет систематическое опережение примерно на
+  13–14 мс;
 - на каждом ударе есть `beatInBar`, `barIndex`, `downbeat`, `strength`,
   `confidence`.
 
@@ -169,6 +187,9 @@ Broadband swell (шум/тарелки) даёт высокую общую гр�
 `lowBandRatio`, `strength`, `confidence`, `nearestBeat`, `offsetFromBeat`.
 Несколько басовых нот между ударами могут попасть в карту — это реальные
 низкочастотные события, а не ложные срабатывания по громкости.
+`nearestBeat` выставляется только при попадании в local-period окно
+(не более 28% IBI); offbeat-бас остаётся событием с `nearestBeat=-1` и не
+превращается в BassDip в choreography.
 
 ### 5.6 Тишина и секции
 
@@ -184,7 +205,10 @@ Broadband swell (шум/тарелки) даёт высокую общую гр�
 - Ключ: `contentHash(PCM) + config.fingerprint()`, в который входит
   `kAnalyzerVersion`.
 - Формат: magic `BGMedia1`, версии формата/схемы/анализатора, размеры,
-  payload + checksum.
+  payload + checksum. `kAnalyzerVersion=2`, schema/cache format `2` после
+  изменения метрической семантики BG Beat; старые записи должны стать miss.
+- Payload хранит раздельные `bpmConfidence`, `bpmLevelConfidence`,
+  `beatPhaseConfidence`, `downbeatConfidence`.
 - Запись атомарная: temp-файл → rename.
 - Загрузка проверяет магию, версии, ключи, checksum, диапазоны времени,
   размеры массивов. Битый файл — `Corrupt`, а не падение и не частичный
