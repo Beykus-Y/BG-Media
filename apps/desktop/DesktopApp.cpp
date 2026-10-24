@@ -4,11 +4,13 @@
 #include "TextRenderer.hpp"
 #include "Theme.hpp"
 #include "Ui.hpp"
+#include "VrmScene.hpp"
 #include "bgmedia/analysis/Analyzer.hpp"
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
 #include "bgmedia/version.hpp"
+#include "bgmedia/vrm/VrmModel.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -35,6 +37,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 namespace bgmedia::desktop {
@@ -231,6 +234,21 @@ struct Layout {
     Rect motionDebug{};
     Rect motionLab{};
 
+    // Character-view switch and VRM controls.
+    Rect mode2D{};
+    Rect mode3D{};
+    Rect vrmLoadButton{};
+    Rect stage3D{};
+    Rect vrmResetCamera{};
+    Rect vrmDemoButton{};
+    Rect vrmScaleMinus{};
+    Rect vrmScalePlus{};
+    Rect vrmOffsetMinus{};
+    Rect vrmOffsetPlus{};
+    Rect vrmLoadStage{};
+    Rect vrmEmptyLoad{};
+    Rect vrmRightLoad{};
+
     Rect ruler{};
     Rect wave{};
     Rect spectrogram{};
@@ -244,6 +262,16 @@ enum class AppState {
     Loading,
     Ready,
     Error
+};
+
+enum class CharacterView {
+    Robot2D,
+    Vrm3D
+};
+
+enum class DialogKind {
+    Audio,
+    Vrm
 };
 
 std::vector<WaveformPeak> buildHiresWaveform(const PcmBuffer& pcm, double& peaksPerSecond) {
@@ -281,6 +309,90 @@ bool isAudioExtension(const std::filesystem::path& path) {
         return static_cast<char>(std::tolower(c));
     });
     return ext == ".wav" || ext == ".mp3" || ext == ".flac";
+}
+
+bool isVrmExtension(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return ext == ".vrm" || ext == ".glb";
+}
+
+std::filesystem::path findDefaultVrm(const std::filesystem::path& base) {
+    const std::vector<std::filesystem::path> directories = {
+        base / "models",
+        base.parent_path() / "models",
+        base.parent_path().parent_path() / "models",
+        base.parent_path().parent_path().parent_path() / "models",
+        std::filesystem::current_path() / "models",
+        std::filesystem::current_path().parent_path() / "models",
+    };
+    for (const auto& directory : directories) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(directory, ec)) {
+            continue;
+        }
+        std::vector<std::filesystem::path> candidates;
+        for (std::filesystem::directory_iterator it(directory, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (it->is_regular_file(ec) && isVrmExtension(it->path())) {
+                candidates.push_back(it->path());
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        if (!candidates.empty()) {
+            return candidates.front();
+        }
+    }
+    return {};
+}
+
+double residentMemoryMb() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
+    }
+#endif
+    return 0.0;
+}
+
+AnalysisResult makeSyntheticAnalysis(int bpm, double duration) {
+    AnalysisResult analysis;
+    analysis.info.duration = duration;
+    analysis.info.sampleRate = 44100;
+    analysis.info.sourceChannels = 2;
+    analysis.bpm = static_cast<double>(bpm);
+    analysis.bpmConfidence = 1.0f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const double period = 60.0 / static_cast<double>(std::max(1, bpm));
+    const double offset = 0.45;
+    int index = 0;
+    for (double time = offset; time < duration - 0.1; time += period, ++index) {
+        Beat beat;
+        beat.time = time;
+        beat.beatInBar = index % 4;
+        beat.barIndex = index / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        beat.strength = beat.downbeat ? 1.0f : 0.64f;
+        beat.confidence = 1.0f;
+        analysis.beats.push_back(beat);
+    }
+    for (std::size_t i = 0; i < analysis.beats.size(); ++i) {
+        const Beat& beat = analysis.beats[i];
+        if (beat.downbeat && (beat.barIndex % 2 == 0)) {
+            BassAccent accent;
+            accent.time = beat.time;
+            accent.strength = 0.95f;
+            accent.lowBandRatio = 0.75f;
+            accent.confidence = 1.0f;
+            accent.nearestBeat = static_cast<int>(i);
+            analysis.bassAccents.push_back(accent);
+        }
+    }
+    return analysis;
 }
 
 std::filesystem::path findAssetsDirectory(const std::filesystem::path& base) {
@@ -332,10 +444,35 @@ struct DesktopApp::Impl {
     PlaybackClock clock;
     AnalysisConfig config;
 
+    VrmScene vrm;
+    CharacterView characterView = CharacterView::Robot2D;
+    std::filesystem::path defaultVrmPath;
+    std::filesystem::path lastVrmDirectory;
+    std::string vrmError;
+    std::string vrmFrameError;
+    sdlgpu::Camera vrmCamera;
+    bool cameraDragging = false;
+    float cameraDragX = 0.0f;
+    float cameraDragY = 0.0f;
+
+    // Synthetic BG Motion test grid for the 3D view. It is used only when no
+    // audio track is loaded, so the character can be verified independently of
+    // BG Beat. Music playback always uses the real track choreography.
+    bool syntheticDemo = false;
+    std::unique_ptr<AnalysisResult> syntheticAnalysis;
+    std::unique_ptr<Choreography> syntheticChoreography;
+    double syntheticPosition = 0.0;
+    bool syntheticPlaying = true;
+
+    double fpsSmoothed = 0.0;
+    double frameMsSmoothed = 0.0;
+
     std::filesystem::path cacheDirectory;
     std::filesystem::path assetsDirectory;
     std::vector<SDL_DialogFileFilter> filters;
+    std::vector<SDL_DialogFileFilter> vrmFilters;
     std::string dialogStartLocation;
+    DialogKind dialogKind = DialogKind::Audio;
 
     AppState state = AppState::Empty;
     std::unique_ptr<LoadedTrack> track;
@@ -394,6 +531,7 @@ struct DesktopApp::Impl {
             SDL_DestroyTexture(spectrogramTexture);
         }
         player.close();
+        vrm.shutdown();
         text.reset();
         if (renderer) {
             SDL_DestroyRenderer(renderer);
@@ -466,10 +604,34 @@ struct DesktopApp::Impl {
             SDL_DialogFileFilter{"Audio files", "*.wav;*.mp3;*.flac"},
             SDL_DialogFileFilter{"All files", "*.*"},
         };
+        vrmFilters = {
+            SDL_DialogFileFilter{"VRM 0.x models", "*.vrm;*.glb"},
+            SDL_DialogFileFilter{"All files", "*.*"},
+        };
 
         motionDebug = options.motionDebug;
         motionStepped = options.motionStepped;
         motionLabBpm = std::max(0, options.motionLabBpm);
+        defaultVrmPath = findDefaultVrm(basePath);
+
+        vrmCamera.yaw = kPi;
+        vrmCamera.pitch = 0.10f;
+        vrmCamera.distanceScale = 1.0f;
+        vrmCamera.fov = 0.56f;
+        vrm.renderSettings().modelScale = std::clamp(options.vrmScale, 0.2f, 5.0f);
+        vrm.renderSettings().modelOffset.y = options.vrmOffsetY;
+
+        // Preserve the old 2D startup path: the SDL_GPU device and private VRM
+        // are loaded lazily on the first switch to 3D. Explicit --vrm/--3d or
+        // --vrm-demo start in 3D and initialize immediately.
+        if (options.startIn3D) {
+            setCharacterView(CharacterView::Vrm3D, false);
+            if (options.vrmDemo || options.motionLabBpm > 0) {
+                setSyntheticDemo(options.motionLabBpm > 0 ? options.motionLabBpm
+                                                          : 123,
+                                 false);
+            }
+        }
 
         SDL_ShowWindow(window);
         return true;
@@ -478,6 +640,7 @@ struct DesktopApp::Impl {
     void shutdown() {
         stopWorker();
         player.close();
+        vrm.shutdown();
         if (spectrogramTexture) {
             SDL_DestroyTexture(spectrogramTexture);
             spectrogramTexture = nullptr;
@@ -686,6 +849,9 @@ struct DesktopApp::Impl {
         state = AppState::Ready;
         errorMessage.clear();
         audioError.clear();
+        syntheticDemo = false;
+        syntheticAnalysis.reset();
+        syntheticChoreography.reset();
         rebuildSpectrogram();
         if (motionLabBpm > 0) {
             rebuildMotionLab();
@@ -707,6 +873,10 @@ struct DesktopApp::Impl {
                 audioError = error;
             } else {
                 (void)clock.update(player.snapshot());
+                if (options.autoplay && !captureMode) {
+                    player.play();
+                    (void)clock.update(player.snapshot());
+                }
             }
         }
         std::string title = "BG Media";
@@ -726,9 +896,20 @@ struct DesktopApp::Impl {
     }
 
     // ---------------------------------------------------------------------
+    // 3D character mode
+    // ---------------------------------------------------------------------
+    void draw3DStage();
+    void draw3DRightPanels();
+    void drawModeChip(const Rect& rect, std::string_view labelText, bool active,
+                      SDL_Color color);
+
+    // ---------------------------------------------------------------------
     // BG Motion lab / comparison
     // ---------------------------------------------------------------------
     [[nodiscard]] const AnalysisResult* activeAnalysis() const {
+        if (syntheticDemo && !track && syntheticAnalysis) {
+            return syntheticAnalysis.get();
+        }
         if (motionLabBpm > 0 && motionLabAnalysis) {
             return motionLabAnalysis.get();
         }
@@ -736,6 +917,9 @@ struct DesktopApp::Impl {
     }
 
     [[nodiscard]] const Choreography* activeChoreography() const {
+        if (syntheticDemo && !track && syntheticChoreography) {
+            return syntheticChoreography.get();
+        }
         if (motionLabBpm > 0 && motionLabChoreography) {
             return motionLabChoreography.get();
         }
@@ -819,14 +1003,21 @@ struct DesktopApp::Impl {
         if (motionLabBpm == 0) {
             motionLabAnalysis.reset();
             motionLabChoreography.reset();
-            showToast("Motion lab off - using analysed music");
+            syntheticDemo = false;
+            syntheticAnalysis.reset();
+            syntheticChoreography.reset();
+            syntheticPosition = 0.0;
+            showToast(track ? "Motion lab off - using analysed music"
+                            : "Synthetic dance off");
             return;
         }
         if (!track) {
-            motionLabBpm = 0;
-            showToast("Load a track before enabling the motion lab");
+            setSyntheticDemo(motionLabBpm, true);
             return;
         }
+        syntheticDemo = false;
+        syntheticAnalysis.reset();
+        syntheticChoreography.reset();
         rebuildMotionLab();
         showToast("Motion lab: synthetic " + std::to_string(motionLabBpm) +
                   " BPM beat grid");
@@ -845,12 +1036,185 @@ struct DesktopApp::Impl {
     }
 
     // ---------------------------------------------------------------------
+    // 3D character mode
+    // ---------------------------------------------------------------------
+    bool loadVrmModel(const std::filesystem::path& path, bool announce) {
+        if (!vrm.initializeRenderer(&vrmError)) {
+            vrmFrameError = vrmError;
+            if (announce) {
+                showToast("3D renderer unavailable: " + vrmError);
+            }
+            return false;
+        }
+        const auto started = Clock::now();
+        std::string error;
+        if (!vrm.load(path, &error)) {
+            vrmError = error.empty() ? "VRM import failed" : error;
+            vrmFrameError = vrmError;
+            if (announce) {
+                showToast("VRM import failed");
+            }
+            return false;
+        }
+        vrmError = vrm.renderError();
+        vrmFrameError = vrmError;
+        lastVrmDirectory = path.parent_path();
+        resetVrmCamera(false);
+        const double ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        if (announce) {
+            const vrm::VrmModel* loaded = vrm.model();
+            std::string message = "VRM loaded";
+            if (loaded) {
+                message += ": " + std::to_string(loaded->diagnostics.triangleCount) +
+                           " tris, " +
+                           std::to_string(loaded->diagnostics.humanoidCount) +
+                           " humanoid bones";
+            }
+            message += " · " + formatNumber(ms, 0) + " ms";
+            showToast(message);
+        }
+        return true;
+    }
+
+    void setCharacterView(CharacterView view, bool announce) {
+        if (view == CharacterView::Vrm3D && !vrm.ready()) {
+            std::filesystem::path candidate = options.vrmFile;
+            if (candidate.empty()) {
+                candidate = defaultVrmPath;
+            }
+            if (!candidate.empty()) {
+                (void)loadVrmModel(candidate, false);
+            }
+        }
+        characterView = view;
+        cameraDragging = false;
+        if (announce) {
+            if (view == CharacterView::Vrm3D) {
+                showToast(vrm.ready() ? "3D VRM character view"
+                                      : "3D view · import a VRM model");
+            } else {
+                showToast("2D robot debug view");
+            }
+        }
+    }
+
+    void toggleCharacterView() {
+        setCharacterView(characterView == CharacterView::Robot2D
+                             ? CharacterView::Vrm3D
+                             : CharacterView::Robot2D,
+                         true);
+    }
+
+    void resetVrmCamera(bool announce = true) {
+        vrmCamera.yaw = kPi;
+        vrmCamera.pitch = 0.10f;
+        vrmCamera.distanceScale = 1.0f;
+        vrmCamera.fov = 0.56f;
+        if (announce) {
+            showToast("Camera reset");
+        }
+    }
+
+    void adjustVrmScale(float delta) {
+        auto& settings = vrm.renderSettings();
+        settings.modelScale =
+            std::clamp(settings.modelScale + delta, 0.25f, 3.0f);
+        showToast("Model scale " + formatNumber(settings.modelScale, 2) + "x");
+    }
+
+    void adjustVrmOffset(float delta) {
+        auto& settings = vrm.renderSettings();
+        settings.modelOffset.y =
+            std::clamp(settings.modelOffset.y + delta, -0.5f, 0.5f);
+        showToast("Model height " +
+                  std::string(settings.modelOffset.y >= 0.0f ? "+" : "") +
+                  formatNumber(settings.modelOffset.y, 2) + " m");
+    }
+
+    void rebuildSyntheticDemo() {
+        if (motionLabBpm <= 0) {
+            syntheticAnalysis.reset();
+            syntheticChoreography.reset();
+            return;
+        }
+        syntheticAnalysis =
+            std::make_unique<AnalysisResult>(makeSyntheticAnalysis(motionLabBpm, 60.0));
+        syntheticChoreography = std::make_unique<Choreography>(
+            ChoreographyBuilder{}.build(*syntheticAnalysis));
+    }
+
+    void setSyntheticDemo(int bpm, bool announce) {
+        motionLabBpm = std::max(0, bpm);
+        if (motionLabBpm == 0) {
+            syntheticDemo = false;
+            syntheticAnalysis.reset();
+            syntheticChoreography.reset();
+            syntheticPosition = 0.0;
+            if (announce) {
+                showToast("Synthetic dance off");
+            }
+            return;
+        }
+        syntheticDemo = true;
+        syntheticPlaying = true;
+        syntheticPosition = 0.0;
+        rebuildSyntheticDemo();
+        if (announce) {
+            showToast("Synthetic dance · " + std::to_string(motionLabBpm) + " BPM");
+        }
+    }
+
+    void updateDemo(double deltaSeconds) {
+        if (!syntheticDemo || track) {
+            return;
+        }
+        if (!syntheticPlaying || !syntheticAnalysis) {
+            return;
+        }
+        const double duration = syntheticAnalysis->info.duration;
+        syntheticPosition += deltaSeconds;
+        if (syntheticPosition >= duration) {
+            syntheticPosition = std::fmod(syntheticPosition, duration);
+        }
+    }
+
+    [[nodiscard]] double vrmMediaTime() const {
+        if (!track) {
+            return syntheticDemo ? syntheticPosition : animationTime;
+        }
+        return currentPosition();
+    }
+
+    void updateVrmFrame() {
+        if (characterView != CharacterView::Vrm3D) {
+            return;
+        }
+        if (!vrm.ready()) {
+            return;
+        }
+        vrm.renderSettings().modelScale =
+            std::clamp(vrm.renderSettings().modelScale, 0.25f, 3.0f);
+        vrm.renderSettings().modelOffset.y =
+            std::clamp(vrm.renderSettings().modelOffset.y, -0.5f, 0.5f);
+        const double time = vrmMediaTime();
+        const CharacterPose pose = sampleActiveAt(time);
+        std::string error;
+        if (!vrm.render(pose, time, vrmCamera, vrm.renderSettings(), &error)) {
+            vrmFrameError = error;
+        } else {
+            vrmFrameError = vrm.renderError();
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Dialog and file handling
     // ---------------------------------------------------------------------
     void openFileDialog() {
         if (!window) {
             return;
         }
+        dialogKind = DialogKind::Audio;
         if (track) {
             dialogStartLocation = toUtf8(track->path.parent_path());
         } else {
@@ -858,6 +1222,23 @@ struct DesktopApp::Impl {
         }
         SDL_ShowOpenFileDialog(&Impl::dialogCallback, this, window, filters.data(),
                                static_cast<int>(filters.size()),
+                               dialogStartLocation.empty() ? nullptr
+                                                           : dialogStartLocation.c_str(),
+                               false);
+    }
+
+    void openVrmFileDialog() {
+        if (!window) {
+            return;
+        }
+        dialogKind = DialogKind::Vrm;
+        if (!lastVrmDirectory.empty()) {
+            dialogStartLocation = toUtf8(lastVrmDirectory);
+        } else {
+            dialogStartLocation = toUtf8(std::filesystem::current_path());
+        }
+        SDL_ShowOpenFileDialog(&Impl::dialogCallback, this, window, vrmFilters.data(),
+                               static_cast<int>(vrmFilters.size()),
                                dialogStartLocation.empty() ? nullptr
                                                            : dialogStartLocation.c_str(),
                                false);
@@ -894,7 +1275,13 @@ struct DesktopApp::Impl {
             showToast("File dialog: " + error);
         }
         if (!path.empty()) {
-            startLoad(fromUtf8(path.c_str()));
+            if (dialogKind == DialogKind::Vrm) {
+                if (loadVrmModel(fromUtf8(path.c_str()), true)) {
+                    setCharacterView(CharacterView::Vrm3D, false);
+                }
+            } else {
+                startLoad(fromUtf8(path.c_str()));
+            }
         }
     }
 
@@ -972,10 +1359,18 @@ struct DesktopApp::Impl {
     // Transport
     // ---------------------------------------------------------------------
     [[nodiscard]] double duration() const {
-        return track ? track->analysis.info.duration : 0.0;
+        if (!track) {
+            return syntheticDemo && syntheticAnalysis
+                       ? syntheticAnalysis->info.duration
+                       : 0.0;
+        }
+        return track->analysis.info.duration;
     }
 
     [[nodiscard]] double currentPosition() const {
+        if (!track && syntheticDemo) {
+            return std::clamp(syntheticPosition, 0.0, duration());
+        }
         if (!track) {
             return 0.0;
         }
@@ -992,7 +1387,10 @@ struct DesktopApp::Impl {
     }
 
     [[nodiscard]] bool playing() const {
-        if (!track || captureMode) {
+        if (!track) {
+            return syntheticDemo && syntheticPlaying;
+        }
+        if (captureMode) {
             return false;
         }
         if (scrubbing) {
@@ -1025,6 +1423,12 @@ struct DesktopApp::Impl {
 
     void togglePlay() {
         if (!track) {
+            if (syntheticDemo) {
+                syntheticPlaying = !syntheticPlaying;
+                showToast(syntheticPlaying ? "Synthetic dance playing"
+                                           : "Synthetic dance paused");
+                return;
+            }
             openFileDialog();
             return;
         }
@@ -1046,6 +1450,11 @@ struct DesktopApp::Impl {
 
     void stopPlayback() {
         if (!track) {
+            if (syntheticDemo) {
+                syntheticPosition = 0.0;
+                syntheticPlaying = false;
+                showToast("Synthetic dance stopped");
+            }
             return;
         }
         if (player.audioAvailable()) {
@@ -1060,6 +1469,10 @@ struct DesktopApp::Impl {
 
     void seekTo(double time, bool resume) {
         if (!track) {
+            if (syntheticDemo) {
+                syntheticPosition = std::clamp(time, 0.0, duration());
+                syntheticPlaying = resume;
+            }
             return;
         }
         time = std::clamp(time, 0.0, duration());
@@ -1076,7 +1489,7 @@ struct DesktopApp::Impl {
     }
 
     void seekRelative(double delta) {
-        if (!track) {
+        if (!track && !syntheticDemo) {
             return;
         }
         seekTo(currentPosition() + delta, playing());
@@ -1177,7 +1590,14 @@ struct DesktopApp::Impl {
             break;
         case SDL_EVENT_DROP_FILE:
             if (event.drop.data) {
-                startLoad(fromUtf8(event.drop.data));
+                const std::filesystem::path dropped = fromUtf8(event.drop.data);
+                if (isVrmExtension(dropped)) {
+                    if (loadVrmModel(dropped, true)) {
+                        setCharacterView(CharacterView::Vrm3D, false);
+                    }
+                } else {
+                    startLoad(dropped);
+                }
             }
             break;
         case SDL_EVENT_KEY_DOWN:
@@ -1189,6 +1609,16 @@ struct DesktopApp::Impl {
         case SDL_EVENT_MOUSE_MOTION:
             mouseX = event.motion.x;
             mouseY = event.motion.y;
+            if (cameraDragging && characterView == CharacterView::Vrm3D) {
+                const float dx = static_cast<float>(mouseX) - cameraDragX;
+                const float dy = static_cast<float>(mouseY) - cameraDragY;
+                cameraDragX = static_cast<float>(mouseX);
+                cameraDragY = static_cast<float>(mouseY);
+                vrmCamera.yaw += dx * 0.0075f;
+                vrmCamera.pitch =
+                    std::clamp(vrmCamera.pitch + dy * 0.0055f, -1.10f, 1.10f);
+                break;
+            }
             if (scrubbing) {
                 scrubPosition = xToTime(static_cast<float>(mouseX), layout.plot);
             }
@@ -1229,6 +1659,7 @@ struct DesktopApp::Impl {
             mouseY = event.button.y;
             if (event.button.button == SDL_BUTTON_LEFT) {
                 mouseDown = false;
+                cameraDragging = false;
                 handleLeftUp(static_cast<float>(event.button.x),
                              static_cast<float>(event.button.y));
             } else if (event.button.button == SDL_BUTTON_MIDDLE) {
@@ -1238,6 +1669,14 @@ struct DesktopApp::Impl {
         case SDL_EVENT_MOUSE_WHEEL:
             mouseX = event.wheel.mouse_x;
             mouseY = event.wheel.mouse_y;
+            if (characterView == CharacterView::Vrm3D &&
+                layout.stage3D.contains(static_cast<float>(mouseX),
+                                        static_cast<float>(mouseY))) {
+                vrmCamera.distanceScale = std::clamp(
+                    vrmCamera.distanceScale * std::pow(1.12f, -event.wheel.y),
+                    0.42f, 2.2f);
+                break;
+            }
             if (layout.plot.contains(static_cast<float>(mouseX),
                                      static_cast<float>(mouseY)) ||
                 layout.timelineCard.contains(static_cast<float>(mouseX),
@@ -1295,6 +1734,50 @@ struct DesktopApp::Impl {
         case SDLK_B:
             cycleMotionLab();
             break;
+        case SDLK_G:
+            toggleCharacterView();
+            break;
+        case SDLK_C:
+            if (characterView == CharacterView::Vrm3D) {
+                resetVrmCamera();
+            }
+            break;
+        case SDLK_T:
+            if (!track) {
+                setSyntheticDemo(syntheticDemo ? 0 : 123, true);
+            } else {
+                cycleMotionLab();
+            }
+            break;
+        case SDLK_2:
+            setCharacterView(CharacterView::Robot2D, true);
+            break;
+        case SDLK_3:
+            setCharacterView(CharacterView::Vrm3D, true);
+            break;
+        case SDLK_F2:
+            openVrmFileDialog();
+            break;
+        case SDLK_MINUS:
+            if (characterView == CharacterView::Vrm3D) {
+                adjustVrmScale(-0.05f);
+            }
+            break;
+        case SDLK_EQUALS:
+            if (characterView == CharacterView::Vrm3D) {
+                adjustVrmScale(0.05f);
+            }
+            break;
+        case SDLK_COMMA:
+            if (characterView == CharacterView::Vrm3D) {
+                adjustVrmOffset(-0.01f);
+            }
+            break;
+        case SDLK_PERIOD:
+            if (characterView == CharacterView::Vrm3D) {
+                adjustVrmOffset(0.01f);
+            }
+            break;
         case SDLK_LEFTBRACKET:
             adjustLatency(-0.005);
             break;
@@ -1317,7 +1800,16 @@ struct DesktopApp::Impl {
     }
 
     void handleLeftDown(float x, float y, int clicks) {
-        if (state == AppState::Loading) {
+        if (layout.mode2D.contains(x, y)) {
+            setCharacterView(CharacterView::Robot2D, true);
+            return;
+        }
+        if (layout.mode3D.contains(x, y)) {
+            setCharacterView(CharacterView::Vrm3D, true);
+            return;
+        }
+        if (layout.vrmLoadButton.contains(x, y)) {
+            openVrmFileDialog();
             return;
         }
         if (layout.loadButton.contains(x, y) ||
@@ -1344,6 +1836,53 @@ struct DesktopApp::Impl {
         }
         if (layout.syncPlus.contains(x, y)) {
             adjustLatency(0.005);
+            return;
+        }
+
+        if (characterView == CharacterView::Vrm3D) {
+            if (layout.vrmLoadStage.contains(x, y) ||
+                layout.vrmEmptyLoad.contains(x, y) ||
+                layout.vrmRightLoad.contains(x, y)) {
+                openVrmFileDialog();
+                return;
+            }
+            if (layout.vrmResetCamera.contains(x, y)) {
+                resetVrmCamera();
+                return;
+            }
+            if (layout.vrmDemoButton.contains(x, y)) {
+                if (track) {
+                    cycleMotionLab();
+                } else {
+                    setSyntheticDemo(syntheticDemo ? 0 : 123, true);
+                }
+                return;
+            }
+            if (layout.vrmScaleMinus.contains(x, y)) {
+                adjustVrmScale(-0.05f);
+                return;
+            }
+            if (layout.vrmScalePlus.contains(x, y)) {
+                adjustVrmScale(0.05f);
+                return;
+            }
+            if (layout.vrmOffsetMinus.contains(x, y)) {
+                adjustVrmOffset(-0.01f);
+                return;
+            }
+            if (layout.vrmOffsetPlus.contains(x, y)) {
+                adjustVrmOffset(0.01f);
+                return;
+            }
+            if (layout.stage3D.contains(x, y)) {
+                cameraDragging = true;
+                cameraDragX = x;
+                cameraDragY = y;
+            }
+            return;
+        }
+
+        if (state == AppState::Loading) {
             return;
         }
         if (layout.motionSmooth.contains(x, y)) {
@@ -1415,6 +1954,23 @@ struct DesktopApp::Impl {
         layout.motionDebug = {layout.motionLab.x - 76.0f, card.y + 10.0f, 70.0f, 24.0f};
         layout.motionSmooth = {layout.motionDebug.x - 104.0f, card.y + 10.0f, 98.0f, 24.0f};
         updateTimelineLayout();
+
+        layout.mode2D = {1048.0f, 80.0f, 54.0f, 40.0f};
+        layout.mode3D = {1108.0f, 80.0f, 54.0f, 40.0f};
+        layout.vrmLoadButton = {1168.0f, 80.0f, 68.0f, 40.0f};
+        layout.stage3D = {24.0f, 124.0f, 1004.0f, 716.0f};
+        layout.vrmLoadStage = {layout.stage3D.right() - 116.0f,
+                               layout.stage3D.y + 16.0f, 96.0f, 28.0f};
+        layout.vrmEmptyLoad = {layout.stage3D.centerX() - 78.0f,
+                               layout.stage3D.centerY() + 54.0f, 156.0f, 40.0f};
+        const Rect right4 = layout.right4;
+        layout.vrmRightLoad = {right4.x + 18.0f, right4.y + 34.0f, 88.0f, 28.0f};
+        layout.vrmResetCamera = {right4.x + 114.0f, right4.y + 34.0f, 96.0f, 28.0f};
+        layout.vrmDemoButton = {right4.x + 218.0f, right4.y + 34.0f, 136.0f, 28.0f};
+        layout.vrmScaleMinus = {right4.x + 74.0f, right4.y + 82.0f, 26.0f, 24.0f};
+        layout.vrmScalePlus = {right4.x + 104.0f, right4.y + 82.0f, 26.0f, 24.0f};
+        layout.vrmOffsetMinus = {right4.x + 268.0f, right4.y + 82.0f, 26.0f, 24.0f};
+        layout.vrmOffsetPlus = {right4.x + 298.0f, right4.y + 82.0f, 26.0f, 24.0f};
     }
 
     // ---------------------------------------------------------------------
@@ -1569,9 +2125,10 @@ void DesktopApp::Impl::drawPills() {
     const Pill pills[] = {
         {"BG BEAT", theme::violet, 72.0f},
         {"BG MOTION", theme::accent, 82.0f},
+        {"BG VRM", theme::pink, 68.0f},
     };
     float x = right;
-    for (int i = 1; i >= 0; --i) {
+    for (int i = static_cast<int>(std::size(pills)) - 1; i >= 0; --i) {
         const Pill& pill = pills[i];
         const Rect rect{x - pill.width, 18, pill.width, 26};
         ui::fillRoundedRect(renderer, rect, 13.0f, theme::alpha(pill.color, 0.09f));
@@ -1661,6 +2218,12 @@ void DesktopApp::Impl::drawToolbar() {
         body("No track loaded", 590, 87, 14, theme::muted);
         label("DROP WAV / MP3 / FLAC ANYWHERE", 590, 104, 9, theme::dim, 1.2f);
     }
+
+    drawModeChip(layout.mode2D, "2D", characterView == CharacterView::Robot2D,
+                 theme::violet);
+    drawModeChip(layout.mode3D, "3D", characterView == CharacterView::Vrm3D,
+                 theme::accent);
+    drawButton(layout.vrmLoadButton, "VRM", false, vrm.ready(), 0);
 
     // Sync trim.
     label("SYNC TRIM", 1244, 72, 8, theme::dim, 1.4f);
@@ -2805,8 +3368,448 @@ void DesktopApp::Impl::drawChoreography() {
 }
 
 // -------------------------------------------------------------------------
-// Footer and overlays
+// 3D character view
 // -------------------------------------------------------------------------
+void DesktopApp::Impl::drawModeChip(const Rect& rect, std::string_view labelText,
+                                    bool active, SDL_Color color) {
+    const bool isHover = hover(rect);
+    ui::fillRoundedRect(renderer, rect, 8.0f,
+                        theme::alpha(color, active ? 0.16f
+                                                  : (isHover ? 0.09f : 0.035f)));
+    ui::strokeRoundedRect(renderer, rect, 8.0f,
+                          theme::alpha(color, active ? 0.48f : 0.18f), 1.0f);
+    text->drawCentered(labelText, rect.centerX(), rect.y + 14.0f, 10,
+                       FontWeight::SemiBold, active ? color : theme::muted);
+}
+
+void DesktopApp::Impl::draw3DStage() {
+    const Rect stage = layout.stage3D;
+    ui::fillRoundedRect(renderer, stage, 12.0f, theme::panel);
+    const Rect sceneRect{stage.x + 2.0f, stage.y + 2.0f, stage.w - 4.0f,
+                         stage.h - 4.0f};
+    std::string drawError;
+    const bool hasFrame = vrm.ready() && vrm.renderable() &&
+                          vrm.draw(renderer, ui::fr(sceneRect), &drawError);
+    if (!hasFrame) {
+        ui::verticalGradient(renderer, sceneRect, SDL_Color{12, 20, 33, 255},
+                             SDL_Color{4, 7, 12, 255});
+        for (int i = 1; i < 12; ++i) {
+            const float y = sceneRect.y + sceneRect.h * (static_cast<float>(i) / 12.0f);
+            ui::thickLine(renderer, sceneRect.x, y, sceneRect.right(), y, 1.0f,
+                          theme::alpha(theme::white, 0.025f), false);
+        }
+    }
+    ui::strokeRoundedRect(renderer, stage, 12.0f, theme::border, 1.0f);
+
+    // Readability gradients over the live 3D frame.
+    ui::verticalGradient(renderer, {sceneRect.x, sceneRect.y, sceneRect.w, 104.0f},
+                         theme::alpha(theme::background, 0.80f),
+                         theme::alpha(theme::background, 0.0f));
+    ui::verticalGradient(renderer,
+                         {sceneRect.x, sceneRect.bottom() - 128.0f, sceneRect.w, 128.0f},
+                         theme::alpha(theme::background, 0.0f),
+                         theme::alpha(theme::background, 0.88f));
+
+    const vrm::VrmModel* loaded = vrm.model();
+    const float left = stage.x + 22.0f;
+    text->draw("BG MEDIA 3D", left, stage.y + 18.0f, 15,
+               FontWeight::SemiBold, theme::accent);
+    label("VRM 0.x  ·  SDL_GPU", left + 138.0f, stage.y + 23.0f, 8, theme::dim,
+          1.2f);
+    std::string modelTitle = "NO VRM MODEL";
+    if (loaded) {
+        modelTitle = loaded->name.empty() ? "VRM CHARACTER" : loaded->name;
+    }
+    body(ellipsize(*text, modelTitle, stage.w - 360.0f, 14, FontWeight::SemiBold),
+         left, stage.y + 40.0f, 14, theme::text, FontWeight::SemiBold);
+    std::string modelLine;
+    if (loaded) {
+        modelLine = std::to_string(loaded->diagnostics.nodeCount) + " nodes  ·  " +
+                    std::to_string(loaded->diagnostics.humanoidCount) +
+                    " humanoid bones  ·  " +
+                    std::to_string(loaded->diagnostics.triangleCount) + " tris";
+        if (!loaded->metadata.licenseName.empty() &&
+            (loaded->metadata.allowedUserName == "OnlyAuthor" ||
+             loaded->metadata.licenseName.find("Redistribution") !=
+                 std::string::npos)) {
+            modelLine += "  ·  PRIVATE / LOCAL";
+        }
+    } else {
+        modelLine = vrmError.empty() ? "Load a VRM file to begin" : vrmError;
+    }
+    body(ellipsize(*text, modelLine, stage.w - 260.0f, 10, FontWeight::Regular),
+         left, stage.y + 60.0f, 10, theme::muted);
+
+    // Stage-level load button.
+    const Rect loadRect = layout.vrmLoadStage;
+    ui::fillRoundedRect(renderer, loadRect, 7.0f,
+                        hover(loadRect) ? theme::panelHover
+                                        : theme::alpha(theme::panelRaised, 0.92f));
+    ui::strokeRoundedRect(renderer, loadRect, 7.0f,
+                          theme::alpha(theme::accent, 0.32f), 1.0f);
+    text->drawCentered("LOAD VRM", loadRect.centerX(), loadRect.y + 8.0f, 9,
+                       FontWeight::SemiBold, theme::accent);
+
+    if (!hasFrame) {
+        const Rect card{stage.centerX() - 250.0f, stage.centerY() - 92.0f, 500.0f,
+                        190.0f};
+        ui::fillRoundedRect(renderer, card, 10.0f, theme::alpha(theme::panel, 0.94f));
+        ui::strokeRoundedRect(renderer, card, 10.0f,
+                              theme::alpha(theme::pink, 0.28f), 1.0f);
+        label("3D CHARACTER IMPORT", card.x + 20.0f, card.y + 18.0f, 9, theme::pink,
+              1.4f);
+        text->draw(loaded ? "GPU FRAME UNAVAILABLE" : "VRM MODEL REQUIRED",
+                   card.x + 20.0f, card.y + 38.0f, 18, FontWeight::SemiBold,
+                   theme::text);
+        const std::string message =
+            loaded ? (vrmFrameError.empty() ? drawError : vrmFrameError) : vrmError;
+        body(ellipsize(*text, message, card.w - 40.0f, 11, FontWeight::Regular),
+             card.x + 20.0f, card.y + 70.0f, 11, theme::muted);
+        body("The character is imported into the engine; the 3D view needs the "
+             "SDL_GPU device.",
+             card.x + 20.0f, card.y + 96.0f, 10, theme::dim);
+        const Rect button = layout.vrmEmptyLoad;
+        ui::fillRoundedRect(renderer, button, 8.0f,
+                            hover(button) ? theme::mix(theme::accent, theme::white, 0.12f)
+                                          : theme::accent);
+        text->drawCentered("CHOOSE VRM FILE", button.centerX(), button.y + 13.0f, 10,
+                           FontWeight::SemiBold, SDL_Color{8, 18, 16, 255});
+    }
+
+    // Bottom transport / motion strip.
+    const float bottom = stage.bottom();
+    const double pos = vrmMediaTime();
+    const double total = duration();
+    const CharacterPose pose = sampleActiveAt(pos);
+    const std::string move = moveName(pose.move);
+    const auto [bar, beat] = currentBarBeat();
+    text->draw(move, left, bottom - 96.0f, 28, FontWeight::SemiBold,
+               pose.accented ? theme::amber : theme::text);
+    std::string syncState;
+    SDL_Color stateColor = theme::accent;
+    if (!track && syntheticDemo) {
+        syncState = "SYNTHETIC BEAT GRID  ·  " + std::to_string(motionLabBpm) +
+                " BPM  ·  BG MOTION";
+        stateColor = theme::pink;
+    } else if (track) {
+        syncState = std::string("BG SYNC  ·  ") +
+                (playing() ? "PLAYING" : "PAUSED") + "  ·  " +
+                formatNumber(player.snapshot().rate, 2) + "x";
+        if (!audioError.empty()) {
+            syncState = "BG SYNC  ·  AUDIO UNAVAILABLE";
+            stateColor = theme::amber;
+        }
+    } else {
+        syncState = "IDLE PREVIEW  ·  NO TRACK";
+        stateColor = theme::muted;
+    }
+    label(syncState, left, bottom - 62.0f, 9, stateColor, 1.1f);
+    const std::string barBeat =
+        (bar > 0 ? "BAR " + std::to_string(bar) + "  ·  BEAT " +
+                       std::to_string(beat)
+                 : "NO BEAT") +
+        (pose.accented ? "  ·  BASS ACCENT" : "");
+    body(barBeat, left, bottom - 44.0f, 11, theme::muted);
+
+    const auto& frame = vrm.frameStats();
+    std::string rightInfo = formatNumber(fpsSmoothed, 0) + " FPS";
+    if (frame.valid) {
+        rightInfo += "  ·  GPU " + formatNumber(frame.gpuMilliseconds, 1) + " ms";
+    }
+    labelRight(rightInfo, stage.right() - 22.0f, bottom - 96.0f, 10,
+               frame.valid ? theme::accent : theme::dim, 0.5f);
+    labelRight(formatTime(pos, true) + " / " + formatTime(total),
+               stage.right() - 22.0f, bottom - 78.0f, 10, theme::muted);
+    if (loaded) {
+        labelRight(std::to_string(loaded->diagnostics.triangleCount) + " tris  ·  " +
+                       std::to_string(frame.drawCalls) + " draw calls  ·  " +
+                       formatNumber(vrm.lastRetargetMs(), 2) + " ms retarget",
+                   stage.right() - 22.0f, bottom - 59.0f, 9, theme::dim);
+        const std::string asset = std::to_string(loaded->diagnostics.meshCount) +
+                                  " meshes  ·  " +
+                                  std::to_string(loaded->diagnostics.materialCount) +
+                                  " materials  ·  " +
+                                  std::to_string(loaded->diagnostics.decodedTextureCount) +
+                                  "/" + std::to_string(loaded->diagnostics.textureCount) +
+                                  " textures  ·  " +
+                                  formatNumber(loaded->height, 2) + " m";
+        labelRight(asset, stage.right() - 22.0f, bottom - 43.0f, 9, theme::dim);
+    }
+    if (!vrm.warning().empty()) {
+        const std::string warning =
+            "IMPORT WARNINGS  ·  " + std::to_string(std::count(
+                vrm.warning().begin(), vrm.warning().end(), '|') + 1);
+        const float width = text->measure(warning, 8, FontWeight::SemiBold) + 18.0f;
+        const Rect badge{stage.right() - 22.0f - width, stage.y + 54.0f, width, 18.0f};
+        ui::fillRoundedRect(renderer, badge, 9.0f, theme::alpha(theme::amber, 0.10f));
+        ui::strokeRoundedRect(renderer, badge, 9.0f, theme::alpha(theme::amber, 0.32f),
+                              1.0f);
+        text->drawCentered(warning, badge.centerX(), badge.y + 5.0f, 8,
+                           FontWeight::SemiBold, theme::amber);
+    }
+    if (!vrmFrameError.empty()) {
+        label("RENDER ERROR  ·  " +
+                  ellipsize(*text, vrmFrameError, stage.w - 90.0f, 9,
+                            FontWeight::SemiBold),
+              left, bottom - 24.0f, 9, theme::red, 0.5f);
+    }
+    label("DRAG ORBIT   ·   WHEEL ZOOM   ·   C RESET   ·   G 2D/3D",
+          left, bottom - 14.0f, 8, theme::dim, 0.8f);
+
+    if (total > 0.001) {
+        const Rect trackBar{stage.x + 22.0f, stage.bottom() - 7.0f,
+                            stage.w - 44.0f, 2.0f};
+        ui::fillRoundedRect(renderer, trackBar, 1.0f,
+                            theme::alpha(theme::white, 0.08f));
+        const float fraction =
+            static_cast<float>(std::clamp(pos / total, 0.0, 1.0));
+        ui::fillRoundedRect(renderer,
+                            {trackBar.x, trackBar.y, trackBar.w * fraction,
+                             trackBar.h},
+                            1.0f, theme::accent);
+    }
+}
+
+void DesktopApp::Impl::draw3DRightPanels() {
+    const auto panelCard = [&](const Rect& rect) {
+        ui::fillRoundedRect(renderer, rect, 12.0f, theme::panel);
+        ui::strokeRoundedRect(renderer, rect, 12.0f, theme::border, 1.0f);
+    };
+    const auto controlButton = [&](const Rect& rect, const std::string& caption,
+                                   bool active, SDL_Color color) {
+        ui::fillRoundedRect(renderer, rect, 6.0f,
+                            theme::alpha(color, hover(rect) ? 0.18f
+                                                            : (active ? 0.12f
+                                                                      : 0.045f)));
+        ui::strokeRoundedRect(renderer, rect, 6.0f,
+                              theme::alpha(color, active ? 0.44f : 0.16f), 1.0f);
+        text->drawCentered(caption, rect.centerX(), rect.y + 8.0f, 8,
+                           FontWeight::SemiBold, active ? color : theme::muted);
+    };
+
+    const vrm::VrmModel* loaded = vrm.model();
+
+    // 1. Character / import.
+    {
+        const Rect card = layout.right1;
+        panelCard(card);
+        text->draw("VRM CHARACTER", card.x + 18.0f, card.y + 14.0f, 11,
+                   FontWeight::SemiBold, theme::text);
+        label("IMPORT / RIG", card.x + 152.0f, card.y + 17.0f, 8, theme::accent,
+              1.2f);
+        float y = card.y + 40.0f;
+        if (loaded) {
+            body(ellipsize(*text, loaded->name, card.w - 36.0f, 15,
+                           FontWeight::SemiBold),
+                 card.x + 18.0f, y, 15, theme::text, FontWeight::SemiBold);
+            y += 24.0f;
+            label("SPEC", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+            body("VRM " + loaded->specVersion + "  ·  glTF 2.0  ·  " +
+                     (loaded->materials.empty() ? "fallback materials" : "MToon"),
+                 card.x + 66.0f, y - 1.0f, 10, theme::muted);
+            y += 19.0f;
+            label("SKELETON", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+            body(std::to_string(loaded->diagnostics.nodeCount) + " nodes  ·  " +
+                     std::to_string(loaded->diagnostics.humanoidCount) +
+                     " humanoid / " +
+                     std::to_string(loaded->diagnostics.humanoidCoreCount) +
+                     " core  ·  " + std::to_string(loaded->diagnostics.skinCount) +
+                     " skins",
+                 card.x + 90.0f, y - 1.0f, 10, theme::muted);
+            y += 19.0f;
+            label("GEOMETRY", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+            body(std::to_string(loaded->diagnostics.meshCount) + " meshes  ·  " +
+                     std::to_string(loaded->diagnostics.triangleCount) +
+                     " tris  ·  " + std::to_string(loaded->diagnostics.vertexCount) +
+                     " verts",
+                 card.x + 90.0f, y - 1.0f, 10, theme::muted);
+            y += 19.0f;
+            label("MATERIALS", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+            body(std::to_string(loaded->diagnostics.materialCount) + " mats  ·  " +
+                     std::to_string(loaded->diagnostics.decodedTextureCount) + "/" +
+                     std::to_string(loaded->diagnostics.textureCount) + " textures  ·  " +
+                     formatNumber(loaded->height, 2) + " m",
+                 card.x + 100.0f, y - 1.0f, 10, theme::muted);
+            y += 19.0f;
+            const std::string license =
+                loaded->metadata.licenseName.empty()
+                    ? "license not specified"
+                    : loaded->metadata.licenseName + " / " +
+                          loaded->metadata.allowedUserName;
+            label("LICENSE", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+            body(ellipsize(*text, license, card.w - 112.0f, 9, FontWeight::Regular),
+                 card.x + 90.0f, y - 1.0f, 9,
+                 (loaded->metadata.allowedUserName == "OnlyAuthor" ||
+                  loaded->metadata.licenseName.find("Redistribution") !=
+                      std::string::npos)
+                     ? theme::amber
+                     : theme::muted);
+            if (!vrm.warning().empty()) {
+                const Rect warn{card.x + 18.0f, card.bottom() - 26.0f,
+                                card.w - 36.0f, 18.0f};
+                ui::fillRoundedRect(renderer, warn, 5.0f,
+                                    theme::alpha(theme::amber, 0.08f));
+                text->drawCentered(
+                    ellipsize(*text, "IMPORT WARNINGS: " + vrm.warning(),
+                              warn.w - 14.0f, 8, FontWeight::SemiBold),
+                    warn.centerX(), warn.y + 5.0f, 8, FontWeight::SemiBold,
+                    theme::amber);
+            }
+        } else {
+            label("NO MODEL", card.x + 18.0f, y, 9, theme::pink, 1.3f);
+            y += 20.0f;
+            body(ellipsize(*text, vrmError.empty() ? "Use LOAD VRM." : vrmError,
+                           card.w - 36.0f, 11, FontWeight::Regular),
+                 card.x + 18.0f, y, 11, theme::muted);
+        }
+    }
+
+    // 2. BG Sync and motion.
+    {
+        const Rect card = layout.right2;
+        panelCard(card);
+        text->draw("BG SYNC / MOTION", card.x + 18.0f, card.y + 14.0f, 11,
+                   FontWeight::SemiBold, theme::text);
+        label(track ? "ANALYSED TRACK" : (syntheticDemo ? "SYNTHETIC" : "IDLE"),
+              card.x + 190.0f, card.y + 17.0f, 8,
+              track ? theme::violet : (syntheticDemo ? theme::pink : theme::dim), 1.0f);
+        const double pos = vrmMediaTime();
+        const double total = duration();
+        const CharacterPose pose = sampleActiveAt(pos);
+        float y = card.y + 40.0f;
+        label("SOURCE", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        const std::string source =
+            track ? track->displayName
+                  : (syntheticDemo
+                         ? "Synthetic dance · " + std::to_string(motionLabBpm) + " BPM"
+                         : "No music loaded");
+        body(ellipsize(*text, source, card.w - 98.0f, 10, FontWeight::Regular),
+             card.x + 84.0f, y - 1.0f, 10, theme::muted);
+        y += 19.0f;
+        label("MEDIA", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        body(formatTime(pos, true) + " / " + formatTime(total), card.x + 84.0f,
+             y - 1.0f, 10, theme::muted);
+        y += 19.0f;
+        label("STATE", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        std::string sync = "IDLE PREVIEW";
+        SDL_Color syncColor = theme::dim;
+        if (track) {
+            sync = std::string("BG SYNC · ") + (playing() ? "PLAYING" : "PAUSED") +
+                   " · " + formatNumber(player.snapshot().rate, 2) + "x";
+            syncColor = playing() ? theme::accent : theme::amber;
+        } else if (syntheticDemo) {
+            sync = std::string("BG MOTION · ") +
+                   (syntheticPlaying ? "PLAYING" : "PAUSED");
+            syncColor = syntheticPlaying ? theme::pink : theme::amber;
+        }
+        body(sync, card.x + 84.0f, y - 1.0f, 10, syncColor);
+        y += 25.0f;
+        ui::thickLine(renderer, card.x + 18.0f, y, card.right() - 18.0f, y, 1.0f,
+                      theme::alpha(theme::white, 0.06f), false);
+        y += 14.0f;
+        text->draw(moveName(pose.move), card.x + 18.0f, y, 21,
+                   FontWeight::SemiBold,
+                   pose.accented ? theme::amber : theme::text);
+        y += 30.0f;
+        body("ACCENT " + std::string(pose.accented ? "ON" : "—") +
+                 "   ·   ENERGY " + formatNumber(pose.energy, 2) +
+                 "   ·   IMPACT " + formatNumber(pose.impact, 2),
+             card.x + 18.0f, y, 9, theme::muted);
+        y += 20.0f;
+        const auto& retarget = vrm.lastPose().stats;
+        body("FOOT IK " + std::string(retarget.footIK ? "ON" : "OFF") +
+                 "   ·   ERR " + formatNumber(retarget.maxFootError * 1000.0f, 1) +
+                 " mm   ·   RETARGET " + formatNumber(vrm.lastRetargetMs(), 2) + " ms",
+             card.x + 18.0f, y, 9, theme::muted);
+    }
+
+    // 3. Renderer.
+    {
+        const Rect card = layout.right3;
+        panelCard(card);
+        text->draw("SDL_GPU RENDERER", card.x + 18.0f, card.y + 14.0f, 11,
+                   FontWeight::SemiBold, theme::text);
+        const auto& frame = vrm.frameStats();
+        label(frame.valid ? "FRAME READY" : "OFFLINE",
+              card.x + 172.0f, card.y + 17.0f, 8,
+              frame.valid ? theme::accent : theme::amber, 1.0f);
+        float y = card.y + 40.0f;
+        label("DEVICE", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        body((frame.driver.empty() ? std::string("D3D12") : frame.driver) +
+                 "  ·  " + std::to_string(frame.width) + "x" +
+                 std::to_string(frame.height) + " offscreen  ·  D32 depth",
+             card.x + 78.0f, y - 1.0f, 9, theme::muted);
+        y += 19.0f;
+        label("FRAME", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        body(formatNumber(fpsSmoothed, 0) + " FPS  ·  GPU " +
+                 formatNumber(frame.gpuMilliseconds, 1) + " ms  ·  readback " +
+                 formatNumber(frame.readbackMilliseconds, 2) + " ms",
+             card.x + 78.0f, y - 1.0f, 9, theme::muted);
+        y += 19.0f;
+        label("GEOMETRY", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        body(std::to_string(frame.drawCalls) + " draws  ·  " +
+                 std::to_string(frame.triangles) + " tris  ·  " +
+                 std::to_string(frame.skinCount) + " skins",
+             card.x + 90.0f, y - 1.0f, 9, theme::muted);
+        y += 19.0f;
+        label("MEMORY", card.x + 18.0f, y, 8, theme::dim, 1.1f);
+        body(std::to_string(frame.textureCount) + " GPU textures  ·  " +
+                 formatNumber(static_cast<double>(frame.textureBytes) /
+                                  (1024.0 * 1024.0),
+                              0) +
+                 " MB VRAM  ·  RSS " + formatNumber(residentMemoryMb(), 0) + " MB",
+             card.x + 78.0f, y - 1.0f, 9, theme::muted);
+        if (!vrmFrameError.empty()) {
+            body(ellipsize(*text, vrmFrameError, card.w - 36.0f, 8, FontWeight::Regular),
+                 card.x + 18.0f, card.bottom() - 20.0f, 8, theme::red);
+        }
+    }
+
+    // 4. Controls.
+    {
+        const Rect card = layout.right4;
+        panelCard(card);
+        text->draw("3D CONTROLS", card.x + 18.0f, card.y + 12.0f, 11,
+                   FontWeight::SemiBold, theme::text);
+        label("LOCAL VRM", card.right() - 86.0f, card.y + 15.0f, 8, theme::dim, 0.8f);
+        controlButton(layout.vrmRightLoad, "LOAD VRM", false, theme::accent);
+        controlButton(layout.vrmResetCamera, "RESET CAM", false, theme::violet);
+        std::string demoLabel;
+        bool demoActive = false;
+        SDL_Color demoColor = theme::pink;
+        if (track) {
+            demoLabel = motionLabBpm > 0 ? "LAB " + std::to_string(motionLabBpm)
+                                         : "MOTION LAB";
+            demoActive = motionLabBpm > 0;
+        } else {
+            demoLabel = syntheticDemo
+                            ? "DEMO " + std::to_string(motionLabBpm)
+                            : "TEST DANCE";
+            demoActive = syntheticDemo;
+        }
+        controlButton(layout.vrmDemoButton, demoLabel, demoActive, demoColor);
+
+        label("SCALE", card.x + 18.0f, card.y + 90.0f, 8, theme::dim, 1.1f);
+        controlButton(layout.vrmScaleMinus, "-", false, theme::muted);
+        controlButton(layout.vrmScalePlus, "+", false, theme::muted);
+        body(formatNumber(vrm.renderSettings().modelScale, 2) + "x",
+             card.x + 138.0f, card.y + 86.0f, 10, theme::text);
+        label("HEIGHT", card.x + 186.0f, card.y + 90.0f, 8, theme::dim, 1.1f);
+        controlButton(layout.vrmOffsetMinus, "-", false, theme::muted);
+        controlButton(layout.vrmOffsetPlus, "+", false, theme::muted);
+        body((vrm.renderSettings().modelOffset.y >= 0.0f ? "+" : "") +
+                 formatNumber(vrm.renderSettings().modelOffset.y, 2) + " m",
+             card.x + 330.0f, card.y + 86.0f, 9, theme::text);
+        label("G 2D/3D  ·  C CAMERA  ·  -/+ SCALE  ·  ,/. HEIGHT  ·  T TEST",
+              card.x + 18.0f, card.bottom() - 26.0f, 8, theme::dim, 0.5f);
+        const std::string renderState =
+            vrm.ready() ? (vrm.renderable() ? "3D READY" : "IMPORT ONLY")
+                        : "NO MODEL";
+        labelRight(renderState, card.right() - 18.0f, card.bottom() - 44.0f, 8,
+                   vrm.renderable() ? theme::accent : theme::amber, 0.8f);
+    }
+}
+
 void DesktopApp::Impl::drawFooter() {
     const Rect bar = layout.footer;
     ui::fillRect(renderer, bar, SDL_Color{6, 8, 13, 255});
@@ -2837,7 +3840,7 @@ void DesktopApp::Impl::drawFooter() {
              190.0f, bar.y + 13.0f, 9, theme::dim);
     }
 
-    text->drawCentered("SPACE PLAY/PAUSE   ←/→ 5s   WHEEL ZOOM   D DEBUG   "
+    text->drawCentered("SPACE PLAY/PAUSE   ←/→ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
                        "V A/B   B LAB   R RATE",
                        720.0f, bar.y + 13.0f, 8, FontWeight::SemiBold,
                        theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
@@ -2928,11 +3931,17 @@ void DesktopApp::Impl::drawOverlays() {
 // -------------------------------------------------------------------------
 void DesktopApp::Impl::renderFrame() {
     computeLayout();
+    if (characterView == CharacterView::Vrm3D) {
+        updateVrmFrame();
+    }
     drawBackground();
     drawHeader();
     drawToolbar();
 
-    if (state == AppState::Empty) {
+    if (characterView == CharacterView::Vrm3D) {
+        draw3DStage();
+        draw3DRightPanels();
+    } else if (state == AppState::Empty) {
         drawEmptyState();
     } else {
         drawTimeline();
@@ -3023,13 +4032,51 @@ int DesktopApp::Impl::runCapture() {
         }
     }
 
+    if (options.captureTime > 0.0) {
+        if (!track && syntheticDemo) {
+            syntheticPosition =
+                std::clamp(options.captureTime, 0.0, duration());
+            syntheticPlaying = false;
+        } else if (track) {
+            capturePosition = std::clamp(options.captureTime, 0.0, duration());
+        }
+        animationTime = options.captureTime;
+    }
+    if (characterView == CharacterView::Vrm3D && vrm.ready()) {
+        // Warm up the GPU upload/pipeline state so the captured frame is the
+        // second, representative one, not the first-use frame.
+        renderFrame();
+        SDL_RenderPresent(renderer);
+    }
+
     SDL_PumpEvents();
-    SDL_Delay(80);
-    renderFrame();
-    SDL_RenderPresent(renderer);
-    SDL_Delay(20);
-    renderFrame();
-    saveCapture(options.captureFile);
+    SDL_Delay(40);
+    if (characterView == CharacterView::Vrm3D) {
+        // Warm up the GPU, measure a representative UI+3D frame, then render
+        // the final frame so the measured FPS is already visible in the
+        // captured still. Read the backbuffer before Present.
+        renderFrame();
+        SDL_RenderPresent(renderer);
+        SDL_Delay(20);
+        const auto captureStart = Clock::now();
+        renderFrame();
+        const auto captureEnd = Clock::now();
+        const double captureMs = std::chrono::duration<double, std::milli>(
+                                     captureEnd - captureStart).count();
+        if (captureMs > 0.0001) {
+            fpsSmoothed = 1000.0 / captureMs;
+            frameMsSmoothed = captureMs;
+        }
+        renderFrame();
+        saveCapture(options.captureFile);
+        SDL_RenderPresent(renderer);
+    } else {
+        renderFrame();
+        SDL_RenderPresent(renderer);
+        SDL_Delay(20);
+        renderFrame();
+        saveCapture(options.captureFile);
+    }
     return 0;
 }
 
@@ -3042,12 +4089,24 @@ int DesktopApp::Impl::run() {
         if (!options.initialFile.empty()) {
             startLoad(options.initialFile);
         }
-        Uint64 last = SDL_GetTicksNS();
+        Uint64 previousFrame = SDL_GetTicksNS();
         while (running) {
+            const Uint64 frameStart = SDL_GetTicksNS();
+            const double deltaSeconds =
+                static_cast<double>(frameStart - previousFrame) / 1e9;
+            previousFrame = frameStart;
+            if (deltaSeconds > 0.0001 && deltaSeconds < 0.5) {
+                const double frameMs = deltaSeconds * 1000.0;
+                frameMsSmoothed = frameMsSmoothed <= 0.0
+                                      ? frameMs
+                                      : frameMsSmoothed * 0.90 + frameMs * 0.10;
+                fpsSmoothed = 1000.0 / frameMsSmoothed;
+            }
             pollWorker();
             pollDialog();
+            updateDemo(deltaSeconds);
             updatePlayback();
-            animationTime = static_cast<double>(SDL_GetTicksNS()) / 1e9;
+            animationTime = static_cast<double>(frameStart) / 1e9;
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
@@ -3059,11 +4118,10 @@ int DesktopApp::Impl::run() {
             // SDL's vsync normally paces us; this protects against a renderer
             // that reports success but has vsync disabled.
             const Uint64 now = SDL_GetTicksNS();
-            const double frameMs = static_cast<double>(now - last) / 1e6;
+            const double frameMs = static_cast<double>(now - frameStart) / 1e6;
             if (frameMs < 8.0) {
                 SDL_Delay(static_cast<Uint32>(8.0 - frameMs));
             }
-            last = SDL_GetTicksNS();
         }
     } else {
         runCapture();

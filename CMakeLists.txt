@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(BGMedia
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "BG Media - music analysis and choreography synchronization engine"
     LANGUAGES C CXX
 )
@@ -83,6 +83,44 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# VRM 0.x importer and humanoid retargeter. Both are pure C++20: no SDL, no
+# GPU API, no window. The desktop renderer is the only consumer of SDL_GPU.
+# ---------------------------------------------------------------------------
+add_library(bgmedia_vrm STATIC
+    src/vrm/VrmModel.cpp
+    src/vrm/VrmLoader.cpp
+    src/vrm/CgltfImpl.cpp
+    src/vrm/StbImageImpl.cpp
+)
+add_library(BGMedia::Vrm ALIAS bgmedia_vrm)
+target_include_directories(bgmedia_vrm
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cgltf
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
+)
+target_compile_features(bgmedia_vrm PUBLIC cxx_std_20)
+target_compile_options(bgmedia_vrm PRIVATE ${BGMEDIA_WARNING_FLAGS})
+if(MSVC)
+    target_compile_definitions(bgmedia_vrm PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+endif()
+
+add_library(bgmedia_rig STATIC
+    src/animation/HumanoidRetargeter.cpp
+)
+add_library(BGMedia::Rig ALIAS bgmedia_rig)
+target_include_directories(bgmedia_rig
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(bgmedia_rig PUBLIC bgmedia_core bgmedia_vrm)
+target_compile_features(bgmedia_rig PUBLIC cxx_std_20)
+target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+# ---------------------------------------------------------------------------
 # Adapters: miniaudio decoding only. Playback belongs to the host application,
 # which keeps the engine independent from any particular audio output API.
 # ---------------------------------------------------------------------------
@@ -109,13 +147,15 @@ if(BGMEDIA_BUILD_DESKTOP)
     if(NOT BGMEDIA_BUILD_MINIAUDIO)
         message(FATAL_ERROR "BGMEDIA_BUILD_DESKTOP requires BGMEDIA_BUILD_MINIAUDIO")
     endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindOrFetchSDL3.cmake)
+    add_subdirectory(adapters/sdlgpu)
     add_subdirectory(apps/desktop)
 endif()
 
 # ---------------------------------------------------------------------------
 # Installation of the reusable core.
 # ---------------------------------------------------------------------------
-install(TARGETS bgmedia_core EXPORT BGMediaTargets
+install(TARGETS bgmedia_core bgmedia_vrm bgmedia_rig EXPORT BGMediaTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

@@ -16,6 +16,17 @@
 !assets/**/*.png
 /fixtures/
 tests/fixtures/generated/
+/artifacts/
+
+# Private VRM assets. Model1.vrm and its textures are licensed for local use
+# only (Redistribution_Prohibited / OnlyAuthor), so they must never be added
+# to this repository. See models/README.md.
+/models/*
+!/models/README.md
+
+# Generated shader binaries; the C headers are committed and rebuilt from HLSL.
+adapters/sdlgpu/shaders/generated/*.dxil
+adapters/sdlgpu/shaders/generated/*.spv
 
 # OS
 .DS_Store

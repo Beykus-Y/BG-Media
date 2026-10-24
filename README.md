@@ -19,8 +19,15 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 
 ![BG Beat metric ambiguity](docs/images/desktop-metric.png)
 
-Текущий этап — полностью рабочий музыкальный анализатор и Desktop-приложение.
-Телеграм-интеграции, сервера, видео и 3D-модели здесь намеренно нет.
+Текущий этап — рабочий музыкальный анализатор, BG Motion и **BG Media 3D**:
+настоящая VRM 0.x-модель в SDL_GPU-сцене, с humanoid-скелетом, retargeting
+BG Motion и синхронизацией с плеером. Телеграм-интеграции, сервера и видео
+здесь по-прежнему нет.
+
+Скриншот 3D-персонажа намеренно не добавлен в Git: модель имеет лицензию
+`OnlyAuthor` / `Redistribution_Prohibited`. Локальная проверка работающего
+Desktop во время воспроизведения музыки сохраняется в
+`artifacts/desktop3d_playing.png` (см. `docs/VRM_INTEGRATION.md`).
 
 ## Что уже работает
 
@@ -46,7 +53,20 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 - Demo-режимы: **SMOOTH / STEPPED** (`V`), **DEBUG** (`D`) с суставами,
   траекториями и keyframe-диагностикой, **MOTION LAB** (`B`) с синтетической
   beat-сеткой 92/123/163/180 BPM независимо от ошибок анализатора.
-- Headless CLI, генератор синтетических тестов, CTest и benchmark.
+- **BG Media 3D:** импорт настоящего VRM 0.x (GLB), 175 узлов, 54 humanoid
+  кости, 35 881 треугольник, 15 материалов и 15 встроенных base-color текстур;
+  человеческая модель, а не манекен.
+- Отдельный `bgmedia_vrm` (загрузчик) и `bgmedia_rig` (retargeting) без SDL;
+  `bgmedia_sdlgpu` — независимый SDL_GPU offscreen-рендерер с depth buffer,
+  skinning, alpha mask/blend, mip-текстурами и камерой. Композитинг в
+  существующий SDL_Renderer UI, без совместного владения GPU-контекстом.
+- 3D-режим: орбита/zoom/reset камеры, масштаб и высота модели, выбор `.vrm`,
+  диагностика импорта, текущий трек/движение/BG Sync/FPS/GPU ms/VRAM/RSS.
+  Без музыки доступен idle preview и синтетический TEST DANCE 123 BPM.
+- Детерминированный humanoid retargeting с quaternion-иерархией, base pose
+  без T-pose, two-bone IK с неподвижными стопами и generic привязкой по
+  VRM humanoid, без индексов конкретной модели.
+- Headless CLI, генератор синтетических тестов, CTest, ASan-прогон и benchmark.
 
 Измерения на синтетическом корпусе и 5-минутном треке:
 **[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)**.
@@ -154,6 +174,11 @@ ctest --preset release
 | smooth / stepped сравнение | `V` или chip **SMOOTH/STEPPED** |
 | motion debug: суставы, траектории, keyframes | `D` или chip **DEBUG** |
 | Motion Lab BPM | `B` или chip **LAB** |
+| 2D robot / 3D VRM | `2` / `3`, `G`, chips **2D/3D** |
+| выбрать VRM | `F2`, кнопка **VRM**, drag-and-drop `.vrm`/`.glb` |
+| 3D-камера: орбита / zoom / reset | ЛКМ + drag / колесо / `C` |
+| масштаб / высота 3D-модели | `-`/`+` · `,`/`.` или кнопки в панели |
+| синтетический танец без музыки | `T` или **TEST DANCE** |
 | sync trim ±5 мс | `[` / `]` |
 | зум timeline | колесо мыши |
 | панорама | средняя кнопка + drag |
@@ -220,6 +245,24 @@ bgmedia_desktop --file fixtures/beat_092.wav \
 `--motion-stepped` включает старый ступенчатый сэмплер для A/B-сравнения.
 Подробности модели и гарантий попадания в удар: [docs/MOTION.md](docs/MOTION.md).
 
+3D-режим можно проверить без музыки и без окна:
+
+```bash
+bgmedia_desktop --vrm models/Model1.vrm --vrm-demo \
+  --capture artifacts/vrm.bmp --capture-time 3.2 --no-audio
+bgmedia_vrm_preview --model models/Model1.vrm --time 3.2 --out artifacts/preview.bmp
+```
+
+С реальным треком:
+
+```bash
+bgmedia_desktop --file track.mp3 --vrm models/Model1.vrm --3d --autoplay
+```
+
+`Model1.vrm` не входит в репозиторий: лицензия `OnlyAuthor` /
+`Redistribution_Prohibited`. Архитектура, поддерживаемые возможности,
+ограничения и измерения: [docs/VRM_INTEGRATION.md](docs/VRM_INTEGRATION.md).
+
 ## Тесты
 
 ```bash
@@ -228,7 +271,7 @@ ctest --test-dir build/windows --output-on-failure
 build/windows/bin/bgmedia_tests.exe
 ```
 
-47 тестов, разбитые на CTest-группы:
+56 тестов, разбитые на CTest-группы:
 
 - `audio` — WAV PCM/float, 24-bit, truncated files, MP3/FLAC/WAV через
   miniaudio, downmix/hash;
@@ -243,7 +286,15 @@ build/windows/bin/bgmedia_tests.exe
 - `motion` — exact accent targets, continuous keyframes, 30/60/120 FPS and
   arbitrary-order determinism, easing/shortest-arc, pause/seek, tempo change,
   fast-tempo amplitude adaptation, offbeat-bass BassDip guard, smooth vs
-  stepped comparison.
+  stepped comparison;
+- `vrm` — GLB/VRM 0.x import, 54 humanoid bones, textures, truncation,
+  malformed containers и 150 случайных мутаций;
+- `retarget` — generic humanoid rig, neutral pose без T-pose, foot IK,
+  артикуляция рук/головы/корпуса, побитовый deterministic sampling после
+  seek/rewind и реальный Model1.vrm (если файл доступен).
+
+ASan-прогон: `scripts/run_asan_windows.ps1` — **56 passed, 0 failed**, без
+sanitizer-сообщений.
 
 Тестовые аудиофайлы — оригинальные синтетические сигналы; см.
 [tests/fixtures/README.md](tests/fixtures/README.md). Подробный
@@ -252,25 +303,30 @@ build/windows/bin/bgmedia_tests.exe
 ## Структура репозитория
 
 ```text
-include/bgmedia/            публичные заголовки core
+include/bgmedia/            публичные заголовки core, math, VRM, rig
 src/audio/                  PCM, WAV decoder
 src/analysis/               STFT, onset, tempo, beat DP, bass, silence
 src/cache/                  версионированный бинарный кеш
 src/sync/                   TransportSnapshot + PlaybackClock
 src/choreography/           cues/poses/media-time sampling
+src/vrm/                    GLB/glTF + VRM 0.x importer, PNG decode
+src/animation/              generic humanoid retargeter, IK, local transforms
 adapters/miniaudio/         MP3/FLAC/WAV decode adapter
-apps/desktop/               SDL3 UI, miniaudio playback, screenshot/audio smoke
+adapters/sdlgpu/            независимый SDL_GPU offscreen VRM renderer
+apps/desktop/               SDL3 UI, 2D/3D compositor, miniaudio playback
 tools/analyze/              headless JSON CLI
 tools/fixturegen/           генератор синтетики
+tools/vrm_preview/          headless 3D preview/test render
 tools/benchmark/            качество + скорость + кеш
-tests/                      CTest + синтетические фикстуры
+tests/                      CTest + synthetic VRM/audio fixtures
 docs/ARCHITECTURE.md        архитектура и точки расширения (включая BG Video)
+docs/VRM_INTEGRATION.md     VRM 0.x, SDL_GPU, retargeting, UI, замеры
 docs/ANDROID_JNI.md         конкретный план Android/JNI
 docs/MOTION.md              BG Motion 2.0: keyframes, blending, accents, debug
 docs/BG_BEAT_AUDIT.md       исправление метрического уровня, downbeat, UI, кеша
 docs/MEASUREMENTS.md        реальные замеры
-docs/images/                скриншоты
-third_party/                KissFFT, miniaudio, stb_truetype, лицензии
+docs/images/                скриншоты 2D UI
+third_party/                KissFFT, miniaudio, stb, cgltf, лицензии
 ```
 
 Публичный umbrella-заголовок — `include/bgmedia/bgmedia.hpp`.
@@ -285,17 +341,26 @@ bgmedia_core
    ├── BG Beat   : анализ PCM → BPM, beats, bass, silence, sections
    ├── BG Sync   : media time, latency, seek/rate, smoothing
    ├── BG Motion : choreography cues/poses без SDL
-   └── cache     : content+config key, checksum, schema version
+   ├── cache     : content+config key, checksum, schema version
+   └── CharacterPose (нормализованный контракт для 2D/3D)
+
+bgmedia_vrm (cgltf/stb_image, без SDL) → VrmModel/humanoid/bind pose
+bgmedia_rig (без SDL) → CharacterPose → local node transforms + foot IK
+adapters/sdlgpu (SDL_GPU) → offscreen RGBA8 + D32 → UI SDL_Texture
 ```
 
 - Core не знает SDL, miniaudio, Telegram, Android и звуковую карту.
+- BG Beat/BG Sync/BG Motion не знают VRM, SDL или GPU.
 - Декодер и плеер — взаимозаменяемые адаптеры.
 - Анализ принимает PCM, поэтому WAV/MP3/FLAC/MediaCodec равноправны.
 - Общая модель времени подходит для будущего видео: audio-master clock,
   presentation timestamps, те же seek/pause/rate/latency.
-- Видео, эффекты и Android пока не реализованы, но точки расширения и JNI-план
+- Видео и Android пока не реализованы, но точки расширения и JNI-план
   зафиксированы. См. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) и
   [docs/ANDROID_JNI.md](docs/ANDROID_JNI.md).
+- 3D: реальный VRM 0.x, skinning, MToon-подобные материалы, BG Motion и
+  media-time синхронизация. См.
+  [docs/VRM_INTEGRATION.md](docs/VRM_INTEGRATION.md).
 
 ### Минимальный API
 
@@ -329,6 +394,9 @@ const auto& a = report.result;
   показывает `STABLE` как гарантию правильного музыкального темпа.
 - Смена темпа показывается как возможная (`TempoTransition`), а не как
   доказанный факт.
+- VRM 1.0, morph targets/blink, spring-bone физика и полный MToon (outline,
+  sphere/rim maps, normal maps) в эту версию не входят; базовый VRM 0.x
+  humanoid, текстуры, alpha и скелетная анимация работают.
 - Meter/downbeat — эвристика. При низкой `meterConfidence` UI скрывает
   downbeat-акценты и пишет `meter uncertain`.
 - Реальные треки проверялись локально, но их эталонный BPM неизвестен; см.

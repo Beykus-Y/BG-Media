@@ -47,10 +47,17 @@ void printUsage() {
         << "  --cache-dir <dir>      analysis cache directory\n"
         << "  --no-cache             disable reading/writing analysis cache\n"
         << "  --no-audio             do not initialise an audio output device\n"
+        << "  --autoplay             start audio playback when the initial track is ready\n"
         << "  --audio-smoke          with --capture: play, pause and seek for 2s\n"
         << "  --capture <file.bmp>   render one frame and exit (UI screenshot)\n"
         << "  --capture-time <sec>   media time for the captured frame (default 2)\n"
         << "  --motion-lab <bpm>     synthetic beat grid for animation demos\n"
+        << "  --vrm <path>           load a VRM 0.x model and switch to 3D\n"
+        << "  --3d                   start in the VRM 3D character view\n"
+        << "  --vrm-demo             synthetic 123 BPM test dance (no music needed)\n"
+        << "  --vrm-scale <value>    initial model scale (default 1.0)\n"
+        << "  --vrm-offset-y <m>     initial model vertical offset\n"
+
         << "  --motion-debug         show joints, trails and keyframe diagnostics\n"
         << "  --motion-stepped       use the legacy stepped sampler (A/B compare)\n"
         << "  --help                 show this help\n\n"
@@ -80,6 +87,8 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
             options.noAudio = true;
         } else if (arg == "--audio-smoke") {
             options.audioSmoke = true;
+        } else if (arg == "--autoplay") {
+            options.autoplay = true;
         } else if (arg == "--motion-lab" && i + 1 < argc) {
             try {
                 options.motionLabBpm = std::stoi(argv[++i]);
@@ -87,7 +96,33 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
                 std::cerr << "invalid --motion-lab BPM\n";
                 return false;
             }
+        } else if (arg == "--vrm" && i + 1 < argc) {
+            options.vrmFile = pathFromUtf8(argv[++i]);
+            options.startIn3D = true;
+        } else if (arg == "--3d") {
+            options.startIn3D = true;
+        } else if (arg == "--vrm-demo") {
+            options.vrmDemo = true;
+            options.startIn3D = true;
+            if (options.motionLabBpm <= 0) {
+                options.motionLabBpm = 123;
+            }
+        } else if (arg == "--vrm-scale" && i + 1 < argc) {
+            try {
+                options.vrmScale = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --vrm-scale value\n";
+                return false;
+            }
+        } else if (arg == "--vrm-offset-y" && i + 1 < argc) {
+            try {
+                options.vrmOffsetY = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --vrm-offset-y value\n";
+                return false;
+            }
         } else if (arg == "--motion-debug") {
+
             options.motionDebug = true;
         } else if (arg == "--motion-stepped") {
             options.motionStepped = true;

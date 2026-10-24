@@ -181,3 +181,36 @@ Desktop Motion Lab (синтетическая сетка 123 BPM, debug-реж�
   сравнения.
 - `docs/images/desktop-metric.png` — 12/8: metric ambiguity, alternatives и
   `meter uncertain`.
+
+## BG Media 3D — VRM 0.x (дополнение 0.2.0)
+
+Оборудование и сборка те же: Ryzen 7 5700X, 32 GB RAM, Windows 11,
+MSVC 19.44 Release, D3D12. Модель: `models/Model1.vrm` (VRM 0.x, VRoid
+Studio 1.22.1), 18 539 292 байт. Размер 3D-таргета: 960×640, offscreen
+RGBA8 sRGB + D32.
+
+| Метрика | Значение |
+|---|---:|
+| импорт GLB + JSON + 15 base-color PNG | 176–179 мс |
+| nodes / meshes / triangles | 175 / 3 / 35 881 |
+| humanoid bindings / core retarget bones | 54 / 24 |
+| materials / textures / decoded textures | 15 / 27 / 15 |
+| skins × joints | 3 × 171 |
+| GPU frame, 15 draw calls, 35 881 tris | 0.6–0.8 мс |
+| readback 960×640 | 0.3–0.5 мс |
+| retarget одного кадра | ~0.02 мс |
+| UI loop на этой машине (8 мс pacing) | ~125–132 FPS |
+| GPU textures с mip-chain | ~112 MB |
+| process RSS в 3D | ~160–168 MB |
+| ASan Debug import Model1 | ~1.7 с |
+| ASan тесты | 56 passed, 0 failed, sanitizer clean |
+
+Проверка воспроизводимости: одинаковые `(CharacterPose, mediaTime, options)`
+дают побитово одинаковые `nodeGlobals`; seek/rewind воспроизводит ту же позу.
+Проверка опоры стоп: `maxFootError ≤ 2 мм` для Bounce/BassDip на Model1,
+XZ-координаты стоп совпадают с bind-позициями в пределах 4 мм.
+
+Скриншот работающего Desktop во время воспроизведения аудио:
+`artifacts/desktop3d_playing.png` (локально, не коммитится из-за лицензии
+модели). Он снят с окна реального `bgmedia_desktop.exe` во время Play, а не
+получен из внешнего 3D-просмотрщика.

@@ -14,6 +14,12 @@ Use `bgmedia_fixturegen` to write the same material for manual listening:
 build/windows/bin/bgmedia_fixturegen.exe fixtures
 ```
 
+`minimal.vrm` is an original, tiny VRM 0.x GLB fixture created for this
+repository. It contains a 22-node humanoid rig (21 mapped humanoid bones),
+a single unskinned triangle, one material and no textures. It exercises GLB
+chunk parsing, node hierarchy, VRM `extensions.VRM`, humanoid mapping, bounds
+and the retargeter without depending on any licensed character.
+
 In addition to the straight click tracks, the generated corpus includes
 `offbeat_100.wav`, `ternary_66.wav`, `halftime_80.wav`, `shuffle_80.wav`,
 `dense_hats_99.wav`, `syncopated_bass_100.wav` and `drift_80.wav`. These

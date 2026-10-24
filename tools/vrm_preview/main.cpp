@@ -1,0 +1,212 @@
+// Headless 3D preview used during BG Media 3D development. It exercises the
+// same importer, retargeter and SDL_GPU renderer as the desktop application but
+// writes one BMP frame, so renderer problems can be isolated from the UI.
+
+#include "bgmedia/animation/HumanoidRetargeter.hpp"
+#include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/sdlgpu/SdlGpuVrmRenderer.hpp"
+#include "bgmedia/vrm/VrmModel.hpp"
+
+#include <SDL3/SDL.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <string>
+
+namespace {
+
+bgmedia::AnalysisResult makeSyntheticAnalysis(double bpm, double duration) {
+    using namespace bgmedia;
+    AnalysisResult analysis;
+    analysis.info.duration = duration;
+    analysis.info.sampleRate = 44100;
+    analysis.info.sourceChannels = 2;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 1.0f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const double period = 60.0 / bpm;
+    double time = 0.45;
+    int index = 0;
+    while (time < duration - 0.1) {
+        Beat beat;
+        beat.time = time;
+        beat.beatInBar = index % 4;
+        beat.barIndex = index / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        beat.strength = beat.downbeat ? 1.0f : 0.64f;
+        beat.confidence = 1.0f;
+        analysis.beats.push_back(beat);
+        if (beat.downbeat && (beat.barIndex % 2 == 0)) {
+            BassAccent accent;
+            accent.time = time;
+            accent.strength = 0.95f;
+            accent.lowBandRatio = 0.75f;
+            accent.confidence = 1.0f;
+            accent.nearestBeat = index;
+            analysis.bassAccents.push_back(accent);
+        }
+        ++index;
+        time += period;
+    }
+    return analysis;
+}
+
+std::string toUtf8(const std::filesystem::path& path) {
+    const std::u8string value = path.u8string();
+    return std::string(reinterpret_cast<const char*>(value.data()), value.size());
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    std::filesystem::path modelPath = "models/Model1.vrm";
+    std::filesystem::path outputPath = "artifacts/vrm-preview.bmp";
+    double time = 2.0;
+    double bpm = 123.0;
+    double zoom = 1.0;
+    double focusY = 0.0;
+    double yawDegrees = 180.0;
+    double pitch = 0.10;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--model" && i + 1 < argc) {
+            modelPath = std::filesystem::path(argv[++i]);
+        } else if (arg == "--out" && i + 1 < argc) {
+            outputPath = std::filesystem::path(argv[++i]);
+        } else if (arg == "--time" && i + 1 < argc) {
+            time = std::stod(argv[++i]);
+        } else if (arg == "--bpm" && i + 1 < argc) {
+            bpm = std::stod(argv[++i]);
+        } else if (arg == "--zoom" && i + 1 < argc) {
+            zoom = std::stod(argv[++i]);
+        } else if (arg == "--focus-y" && i + 1 < argc) {
+            focusY = std::stod(argv[++i]);
+        } else if (arg == "--yaw" && i + 1 < argc) {
+            yawDegrees = std::stod(argv[++i]);
+        } else if (arg == "--pitch" && i + 1 < argc) {
+            pitch = std::stod(argv[++i]);
+        }
+    }
+
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    bgmedia::vrm::LoadResult loaded = bgmedia::vrm::VrmLoader::load(modelPath);
+    if (!loaded.ok()) {
+        std::fprintf(stderr, "VRM import failed: %s\n", loaded.error.c_str());
+        SDL_Quit();
+        return 1;
+    }
+    const bgmedia::vrm::VrmModel& model = *loaded.model;
+    std::printf("VRM %s: nodes=%d meshes=%d tris=%d materials=%d textures=%d "
+                "decoded=%d humanoid=%d height=%.3f forward=(%.2f,%.2f,%.2f)\n",
+                toUtf8(modelPath).c_str(), model.diagnostics.nodeCount,
+                model.diagnostics.meshCount, model.diagnostics.triangleCount,
+                model.diagnostics.materialCount, model.diagnostics.textureCount,
+                model.diagnostics.decodedTextureCount,
+                model.diagnostics.humanoidCoreCount, model.height,
+                model.forward.x, model.forward.y, model.forward.z);
+    for (const std::string& warning : loaded.warnings) {
+        std::printf("warning: %s\n", warning.c_str());
+    }
+
+    bgmedia::animation::HumanoidRetargeter rig(model);
+    if (!rig.valid()) {
+        std::fprintf(stderr, "retargeter unavailable: %s\n", rig.error().c_str());
+        SDL_Quit();
+        return 1;
+    }
+    bgmedia::sdlgpu::SdlGpuVrmRenderer renderer;
+    std::string error;
+    if (!renderer.initialize(&error)) {
+        std::fprintf(stderr, "renderer init failed: %s\n", error.c_str());
+        SDL_Quit();
+        return 1;
+    }
+    if (!renderer.setModel(model, &error)) {
+        std::fprintf(stderr, "renderer model upload failed: %s\n", error.c_str());
+        renderer.shutdown();
+        SDL_Quit();
+        return 1;
+    }
+
+    const bgmedia::AnalysisResult analysis = makeSyntheticAnalysis(bpm, 120.0);
+    const bgmedia::Choreography choreography =
+        bgmedia::ChoreographyBuilder{}.build(analysis);
+    const bgmedia::CharacterPose pose =
+        bgmedia::ChoreographySampler{}.sample(choreography, time);
+    const bgmedia::animation::RetargetedPose retargeted = rig.apply(pose, time);
+    std::printf("pose move=%d bob=%.2f lean=%.2f armL=%.2f armR=%.2f rot=%.3f hipDrop=%.3f footErr=%.4f\n",
+                static_cast<int>(pose.move), pose.bob, pose.lean, pose.armLeft,
+                pose.armRight, pose.rotation, retargeted.stats.hipDrop,
+                retargeted.stats.maxFootError);
+    const auto target = model.bounds.center();
+    const auto eye = target + bgmedia::math::Vec3{0.0f, 0.42f, -model.height * 2.22f};
+    const auto view = bgmedia::math::lookAtLH(eye, target, {0.0f, 1.0f, 0.0f});
+    const auto proj = bgmedia::math::perspectiveFovLH(0.56f, 1.5f, 0.03f, 200.0f);
+    const auto vp = proj * view;
+    const auto clip = [&](bgmedia::math::Vec3 p) {
+        const auto m = vp.m;
+        return bgmedia::math::Vec4{m[0]*p.x + m[4]*p.y + m[8]*p.z + m[12],
+                                   m[1]*p.x + m[5]*p.y + m[9]*p.z + m[13],
+                                   m[2]*p.x + m[6]*p.y + m[10]*p.z + m[14],
+                                   m[3]*p.x + m[7]*p.y + m[11]*p.z + m[15]};
+    };
+    const auto c = clip(target);
+    std::printf("camera eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) clip center=(%.3f,%.3f,%.3f,%.3f) ndc=(%.3f,%.3f)\n",
+                eye.x, eye.y, eye.z, target.x, target.y, target.z, c.x, c.y, c.z, c.w,
+                c.x / c.w, c.y / c.w);
+
+
+    bgmedia::sdlgpu::Camera camera;
+    camera.distanceScale = static_cast<float>(zoom);
+    camera.targetYBias = static_cast<float>(focusY);
+    camera.yaw = static_cast<float>(yawDegrees * 3.14159265358979323846 / 180.0);
+    camera.pitch = static_cast<float>(pitch);
+    bgmedia::sdlgpu::RenderSettings settings;
+    if (!renderer.render(retargeted, camera, settings, &error)) {
+        std::fprintf(stderr, "render failed: %s\n", error.c_str());
+        renderer.shutdown();
+        SDL_Quit();
+        return 1;
+    }
+
+    const auto& stats = renderer.stats();
+    std::printf("frame %dx%d: tris=%d draws=%d gpu=%.2fms readback=%.2fms "
+                "driver=%s tex=%d/%llu KiB\n",
+                stats.width, stats.height, stats.triangles, stats.drawCalls,
+                stats.gpuMilliseconds, stats.readbackMilliseconds,
+                stats.driver.c_str(), stats.textureCount,
+                static_cast<unsigned long long>(stats.textureBytes / 1024));
+
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(
+        renderer.width(), renderer.height(), SDL_PIXELFORMAT_RGBA32,
+        const_cast<std::uint8_t*>(renderer.pixels().data()),
+        renderer.width() * 4);
+    if (!surface) {
+        std::fprintf(stderr, "surface creation failed: %s\n", SDL_GetError());
+        renderer.shutdown();
+        SDL_Quit();
+        return 1;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(outputPath.parent_path(), ec);
+    if (!SDL_SaveBMP(surface, toUtf8(outputPath).c_str())) {
+        std::fprintf(stderr, "BMP save failed: %s\n", SDL_GetError());
+        SDL_DestroySurface(surface);
+        renderer.shutdown();
+        SDL_Quit();
+        return 1;
+    }
+    SDL_DestroySurface(surface);
+    std::printf("wrote %s\n", toUtf8(outputPath).c_str());
+
+    renderer.shutdown();
+    SDL_Quit();
+    return 0;
+}

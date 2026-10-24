@@ -10,20 +10,31 @@ BG Media — самостоятельный кроссплатформенный
 
 - `bgmedia_core` — независимая C++20-библиотека: анализ PCM, карта ударов,
   басовые акценты, тишина, кеш, модель времени, расчёт хореографии.
+- `bgmedia_vrm` — импорт VRM 0.x (GLB/glTF 2.0, cgltf, stb_image), bind pose и
+  humanoid mapping; без SDL.
+- `bgmedia_rig` — generic humanoid retargeter `CharacterPose → local transforms`
+  с two-bone foot IK; без SDL.
+- `bgmedia_sdlgpu` — независимый SDL_GPU offscreen-рендерер (sRGB color, D32
+  depth, skinning, alpha, mip-текстуры); отдаёт RGBA8-кадр в Desktop.
 - `bgmedia_miniaudio` — адаптер декодирования WAV/MP3/FLAC.
-- `apps/desktop` — тестовое SDL3-приложение: декодирует через miniaudio, играет
-  через miniaudio, но сам движок об этих зависимостях не знает.
-- `tools` — headless-анализ, генератор синтетических треков, benchmark.
+- `apps/desktop` — SDL3-приложение: окно, UI SDL_Renderer, miniaudio playback,
+  композитинг 3D-кадра, но сам движок об этих зависимостях не знает.
+- `tools` — headless-анализ, 3D preview, генератор синтетических треков,
+  benchmark.
 
-Видеоплеер, сервер, Telegram-интеграция и 3D-модель в этот этап намеренно не
-входят. Точки расширения под них описаны в разделе 8.
+Видеоплеер, сервер и Telegram-интеграция в этот этап намеренно не входят.
+VRM 0.x и 3D-персонаж реализованы; подробности и ограничения:
+[docs/VRM_INTEGRATION.md](VRM_INTEGRATION.md).
 
 ## 2. Направление зависимостей
 
 ```text
-apps/desktop (SDL3 + miniaudio playback + UI)
+apps/desktop (SDL3 window + SDL_Renderer UI + miniaudio playback)
    │
    ├── bgmedia_miniaudio (только decoder adapter)
+   ├── bgmedia_sdlgpu (SDL_GPU offscreen renderer)
+   │      ├── bgmedia_vrm (cgltf/stb_image, no SDL)
+   │      └── bgmedia_rig (no SDL)
    └── bgmedia_core
          ├── audio      : PcmBuffer, WAV decoder, decoder interfaces
          ├── analysis   : STFT, onset, tempo, beats, bass, silence, sections
@@ -59,11 +70,31 @@ apps/desktop (SDL3 + miniaudio playback + UI)
 | **BG Beat** | BPM, удары, onset, бас, тишина | `bgmedia_core/analysis` |
 | **BG Motion** | хореография, cues, позы | `bgmedia_core/choreography` |
 | **BG Sync** | общая модель времени, latency, seek, rate | `bgmedia_core/sync` |
+| **BG VRM** | GLB/VRM 0.x, humanoid rig, textures | `bgmedia_vrm` |
+| **BG Rig** | retargeting BG Motion в humanoid-кости, IK | `bgmedia_rig` |
+| **BG Render 3D** | SDL_GPU offscreen scene, skinning, MToon-lite | `bgmedia_sdlgpu` |
 | **BG Effects** | эффекты поверх медиа | интерфейсы появятся вместе с видеослоем |
 
 Новые модули должны подключаться как отдельные CMake-таргеты/адаптеры, не меняя
 публичные типы анализа. Например, BG Video сможет использовать тот же
-`TransportSnapshot` и `PlaybackClock`, не затрагивая `Analyzer`.
+`TransportSnapshot` и `PlaybackClock`, не затрагивая `Analyzer`. VRM-модуль
+подключён именно так: `bgmedia_core` не включает ни SDL, ни cgltf, ни GPU-типы;
+`bgmedia_rig` знает только `CharacterPose` и `VrmModel`.
+
+### 3.1 3D-конвейер
+
+```text
+media PCM → Analyzer → CharacterPose (media time)
+    → HumanoidRetargeter (generic, no model indices)
+    → node globals + foot IK
+    → skin palette = model * jointGlobal * inverseBind
+    → SDL_GPU offscreen (color + D32) → readback
+    → SDL_Texture in existing SDL_Renderer UI
+```
+
+SDL_Renderer и SDL_GPU не делят окно/контекст. SDL_GPU владеет только
+отдельным offscreen-устройством; UI получает уже готовые пиксели. Это
+осознанная граница, а не недокументированное совместное владение контекстом.
 
 ## 4. Модель времени
 
