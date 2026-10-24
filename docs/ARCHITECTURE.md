@@ -194,21 +194,48 @@ Broadband swell (шум/тарелки) даёт высокую общую гр�
 - Кеш не является публичным форматом обмена; для Android/JNI лучше
   сериализовать события в JSON/flatbuffer, а не читать `.bgm` напрямую.
 
-## 7. Хореография и рендеринг
+## 7. BG Motion 2.0 и рендеринг
 
-`ChoreographyBuilder` — чистая функция от `AnalysisResult`:
+`ChoreographyBuilder` — чистая функция от `AnalysisResult`. В версии 2.0 он
+строит не только legacy-cues, но и непрерывный `MotionKeyframe` timeline
+([docs/MOTION.md](MOTION.md)):
 
-- cues на ударах, downbeat, смене движения, басовом акценте;
-- freeze в тишине;
-- детерминированная последовательность (bar 0 → arm wave, bar 1 → sway,
-  bar 2 → bounce, bar 3 → spin);
-- `ChoreographySampler::sample(choreography, mediaSeconds)` возвращает
-  `CharacterPose` (bob, lean, arms, legs, rotation, energy).
-- `ICharacterPresenter` — интерфейс для SDL-демо, спрайтов, Live2D, glTF,
-  Telegram-аватара и т.д. Engine не содержит типов графического API.
+- ключи на под-битовой сетке, точных ударах, границах бара, anticipation и
+  release-окнах;
+- кроссфейд базовых движений до границы бара;
+- `AccentTarget` для каждого beat с позой, которая достигается в точный
+  музыкальный момент;
+- freeze в тишине и плавный fade к нему;
+- шесть движений: Bounce, Sway, ArmWave, HeadNod, BassDip, AccentPose;
+- `ChoreographySampler::sample(choreography, mediaSeconds)` интерполирует
+  соседние keyframes (кубический Hermite или выбранный easing) и возвращает
+  расширенный `CharacterPose`;
+- `sampleStepped()` сохранён для сравнения со старым ступенчатым поведением;
+- `sampleWithDebug()` отдаёт индексы keyframes, blend, easing и phase для
+  debug-панели.
 
-SDL-демо рисует робота из примитивов, но это лишь один presenter. Замена
-рендерера не требует изменений в анализе или хореографии.
+`CharacterPose` остаётся backend-independent: старые поля сохранены, добавлены
+суставы головы/коленей/локтей, chest twist, hip shift и rotation с
+shortest-arc интерполяцией. `ICharacterPresenter` — интерфейс для SDL-демо,
+спрайтов, Live2D, glTF, Telegram-аватара и т.д. Engine не содержит типов
+графического API.
+
+SDL-демо рисует робота из примитивов, но это лишь один presenter. Ноги решаются
+двухзвенной IK с закреплёнными стопами, поэтому bob/dip не вызывают скольжения.
+Замена рендерера не требует изменений в анализе или хореографии.
+
+### Гарантия акцента в удар
+
+1. Builder вычисляет `AccentTarget.pose` в точное время beat.
+2. В этот же момент добавляется `MotionKeyframe` с тем же результатом.
+3. Sampler при совпадении media time с ключом (1e-6 с) возвращает позу ключа
+   напрямую, без размытия интерполяцией.
+4. Accent overlay имеет weight 1 ровно в beat time (подготовка 0→1, затем
+   короткий hold и release 1→0).
+5. `tests/test_motion.cpp` проверяет каждый `AccentTarget` с порогом 2e-4.
+
+Anticipation начинается до удара, целевая поза достигается на ударе,
+follow-through/инерция продолжаются после него.
 
 ## 8. Точки расширения под BG Video / BG Effects
 

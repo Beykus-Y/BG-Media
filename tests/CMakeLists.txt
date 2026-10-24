@@ -5,6 +5,7 @@ add_executable(bgmedia_tests
     test_cache.cpp
     test_sync.cpp
     test_choreography.cpp
+    test_motion.cpp
 )
 target_link_libraries(bgmedia_tests PRIVATE
     bgmedia_core
@@ -20,7 +21,7 @@ target_compile_definitions(bgmedia_tests PRIVATE
 )
 target_compile_options(bgmedia_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
-foreach(test_name audio analysis cache sync choreography)
+foreach(test_name audio analysis cache sync choreography motion)
     add_test(NAME bgmedia.${test_name} COMMAND bgmedia_tests ${test_name}.)
     set_tests_properties(bgmedia.${test_name} PROPERTIES
         TIMEOUT 120

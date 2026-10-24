@@ -102,13 +102,37 @@ build-gui\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 ## Автотесты
 
 ```text
-100% tests passed, 0 failed out of 5
+100% tests passed, 0 failed out of 6
 Total Test time (real) ≈ 1.1 s
 ```
 
-25 unit/integration кейсов, включая WAV (8/16/24/32-bit, float), MP3/FLAC
+37 unit/integration кейсов, включая WAV (8/16/24/32-bit, float), MP3/FLAC
 decode, BPM, beat alignment, tempo change, silence, bass vs swell, cache
-corruption/versioning, sync latency/seek/rate, choreography.
+corruption/versioning, sync latency/seek/rate, choreography и BG Motion 2.0.
+
+## BG Motion 2.0
+
+12 motion-тестов проверяют не только «нет NaN», а конкретные инварианты:
+
+| Проверка | Порог / результат |
+|---|---|
+| Совпадение `AccentTarget` с сэмплом в точный beat | `< 2e-4` |
+| Разрыв на keyframe/cue границе (сэмпл ±1 мс) | `< 0.07` по нормированной позе |
+| Непрерывность по треку (шаг 2 мс) | `< 0.15` |
+| Детерминизм при 30/60/120 FPS и обратном порядке | побитово одинаковые позы |
+| Изменение BPM | нет скачка `> 0.08` на границах |
+| 200 BPM против 100 BPM | амплитуда быстрого трека `< 0.82` от медленного |
+| Антиципация | preparation начинается до beat, release заканчивается после |
+| Freeze в тишине | `energy = 0`, `impact = 0` |
+
+Акцентная поза гарантируется тем, что `AccentTarget.pose` вычисляется в точный
+beat, в timeline ставится keyframe с тем же значением, а сэмплер при совпадении
+времени возвращает keyframe без интерполяционного размытия. Подробнее:
+[docs/MOTION.md](MOTION.md).
+
+Desktop Motion Lab (синтетическая сетка 123 BPM, debug-режим):
+`docs/images/desktop-motion-debug.png`. Ступенчатый режим для A/B:
+`docs/images/desktop-motion-stepped.png`.
 
 ## Ограничения измерений
 
@@ -135,3 +159,7 @@ corruption/versioning, sync latency/seek/rate, choreography.
 - `docs/images/desktop-silence.png` — пауза, freeze и отсутствие выдуманных
   ударов.
 - `docs/images/desktop-empty.png` — стартовый экран.
+- `docs/images/desktop-motion-debug.png` — BG Motion 2.0, joints/trails,
+  Motion Lab 123 BPM.
+- `docs/images/desktop-motion-stepped.png` — старый ступенчатый режим для
+  сравнения.

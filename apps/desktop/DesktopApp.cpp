@@ -113,6 +113,12 @@ std::string moveName(MoveKind move) {
         return "POSE";
     case MoveKind::Freeze:
         return "FREEZE";
+    case MoveKind::HeadNod:
+        return "HEAD NOD";
+    case MoveKind::BassDip:
+        return "BASS DIP";
+    case MoveKind::AccentPose:
+        return "ACCENT POSE";
     }
     return "IDLE";
 }
@@ -220,6 +226,10 @@ struct Layout {
     Rect syncMinus{1244, 88, 28, 24};
     Rect syncPlus{1352, 88, 28, 24};
     Rect emptyLoad{};
+
+    Rect motionSmooth{};
+    Rect motionDebug{};
+    Rect motionLab{};
 
     Rect ruler{};
     Rect wave{};
@@ -359,6 +369,12 @@ struct DesktopApp::Impl {
     bool running = true;
     bool fullscreen = false;
 
+    bool motionDebug = false;
+    bool motionStepped = false;
+    int motionLabBpm = 0;
+    std::unique_ptr<AnalysisResult> motionLabAnalysis;
+    std::unique_ptr<Choreography> motionLabChoreography;
+
     std::thread workerThread;
     std::atomic<bool> workerCancel{false};
     std::atomic<std::uint64_t> generation{0};
@@ -450,6 +466,10 @@ struct DesktopApp::Impl {
             SDL_DialogFileFilter{"Audio files", "*.wav;*.mp3;*.flac"},
             SDL_DialogFileFilter{"All files", "*.*"},
         };
+
+        motionDebug = options.motionDebug;
+        motionStepped = options.motionStepped;
+        motionLabBpm = std::max(0, options.motionLabBpm);
 
         SDL_ShowWindow(window);
         return true;
@@ -667,6 +687,12 @@ struct DesktopApp::Impl {
         errorMessage.clear();
         audioError.clear();
         rebuildSpectrogram();
+        if (motionLabBpm > 0) {
+            rebuildMotionLab();
+        } else {
+            motionLabAnalysis.reset();
+            motionLabChoreography.reset();
+        }
         viewStart = 0.0;
         viewEnd = std::max(0.001, track->analysis.info.duration);
         fallbackPosition = 0.0;
@@ -697,6 +723,125 @@ struct DesktopApp::Impl {
     void showToast(std::string message) {
         toast = std::move(message);
         toastUntil = animationTime + 3.2;
+    }
+
+    // ---------------------------------------------------------------------
+    // BG Motion lab / comparison
+    // ---------------------------------------------------------------------
+    [[nodiscard]] const AnalysisResult* activeAnalysis() const {
+        if (motionLabBpm > 0 && motionLabAnalysis) {
+            return motionLabAnalysis.get();
+        }
+        return track ? &track->analysis : nullptr;
+    }
+
+    [[nodiscard]] const Choreography* activeChoreography() const {
+        if (motionLabBpm > 0 && motionLabChoreography) {
+            return motionLabChoreography.get();
+        }
+        return track ? &track->choreography : nullptr;
+    }
+
+    [[nodiscard]] CharacterPose sampleActiveAt(double time) const {
+        const Choreography* choreography = activeChoreography();
+        if (!choreography) {
+            return {};
+        }
+        ChoreographySampler sampler;
+        return motionStepped ? sampler.sampleStepped(*choreography, time)
+                             : sampler.sample(*choreography, time);
+    }
+
+    [[nodiscard]] MotionSample sampleActiveWithDebug(double time) const {
+        MotionSample sample;
+        const Choreography* choreography = activeChoreography();
+        if (!choreography) {
+            return sample;
+        }
+        ChoreographySampler sampler;
+        if (motionStepped) {
+            sample.pose = sampler.sampleStepped(*choreography, time);
+            sample.move = sample.pose.move;
+            sample.accent = sample.pose.accented;
+            return sample;
+        }
+        return sampler.sampleWithDebug(*choreography, time);
+    }
+
+    void rebuildMotionLab() {
+        if (!track || motionLabBpm <= 0) {
+            motionLabAnalysis.reset();
+            motionLabChoreography.reset();
+            return;
+        }
+        const double duration = std::max(2.0, track->analysis.info.duration);
+        auto analysis = std::make_unique<AnalysisResult>();
+        analysis->info = track->analysis.info;
+        analysis->info.duration = duration;
+        analysis->bpm = static_cast<double>(motionLabBpm);
+        analysis->bpmConfidence = 1.0f;
+        analysis->tempoStable = true;
+        analysis->beatsPerBar = 4;
+        const double period = 60.0 / static_cast<double>(motionLabBpm);
+        const double offset = 0.45;
+        int index = 0;
+        for (double time = offset; time < duration - 0.1; time += period, ++index) {
+            Beat beat;
+            beat.time = time;
+            beat.beatInBar = index % 4;
+            beat.barIndex = index / 4;
+            beat.downbeat = beat.beatInBar == 0;
+            beat.strength = beat.downbeat ? 1.0f : 0.64f;
+            beat.confidence = 1.0f;
+            analysis->beats.push_back(beat);
+        }
+        // The lab uses the same musical event vocabulary as real analysis:
+        // bass on every other downbeat, so both BassDip and AccentPose appear.
+        for (std::size_t i = 0; i < analysis->beats.size(); ++i) {
+            const Beat& beat = analysis->beats[i];
+            if (beat.downbeat && (beat.barIndex % 2 == 0)) {
+                BassAccent accent;
+                accent.time = beat.time;
+                accent.strength = 0.95f;
+                accent.lowBandRatio = 0.75f;
+                accent.confidence = 1.0f;
+                accent.nearestBeat = static_cast<int>(i);
+                analysis->bassAccents.push_back(accent);
+            }
+        }
+        Choreography style = ChoreographyBuilder{}.build(*analysis);
+        motionLabChoreography = std::make_unique<Choreography>(std::move(style));
+        motionLabAnalysis = std::move(analysis);
+    }
+
+    void setMotionLab(int bpm) {
+        motionLabBpm = std::max(0, bpm);
+        if (motionLabBpm == 0) {
+            motionLabAnalysis.reset();
+            motionLabChoreography.reset();
+            showToast("Motion lab off - using analysed music");
+            return;
+        }
+        if (!track) {
+            motionLabBpm = 0;
+            showToast("Load a track before enabling the motion lab");
+            return;
+        }
+        rebuildMotionLab();
+        showToast("Motion lab: synthetic " + std::to_string(motionLabBpm) +
+                  " BPM beat grid");
+    }
+
+    void cycleMotionLab() {
+        static constexpr int choices[] = {0, 92, 123, 163, 180};
+        int next = choices[1];
+        for (std::size_t i = 0; i < std::size(choices); ++i) {
+            if (choices[i] == motionLabBpm) {
+                next = choices[(i + 1) % std::size(choices)];
+                break;
+            }
+        }
+        setMotionLab(next);
     }
 
     // ---------------------------------------------------------------------
@@ -1138,6 +1283,18 @@ struct DesktopApp::Impl {
         case SDLK_R:
             cycleRate();
             break;
+        case SDLK_D:
+            motionDebug = !motionDebug;
+            showToast(motionDebug ? "Motion debug on" : "Motion debug off");
+            break;
+        case SDLK_V:
+            motionStepped = !motionStepped;
+            showToast(motionStepped ? "Legacy stepped animation"
+                                    : "Smooth BG Motion 2.0");
+            break;
+        case SDLK_B:
+            cycleMotionLab();
+            break;
         case SDLK_LEFTBRACKET:
             adjustLatency(-0.005);
             break;
@@ -1189,6 +1346,21 @@ struct DesktopApp::Impl {
             adjustLatency(0.005);
             return;
         }
+        if (layout.motionSmooth.contains(x, y)) {
+            motionStepped = !motionStepped;
+            showToast(motionStepped ? "Legacy stepped animation"
+                                    : "Smooth BG Motion 2.0");
+            return;
+        }
+        if (layout.motionDebug.contains(x, y)) {
+            motionDebug = !motionDebug;
+            showToast(motionDebug ? "Motion debug on" : "Motion debug off");
+            return;
+        }
+        if (layout.motionLab.contains(x, y)) {
+            cycleMotionLab();
+            return;
+        }
         if (!track) {
             return;
         }
@@ -1238,6 +1410,10 @@ struct DesktopApp::Impl {
     void computeLayout() {
         layout.emptyLoad = {layout.empty.centerX() - 86.0f,
                             layout.empty.y + 380.0f, 172.0f, 44.0f};
+        const Rect card = layout.choreoCard;
+        layout.motionLab = {card.right() - 104.0f, card.y + 10.0f, 90.0f, 24.0f};
+        layout.motionDebug = {layout.motionLab.x - 76.0f, card.y + 10.0f, 70.0f, 24.0f};
+        layout.motionSmooth = {layout.motionDebug.x - 104.0f, card.y + 10.0f, 98.0f, 24.0f};
         updateTimelineLayout();
     }
 
@@ -1276,20 +1452,19 @@ struct DesktopApp::Impl {
     }
 
     [[nodiscard]] std::string currentMoveName() const {
-        if (!track) {
+        if (!activeChoreography()) {
             return "IDLE";
         }
-        const DanceCue* cue =
-            ChoreographySampler{}.activeCue(track->choreography, currentPosition());
-        return cue ? moveName(cue->move) : "IDLE";
+        return moveName(sampleActiveAt(currentPosition()).move);
     }
 
     [[nodiscard]] std::pair<int, int> currentBarBeat() const {
-        if (!track || track->analysis.beats.empty()) {
+        const AnalysisResult* analysis = activeAnalysis();
+        if (!analysis || analysis->beats.empty()) {
             return {0, 0};
         }
         double offset = 0.0;
-        const Beat* beat = previousBeat(track->analysis.beats, currentPosition(), &offset);
+        const Beat* beat = previousBeat(analysis->beats, currentPosition(), &offset);
         if (!beat || offset > 2.5) {
             return {0, 0};
         }
@@ -1602,8 +1777,9 @@ void DesktopApp::Impl::drawRuler() {
                ruler.y + 1.0f, 9, theme::dim);
 
     // Bar numbers replace time labels when zoomed close enough.
-    if (track && span <= 24.0 && !track->analysis.beats.empty()) {
-        for (const Beat& beat : track->analysis.beats) {
+    const AnalysisResult* visibleAnalysis = activeAnalysis();
+    if (visibleAnalysis && span <= 24.0 && !visibleAnalysis->beats.empty()) {
+        for (const Beat& beat : visibleAnalysis->beats) {
             if (!beat.downbeat || beat.time < viewStart || beat.time > viewEnd) {
                 continue;
             }
@@ -1915,17 +2091,24 @@ void DesktopApp::Impl::drawBpmPanel(const Rect& rect) {
         return;
     }
     const auto& analysis = track->analysis;
-    if (!analysis.tempoStable) {
+    if (motionLabBpm > 0) {
+        labelRight("MOTION LAB " + std::to_string(motionLabBpm), rect.right() - 18.0f,
+                   rect.y + 16.0f, 8, theme::pink, 0.8f);
+    } else if (!analysis.tempoStable) {
         labelRight("CHANGE SUSPECTED", rect.right() - 18.0f, rect.y + 16.0f, 8,
                    theme::amber, 0.8f);
+    } else if (analysis.bpm > 0.0) {
+        labelRight(analysis.octaveAmbiguous ? "OCTAVE AMBIGUOUS" : "STABLE",
+                   rect.right() - 18.0f, rect.y + 16.0f, 8,
+                   analysis.octaveAmbiguous ? theme::amber : theme::accent, 0.8f);
+    }
+
+    if (!analysis.tempoStable) {
         text->draw("MIXED", rect.x + 18.0f, rect.y + 38.0f, 36, FontWeight::SemiBold,
                    theme::amber);
         body(formatNumber(analysis.bpm, 1) + " BPM weighted  ·  see tempo map",
              rect.x + 18.0f, rect.y + 92.0f, 11, theme::muted);
     } else if (analysis.bpm > 0.0) {
-        labelRight(analysis.octaveAmbiguous ? "OCTAVE AMBIGUOUS" : "STABLE",
-                   rect.right() - 18.0f, rect.y + 16.0f, 8,
-                   analysis.octaveAmbiguous ? theme::amber : theme::accent, 0.8f);
         text->draw(formatNumber(analysis.bpm, 1), rect.x + 18.0f, rect.y + 30.0f, 56,
                    FontWeight::SemiBold, theme::text);
         const float numberWidth =
@@ -2104,13 +2287,111 @@ void DesktopApp::Impl::drawRightPanels() {
 // -------------------------------------------------------------------------
 // Choreography card and dancer
 // -------------------------------------------------------------------------
+namespace {
+
+struct JointPoint {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
+struct DancerSkeleton {
+    JointPoint hip;
+    JointPoint shoulder;
+    JointPoint head;
+    JointPoint leftShoulder;
+    JointPoint rightShoulder;
+    JointPoint leftElbow;
+    JointPoint rightElbow;
+    JointPoint leftHand;
+    JointPoint rightHand;
+    JointPoint leftKnee;
+    JointPoint rightKnee;
+    JointPoint leftFoot;
+    JointPoint rightFoot;
+    float floorY = 0.0f;
+};
+
+JointPoint solveKnee(JointPoint hip, JointPoint foot, float thigh, float shin,
+                     float sideSign) {
+    const float dx = foot.x - hip.x;
+    const float dy = foot.y - hip.y;
+    const float distance = std::max(0.001f, std::sqrt(dx * dx + dy * dy));
+    const float clamped = std::clamp(distance, std::abs(thigh - shin) + 0.01f,
+                                     thigh + shin - 0.01f);
+    const float ux = dx / distance;
+    const float uy = dy / distance;
+    const float along = (thigh * thigh - shin * shin + clamped * clamped) /
+                        (2.0f * clamped);
+    const float bend = std::sqrt(std::max(0.0f, thigh * thigh - along * along));
+    const float baseX = hip.x + ux * along;
+    const float baseY = hip.y + uy * along;
+    const float perpX = -uy;
+    const float perpY = ux;
+    return {baseX + perpX * bend * sideSign, baseY + perpY * bend * sideSign};
+}
+
+DancerSkeleton makeDancerSkeleton(const Rect& stage, const CharacterPose& pose) {
+    DancerSkeleton skeleton;
+    const float cx = stage.centerX();
+    const float floorY = stage.y + stage.h - 28.0f;
+    skeleton.floorY = floorY;
+    const float bob = -pose.bob * 13.0f;
+    const float hipX = cx + pose.lean * 9.0f + pose.hipShift * 12.0f;
+    const float hipY = floorY - 66.0f + bob;
+    const float shoulderX = cx + pose.lean * 23.0f + pose.hipShift * 8.0f;
+    const float shoulderY = hipY - 62.0f;
+    const float headX = shoulderX + pose.lean * 9.0f + pose.headTurn * 8.0f;
+    const float headY = shoulderY - 34.0f + pose.headNod * 7.0f;
+    const float twist = pose.chestTwist * 10.0f;
+
+    skeleton.hip = {hipX, hipY};
+    skeleton.shoulder = {shoulderX, shoulderY};
+    skeleton.head = {headX, headY};
+    skeleton.leftShoulder = {shoulderX - 18.0f + twist, shoulderY + 6.0f};
+    skeleton.rightShoulder = {shoulderX + 18.0f - twist, shoulderY + 6.0f};
+
+    const float footLiftLeft = std::max(0.0f, pose.footLeft) * 9.0f;
+    const float footLiftRight = std::max(0.0f, pose.footRight) * 9.0f;
+    skeleton.leftFoot = {cx - 24.0f, floorY + 2.0f - footLiftLeft};
+    skeleton.rightFoot = {cx + 24.0f, floorY + 2.0f - footLiftRight};
+    // Bend each knee away from the body's centre line. The foot anchors are
+    // fixed; only the knee solve changes with bob/dip.
+    skeleton.leftKnee =
+        solveKnee(skeleton.hip, skeleton.leftFoot, 35.0f, 39.0f, 1.0f);
+    skeleton.rightKnee =
+        solveKnee(skeleton.hip, skeleton.rightFoot, 35.0f, 39.0f, -1.0f);
+
+    const float leftReach = pose.armLeft * 1.05f;
+    const float rightReach = pose.armRight * 1.05f;
+    skeleton.leftElbow = {
+        skeleton.leftShoulder.x + std::sin(leftReach - 0.35f) * 31.0f,
+        skeleton.leftShoulder.y + std::cos(leftReach - 0.35f) * 31.0f};
+    skeleton.rightElbow = {
+        skeleton.rightShoulder.x + std::sin(rightReach + 0.35f) * 31.0f,
+        skeleton.rightShoulder.y + std::cos(rightReach + 0.35f) * 31.0f};
+    skeleton.leftHand = {
+        skeleton.leftElbow.x + std::sin(leftReach - 0.35f + pose.elbowLeft * 0.6f) * 27.0f,
+        skeleton.leftElbow.y + std::cos(leftReach - 0.35f + pose.elbowLeft * 0.6f) * 27.0f};
+    skeleton.rightHand = {
+        skeleton.rightElbow.x + std::sin(rightReach + 0.35f + pose.elbowRight * 0.6f) * 27.0f,
+        skeleton.rightElbow.y + std::cos(rightReach + 0.35f + pose.elbowRight * 0.6f) * 27.0f};
+    return skeleton;
+}
+
+void drawJoint(SDL_Renderer* renderer, JointPoint point, SDL_Color color,
+               float radius) {
+    ui::fillCircle(renderer, point.x, point.y, radius, color);
+    ui::ring(renderer, point.x, point.y, radius + 1.5f, 1.0f,
+             theme::alpha(theme::white, 0.22f));
+}
+
+} // namespace
+
 void DesktopApp::Impl::drawDancer(const Rect& stage, const CharacterPose& pose) {
     const float cx = stage.centerX();
     const float floorY = stage.y + stage.h - 28.0f;
-    const float bob = -pose.bob * 13.0f;
-    const float lean = pose.lean;
 
-    // Stage floor.
+    // Stage floor and depth lines.
     ui::thickLine(renderer, cx - 150.0f, floorY + 10.0f, cx + 150.0f, floorY + 10.0f,
                   1.0f, theme::alpha(theme::white, 0.08f), false);
     ui::thickLine(renderer, cx - 80.0f, floorY + 18.0f, cx + 80.0f, floorY + 18.0f,
@@ -2118,11 +2399,66 @@ void DesktopApp::Impl::drawDancer(const Rect& stage, const CharacterPose& pose) 
     ui::fillCircle(renderer, cx, floorY + 13.0f, 44.0f,
                    theme::alpha(theme::accent, 0.035f));
 
-    // Beat pulse ring.
+    // A deterministic trail pass is drawn before the character, so debug
+    // trajectories never obscure the pose itself. It samples media time
+    // directly, not rendered frames.
+    if (motionDebug) {
+        const Choreography* motion = activeChoreography();
+        if (motion) {
+            const double pos = currentPosition();
+            constexpr int kTrailSamples = 52;
+            constexpr double kTrailSpan = 1.15;
+            for (int sampleIndex = 0; sampleIndex < kTrailSamples; ++sampleIndex) {
+                const double u =
+                    static_cast<double>(sampleIndex) / (kTrailSamples - 1);
+                const double sampleTime = pos - kTrailSpan + kTrailSpan * u;
+                if (sampleTime < 0.0) {
+                    continue;
+                }
+                const CharacterPose trailPose = sampleActiveAt(sampleTime);
+                const DancerSkeleton trail = makeDancerSkeleton(stage, trailPose);
+                if (sampleIndex > 0) {
+                    const double previousU =
+                        static_cast<double>(sampleIndex - 1) / (kTrailSamples - 1);
+                    const CharacterPose previousPose =
+                        sampleActiveAt(pos - kTrailSpan + kTrailSpan * previousU);
+                    const DancerSkeleton previous =
+                        makeDancerSkeleton(stage, previousPose);
+                    const float alpha = static_cast<float>(0.20 + 0.65 * u);
+                    ui::thickLine(renderer, previous.leftHand.x, previous.leftHand.y,
+                                  trail.leftHand.x, trail.leftHand.y, 2.0f,
+                                  theme::alpha(theme::violet, alpha), false);
+                    ui::thickLine(renderer, previous.rightHand.x, previous.rightHand.y,
+                                  trail.rightHand.x, trail.rightHand.y, 2.0f,
+                                  theme::alpha(theme::pink, alpha), false);
+                    ui::thickLine(renderer, previous.head.x, previous.head.y,
+                                  trail.head.x, trail.head.y, 1.6f,
+                                  theme::alpha(theme::accent, alpha * 0.8f), false);
+                }
+                if (sampleIndex % 8 == 0) {
+                    const float markerAlpha =
+                        static_cast<float>(0.25 + 0.5 * u);
+                    ui::fillCircle(renderer, trail.leftHand.x, trail.leftHand.y, 1.8f,
+                                   theme::alpha(theme::violet, markerAlpha));
+                    ui::fillCircle(renderer, trail.rightHand.x, trail.rightHand.y, 1.8f,
+                                   theme::alpha(theme::pink, markerAlpha));
+                }
+                if (sampleIndex == kTrailSamples - 1) {
+                    ui::fillCircle(renderer, trail.leftHand.x, trail.leftHand.y, 3.0f,
+                                   theme::violet);
+                    ui::fillCircle(renderer, trail.rightHand.x, trail.rightHand.y, 3.0f,
+                                   theme::pink);
+                }
+            }
+        }
+    }
+
+    // Beat pulse ring, driven by media time.
     const double pos = currentPosition();
-    if (track && !track->analysis.beats.empty()) {
+    const AnalysisResult* active = activeAnalysis();
+    if (active && !active->beats.empty()) {
         double nearest = 1e9;
-        for (const Beat& beat : track->analysis.beats) {
+        for (const Beat& beat : active->beats) {
             nearest = std::min(nearest, std::abs(beat.time - pos));
         }
         if (nearest < 0.16) {
@@ -2132,20 +2468,13 @@ void DesktopApp::Impl::drawDancer(const Rect& stage, const CharacterPose& pose) 
         }
     }
 
-    // Energy aura.
     if (pose.energy > 0.05f) {
         ui::fillCircle(renderer, cx, floorY - 92.0f, 86.0f,
                        theme::alpha(pose.accented ? theme::amber : theme::accent,
                                     0.035f + 0.03f * pose.energy));
     }
 
-    const float hipX = cx + lean * 9.0f;
-    const float hipY = floorY - 66.0f + bob;
-    const float shoulderX = cx + lean * 25.0f;
-    const float shoulderY = hipY - 62.0f;
-    const float headX = cx + lean * 32.0f;
-    const float headY = shoulderY - 36.0f;
-
+    const DancerSkeleton skeleton = makeDancerSkeleton(stage, pose);
     const SDL_Color limbDark{17, 24, 34, 255};
     const SDL_Color limbColor = pose.move == MoveKind::Freeze
                                     ? theme::muted
@@ -2153,69 +2482,129 @@ void DesktopApp::Impl::drawDancer(const Rect& stage, const CharacterPose& pose) 
     const SDL_Color jointColor = theme::violet;
     const float thickness = 11.0f;
 
-    // Shadow.
-    ui::thickLine(renderer, hipX - 28.0f, floorY + 4.0f, hipX + 28.0f, floorY + 4.0f,
-                  7.0f, SDL_Color{0, 0, 0, 90}, false);
+    // Shadow anchored to the planted feet.
+    ui::thickLine(renderer, skeleton.leftFoot.x - 7.0f, floorY + 4.0f,
+                  skeleton.rightFoot.x + 7.0f, floorY + 4.0f, 7.0f,
+                  SDL_Color{0, 0, 0, 90}, false);
 
-    // Legs.
-    for (int side = -1; side <= 1; side += 2) {
-        const float swing = (side < 0 ? pose.legLeft : pose.legRight) * 0.55f;
-        const float kneeX = hipX + side * 12.0f + swing * 15.0f;
-        const float kneeY = hipY + 34.0f;
-        const float footX = kneeX + side * 6.0f + swing * 22.0f;
-        const float footY = floorY + 2.0f + bob * 0.15f;
-        ui::thickLine(renderer, hipX, hipY, kneeX, kneeY, thickness + 4.0f, limbDark);
-        ui::thickLine(renderer, kneeX, kneeY, footX, footY, thickness + 4.0f, limbDark);
-        ui::thickLine(renderer, hipX, hipY, kneeX, kneeY, thickness, limbColor);
-        ui::thickLine(renderer, kneeX, kneeY, footX, footY, thickness, limbColor);
-        ui::fillCircle(renderer, kneeX, kneeY, thickness * 0.58f, jointColor);
-        ui::fillCircle(renderer, footX, footY, 6.0f, jointColor);
+    // Legs use a two-bone IK solve with planted feet, so bob/dip/weight shifts
+    // bend the knees instead of sliding the feet across the floor.
+    for (int side = 0; side < 2; ++side) {
+        const JointPoint knee = side == 0 ? skeleton.leftKnee : skeleton.rightKnee;
+        const JointPoint foot = side == 0 ? skeleton.leftFoot : skeleton.rightFoot;
+        ui::thickLine(renderer, skeleton.hip.x, skeleton.hip.y, knee.x, knee.y,
+                      thickness + 4.0f, limbDark);
+        ui::thickLine(renderer, knee.x, knee.y, foot.x, foot.y, thickness + 4.0f,
+                      limbDark);
+        ui::thickLine(renderer, skeleton.hip.x, skeleton.hip.y, knee.x, knee.y,
+                      thickness, limbColor);
+        ui::thickLine(renderer, knee.x, knee.y, foot.x, foot.y, thickness, limbColor);
+        ui::fillCircle(renderer, knee.x, knee.y, thickness * 0.58f, jointColor);
+        ui::fillCircle(renderer, foot.x, foot.y, 6.0f, jointColor);
     }
 
-    // Arms.
-    for (int side = -1; side <= 1; side += 2) {
-        const float arm = side < 0 ? pose.armLeft : pose.armRight;
-        const float reach = arm * 1.05f;
-        const float shoulderLocalX = shoulderX + side * 18.0f;
-        const float upperX = shoulderLocalX + std::sin(reach + side * 0.4f) * 31.0f;
-        const float upperY = shoulderY + 8.0f + std::cos(reach + side * 0.4f) * 31.0f;
-        const float handX = upperX + std::sin(reach + side * 0.4f + 0.45f) * 28.0f;
-        const float handY = upperY + std::cos(reach + side * 0.4f + 0.45f) * 28.0f;
-        ui::thickLine(renderer, shoulderLocalX, shoulderY + 6.0f, upperX, upperY,
+    // Arms with articulated elbows.
+    for (int side = 0; side < 2; ++side) {
+        const JointPoint shoulder =
+            side == 0 ? skeleton.leftShoulder : skeleton.rightShoulder;
+        const JointPoint elbow = side == 0 ? skeleton.leftElbow : skeleton.rightElbow;
+        const JointPoint hand = side == 0 ? skeleton.leftHand : skeleton.rightHand;
+        ui::thickLine(renderer, shoulder.x, shoulder.y, elbow.x, elbow.y,
                       thickness - 1.0f, limbDark);
-        ui::thickLine(renderer, upperX, upperY, handX, handY, thickness - 1.0f, limbDark);
-        ui::thickLine(renderer, shoulderLocalX, shoulderY + 6.0f, upperX, upperY,
+        ui::thickLine(renderer, elbow.x, elbow.y, hand.x, hand.y, thickness - 1.0f,
+                      limbDark);
+        ui::thickLine(renderer, shoulder.x, shoulder.y, elbow.x, elbow.y,
                       thickness - 4.0f, limbColor);
-        ui::thickLine(renderer, upperX, upperY, handX, handY, thickness - 4.0f, limbColor);
-        ui::fillCircle(renderer, upperX, upperY, thickness * 0.5f, jointColor);
-        ui::fillCircle(renderer, handX, handY, 4.5f, limbColor);
+        ui::thickLine(renderer, elbow.x, elbow.y, hand.x, hand.y, thickness - 4.0f,
+                      limbColor);
+        ui::fillCircle(renderer, elbow.x, elbow.y, thickness * 0.5f, jointColor);
+        ui::fillCircle(renderer, hand.x, hand.y, 4.5f, limbColor);
     }
 
-    // Torso.
-    ui::thickLine(renderer, hipX, hipY + 2.0f, shoulderX, shoulderY, 41.0f, limbDark,
-                  true);
-    ui::thickLine(renderer, hipX, hipY + 2.0f, shoulderX, shoulderY, 34.0f,
-                   SDL_Color{22, 30, 43, 255}, true);
-    ui::fillCircle(renderer, shoulderX, shoulderY, 4.0f, limbColor);
-    ui::fillCircle(renderer, hipX, hipY, 4.0f, limbColor);
-    // Chest light.
-    const float chestX = (hipX + shoulderX) * 0.5f;
-    const float chestY = (hipY + shoulderY) * 0.5f - 2.0f;
+    // Torso, chest light and head.
+    ui::thickLine(renderer, skeleton.hip.x, skeleton.hip.y + 2.0f,
+                  skeleton.shoulder.x, skeleton.shoulder.y, 41.0f, limbDark, true);
+    ui::thickLine(renderer, skeleton.hip.x, skeleton.hip.y + 2.0f,
+                  skeleton.shoulder.x, skeleton.shoulder.y, 34.0f,
+                  SDL_Color{22, 30, 43, 255}, true);
+    ui::fillCircle(renderer, skeleton.shoulder.x, skeleton.shoulder.y, 4.0f,
+                   limbColor);
+    ui::fillCircle(renderer, skeleton.hip.x, skeleton.hip.y, 4.0f, limbColor);
+    const float chestX = (skeleton.hip.x + skeleton.shoulder.x) * 0.5f;
+    const float chestY = (skeleton.hip.y + skeleton.shoulder.y) * 0.5f - 2.0f;
     ui::fillCircle(renderer, chestX, chestY, 4.0f,
                    theme::alpha(pose.accented ? theme::amber : theme::accent, 0.9f));
 
-    // Head.
-    ui::fillCircle(renderer, headX, headY, 25.0f, limbDark);
-    ui::ring(renderer, headX, headY, 25.0f, 1.5f,
+    ui::fillCircle(renderer, skeleton.head.x, skeleton.head.y, 25.0f, limbDark);
+    ui::ring(renderer, skeleton.head.x, skeleton.head.y, 25.0f, 1.5f,
              theme::alpha(theme::white, 0.18f));
-    ui::fillRoundedRect(renderer, {headX - 15.0f, headY - 4.0f, 30.0f, 10.0f}, 5.0f,
-                        theme::alpha(theme::accent, 0.85f));
-    ui::fillCircle(renderer, headX + 8.0f, headY + 1.0f, 1.8f, SDL_Color{8, 20, 18, 255});
-    // Antenna.
-    ui::thickLine(renderer, headX, headY - 25.0f, headX + lean * 4.0f, headY - 37.0f,
+    ui::fillRoundedRect(renderer,
+                        {skeleton.head.x - 15.0f + pose.headTurn * 5.0f,
+                         skeleton.head.y - 4.0f + pose.headNod * 2.0f, 30.0f, 10.0f},
+                        5.0f, theme::alpha(theme::accent, 0.85f));
+    ui::fillCircle(renderer, skeleton.head.x + 8.0f + pose.headTurn * 4.0f,
+                   skeleton.head.y + 1.0f + pose.headNod * 2.0f, 1.8f,
+                   SDL_Color{8, 20, 18, 255});
+    ui::thickLine(renderer, skeleton.head.x, skeleton.head.y - 25.0f,
+                  skeleton.head.x + pose.lean * 4.0f, skeleton.head.y - 37.0f,
                   2.0f, theme::alpha(theme::muted, 0.8f));
-    ui::fillCircle(renderer, headX + lean * 4.0f, headY - 38.0f, 2.4f,
+    ui::fillCircle(renderer, skeleton.head.x + pose.lean * 4.0f,
+                   skeleton.head.y - 38.0f, 2.4f,
                    pose.accented ? theme::amber : theme::accent);
+
+    if (motionDebug) {
+        const SDL_Color debugJoint = theme::alpha(theme::accent, 0.95f);
+        drawJoint(renderer, skeleton.hip, debugJoint, 2.6f);
+        drawJoint(renderer, skeleton.shoulder, debugJoint, 2.6f);
+        drawJoint(renderer, skeleton.head, theme::pink, 2.8f);
+        drawJoint(renderer, skeleton.leftElbow, theme::violet, 2.2f);
+        drawJoint(renderer, skeleton.rightElbow, theme::violet, 2.2f);
+        drawJoint(renderer, skeleton.leftKnee, theme::amber, 2.2f);
+        drawJoint(renderer, skeleton.rightKnee, theme::amber, 2.2f);
+        drawJoint(renderer, skeleton.leftFoot, theme::accent, 2.4f);
+        drawJoint(renderer, skeleton.rightFoot, theme::accent, 2.4f);
+
+        // Keyframe/accent ruler at the bottom edge of the stage.
+        const float stripY = stage.bottom() - 13.0f;
+        ui::thickLine(renderer, stage.x + 18.0f, stripY, stage.right() - 18.0f, stripY,
+                      1.0f, theme::alpha(theme::white, 0.14f), false);
+        const auto* activeData = activeAnalysis();
+        const Choreography* activeMotion = activeChoreography();
+        if (activeMotion) {
+            for (const MotionKeyframe& key : activeMotion->keyframes) {
+                if (std::abs(key.time - pos) > 1.2) {
+                    continue;
+                }
+                const float x = stage.centerX() +
+                                static_cast<float>((key.time - pos) / 1.2) *
+                                    (stage.w * 0.45f);
+                SDL_SetRenderDrawColor(renderer, 156, 130, 255, 125);
+                SDL_RenderLine(renderer, x, stripY + 1.0f, x, stripY + 4.0f);
+            }
+        }
+        if (activeData) {
+            for (const Beat& beat : activeData->beats) {
+                if (std::abs(beat.time - pos) > 1.2) {
+                    continue;
+                }
+                const float x = stage.centerX() +
+                                static_cast<float>((beat.time - pos) / 1.2) *
+                                    (stage.w * 0.45f);
+                const bool nearAccent =
+                    beat.downbeat ||
+                    std::any_of(activeData->bassAccents.begin(),
+                                activeData->bassAccents.end(),
+                                [&](const BassAccent& accent) {
+                                    return std::abs(accent.time - beat.time) < 0.08;
+                                });
+                SDL_SetRenderDrawColor(renderer, nearAccent ? 255 : 150,
+                                       nearAccent ? 181 : 180,
+                                       nearAccent ? 77 : 205,
+                                       nearAccent ? 220 : 100);
+                SDL_RenderLine(renderer, x, stripY - 5.0f, x, stripY + 4.0f);
+            }
+        }
+    }
 }
 
 void DesktopApp::Impl::drawChoreography() {
@@ -2225,8 +2614,25 @@ void DesktopApp::Impl::drawChoreography() {
     text->draw("CHOREOGRAPHY", card.x + 18.0f, card.y + 14.0f, 12,
                FontWeight::SemiBold, theme::text);
     label("BG MOTION", card.x + 150.0f, card.y + 17.0f, 8, theme::accent, 1.1f);
-    labelRight("SAMPLED AT MEDIA TIME  ·  NOT SCREEN FPS", card.right() - 18.0f,
-               card.y + 17.0f, 8, theme::dim, 0.6f);
+    label("MEDIA-TIME  ·  FPS INDEPENDENT", card.x + 248.0f, card.y + 17.0f, 8,
+          theme::dim, 0.5f);
+
+    auto motionChip = [&](const Rect& rect, const std::string& caption, bool selected,
+                          SDL_Color color) {
+        ui::fillRoundedRect(renderer, rect, 12.0f,
+                            theme::alpha(color, selected ? 0.14f : 0.055f));
+        ui::strokeRoundedRect(renderer, rect, 12.0f,
+                              theme::alpha(color, selected ? 0.38f : 0.16f), 1.0f);
+        text->drawCentered(caption, rect.centerX(), rect.y + 7.0f, 8,
+                           FontWeight::SemiBold,
+                           selected ? color : theme::muted);
+    };
+    motionChip(layout.motionSmooth, motionStepped ? "STEPPED" : "SMOOTH",
+               true, motionStepped ? theme::amber : theme::accent);
+    motionChip(layout.motionDebug, "DEBUG", motionDebug, theme::violet);
+    motionChip(layout.motionLab,
+               motionLabBpm > 0 ? "LAB " + std::to_string(motionLabBpm) : "LAB OFF",
+               motionLabBpm > 0, theme::pink);
 
     const Rect stage{card.x + 18.0f, card.y + 46.0f, 420.0f, 224.0f};
     ui::fillRoundedRect(renderer, stage, 8.0f, theme::panelRaised);
@@ -2239,8 +2645,10 @@ void DesktopApp::Impl::drawChoreography() {
     }
 
     CharacterPose pose;
-    if (track) {
-        pose = ChoreographySampler{}.sample(track->choreography, currentPosition());
+    MotionSample motionSample;
+    if (activeChoreography()) {
+        motionSample = sampleActiveWithDebug(currentPosition());
+        pose = motionSample.pose;
     }
     drawDancer(stage, pose);
 
@@ -2249,13 +2657,14 @@ void DesktopApp::Impl::drawChoreography() {
     float y = card.y + 52.0f;
     label("ACTIVE MOVE", x, y, 8, theme::dim, 1.3f);
     y += 15.0f;
-    const std::string move = currentMoveName();
+    const std::string move = moveName(pose.move);
     text->draw(move, x, y, 27, FontWeight::SemiBold,
                pose.accented ? theme::amber : theme::text);
     y += 39.0f;
     const auto [bar, beat] = currentBarBeat();
+    const AnalysisResult* currentAnalysis = activeAnalysis();
     body("Bar " + std::to_string(bar) + "   ·   Beat " + std::to_string(beat) +
-             (track ? "/" + std::to_string(track->analysis.beatsPerBar) : ""),
+             (currentAnalysis ? "/" + std::to_string(currentAnalysis->beatsPerBar) : ""),
          x, y, 13, theme::muted);
     y += 24.0f;
 
@@ -2280,10 +2689,11 @@ void DesktopApp::Impl::drawChoreography() {
 
     label("NEXT CUES", x, y, 8, theme::dim, 1.3f);
     y += 16.0f;
-    if (track) {
+    const Choreography* motion = activeChoreography();
+    if (motion) {
         int shown = 0;
         const double pos = currentPosition();
-        for (const DanceCue& cue : track->choreography.cues) {
+        for (const DanceCue& cue : motion->cues) {
             if (cue.time <= pos + 0.02) {
                 continue;
             }
@@ -2315,6 +2725,36 @@ void DesktopApp::Impl::drawChoreography() {
              ? formatNumber((player.baseLatency() + latencyTrim) * 1000.0, 0) + " ms"
              : "--",
          x + 188.0f, footerY - 2.0f, 10, theme::muted);
+    label("MOTION", x + 250.0f, footerY, 8, theme::dim, 1.1f);
+    body(motionStepped ? "STEPPED" : "SMOOTH", x + 302.0f, footerY - 2.0f, 10,
+         motionStepped ? theme::amber : theme::accent,
+         FontWeight::SemiBold);
+
+    if (motionDebug) {
+        // A compact diagnostics strip over the stage. It deliberately uses
+        // media time and sampler output, never a frame counter.
+        const float dx = stage.x + 8.0f;
+        float dy = stage.y + 7.0f;
+        auto debugLine = [&](const std::string& lineText) {
+            const Rect line{dx - 4.0f, dy - 2.0f,
+                            text->measure(lineText, 8, FontWeight::SemiBold) + 10.0f,
+                            13.0f};
+            ui::fillRoundedRect(renderer, line, 3.0f, theme::alpha(theme::background, 0.9f));
+            body(lineText, dx, dy, 8, theme::alpha(theme::accent, 0.9f));
+            dy += 13.0f;
+        };
+        debugLine("t " + formatTime(currentPosition(), true) + "   phase " +
+                  formatNumber(pose.phase, 2) + "   impact " +
+                  formatNumber(pose.impact, 2));
+        debugLine("key " + std::to_string(motionSample.keyframeIndex) + " -> " +
+                  std::to_string(motionSample.nextKeyframeIndex) + "   blend " +
+                  formatNumber(motionSample.segmentT, 2) + "   movement " +
+                  formatNumber(pose.blend, 2));
+        debugLine("easing " + std::string(motionSample.easing == Easing::Cubic
+                                             ? "cubic"
+                                             : "eased") +
+                  "   " + moveName(pose.move));
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -2350,8 +2790,8 @@ void DesktopApp::Impl::drawFooter() {
              190.0f, bar.y + 13.0f, 9, theme::dim);
     }
 
-    text->drawCentered("SPACE  PLAY/PAUSE      ←/→  5s      WHEEL  ZOOM      L  LOAD      "
-                       "[ ]  SYNC TRIM      R  RATE",
+    text->drawCentered("SPACE PLAY/PAUSE   ←/→ 5s   WHEEL ZOOM   D DEBUG   "
+                       "V A/B   B LAB   R RATE",
                        720.0f, bar.y + 13.0f, 8, FontWeight::SemiBold,
                        theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
     labelRight("BG MEDIA v" BGMEDIA_VERSION_STRING "   ·   OFFLINE / DETERMINISTIC",

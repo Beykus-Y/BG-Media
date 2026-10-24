@@ -13,6 +13,12 @@ struct DesktopOptions {
     bool noCache = false;
     bool noAudio = false;
     bool audioSmoke = false;
+
+    // BG Motion lab/demo options. They affect only choreography rendering,
+    // not the analyzer or the cache.
+    int motionLabBpm = 0;
+    bool motionDebug = false;
+    bool motionStepped = false;
 };
 
 class DesktopApp {

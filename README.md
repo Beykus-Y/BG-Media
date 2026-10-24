@@ -7,6 +7,13 @@
 
 ![BG Media desktop](docs/images/desktop-analysis.png)
 
+BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Рядом —
+тот же момент в старом ступенчатом режиме (`V` / `--motion-stepped`):
+
+![BG Motion 2.0 debug](docs/images/desktop-motion-debug.png)
+
+![BG Motion legacy stepped](docs/images/desktop-motion-stepped.png)
+
 Текущий этап — полностью рабочий музыкальный анализатор и Desktop-приложение.
 Телеграм-интеграции, сервера, видео и 3D-модели здесь намеренно нет.
 
@@ -25,8 +32,14 @@
 - Анализ в фоновом потоке; UI не зависает, прогресс и отмена поддерживаются.
 - Кеш результатов по fingerprint PCM + конфигурации; попадание в кеш
   занимает доли миллисекунды.
-- Детерминированная хореография в media time (BG Motion), независимая от FPS,
-  с 2D-роботом в качестве одного из возможных рендереров.
+- **BG Motion 2.0:** непрерывный keyframe-таймлайн, кубическая интерполяция,
+  short-arc повороты, anticipation/release, кроссфейд движений, адаптация
+  амплитуды на быстром темпе и точное попадание акцентной позы в удар.
+- Шесть танцевальных движений: Bounce, Sway, Arm Wave, Head Nod, Bass Dip,
+  Accent Pose; тела/руки/голова/ноги движутся согласованно.
+- Demo-режимы: **SMOOTH / STEPPED** (`V`), **DEBUG** (`D`) с суставами,
+  траекториями и keyframe-диагностикой, **MOTION LAB** (`B`) с синтетической
+  beat-сеткой 92/123/163/180 BPM независимо от ошибок анализатора.
 - Headless CLI, генератор синтетических тестов, CTest и benchmark.
 
 Измерения на синтетическом корпусе и 5-минутном треке:
@@ -131,6 +144,9 @@ ctest --preset release
 | перемотка ±5 с / ±30 с | `←` / `→`, с `Shift` — ±30 с |
 | начало / конец | `Home` / `End` |
 | скорость | `R` или кнопка с `×` |
+| smooth / stepped сравнение | `V` или chip **SMOOTH/STEPPED** |
+| motion debug: суставы, траектории, keyframes | `D` или chip **DEBUG** |
+| Motion Lab BPM | `B` или chip **LAB** |
 | sync trim ±5 мс | `[` / `]` |
 | зум timeline | колесо мыши |
 | панорама | средняя кнопка + drag |
@@ -186,6 +202,17 @@ bgmedia_desktop --file fixtures/beat_092.wav \
 аудиовыход, проигрывает/паузит/перематывает трек, проверяет скорость и печатает
 измеренную позицию и latency. Это удобно для smoke-проверки драйвера.
 
+Снимок нового motion-движка без зависимости от результата BG Beat:
+
+```bash
+bgmedia_desktop --file fixtures/beat_092.wav \
+  --capture motion.bmp --capture-time 5.2 \
+  --motion-lab 123 --motion-debug --no-audio
+```
+
+`--motion-stepped` включает старый ступенчатый сэмплер для A/B-сравнения.
+Подробности модели и гарантий попадания в удар: [docs/MOTION.md](docs/MOTION.md).
+
 ## Тесты
 
 ```bash
@@ -194,7 +221,7 @@ ctest --test-dir build/windows --output-on-failure
 build/windows/bin/bgmedia_tests.exe
 ```
 
-25 тестов, разбитые на CTest-группы:
+37 тестов, разбитые на CTest-группы:
 
 - `audio` — WAV PCM/float, 24-bit, truncated files, MP3/FLAC/WAV через
   miniaudio, downmix/hash;
@@ -202,7 +229,10 @@ build/windows/bin/bgmedia_tests.exe
   fully silent, bass vs broadband swell, ambiguous rhythm, cancellation;
 - `cache` — roundtrip, corruption, version mismatch, key mismatch, atomic store;
 - `sync` — latency compensation, pause/seek/rate, clamping, monotonic smoothing;
-- `choreography` — cues, freezes, deterministic sampling, empty input.
+- `choreography` — cues, freezes, deterministic sampling, empty input;
+- `motion` — exact accent targets, continuous keyframes, 30/60/120 FPS and
+  arbitrary-order determinism, easing/shortest-arc, pause/seek, tempo change,
+  fast-tempo amplitude adaptation, smooth vs stepped comparison.
 
 Тестовые аудиофайлы — оригинальные синтетические сигналы; см.
 [tests/fixtures/README.md](tests/fixtures/README.md).
@@ -224,6 +254,7 @@ tools/benchmark/            качество + скорость + кеш
 tests/                      CTest + синтетические фикстуры
 docs/ARCHITECTURE.md        архитектура и точки расширения (включая BG Video)
 docs/ANDROID_JNI.md         конкретный план Android/JNI
+docs/MOTION.md              BG Motion 2.0: keyframes, blending, accents, debug
 docs/MEASUREMENTS.md        реальные замеры
 docs/images/                скриншоты
 third_party/                KissFFT, miniaudio, stb_truetype, лицензии

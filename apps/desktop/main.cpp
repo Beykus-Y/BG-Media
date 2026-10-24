@@ -50,11 +50,15 @@ void printUsage() {
         << "  --audio-smoke          with --capture: play, pause and seek for 2s\n"
         << "  --capture <file.bmp>   render one frame and exit (UI screenshot)\n"
         << "  --capture-time <sec>   media time for the captured frame (default 2)\n"
+        << "  --motion-lab <bpm>     synthetic beat grid for animation demos\n"
+        << "  --motion-debug         show joints, trails and keyframe diagnostics\n"
+        << "  --motion-stepped       use the legacy stepped sampler (A/B compare)\n"
         << "  --help                 show this help\n\n"
         << "Controls:\n"
         << "  Space play/pause   L load   Left/Right seek 5s   Shift+Left/Right 30s\n"
         << "  Home/End start/end   R playback rate   [ ] output-latency trim\n"
         << "  Mouse wheel zoom timeline   drag to scrub   middle-drag to pan\n"
+        << "  D motion debug   V smooth/stepped compare   B motion lab BPM\n"
         << "  Double-click timeline to reset zoom   F fullscreen   Esc exit fullscreen\n";
 }
 
@@ -76,6 +80,17 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
             options.noAudio = true;
         } else if (arg == "--audio-smoke") {
             options.audioSmoke = true;
+        } else if (arg == "--motion-lab" && i + 1 < argc) {
+            try {
+                options.motionLabBpm = std::stoi(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --motion-lab BPM\n";
+                return false;
+            }
+        } else if (arg == "--motion-debug") {
+            options.motionDebug = true;
+        } else if (arg == "--motion-stepped") {
+            options.motionStepped = true;
         } else if (arg == "--capture" && i + 1 < argc) {
             options.captureFile = pathFromUtf8(argv[++i]);
         } else if (arg == "--capture-time" && i + 1 < argc) {
