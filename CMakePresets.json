@@ -1,0 +1,75 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BGMEDIA_BUILD_DESKTOP": "ON",
+        "BGMEDIA_BUILD_TESTS": "ON",
+        "BGMEDIA_BUILD_TOOLS": "ON",
+        "BGMEDIA_BUILD_MINIAUDIO": "ON",
+        "BGMEDIA_FETCH_SDL3": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "BG Media Release (desktop + tests + tools)",
+      "inherits": "base"
+    },
+    {
+      "name": "debug",
+      "displayName": "BG Media Debug",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "core-only",
+      "displayName": "BG Media core + tools (no SDL)",
+      "inherits": "base",
+      "cacheVariables": {
+        "BGMEDIA_BUILD_DESKTOP": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "core-only",
+      "configurePreset": "core-only"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "core-only",
+      "configurePreset": "core-only",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

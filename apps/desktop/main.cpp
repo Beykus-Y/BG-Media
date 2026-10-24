@@ -1,0 +1,140 @@
+#include "DesktopApp.hpp"
+#include "bgmedia/version.hpp"
+
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
+namespace {
+
+#ifdef _WIN32
+std::string wideToUtf8(const wchar_t* text) {
+    if (!text) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr,
+                                         nullptr);
+    if (size <= 1) {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+    result.resize(static_cast<std::size_t>(size - 1));
+    return result;
+}
+#endif
+
+std::filesystem::path pathFromUtf8(const char* value) {
+    if (!value) {
+        return {};
+    }
+    const std::u8string text(reinterpret_cast<const char8_t*>(value));
+    return std::filesystem::path(text);
+}
+
+void printUsage() {
+    std::cout
+        << "BG Media desktop - musical analysis and choreography synchronisation\n\n"
+        << "Usage: bgmedia_desktop [options]\n\n"
+        << "Options:\n"
+        << "  --file <path>          open an audio file on startup\n"
+        << "  --cache-dir <dir>      analysis cache directory\n"
+        << "  --no-cache             disable reading/writing analysis cache\n"
+        << "  --no-audio             do not initialise an audio output device\n"
+        << "  --audio-smoke          with --capture: play, pause and seek for 2s\n"
+        << "  --capture <file.bmp>   render one frame and exit (UI screenshot)\n"
+        << "  --capture-time <sec>   media time for the captured frame (default 2)\n"
+        << "  --help                 show this help\n\n"
+        << "Controls:\n"
+        << "  Space play/pause   L load   Left/Right seek 5s   Shift+Left/Right 30s\n"
+        << "  Home/End start/end   R playback rate   [ ] output-latency trim\n"
+        << "  Mouse wheel zoom timeline   drag to scrub   middle-drag to pan\n"
+        << "  Double-click timeline to reset zoom   F fullscreen   Esc exit fullscreen\n";
+}
+
+bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options) {
+    using namespace bgmedia::desktop;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            printUsage();
+            return false;
+        }
+        if (arg == "--file" && i + 1 < argc) {
+            options.initialFile = pathFromUtf8(argv[++i]);
+        } else if (arg == "--cache-dir" && i + 1 < argc) {
+            options.cacheDirectory = pathFromUtf8(argv[++i]);
+        } else if (arg == "--no-cache") {
+            options.noCache = true;
+        } else if (arg == "--no-audio") {
+            options.noAudio = true;
+        } else if (arg == "--audio-smoke") {
+            options.audioSmoke = true;
+        } else if (arg == "--capture" && i + 1 < argc) {
+            options.captureFile = pathFromUtf8(argv[++i]);
+        } else if (arg == "--capture-time" && i + 1 < argc) {
+            try {
+                options.captureTime = std::stod(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --capture-time value\n";
+                return false;
+            }
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "unknown option: " << arg << '\n';
+            return false;
+        } else if (options.initialFile.empty()) {
+            options.initialFile = pathFromUtf8(arg.c_str());
+        } else {
+            std::cerr << "unexpected extra argument: " << arg << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    int effectiveArgc = argc;
+    char** effectiveArgv = argv;
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    // Windows passes the command line in the active code page through main().
+    // Convert the wide command line to UTF-8 so file names with Cyrillic or
+    // other non-ASCII characters survive into std::filesystem.
+    int wideArgc = 0;
+    LPWSTR* wideArgv = CommandLineToArgvW(GetCommandLineW(), &wideArgc);
+    std::vector<std::string> utf8Args;
+    std::vector<char*> utf8Pointers;
+    if (wideArgv && wideArgc > 0) {
+        utf8Args.reserve(static_cast<std::size_t>(wideArgc));
+        for (int i = 0; i < wideArgc; ++i) {
+            utf8Args.push_back(wideToUtf8(wideArgv[i]));
+        }
+        utf8Pointers.reserve(utf8Args.size());
+        for (std::string& value : utf8Args) {
+            utf8Pointers.push_back(value.data());
+        }
+        effectiveArgc = wideArgc;
+        effectiveArgv = utf8Pointers.data();
+    }
+    if (wideArgv) {
+        LocalFree(wideArgv);
+    }
+#endif
+
+    bgmedia::desktop::DesktopOptions options;
+    if (!parseArgs(effectiveArgc, effectiveArgv, options)) {
+        return 0;
+    }
+
+    std::cout << "BG Media " << BGMEDIA_VERSION_STRING << " desktop\n";
+    bgmedia::desktop::DesktopApp app;
+    return app.run(options);
+}

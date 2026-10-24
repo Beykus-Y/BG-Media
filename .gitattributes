@@ -1,0 +1,15 @@
+* text=auto
+*.cpp text
+*.hpp text
+*.h text
+*.c text
+*.md text
+*.json text
+*.ps1 text
+*.sh text
+*.png binary
+*.bmp binary
+*.ttf binary
+*.wav binary
+*.mp3 binary
+*.flac binary

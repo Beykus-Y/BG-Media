@@ -1,0 +1,26 @@
+# Build outputs
+/build*/
+/out/
+/cmake-build-*/
+*.user
+.vs/
+.vscode/
+.idea/
+
+# Generated / local data
+.bgmedia_cache/
+*.bgm
+*.bmp
+*.png
+!docs/images/*.png
+!assets/**/*.png
+/fixtures/
+tests/fixtures/generated/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Root-level temporary dependency extraction
+third_party/SDL3-*/

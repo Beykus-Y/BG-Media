@@ -1,0 +1,16 @@
+{
+  "longTrackSeconds": 300.000000,
+  "longMedianMs": 1356.033900,
+  "longRealtimeFactor": 221.233407,
+  "cacheWriteMs": 4.431300,
+  "cacheReadMs": 8.245100,
+  "cases": [
+    {"name": "92 BPM", "expectedBpm": 92.000000, "detectedBpm": 92.056044, "confidence": 0.696189, "precision": 0.903226, "recall": 1.000000, "meanBeatErrorMs": 15.663995, "analysisMs": 56.418100, "realtimeFactor": 354.594211, "beats": 31, "tempoChange": false},
+    {"name": "123 BPM", "expectedBpm": 123.000000, "detectedBpm": 123.002308, "confidence": 0.757325, "precision": 0.902439, "recall": 1.000000, "meanBeatErrorMs": 14.611693, "analysisMs": 97.314200, "realtimeFactor": 205.550691, "beats": 41, "tempoChange": false},
+    {"name": "163 BPM", "expectedBpm": 163.000000, "detectedBpm": 162.746969, "confidence": 0.696446, "precision": 0.890909, "recall": 1.000000, "meanBeatErrorMs": 20.056670, "analysisMs": 78.270900, "realtimeFactor": 255.583215, "beats": 55, "tempoChange": false},
+    {"name": "tempo 92 -> 123", "expectedBpm": 0.000000, "detectedBpm": 108.858883, "confidence": 0.513319, "precision": 0.840909, "recall": 0.925000, "meanBeatErrorMs": 14.730033, "analysisMs": 101.059400, "realtimeFactor": 237.527105, "beats": 44, "tempoChange": true},
+    {"name": "silence gap", "expectedBpm": 92.000000, "detectedBpm": 92.101657, "confidence": 0.556395, "precision": 0.750000, "recall": 1.000000, "meanBeatErrorMs": 15.680195, "analysisMs": 29.873200, "realtimeFactor": 435.378159, "beats": 12, "tempoChange": false},
+    {"name": "bass accents", "expectedBpm": 92.000000, "detectedBpm": 92.039039, "confidence": 0.600273, "precision": 0.903226, "recall": 1.000000, "meanBeatErrorMs": 15.288141, "analysisMs": 55.909000, "realtimeFactor": 357.828482, "beats": 31, "tempoChange": false},
+    {"name": "ambiguous rhythm", "expectedBpm": 0.000000, "detectedBpm": 91.899901, "confidence": 0.439442, "precision": 0.903226, "recall": 1.000000, "meanBeatErrorMs": 10.480434, "analysisMs": 119.030000, "realtimeFactor": 168.052540, "beats": 31, "tempoChange": false}
+  ]
+}
