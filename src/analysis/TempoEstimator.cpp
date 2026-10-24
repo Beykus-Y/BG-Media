@@ -746,18 +746,17 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
 
     std::vector<TempoWindow> windows;
     double continuity = 0.0;
+    double previousValidCentre = -1e9;
     for (int start : starts) {
         const int end = std::min(static_cast<int>(n), start + windowFrames);
         std::vector<float> slice(static_cast<std::size_t>(end - start), 0.0f);
         double activeCount = 0.0;
-        double lastActive = 0.0;
         for (int i = start; i < end; ++i) {
             const bool isActive = active.empty() || active[static_cast<std::size_t>(i)] != 0;
             slice[static_cast<std::size_t>(i - start)] =
                 isActive ? env[static_cast<std::size_t>(i)] : 0.0f;
             if (isActive) {
                 activeCount += 1.0;
-                lastActive = static_cast<double>(i) / fps;
             }
         }
         const double activeFraction = activeCount / static_cast<double>(end - start);
@@ -769,7 +768,9 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
 
         if (activeFraction >= 0.25) {
             const double useContinuity =
-                (continuity > 0.0 && window.centre - lastActive < 12.0) ? continuity : 0.0;
+                (continuity > 0.0 && window.centre - previousValidCentre < 12.0)
+                    ? continuity
+                    : 0.0;
             const TempoEstimate estimate =
                 estimateTempo(slice, fps, config, activeFraction, useContinuity);
             window.bpm = estimate.bpm;
@@ -777,6 +778,7 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
                                 static_cast<float>(std::clamp(activeFraction / 0.65, 0.5, 1.0));
             if (window.confidence >= 0.3f && window.bpm > 0.0) {
                 continuity = window.bpm;
+                previousValidCentre = window.centre;
             }
         }
         windows.push_back(window);
@@ -899,15 +901,14 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
     // reported as uncertain and never folded into a stable BPM segment.
     for (std::size_t i = 0; i < cleaned.size(); ++i) {
         if (i > 0) {
-            const double reference = changes[std::min(i - 1, changes.size() - 1)].boundary;
-            const double half = std::min(1.25, config.tempoHopSeconds * 0.85 + 0.35);
             TempoTransition transition;
-            transition.start = std::max(0.0, reference - half);
-            transition.end = std::min(duration, reference + half);
+            transition.start = cleaned[i - 1].end;
+            transition.end = std::max(transition.start, cleaned[i].start);
             transition.fromBpm = cleaned[i - 1].bpm;
             transition.toBpm = cleaned[i].bpm;
-            transition.confidence = std::min(0.5f, 0.5f * (cleaned[i - 1].confidence +
-                                                            cleaned[i].confidence));
+            transition.confidence =
+                std::min(0.5f, 0.5f * (cleaned[i - 1].confidence +
+                                       cleaned[i].confidence));
             structure.transitions.push_back(transition);
             // Ensure stable segments do not claim the uncertain region.
             cleaned[i - 1].end = std::min(cleaned[i - 1].end, transition.start);
