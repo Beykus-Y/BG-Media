@@ -103,7 +103,7 @@ build-gui\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 
 ```text
 100% tests passed, 0 failed out of 5
-Total Test time (real) = 1.07 s
+Total Test time (real) ≈ 1.1 s
 ```
 
 25 unit/integration кейсов, включая WAV (8/16/24/32-bit, float), MP3/FLAC
