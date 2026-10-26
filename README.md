@@ -14,15 +14,21 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 
 ![BG Motion legacy stepped](docs/images/desktop-motion-stepped.png)
 
+BG Motion 3.0 играет авторские танцевальные клипы на VRM: Groove, Hip-Hop,
+Side Step и Energetic, с переходами по музыкальным beats. Скриншот сцены с
+`Model1.vrm` не добавлен в Git из-за лицензии модели; локальные кадры лежат в
+`artifacts/` (игнорируется). Формат клипов, хореография и QA описаны в
+[docs/BG_MOTION_3.md](docs/BG_MOTION_3.md).
+
 Честная метрическая неоднозначность на 12/8-стимуле: выбран пульс 66.3 BPM,
 но UI показывает альтернативы 99.2/198.9 и `meter uncertain`:
 
 ![BG Beat metric ambiguity](docs/images/desktop-metric.png)
 
-Текущий этап — рабочий музыкальный анализатор, BG Motion и **BG Media 3D**:
-настоящая VRM 0.x-модель в SDL_GPU-сцене, с humanoid-скелетом, retargeting
-BG Motion и синхронизацией с плеером. Телеграм-интеграции, сервера и видео
-здесь по-прежнему нет.
+Текущий этап — рабочий музыкальный анализатор, **BG Motion 3.0** и
+**BG Media 3D**: настоящая VRM 0.x-модель в SDL_GPU-сцене, humanoid-скелет,
+retargeting авторских танцевальных клипов и синхронизация с плеером.
+Телеграм-интеграции, сервера и видео здесь по-прежнему нет.
 
 Скриншот 3D-персонажа намеренно не добавлен в Git: модель имеет лицензию
 `OnlyAuthor` / `Redistribution_Prohibited`. Локальная проверка работающего
@@ -48,8 +54,21 @@ Desktop во время воспроизведения музыки сохран
 - **BG Motion 2.0:** непрерывный keyframe-таймлайн, кубическая интерполяция,
   short-arc повороты, anticipation/release, кроссфейд движений, адаптация
   амплитуды на быстром темпе и точное попадание акцентной позы в удар.
-- Шесть танцевальных движений: Bounce, Sway, Arm Wave, Head Nod, Bass Dip,
-  Accent Pose; тела/руки/голова/ноги движутся согласованно.
+- Шесть танцевальных движений BG Motion 2.0: Bounce, Sway, Arm Wave, Head Nod,
+  Bass Dip, Accent Pose; тела/руки/голова/ноги движутся согласованно.
+- **BG Motion 3.0:** четыре авторских танца — Groove, Hip-Hop, Side Step,
+  Energetic — плюс Idle. Клипы хранятся как model-independent JSON, играют от
+  музыкальных beats, а не от таймера, и переходят друг в друга на entry beat
+  через двухбитовый crossfade.
+- Footwork хранится как stage-space цели стоп с контактами `stance`/`pivot`:
+  опорная стопа не скользит, поворот идёт вокруг неё, IK сам опускает таз,
+  если широкая стойка недостижима. Root motion ограничен и не уводит камеру.
+- Manual/Auto режимы: ручной выбор стиля на следующий beat или Auto-план по
+  фразам, энергии секций, басовым акцентам и тишине; low-confidence BG Beat
+  остаётся на стабильном Groove.
+- Presentation mode (`P` / `--presentation`), debug-виды foot contact,
+  skeleton и root motion, CLI `--dance`, `--dance-plan`, `--dance-bpm`,
+  `--legacy-motion` для A/B с BG Motion 2.0.
 - Demo-режимы: **SMOOTH / STEPPED** (`V`), **DEBUG** (`D`) с суставами,
   траекториями и keyframe-диагностикой, **MOTION LAB** (`B`) с синтетической
   beat-сеткой 92/123/163/180 BPM независимо от ошибок анализатора.
@@ -62,7 +81,7 @@ Desktop во время воспроизведения музыки сохран
   существующий SDL_Renderer UI, без совместного владения GPU-контекстом.
 - 3D-режим: орбита/zoom/reset камеры, масштаб и высота модели, выбор `.vrm`,
   диагностика импорта, текущий трек/движение/BG Sync/FPS/GPU ms/VRAM/RSS.
-  Без музыки доступен idle preview и синтетический TEST DANCE 123 BPM.
+  Без музыки танцы идут от Motion Lab BPM; с музыкой — от BG Beat/BG Sync.
 - Детерминированный humanoid retargeting с quaternion-иерархией, base pose
   без T-pose, two-bone IK с неподвижными стопами и generic привязкой по
   VRM humanoid, без индексов конкретной модели.
@@ -94,6 +113,8 @@ build/windows/bin/bgmedia_analyze.exe
 build/windows/bin/bgmedia_benchmark.exe
 build/windows/bin/bgmedia_fixturegen.exe
 build/windows/bin/bgmedia_tests.exe
+build/windows/bin/bgmedia_motion_qa.exe
+build/windows/bin/bgmedia_motion_sheet.exe
 ```
 
 Запуск:
@@ -178,7 +199,15 @@ ctest --preset release
 | выбрать VRM | `F2`, кнопка **VRM**, drag-and-drop `.vrm`/`.glb` |
 | 3D-камера: орбита / zoom / reset | ЛКМ + drag / колесо / `C` |
 | масштаб / высота 3D-модели | `-`/`+` · `,`/`.` или кнопки в панели |
-| синтетический танец без музыки | `T` или **TEST DANCE** |
+| BG Motion 3.0: Groove / Hip-Hop / Side Step / Energetic | `1` / `2` / `3` / `4` (в 3D) |
+| BG Motion 3.0: Idle | `0` или `5` (в 3D) |
+| Manual / Auto | `A` или **MANUAL/AUTO** |
+| Loop / one-shot | `N` или **LOOP/ONE SHOT** |
+| TEST DANCE: все стили подряд | `T` или **TEST DANCE** |
+| Presentation mode | `P` или **PRESENT** |
+| foot contact / skeleton / root debug | `F5` / `F6` / `F7` |
+| BPM Motion Lab | `↑` / `↓` (с `Shift` — по 10) |
+| синтетический танец BG Motion 2.0 без музыки | `T` вне 3D-танцев |
 | sync trim ±5 мс | `[` / `]` |
 | зум timeline | колесо мыши |
 | панорама | средняя кнопка + drag |
@@ -190,6 +219,8 @@ ctest --preset release
 Кнопки выбора файла, play/pause, stop, rate и sync trim также кликабельны.
 Курсор показывает audible media time, а не позицию чтения декодера: задержка
 устройства вычитается через `BG Sync`, с возможностью ручной коррекции.
+В 3D-режиме с загруженными танцами клавиши `1`–`4` переключают стили
+BG Motion 3.0; для 2D/3D используйте `G` или chips **2D/3D**.
 
 ## Headless CLI
 
@@ -253,11 +284,39 @@ bgmedia_desktop --vrm models/Model1.vrm --vrm-demo \
 bgmedia_vrm_preview --model models/Model1.vrm --time 3.2 --out artifacts/preview.bmp
 ```
 
+BG Motion 3.0 можно проверить в реальном Desktop-приложении детерминированно:
+`--capture` запускает тот же exe, тот же retargeter и SDL_GPU, но сохраняет
+один кадр. Например, переход Groove → Hip-Hop на 4-й секунде при 120 BPM:
+
+```bash
+bgmedia_desktop --vrm models/Model1.vrm --dance-plan groove,hiphop \
+  --dance-span 8 --dance-bpm 120 --capture artifacts/groove_hiphop.bmp \
+  --capture-time 3.9 --no-audio
+```
+
+Контактный лист и GIF по кадрам реального приложения:
+
+```bash
+python scripts/capture_dance_sequence.py --name groove_cycle \
+  --args "--dance groove --dance-bpm 96" --times 0:10:20 --bpm 96 --gif
+```
+
+QA-метрики клипов:
+
+```bash
+bgmedia_motion_qa --dances assets/dances --model models/Model1.vrm
+```
+
 С реальным треком:
 
 ```bash
-bgmedia_desktop --file track.mp3 --vrm models/Model1.vrm --3d --autoplay
+bgmedia_desktop --file track.mp3 --vrm models/Model1.vrm --3d --dance auto --autoplay
+bgmedia_desktop --file track.mp3 --vrm models/Model1.vrm --3d --dance groove --autoplay
 ```
+
+Флаг `--legacy-motion` включает в 3D старый BG Motion 2.0 `CharacterPose` для
+A/B-сравнения. Полное описание BG Motion 3.0:
+[docs/BG_MOTION_3.md](docs/BG_MOTION_3.md).
 
 `Model1.vrm` не входит в репозиторий: лицензия `OnlyAuthor` /
 `Redistribution_Prohibited`. Архитектура, поддерживаемые возможности,
@@ -271,7 +330,7 @@ ctest --test-dir build/windows --output-on-failure
 build/windows/bin/bgmedia_tests.exe
 ```
 
-56 тестов, разбитые на CTest-группы:
+82 теста, разбитые на 9 CTest-групп:
 
 - `audio` — WAV PCM/float, 24-bit, truncated files, MP3/FLAC/WAV через
   miniaudio, downmix/hash;
@@ -291,10 +350,15 @@ build/windows/bin/bgmedia_tests.exe
   malformed containers и 150 случайных мутаций;
 - `retarget` — generic humanoid rig, neutral pose без T-pose, foot IK,
   артикуляция рук/головы/корпуса, побитовый deterministic sampling после
-  seek/rewind и реальный Model1.vrm (если файл доступен).
+  seek/rewind и реальный Model1.vrm (если файл доступен);
+- `dance` — загрузка/валидация `bgmotion.clip`, loop seam, ограниченные
+  скорость и ускорение, footwork и отсутствие slide, повороты вокруг опорной
+  стопы, 20 пар стилей при 80/123/180 BPM (60 переходов), seek/pause/resume,
+  one-shot,
+  metric levels 0.5/1/2, Manual entry beat, Auto-план и смена темпа.
 
-ASan-прогон: `scripts/run_asan_windows.ps1` — **56 passed, 0 failed**, без
-sanitizer-сообщений.
+ASan-прогон: `scripts/run_asan_windows.ps1` — dance-тесты входят в тот же
+набор; результат фиксируется в `docs/MEASUREMENTS.md`.
 
 Тестовые аудиофайлы — оригинальные синтетические сигналы; см.
 [tests/fixtures/README.md](tests/fixtures/README.md). Подробный
@@ -308,21 +372,26 @@ src/audio/                  PCM, WAV decoder
 src/analysis/               STFT, onset, tempo, beat DP, bass, silence
 src/cache/                  версионированный бинарный кеш
 src/sync/                   TransportSnapshot + PlaybackClock
-src/choreography/           cues/poses/media-time sampling
+src/choreography/           BG Motion 2.0 cues/poses/media-time sampling
+src/motion3/                BG Motion 3.0 clips, BeatClock, schedule, director
 src/vrm/                    GLB/glTF + VRM 0.x importer, PNG decode
-src/animation/              generic humanoid retargeter, IK, local transforms
+src/animation/              generic humanoid retargeter, clip IK, local transforms
 adapters/miniaudio/         MP3/FLAC/WAV decode adapter
 adapters/sdlgpu/            независимый SDL_GPU offscreen VRM renderer
 apps/desktop/               SDL3 UI, 2D/3D compositor, miniaudio playback
 tools/analyze/              headless JSON CLI
 tools/fixturegen/           генератор синтетики
 tools/vrm_preview/          headless 3D preview/test render
+tools/motion_qa/            BG Motion 3.0 quality report
+tools/motion_sheet/         contact sheets on the real renderer
+tools/dancegen/             Python DSL + deterministic dance baker
 tools/benchmark/            качество + скорость + кеш
 tests/                      CTest + synthetic VRM/audio fixtures
 docs/ARCHITECTURE.md        архитектура и точки расширения (включая BG Video)
 docs/VRM_INTEGRATION.md     VRM 0.x, SDL_GPU, retargeting, UI, замеры
 docs/ANDROID_JNI.md         конкретный план Android/JNI
 docs/MOTION.md              BG Motion 2.0: keyframes, blending, accents, debug
+docs/BG_MOTION_3.md         BG Motion 3.0: clip format, footwork, transitions, QA
 docs/BG_BEAT_AUDIT.md       исправление метрического уровня, downbeat, UI, кеша
 docs/MEASUREMENTS.md        реальные замеры
 docs/images/                скриншоты 2D UI
@@ -340,17 +409,19 @@ host app (SDL3 / Android / ...)
 bgmedia_core
    ├── BG Beat   : анализ PCM → BPM, beats, bass, silence, sections
    ├── BG Sync   : media time, latency, seek/rate, smoothing
-   ├── BG Motion : choreography cues/poses без SDL
+   ├── BG Motion 2.0 : choreography cues/poses без SDL
    ├── cache     : content+config key, checksum, schema version
    └── CharacterPose (нормализованный контракт для 2D/3D)
 
 bgmedia_vrm (cgltf/stb_image, без SDL) → VrmModel/humanoid/bind pose
-bgmedia_rig (без SDL) → CharacterPose → local node transforms + foot IK
+bgmedia_rig (без SDL) → BG Motion 3.0 DancePlayer → ClipPose
+                       → local node transforms + foot IK
 adapters/sdlgpu (SDL_GPU) → offscreen RGBA8 + D32 → UI SDL_Texture
 ```
 
 - Core не знает SDL, miniaudio, Telegram, Android и звуковую карту.
-- BG Beat/BG Sync/BG Motion не знают VRM, SDL или GPU.
+- BG Beat/BG Sync и BG Motion 2.0 не знают SDL или GPU; BG Motion 3.0 хранит
+  клипы в humanoid-пространстве и не зависит от индексов конкретной модели.
 - Декодер и плеер — взаимозаменяемые адаптеры.
 - Анализ принимает PCM, поэтому WAV/MP3/FLAC/MediaCodec равноправны.
 - Общая модель времени подходит для будущего видео: audio-master clock,
@@ -397,6 +468,10 @@ const auto& a = report.result;
 - VRM 1.0, morph targets/blink, spring-bone физика и полный MToon (outline,
   sphere/rim maps, normal maps) в эту версию не входят; базовый VRM 0.x
   humanoid, текстуры, alpha и скелетная анимация работают.
+- BG Motion 3.0 — авторская keyframe-хореография, не motion capture. Переход
+  смешивает позиции стоп, поэтому на смене широкой и узкой стойки возможен
+  короткий контролируемый slide; floor collision, лестниц и физических
+  прыжков нет. Auto не угадывает стиль при низком confidence BG Beat.
 - Meter/downbeat — эвристика. При низкой `meterConfidence` UI скрывает
   downbeat-акценты и пишет `meter uncertain`.
 - Реальные треки проверялись локально, но их эталонный BPM неизвестен; см.

@@ -66,3 +66,20 @@ if(MSVC)
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
     )
 endif()
+
+# Contact-sheet renderer for dance clips (development / QA tool).
+add_executable(bgmedia_motion_sheet
+    ${CMAKE_SOURCE_DIR}/tools/motion_sheet/main.cpp
+)
+target_link_libraries(bgmedia_motion_sheet PRIVATE
+    bgmedia_rig
+    bgmedia_sdlgpu
+    SDL3::SDL3
+)
+target_compile_features(bgmedia_motion_sheet PRIVATE cxx_std_20)
+target_compile_options(bgmedia_motion_sheet PRIVATE ${BGMEDIA_WARNING_FLAGS})
+if(MSVC)
+    target_compile_definitions(bgmedia_motion_sheet PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+endif()

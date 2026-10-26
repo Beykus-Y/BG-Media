@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 
 namespace bgmedia::desktop {
 
@@ -27,6 +28,21 @@ struct DesktopOptions {
     bool vrmDemo = false;
     float vrmScale = 1.0f;
     float vrmOffsetY = 0.0f;
+
+    // BG Motion 3.0.
+    std::filesystem::path dancesDirectory;  // default: <assets>/dances
+    std::string dance;     // initial style: groove|hiphop|sidestep|energetic|idle|auto|test
+    int danceBpm = 0;      // Motion Lab BPM when no music is loaded
+    std::string dancePlan; // comma separated styles played in sequence (demo / captures)
+    double danceSpan = 16.0;  // beats per style in --dance-plan
+    bool presentation = false;
+    bool debugFeet = false;
+    bool debugSkeleton = false;
+    bool debugRoot = false;
+    bool legacyMotion = false;  // use the BG Motion 2.0 CharacterPose in 3D
+    bool hasCameraYaw = false;
+    float cameraYawDegrees = 180.0f;
+    float cameraZoom = 1.0f;
 };
 
 class DesktopApp {

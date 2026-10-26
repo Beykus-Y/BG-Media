@@ -32,8 +32,14 @@ public:
                               const sdlgpu::Camera& camera,
                               const sdlgpu::RenderSettings& settings,
                               std::string* error);
+    // BG Motion 3.0: poses the model from a sampled dance clip instead of a
+    // CharacterPose.
+    [[nodiscard]] bool renderClip(const motion::ClipPose& pose, double mediaTime,
+                                  const sdlgpu::Camera& camera,
+                                  const sdlgpu::RenderSettings& settings,
+                                  std::string* error);
     [[nodiscard]] bool draw(SDL_Renderer* renderer, const SDL_FRect& destination,
-                            std::string* error);
+                            std::string* error, bool cover = false);
 
     [[nodiscard]] const vrm::VrmModel* model() const;
     [[nodiscard]] const animation::RetargetedPose& lastPose() const;

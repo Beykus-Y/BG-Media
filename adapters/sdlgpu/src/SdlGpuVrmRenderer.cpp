@@ -953,9 +953,16 @@ bool SdlGpuVrmRenderer::Impl::render(
     const Vec3 boundsCenter = model->bounds.center();
     const float scale = std::clamp(settings.modelScale, 0.1f, 10.0f);
     const Mat4 scaleMatrix = Mat4::scale({scale, scale, scale});
-    const Mat4 modelMatrix = Mat4::translation(settings.modelOffset) *
-                             pose.modelTransform * scaleMatrix;
-    Vec3 target = modelMatrix.transformPoint(boundsCenter);
+    // BG Motion 3.0 root translation scales with the user's model scale and
+    // never moves the camera: the stage stays fixed while the dancer travels.
+    const Vec3 pivotScaled = pose.rootPivot * scale;
+    const Mat4 modelMatrix =
+        Mat4::translation(settings.modelOffset + pose.rootOffset * scale + pivotScaled) *
+        pose.modelTransform * Mat4::translation(-pivotScaled) * scaleMatrix;
+    const Mat4 cameraMatrix = Mat4::translation(settings.modelOffset) *
+                              Mat4::translation(pivotScaled) * pose.modelTransform *
+                              Mat4::translation(-pivotScaled) * scaleMatrix;
+    Vec3 target = cameraMatrix.transformPoint(boundsCenter);
     target.y += camera.targetYBias;
     const float height = std::max(0.1f, model->height * scale);
     const float distance =
@@ -968,10 +975,15 @@ bool SdlGpuVrmRenderer::Impl::render(
         distance;
     const Vec3 eye = target + orbit;
     const Mat4 view = math::lookAtLH(eye, target, {0.0f, 1.0f, 0.0f});
-    const Mat4 projection =
+    Mat4 projection =
         math::perspectiveFovLH(std::clamp(camera.fov, 0.2f, 1.4f),
                                static_cast<float>(kWidth) / kHeight,
                                std::max(0.02f, distance * 0.01f), 200.0f);
+    // glTF/VRM data is right handed while lookAtLH/perspectiveFovLH build a
+    // left handed view. Without this correction the image is a mirror image:
+    // a character facing the camera would show its right arm on the viewer's
+    // right. Back-face culling is disabled, so flipping X needs nothing else.
+    projection.m[0] = -projection.m[0];
     const Mat4 viewProjection = projection * view;
 
     // Sort blended primitives back-to-front using their bind-space centroid.

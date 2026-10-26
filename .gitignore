@@ -24,6 +24,16 @@ tests/fixtures/generated/
 /models/*
 !/models/README.md
 
+# No private model, exported GLB or extracted texture directory may be
+# committed from anywhere in the tree. The tests use a small, self-authored
+# synthetic fixture; keep that one explicitly visible.
+*.vrm
+!tests/fixtures/minimal.vrm
+*.glb
+/model_textures/
+/model_exports/
+/artifacts/textures/
+
 # Generated shader binaries; the C headers are committed and rebuilt from HLSL.
 adapters/sdlgpu/shaders/generated/*.dxil
 adapters/sdlgpu/shaders/generated/*.spv

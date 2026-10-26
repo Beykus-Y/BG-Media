@@ -145,8 +145,34 @@ bool VrmScene::render(const CharacterPose& pose, double mediaTime,
     return true;
 }
 
+bool VrmScene::renderClip(const motion::ClipPose& pose, double mediaTime,
+                          const sdlgpu::Camera& camera,
+                          const sdlgpu::RenderSettings& settings, std::string* error) {
+    if (!impl_->model || !impl_->retargeter || !impl_->renderable ||
+        !impl_->renderer.hasModel()) {
+        if (error) {
+            *error = impl_->renderError.empty() ? "VRM scene is not renderable"
+                                                : impl_->renderError;
+        }
+        return false;
+    }
+    impl_->lastPose = impl_->retargeter->applyClip(pose, mediaTime);
+    impl_->lastRetargetMs = impl_->lastPose.stats.retargetMilliseconds;
+    if (!impl_->lastPose.stats.valid) {
+        if (error) {
+            *error = "retargeting produced an invalid pose";
+        }
+        return false;
+    }
+    if (!impl_->renderer.render(impl_->lastPose, camera, settings, error)) {
+        return false;
+    }
+    impl_->settings = settings;
+    return true;
+}
+
 bool VrmScene::draw(SDL_Renderer* renderer, const SDL_FRect& destination,
-                    std::string* error) {
+                    std::string* error, bool cover) {
     if (!renderer) {
         return false;
     }
@@ -186,6 +212,19 @@ bool VrmScene::draw(SDL_Renderer* renderer, const SDL_FRect& destination,
     SDL_FRect target = destination;
     const float sourceAspect = static_cast<float>(width) / height;
     const float targetAspect = destination.w / std::max(0.001f, destination.h);
+    if (cover) {
+        // Fill the whole destination and crop the overflowing edges of the frame.
+        SDL_FRect source{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
+        if (targetAspect > sourceAspect) {
+            source.h = static_cast<float>(width) / targetAspect;
+            source.y = (static_cast<float>(height) - source.h) * 0.5f;
+        } else {
+            source.w = static_cast<float>(height) * targetAspect;
+            source.x = (static_cast<float>(width) - source.w) * 0.5f;
+        }
+        SDL_RenderTexture(renderer, impl_->texture, &source, &destination);
+        return true;
+    }
     if (targetAspect > sourceAspect) {
         target.w = destination.h * sourceAspect;
         target.x = destination.x + (destination.w - target.w) * 0.5f;

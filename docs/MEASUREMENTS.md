@@ -114,14 +114,16 @@ build\windows\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 ## Автотесты
 
 ```text
-100% tests passed, 0 failed out of 6
-Total Test time (real) ≈ 3.2 s
+1/9 ... 9/9
+100% tests passed, 0 tests failed out of 9
+Total Test time (real) ≈ 6.0 s
 ```
 
-47 unit/integration кейсов, включая WAV (8/16/24/32-bit, float), MP3/FLAC
+82 unit/integration кейса, включая WAV (8/16/24/32-bit, float), MP3/FLAC
 decode, straight/offbeat/ternary/half-time/shuffle/dense/drift BPM,
 downbeats, onset timestamp, tempo change, silence, bass semantics, cache
-corruption/versioning, sync latency/seek/rate, choreography и BG Motion 2.0.
+corruption/versioning, sync latency/seek/rate, choreography, BG Motion 2.0,
+VRM/retargeting и BG Motion 3.0 (26 кейсов).
 
 ## BG Motion 2.0
 
@@ -146,6 +148,45 @@ beat, в timeline ставится keyframe с тем же значением, �
 Desktop Motion Lab (синтетическая сетка 123 BPM, debug-режим):
 `docs/images/desktop-motion-debug.png`. Ступенчатый режим для A/B:
 `docs/images/desktop-motion-stepped.png`.
+
+## BG Motion 3.0
+
+Измерения выполнены `bgmedia_motion_qa` на `Model1.vrm` (1.62 м), Release,
+Ryzen 7 5700X, 240 Hz. Для каждого клипа брались BPM `0.8×`, `1.0×`, `1.25×`
+от авторского.
+
+| Клип | seam rot | seam pos | maxW °/s | slide mm | IK err mm | reach drop cm | swings |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Groove (77/96/120) | 0.000° | 0.0000 | 103 | 2.15 | 0.00 | 0.00 | 7–8 |
+| Hip-Hop (74/92/115) | 0.000° | 0.0000 | 325 | 2.26 | 0.00 | 0.00 | 9 |
+| Side Step (86/108/135) | 0.000° | 0.0000 | 320 | 2.51 | 0.00 | 0.00 | 14 |
+| Energetic (101/126/158) | 0.000° | 0.0000 | 582 | 2.29 | 0.00 | 0.00 | 12 |
+| Idle (48/60/75) | 0.000° | 0.0000 | 3 | 0.00 | 0.00 | 0.91 | 0 |
+
+`maxW` — максимальная угловая скорость любой кости; `slide` — максимальное
+смещение заретаргетенной опорной лодыжки; `reach drop` — автоматическое
+опускание таза для достижимости опоры.
+
+Все 20 пар из пяти стилей проверены на каждом из 80/123/180 BPM (60
+переходов); переключение запрашивалось в середине beat (не на сетке):
+
+| Метрика перехода | Худшее значение | Порог теста |
+|---|---:|---:|
+| угловая скорость | 591 °/s | < 900 °/s |
+| угловое ускорение | 17 484 °/s² | < 4.0e4 °/s² |
+| шаг таза за кадр | 0.00313 height (≈5.1 мм) | < 0.006 |
+| шаг root за кадр | 0.00312 height | < 0.006 |
+| шаг стопы за кадр | 0.00993 height (≈1.6 см) | < 0.02 |
+| нефинитные позы | 0 | 0 |
+
+Дополнительно проверено 60 быстрых переключений подряд (чаще длины fade):
+`maxAngularSpeed < 1100 °/s`, `hipsStep < 0.008`, `footStep < 0.025`,
+расписание остаётся < 80 сегментов.
+
+Контактные листы реального Desktop (`bgmedia_desktop --capture`, тот же
+retargeter/SDL_GPU) для Groove → Hip-Hop и Energetic → Idle подтверждают
+отсутствие скачков на 24 кадрах вокруг каждого перехода. Артефакты лежат
+локально в `artifacts/dance-captures/` и не коммитятся из-за лицензии модели.
 
 ## Ограничения измерений
 
@@ -182,7 +223,7 @@ Desktop Motion Lab (синтетическая сетка 123 BPM, debug-реж�
 - `docs/images/desktop-metric.png` — 12/8: metric ambiguity, alternatives и
   `meter uncertain`.
 
-## BG Media 3D — VRM 0.x (дополнение 0.2.0)
+## BG Media 3D — VRM 0.x (дополнение 0.3.0)
 
 Оборудование и сборка те же: Ryzen 7 5700X, 32 GB RAM, Windows 11,
 MSVC 19.44 Release, D3D12. Модель: `models/Model1.vrm` (VRM 0.x, VRoid
@@ -203,7 +244,7 @@ RGBA8 sRGB + D32.
 | GPU textures с mip-chain | ~112 MB |
 | process RSS в 3D | ~160–168 MB |
 | ASan Debug import Model1 | ~1.7 с |
-| ASan тесты | 56 passed, 0 failed, sanitizer clean |
+| ASan тесты | 82 passed, 0 failed, sanitizer clean |
 
 Проверка воспроизводимости: одинаковые `(CharacterPose, mediaTime, options)`
 дают побитово одинаковые `nodeGlobals`; seek/rewind воспроизводит ту же позу.

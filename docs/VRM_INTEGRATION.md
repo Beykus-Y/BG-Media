@@ -195,22 +195,37 @@ GLB 18 539 292 bytes, 175 nodes, 3 meshes, 35 881 triangles,
 
 ## 5. Синхронизация с музыкой
 
-Существующая цепочка не изменена:
+Цепочка BG Beat → BG Sync не изменена. В 3D можно выбрать один из двух
+путей:
 
 ```text
+# BG Motion 2.0 (2D и --legacy-motion)
 Audio decode → Analyzer/BG Beat → ChoreographyBuilder/BG Motion
     → ChoreographySampler.sample(mediaSeconds) → CharacterPose
     → HumanoidRetargeter.apply(pose, mediaSeconds)
-    → SDL_GPU renderer
+
+# BG Motion 3.0 (по умолчанию в 3D, если загружены клипы)
+Audio decode → Analyzer/BG Beat → BeatClock
+    → DancePlayer.update(currentPosition()) → ClipPose
+    → HumanoidRetargeter.applyClip(pose, mediaSeconds)
+
+# оба пути → SDL_GPU renderer
 ```
 
 - `PlaybackClock` компенсирует output latency.
 - В 3D-режиме media time берётся из того же `currentPosition()`, что и в 2D.
 - `pause` останавливает media time и поза замирает.
-- `seek` сдвигает clock/позицию; следующий кадр сэмплирует точную позу.
+- `seek` сдвигает clock/позицию; `DancePlayer` делает reseed, сохраняя фазу
+  такта. Следующий кадр сэмплирует точную позу.
 - `rate` меняет media time через существующий плеер (pitch follows speed).
 - Synthetic Motion Lab / Test Dance использует отдельную synthetic beat map
   только когда трек не загружен; это не второй плеер.
+
+BG Motion 3.0 не создаёт собственный таймер: `BeatClock` — единственная связь
+между media time и музыкальными beats. Поэтому клип не может «уехать» от
+музыки при смене FPS или после seek. Переходы — часть `DanceSchedule`, а не
+скрытое состояние рендерера. Подробности:
+[docs/BG_MOTION_3.md](BG_MOTION_3.md).
 
 ## 6. Desktop UI
 
@@ -223,10 +238,14 @@ Audio decode → Analyzer/BG Beat → ChoreographyBuilder/BG Motion
   - `C` / RESET CAM — сброс;
   - `-`/`+` — масштаб модели;
   - `,`/`.` — вертикальное положение модели;
-  - `T` / TEST DANCE — синтетический танец 123 BPM без музыки;
-  - `Space` — play/pause (в demo — play/pause синтетического танца);
+  - `T` / TEST DANCE — Groove → Hip-Hop → Side Step → Energetic → Idle,
+    когда загружены танцевальные клипы; без них — старый synthetic demo;
+  - `1`–`4` / `0` — стили BG Motion 3.0, `A` — Manual/Auto, `N` — Loop/One
+    Shot, `P` — presentation, `F5`–`F7` — debug-виды;
+  - `Space` — play/pause (в Motion Lab — play/pause танца);
   `--autoplay` запускает воспроизведение сразу после загрузки трека.
-- Панели справа: импорт/rig, BG Sync/Motion, SDL_GPU renderer, controls.
+- Панели справа: DANCE / CLIP STATE / DEBUG, импорт/rig, BG Sync/Motion,
+  SDL_GPU renderer, controls.
 - Видны: модель, сцена, текущий трек/синтетика, время, play/pause, rate,
   текущее движение, bar/beat, accent, foot IK, retarget ms, FPS, GPU ms,
   readback ms, VRAM, RSS, лицензия и предупреждения импорта.
@@ -244,12 +263,28 @@ build\windows\bin\bgmedia_desktop.exe
 3D-демо:
 
 ```powershell
-# локальная модель + синтетический танец, без музыки
+# локальная модель + старый синтетический танец 123 BPM, без музыки
 build\windows\bin\bgmedia_desktop.exe --vrm models\Model1.vrm --vrm-demo
 
-# музыка + модель; --autoplay сразу запускает воспроизведение
-build\windows\bin\bgmedia_desktop.exe --file track.mp3 --vrm models\Model1.vrm --3d --autoplay
+# BG Motion 3.0: один стиль и Motion Lab BPM
+build\windows\bin\bgmedia_desktop.exe --vrm models\Model1.vrm --3d ^
+  --dance groove --dance-bpm 100
+
+# все стили по 8 битов, затем Idle
+build\windows\bin\bgmedia_desktop.exe --vrm models\Model1.vrm ^
+  --dance-plan groove,hiphop,sidestep,energetic,idle --dance-span 8 --dance-bpm 120
+
+# музыка + Auto-план по BG Beat; --autoplay сразу запускает воспроизведение
+build\windows\bin\bgmedia_desktop.exe --file track.mp3 --vrm models\Model1.vrm ^
+  --3d --dance auto --autoplay
+
+# A/B: старый BG Motion 2.0 CharacterPose в 3D
+build\windows\bin\bgmedia_desktop.exe --vrm models\Model1.vrm --3d ^
+  --legacy-motion --autoplay --file track.mp3
 ```
+
+`--presentation` убирает панели и кадрирует сцену по ширине окна (cover), в
+этом режиме `P`/`Esc` возвращает интерфейс.
 
 Headless 3D preview (та же цепочка importer/retargeter/renderer):
 
@@ -276,14 +311,15 @@ SPIR-V/MSL-варианты (исходный HLSL уже отделён от AP
 `ctest --test-dir build\windows --output-on-failure`:
 
 ```text
-1/8 audio          Passed
-2/8 analysis       Passed
-3/8 cache          Passed
-4/8 sync           Passed
-5/8 choreography   Passed
-6/8 motion         Passed
-7/8 vrm            Passed
-8/8 retarget       Passed
+1/9 audio          Passed
+2/9 analysis       Passed
+3/9 cache          Passed
+4/9 sync           Passed
+5/9 choreography   Passed
+6/9 motion         Passed
+7/9 vrm            Passed
+8/9 retarget       Passed
+9/9 dance          Passed
 100% tests passed
 ```
 
@@ -301,7 +337,11 @@ SPIR-V/MSL-варианты (исходный HLSL уже отделён от AP
 - `retarget.arms_head_and_torso_are_articulated`;
 - `retarget.is_deterministic_and_frame_rate_independent` — бит-в-бит
   воспроизведение после seek/rewind и 30-секундный sweep;
-- `retarget.model1_if_available` — реальный риг.
+- `retarget.model1_if_available` — реальный риг;
+- `dance.*` (26 кейсов) — формат `bgmotion.clip`, loop seam, скорость и
+  ускорение, foot slide, повороты вокруг опорной стопы, 20 пар стилей на
+  80/123/180 BPM (60 переходов), seek/pause/resume, one-shot, metric levels, Manual entry
+  beat, Auto-план и смена темпа. Подробнее: [BG_MOTION_3.md](BG_MOTION_3.md).
 
 ASan (MSVC):
 
@@ -309,8 +349,8 @@ ASan (MSVC):
 powershell -ExecutionPolicy Bypass -File scripts/run_asan_windows.ps1
 ```
 
-Результат: **56 passed, 0 failed**, без ASan-сообщений. Debug/ASan медленнее,
-поэтому импорт Model1 там ~1.7 с вместо ~0.18 с Release.
+Результат: **82 passed, 0 failed**, без ASan-сообщений. Debug/ASan медленнее,
+поэтому импорт Model1 там ~1.9 с вместо ~0.18 с Release.
 
 Измерения (Release, Ryzen 7 5700X, Windows 11, D3D12, 960×640 offscreen):
 
@@ -332,9 +372,10 @@ SDL_Renderer backend на этой машине не ограничивает с
 ## 9. Правила использования модели
 
 `Model1.vrm` и его текстуры **не коммитятся**. `.gitignore` исключает
-`/models/*` (кроме README) и `/artifacts/`. Скриншот
-`artifacts/desktop3d_playing.png` тоже локальный. Для публикации нужен
-отдельный VRM с совместимой лицензией.
+`/models/*` (кроме README), все `*.vrm`/`*.glb` (кроме синтетического
+`tests/fixtures/minimal.vrm`), каталоги экспорта модели и `/artifacts/`.
+Скриншоты `artifacts/desktop3d_playing.png` и `artifacts/dance-captures/*`
+тоже локальные. Для публикации нужен отдельный VRM с совместимой лицензией.
 
 ## 10. Следующие шаги
 

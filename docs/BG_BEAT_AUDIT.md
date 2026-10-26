@@ -128,8 +128,8 @@ confidence низкие, альтернативы видны. Это честн�
 
 `bgmedia_fixturegen` пишет соответствующие WAV в `fixtures/`. Проверяются BPM,
 one-to-one beat F1, downbeat F1, signed timing bias, `nearestBeat` для
-syncopated bass и cache invalidation. Всего в проекте **47 тестов**, 6
-CTest-групп.
+syncopated bass и cache invalidation. Всего в проекте **82 теста**, 9
+CTest-групп (включая 26 кейсов BG Motion 3.0).
 
 ## 6. Что осталось открытым
 

@@ -60,6 +60,18 @@ void printUsage() {
 
         << "  --motion-debug         show joints, trails and keyframe diagnostics\n"
         << "  --motion-stepped       use the legacy stepped sampler (A/B compare)\n"
+        << "  --dance <name>         BG Motion 3.0 start dance: groove|hiphop|sidestep|\n"
+        << "                         energetic|idle|auto|test (works without music)\n"
+        << "  --dance-plan <a,b,..>  play styles in sequence (--dance-span beats each, default 16)\n"
+        << "  --dance-bpm <bpm>      Motion Lab tempo when no music is loaded (default 100)\n"
+        << "  --dances <dir>         dance clip directory (default <assets>/dances)\n"
+        << "  --presentation         clean presentation mode\n"
+        << "  --debug-feet           foot contact debug views\n"
+        << "  --debug-skeleton       skeleton debug views\n"
+        << "  --debug-root           root motion debug view\n"
+        << "  --legacy-motion        BG Motion 2.0 CharacterPose in 3D (A/B compare)\n"
+        << "  --camera-yaw <deg>     3D camera yaw (180 = front, 90 / 270 = side)\n"
+        << "  --camera-zoom <x>      3D camera distance scale\n"
         << "  --help                 show this help\n\n"
         << "Controls:\n"
         << "  Space play/pause   L load   Left/Right seek 5s   Shift+Left/Right 30s\n"
@@ -121,8 +133,55 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
                 std::cerr << "invalid --vrm-offset-y value\n";
                 return false;
             }
+        } else if (arg == "--dance" && i + 1 < argc) {
+            options.dance = argv[++i];
+            options.startIn3D = true;
+        } else if (arg == "--dance-plan" && i + 1 < argc) {
+            options.dancePlan = argv[++i];
+            options.startIn3D = true;
+        } else if (arg == "--dance-span" && i + 1 < argc) {
+            try {
+                options.danceSpan = std::stod(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --dance-span value" << std::endl;
+                return false;
+            }
+        } else if (arg == "--dance-bpm" && i + 1 < argc) {
+            try {
+                options.danceBpm = std::stoi(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --dance-bpm value\n";
+                return false;
+            }
+        } else if (arg == "--dances" && i + 1 < argc) {
+            options.dancesDirectory = pathFromUtf8(argv[++i]);
+        } else if (arg == "--presentation") {
+            options.presentation = true;
+            options.startIn3D = true;
+        } else if (arg == "--debug-feet") {
+            options.debugFeet = true;
+        } else if (arg == "--debug-skeleton") {
+            options.debugSkeleton = true;
+        } else if (arg == "--debug-root") {
+            options.debugRoot = true;
+        } else if (arg == "--legacy-motion") {
+            options.legacyMotion = true;
+        } else if (arg == "--camera-yaw" && i + 1 < argc) {
+            try {
+                options.cameraYawDegrees = std::stof(argv[++i]);
+                options.hasCameraYaw = true;
+            } catch (...) {
+                std::cerr << "invalid --camera-yaw value\n";
+                return false;
+            }
+        } else if (arg == "--camera-zoom" && i + 1 < argc) {
+            try {
+                options.cameraZoom = std::stof(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --camera-zoom value\n";
+                return false;
+            }
         } else if (arg == "--motion-debug") {
-
             options.motionDebug = true;
         } else if (arg == "--motion-stepped") {
             options.motionStepped = true;

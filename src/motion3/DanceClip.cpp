@@ -1,0 +1,764 @@
+#include "bgmedia/motion3/DanceClip.hpp"
+
+#include "Json.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+
+namespace bgmedia::motion {
+namespace {
+
+using json::Value;
+
+constexpr float kTwoPi = 6.28318530717958647692f;
+
+float smoothstep(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+template <typename T>
+T catmull(const T& p0, const T& p1, const T& p2, const T& p3, float u) {
+    const float u2 = u * u;
+    const float u3 = u2 * u;
+    return (p1 * 2.0f + (p2 - p0) * u + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * u2 +
+            (p1 * 3.0f - p0 - p2 * 3.0f + p3) * u3) *
+           0.5f;
+}
+
+float catmullF(float p0, float p1, float p2, float p3, float u) {
+    const float u2 = u * u;
+    const float u3 = u2 * u;
+    return 0.5f * (2.0f * p1 + (p2 - p0) * u +
+                   (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * u2 +
+                   (3.0f * p1 - p0 - 3.0f * p2 + p3) * u3);
+}
+
+Quat alignTo(Quat q, const Quat& reference) {
+    if (math::dot(q, reference) < 0.0f) {
+        return {-q.x, -q.y, -q.z, -q.w};
+    }
+    return q;
+}
+
+Quat catmullQuat(Quat p0, const Quat& p1, Quat p2, Quat p3, float u) {
+    p0 = alignTo(p0, p1);
+    p2 = alignTo(p2, p1);
+    p3 = alignTo(p3, p2);
+    const float u2 = u * u;
+    const float u3 = u2 * u;
+    const auto channel = [&](float a, float b, float c, float d) {
+        return 0.5f * (2.0f * b + (c - a) * u + (2.0f * a - 5.0f * b + 4.0f * c - d) * u2 +
+                       (3.0f * b - a - 3.0f * c + d) * u3);
+    };
+    return Quat{channel(p0.x, p1.x, p2.x, p3.x), channel(p0.y, p1.y, p2.y, p3.y),
+                channel(p0.z, p1.z, p2.z, p3.z), channel(p0.w, p1.w, p2.w, p3.w)}
+        .normalized();
+}
+
+struct KeyWindow {
+    int i0 = 0;
+    int im1 = 0;
+    int i2 = 0;
+    int i3 = 0;
+    float u = 0.0f;
+};
+
+KeyWindow makeWindow(const HumanoidClip& clip, double clipBeat) {
+    KeyWindow w;
+    const int n = clip.keyCount;
+    double beat = clipBeat;
+    if (clip.loop) {
+        beat = std::fmod(beat, static_cast<double>(clip.beats));
+        if (beat < 0.0) {
+            beat += clip.beats;
+        }
+    } else {
+        beat = std::clamp(beat, 0.0, static_cast<double>(clip.beats));
+    }
+    const double f = beat * clip.keysPerBeat;
+    int i0 = static_cast<int>(std::floor(f));
+    float u = static_cast<float>(f - i0);
+    if (i0 >= n - 1) {
+        i0 = n - 2;
+        u = 1.0f;
+    }
+    w.i0 = i0;
+    w.u = u;
+    if (clip.loop) {
+        const int period = n - 1;
+        w.im1 = (i0 - 1 + period) % period;
+        w.i2 = (i0 + 1) % period;
+        w.i3 = (i0 + 2) % period;
+    } else {
+        w.im1 = std::max(0, i0 - 1);
+        w.i2 = std::min(n - 1, i0 + 1);
+        w.i3 = std::min(n - 1, i0 + 2);
+    }
+    return w;
+}
+
+FootPhase footPhaseAt(const HumanoidClip& clip, int foot, double beat, float& contact) {
+    constexpr float kRamp = 0.20f;
+    double b = beat;
+    if (clip.loop) {
+        b = std::fmod(b, static_cast<double>(clip.beats));
+        if (b < 0.0) {
+            b += clip.beats;
+        }
+    }
+    for (const ContactSegment& seg : clip.contacts) {
+        if (seg.foot != foot || b < seg.start || b > seg.end) {
+            continue;
+        }
+        const float sinceStart = static_cast<float>(b - seg.start);
+        const float untilEnd = static_cast<float>(seg.end - b);
+        contact = smoothstep(std::min(sinceStart, untilEnd) / kRamp);
+        // Segments that touch the clip boundary continue across the loop seam:
+        // they have no plant / release moment there.
+        const bool touchesStart = seg.start <= 1e-4f && clip.loop;
+        const bool touchesEnd = seg.end >= clip.beats - 1e-4f && clip.loop;
+        if (touchesStart) contact = std::min(1.0f, smoothstep(untilEnd / kRamp));
+        if (touchesEnd) contact = std::min(1.0f, smoothstep(sinceStart / kRamp));
+        if (touchesStart && touchesEnd) contact = 1.0f;
+        if (sinceStart < kRamp && !touchesStart) return FootPhase::Plant;
+        if (untilEnd < kRamp && !touchesEnd) return FootPhase::Release;
+        return seg.pivot ? FootPhase::Pivot : FootPhase::Stance;
+    }
+    contact = 0.0f;
+    return FootPhase::Swing;
+}
+
+float accentEnvelope(const HumanoidClip& clip, double beat) {
+    double b = beat;
+    if (clip.loop) {
+        b = std::fmod(b, static_cast<double>(clip.beats));
+        if (b < 0.0) {
+            b += clip.beats;
+        }
+    }
+    float best = 0.0f;
+    for (const AccentMark& mark : clip.accents) {
+        double d = std::abs(b - mark.beat);
+        if (clip.loop) {
+            d = std::min(d, static_cast<double>(clip.beats) - d);
+        }
+        const float v = mark.strength * std::max(0.0f, 1.0f - static_cast<float>(d) / 0.35f);
+        best = std::max(best, v);
+    }
+    return best;
+}
+
+// --- JSON helpers -----------------------------------------------------------
+
+struct Reader {
+    const std::string& source;
+    std::vector<ClipDiagnostic>& out;
+
+    void error(const std::string& message) {
+        out.push_back({ClipDiagnostic::Severity::Error, source, message});
+    }
+    void warn(const std::string& message) {
+        out.push_back({ClipDiagnostic::Severity::Warning, source, message});
+    }
+
+    bool number(const Value& obj, const char* key, double& dst, bool required = false) {
+        const Value* v = obj.find(key);
+        if (!v) {
+            if (required) error(std::string("missing required field '") + key + "'");
+            return !required;
+        }
+        if (!v->isNumber() || !std::isfinite(v->number)) {
+            error(std::string("field '") + key + "' must be a finite number");
+            return false;
+        }
+        dst = v->number;
+        return true;
+    }
+    bool text(const Value& obj, const char* key, std::string& dst, bool required = false) {
+        const Value* v = obj.find(key);
+        if (!v) {
+            if (required) error(std::string("missing required field '") + key + "'");
+            return !required;
+        }
+        if (!v->isString()) {
+            error(std::string("field '") + key + "' must be a string");
+            return false;
+        }
+        dst = v->string;
+        return true;
+    }
+    bool flag(const Value& obj, const char* key, bool& dst) {
+        const Value* v = obj.find(key);
+        if (!v) return true;
+        if (v->type != Value::Type::Bool) {
+            error(std::string("field '") + key + "' must be true or false");
+            return false;
+        }
+        dst = v->boolean;
+        return true;
+    }
+    bool floats(const Value& arr, const std::string& what, std::vector<float>& dst) {
+        if (!arr.isArray()) {
+            error(what + " must be an array of numbers");
+            return false;
+        }
+        dst.clear();
+        dst.reserve(arr.array.size());
+        for (const Value& element : arr.array) {
+            if (!element.isNumber() || !std::isfinite(element.number)) {
+                error(what + " contains a non-numeric or non-finite value");
+                return false;
+            }
+            dst.push_back(static_cast<float>(element.number));
+        }
+        return true;
+    }
+};
+
+bool vec3Track(Reader& reader, const Value& arr, const std::string& what, int keyCount,
+               int stride, std::vector<Vec3>& dst, std::vector<float>* extra) {
+    std::vector<float> flat;
+    if (!reader.floats(arr, what, flat)) {
+        return false;
+    }
+    if (flat.size() != static_cast<std::size_t>(keyCount) * static_cast<std::size_t>(stride)) {
+        reader.error(what + " has " + std::to_string(flat.size()) + " values, expected " +
+                     std::to_string(keyCount) + " keys x " + std::to_string(stride));
+        return false;
+    }
+    dst.resize(static_cast<std::size_t>(keyCount));
+    if (extra) {
+        extra->resize(static_cast<std::size_t>(keyCount));
+    }
+    for (int i = 0; i < keyCount; ++i) {
+        const std::size_t base = static_cast<std::size_t>(i) * static_cast<std::size_t>(stride);
+        dst[static_cast<std::size_t>(i)] = {flat[base], flat[base + 1], flat[base + 2]};
+        if (extra && stride > 3) {
+            (*extra)[static_cast<std::size_t>(i)] = flat[base + 3];
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+const char* styleName(DanceStyle style) {
+    switch (style) {
+    case DanceStyle::Idle: return "idle";
+    case DanceStyle::Groove: return "groove";
+    case DanceStyle::HipHop: return "hiphop";
+    case DanceStyle::SideStep: return "sidestep";
+    case DanceStyle::Energetic: return "energetic";
+    case DanceStyle::Custom: return "custom";
+    }
+    return "custom";
+}
+
+DanceStyle styleFromName(const std::string& name) {
+    std::string lower;
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower == "idle") return DanceStyle::Idle;
+    if (lower == "groove") return DanceStyle::Groove;
+    if (lower == "hiphop" || lower == "hip-hop" || lower == "hip_hop") return DanceStyle::HipHop;
+    if (lower == "sidestep" || lower == "side-step" || lower == "footwork") return DanceStyle::SideStep;
+    if (lower == "energetic" || lower == "drop") return DanceStyle::Energetic;
+    return DanceStyle::Custom;
+}
+
+const char* footPhaseName(FootPhase phase) {
+    switch (phase) {
+    case FootPhase::Swing: return "Swing";
+    case FootPhase::Plant: return "Plant";
+    case FootPhase::Stance: return "Stance";
+    case FootPhase::Pivot: return "Pivot";
+    case FootPhase::Release: return "Release";
+    }
+    return "?";
+}
+
+ClipPose neutralClipPose() {
+    ClipPose pose;
+    pose.bone.fill(Quat::identity());
+    return pose;
+}
+
+void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out) {
+    out = neutralClipPose();
+    if (clip.keyCount < 2) {
+        return;
+    }
+    const KeyWindow w = makeWindow(clip, clipBeat);
+    for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+        const auto& track = clip.bones[b];
+        if (track.size() != static_cast<std::size_t>(clip.keyCount)) {
+            continue;
+        }
+        out.bone[b] = catmullQuat(track[static_cast<std::size_t>(w.im1)],
+                                  track[static_cast<std::size_t>(w.i0)],
+                                  track[static_cast<std::size_t>(w.i2)],
+                                  track[static_cast<std::size_t>(w.i3)], w.u);
+    }
+    const auto vec = [&](const std::vector<Vec3>& track) {
+        return catmull(track[static_cast<std::size_t>(w.im1)],
+                       track[static_cast<std::size_t>(w.i0)],
+                       track[static_cast<std::size_t>(w.i2)],
+                       track[static_cast<std::size_t>(w.i3)], w.u);
+    };
+    const auto scalar = [&](const std::vector<float>& track) {
+        return catmullF(track[static_cast<std::size_t>(w.im1)],
+                        track[static_cast<std::size_t>(w.i0)],
+                        track[static_cast<std::size_t>(w.i2)],
+                        track[static_cast<std::size_t>(w.i3)], w.u);
+    };
+    if (clip.hips.size() == static_cast<std::size_t>(clip.keyCount)) {
+        out.hips = vec(clip.hips);
+    }
+    if (clip.root.size() == static_cast<std::size_t>(clip.keyCount)) {
+        const Vec3 r = vec(clip.root);
+        out.rootX = r.x;
+        out.rootZ = r.y;
+        out.rootYaw = r.z;
+    }
+    for (int f = 0; f < 2; ++f) {
+        const FootTrack& track = clip.feet[static_cast<std::size_t>(f)];
+        ClipPose::Foot& foot = out.foot[static_cast<std::size_t>(f)];
+        if (track.position.size() == static_cast<std::size_t>(clip.keyCount)) {
+            foot.position = vec(track.position);
+        }
+        if (track.yaw.size() == static_cast<std::size_t>(clip.keyCount)) {
+            foot.yaw = scalar(track.yaw);
+        }
+        foot.phase = footPhaseAt(clip, f, clipBeat, foot.contact);
+    }
+    for (int h = 0; h < 2; ++h) {
+        const auto& track = clip.hands[static_cast<std::size_t>(h)];
+        if (track.size() == static_cast<std::size_t>(clip.keyCount)) {
+            out.hand[static_cast<std::size_t>(h)] = std::clamp(scalar(track), 0.0f, 1.0f);
+        }
+    }
+    out.energy = clip.energy;
+    out.accent = accentEnvelope(clip, clipBeat);
+}
+
+ClipPose sampleClip(const HumanoidClip& clip, double clipBeat) {
+    ClipPose pose;
+    sampleClip(clip, clipBeat, pose);
+    return pose;
+}
+
+ClipPose blendPoses(const ClipPose& a, const ClipPose& b, float w) {
+    w = std::clamp(w, 0.0f, 1.0f);
+    if (w <= 0.0f) return a;
+    if (w >= 1.0f) return b;
+    ClipPose out;
+    for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
+        out.bone[i] = math::slerp(a.bone[i], b.bone[i], w);
+    }
+    out.hips = math::lerp(a.hips, b.hips, w);
+    out.rootX = a.rootX + (b.rootX - a.rootX) * w;
+    out.rootZ = a.rootZ + (b.rootZ - a.rootZ) * w;
+    const auto arc = [&](float from, float to) {
+        float d = to - from;
+        d -= std::round(d);
+        return from + d * w;
+    };
+    out.rootYaw = arc(a.rootYaw, b.rootYaw);
+    for (std::size_t f = 0; f < 2; ++f) {
+        out.foot[f].position = math::lerp(a.foot[f].position, b.foot[f].position, w);
+        out.foot[f].yaw = arc(a.foot[f].yaw, b.foot[f].yaw);
+        out.foot[f].contact = a.foot[f].contact + (b.foot[f].contact - a.foot[f].contact) * w;
+        out.foot[f].phase = w < 0.5f ? a.foot[f].phase : b.foot[f].phase;
+    }
+    for (std::size_t h = 0; h < 2; ++h) {
+        out.hand[h] = a.hand[h] + (b.hand[h] - a.hand[h]) * w;
+    }
+    out.energy = a.energy + (b.energy - a.energy) * w;
+    out.accent = std::max(a.accent * (1.0f - w), b.accent * w);
+    return out;
+}
+
+// --- parsing ---------------------------------------------------------------
+
+ClipLoadResult parseClipJson(const std::string& text, const std::string& sourceName) {
+    ClipLoadResult result;
+    Reader reader{sourceName, result.diagnostics};
+    Value root;
+    std::string parseError;
+    json::Parser parser(text);
+    if (!parser.parse(root, parseError)) {
+        reader.error(parseError);
+        return result;
+    }
+    if (!root.isObject()) {
+        reader.error("top level must be a JSON object");
+        return result;
+    }
+    HumanoidClip& clip = result.clip;
+    std::string format;
+    reader.text(root, "format", format, true);
+    if (!format.empty() && format != kClipFormatName) {
+        reader.error("format is '" + format + "', expected '" + kClipFormatName + "'");
+    }
+    double version = 0;
+    reader.number(root, "version", version, true);
+    clip.formatVersion = static_cast<int>(version);
+    if (clip.formatVersion != kClipFormatVersion && version != 0) {
+        reader.error("unsupported clip format version " +
+                     std::to_string(clip.formatVersion) + " (this build reads version " +
+                     std::to_string(kClipFormatVersion) + ")");
+    }
+    reader.text(root, "id", clip.id, true);
+    reader.text(root, "name", clip.name);
+    reader.text(root, "description", clip.description);
+    reader.text(root, "author", clip.author);
+    reader.text(root, "origin", clip.origin);
+    std::string style;
+    reader.text(root, "style", style);
+    clip.style = styleFromName(style);
+    if (clip.name.empty()) clip.name = clip.id;
+
+    double beats = 0;
+    double keys = 16;
+    double bpmRange[2] = {0, 0};
+    double beatsPerBar = 4;
+    double energy = 0.5;
+    reader.number(root, "bpm", clip.bpm, true);
+    reader.number(root, "beats", beats, true);
+    reader.number(root, "keysPerBeat", keys);
+    reader.number(root, "beatsPerBar", beatsPerBar);
+    reader.number(root, "energy", energy);
+    reader.flag(root, "loop", clip.loop);
+    reader.flag(root, "seamless", clip.seamless);
+    reader.flag(root, "tempoSync", clip.tempoSync);
+    clip.beats = static_cast<float>(beats);
+    clip.keysPerBeat = static_cast<int>(keys);
+    clip.beatsPerBar = static_cast<int>(beatsPerBar);
+    clip.energy = static_cast<float>(energy);
+    clip.bpmMin = clip.bpm * 0.75;
+    clip.bpmMax = clip.bpm * 1.3;
+    if (const Value* range = root.find("bpmRange")) {
+        if (range->isArray() && range->array.size() == 2 && range->array[0].isNumber() &&
+            range->array[1].isNumber()) {
+            bpmRange[0] = range->array[0].number;
+            bpmRange[1] = range->array[1].number;
+            clip.bpmMin = bpmRange[0];
+            clip.bpmMax = bpmRange[1];
+        } else {
+            reader.error("'bpmRange' must be [min, max]");
+        }
+    }
+    const auto beatList = [&](const char* key, std::vector<float>& dst) {
+        if (const Value* v = root.find(key)) {
+            std::vector<float> tmp;
+            if (reader.floats(*v, key, tmp)) dst = tmp;
+        }
+    };
+    beatList("entryBeats", clip.entryBeats);
+    beatList("exitBeats", clip.exitBeats);
+
+    if (const Value* accents = root.find("accents")) {
+        if (!accents->isArray()) {
+            reader.error("'accents' must be an array");
+        } else {
+            for (const Value& item : accents->array) {
+                AccentMark mark;
+                double beat = 0;
+                double strength = 1;
+                if (item.isObject() && reader.number(item, "beat", beat, true)) {
+                    reader.number(item, "strength", strength);
+                    reader.text(item, "kind", mark.kind);
+                    mark.beat = static_cast<float>(beat);
+                    mark.strength = static_cast<float>(strength);
+                    clip.accents.push_back(mark);
+                } else if (!item.isObject()) {
+                    reader.error("each accent must be an object {beat, strength, kind}");
+                }
+            }
+        }
+    }
+    if (const Value* contacts = root.find("contacts")) {
+        if (!contacts->isArray()) {
+            reader.error("'contacts' must be an array");
+        } else {
+            for (const Value& item : contacts->array) {
+                if (!item.isObject()) {
+                    reader.error("each contact must be an object");
+                    continue;
+                }
+                ContactSegment seg;
+                std::string foot;
+                double start = 0, end = 0;
+                reader.text(item, "foot", foot, true);
+                reader.number(item, "start", start, true);
+                reader.number(item, "end", end, true);
+                std::string kind = "stance";
+                reader.text(item, "kind", kind);
+                if (foot == "left" || foot == "L") seg.foot = 0;
+                else if (foot == "right" || foot == "R") seg.foot = 1;
+                else reader.error("contact foot must be 'left' or 'right'");
+                seg.start = static_cast<float>(start);
+                seg.end = static_cast<float>(end);
+                seg.pivot = kind == "pivot";
+                clip.contacts.push_back(seg);
+            }
+        }
+    }
+
+    if (beats <= 0 || keys < 1 || keys > 240 || beats > 4096) {
+        reader.error("'beats' and 'keysPerBeat' are out of range");
+    } else {
+        clip.keyCount = static_cast<int>(std::lround(beats * keys)) + 1;
+        if (std::abs(beats * keys - std::round(beats * keys)) > 1e-6) {
+            reader.error("beats * keysPerBeat must be a whole number");
+        }
+    }
+
+    const Value* tracks = root.find("tracks");
+    if (!tracks || !tracks->isObject()) {
+        reader.error("missing 'tracks' object");
+    } else if (clip.keyCount > 1) {
+        if (const Value* bones = tracks->find("bones")) {
+            if (!bones->isObject()) {
+                reader.error("'tracks.bones' must be an object keyed by humanoid bone name");
+            } else {
+                for (const auto& entry : bones->object) {
+                    const auto bone = vrm::humanoidBoneFromVrmName(entry.first);
+                    if (!bone) {
+                        reader.error("unknown humanoid bone '" + entry.first + "'");
+                        continue;
+                    }
+                    std::vector<float> flat;
+                    if (!reader.floats(entry.second, "bone '" + entry.first + "'", flat)) {
+                        continue;
+                    }
+                    if (flat.size() != static_cast<std::size_t>(clip.keyCount) * 4) {
+                        reader.error("bone '" + entry.first + "' has " +
+                                     std::to_string(flat.size()) + " values, expected " +
+                                     std::to_string(clip.keyCount) + " keys x 4");
+                        continue;
+                    }
+                    auto& dst = clip.bones[static_cast<std::size_t>(*bone)];
+                    dst.resize(static_cast<std::size_t>(clip.keyCount));
+                    for (int i = 0; i < clip.keyCount; ++i) {
+                        const std::size_t base = static_cast<std::size_t>(i) * 4;
+                        Quat q{flat[base], flat[base + 1], flat[base + 2], flat[base + 3]};
+                        const float norm = std::sqrt(q.lengthSquared());
+                        if (norm < 0.9f || norm > 1.1f) {
+                            reader.error("bone '" + entry.first + "' key " + std::to_string(i) +
+                                         " is not a unit quaternion (|q|=" +
+                                         std::to_string(norm) + ")");
+                            break;
+                        }
+                        dst[static_cast<std::size_t>(i)] = q.normalized();
+                    }
+                }
+            }
+        }
+        if (const Value* v = tracks->find("hips")) {
+            vec3Track(reader, *v, "tracks.hips", clip.keyCount, 3, clip.hips, nullptr);
+        }
+        if (const Value* v = tracks->find("root")) {
+            vec3Track(reader, *v, "tracks.root", clip.keyCount, 3, clip.root, nullptr);
+        }
+        if (const Value* v = tracks->find("footLeft")) {
+            vec3Track(reader, *v, "tracks.footLeft", clip.keyCount, 4, clip.feet[0].position,
+                      &clip.feet[0].yaw);
+        }
+        for (int h = 0; h < 2; ++h) {
+            if (const Value* v = tracks->find(h == 0 ? "handLeft" : "handRight")) {
+                std::vector<float> flat;
+                if (reader.floats(*v, h == 0 ? "tracks.handLeft" : "tracks.handRight", flat)) {
+                    if (flat.size() == static_cast<std::size_t>(clip.keyCount)) {
+                        clip.hands[static_cast<std::size_t>(h)] = std::move(flat);
+                    } else {
+                        reader.error(std::string("tracks.") + (h == 0 ? "handLeft" : "handRight") +
+                                     " has " + std::to_string(flat.size()) + " values, expected " +
+                                     std::to_string(clip.keyCount));
+                    }
+                }
+            }
+        }
+        if (const Value* v = tracks->find("footRight")) {
+            vec3Track(reader, *v, "tracks.footRight", clip.keyCount, 4, clip.feet[1].position,
+                      &clip.feet[1].yaw);
+        }
+    }
+
+    bool hadError = false;
+    for (const ClipDiagnostic& d : result.diagnostics) {
+        hadError = hadError || d.severity == ClipDiagnostic::Severity::Error;
+    }
+    if (!hadError) {
+        validateClip(clip, sourceName, result.diagnostics);
+    }
+    result.ok = true;
+    for (const ClipDiagnostic& d : result.diagnostics) {
+        if (d.severity == ClipDiagnostic::Severity::Error) {
+            result.ok = false;
+        }
+    }
+    return result;
+}
+
+ClipLoadResult loadClipFile(const std::filesystem::path& path) {
+    const std::string name = path.filename().string();
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        ClipLoadResult result;
+        result.diagnostics.push_back(
+            {ClipDiagnostic::Severity::Error, name, "cannot open file"});
+        return result;
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return parseClipJson(buffer.str(), name);
+}
+
+void validateClip(const HumanoidClip& clip, const std::string& sourceName,
+                  std::vector<ClipDiagnostic>& out) {
+    const auto error = [&](const std::string& m) {
+        out.push_back({ClipDiagnostic::Severity::Error, sourceName, m});
+    };
+    const auto warn = [&](const std::string& m) {
+        out.push_back({ClipDiagnostic::Severity::Warning, sourceName, m});
+    };
+    if (clip.id.empty()) error("clip has no id");
+    if (!(clip.bpm > 20.0 && clip.bpm < 400.0)) error("bpm must be within 20..400");
+    if (!(clip.bpmMin > 0.0 && clip.bpmMax >= clip.bpmMin)) error("bpmRange is invalid");
+    if (clip.beats < 1.0f) error("a clip needs at least one beat");
+    if (clip.keyCount < 2) {
+        error("clip has no keys");
+        return;
+    }
+    bool anyTrack = !clip.hips.empty() || !clip.root.empty();
+    for (const auto& bone : clip.bones) {
+        anyTrack = anyTrack || !bone.empty();
+    }
+    if (!anyTrack) error("clip has no animation tracks");
+    for (float entry : clip.entryBeats) {
+        if (entry < 0.0f || entry > clip.beats) warn("entry beat outside the clip");
+    }
+    for (const AccentMark& a : clip.accents) {
+        if (a.beat < 0.0f || a.beat > clip.beats) warn("accent beat outside the clip");
+    }
+
+    // Contact segments.
+    for (std::size_t i = 0; i < clip.contacts.size(); ++i) {
+        const ContactSegment& a = clip.contacts[i];
+        if (!(a.end > a.start) || a.start < -1e-4f || a.end > clip.beats + 1e-4f) {
+            error("contact segment " + std::to_string(i) + " has an invalid range");
+        }
+        for (std::size_t j = i + 1; j < clip.contacts.size(); ++j) {
+            const ContactSegment& b = clip.contacts[j];
+            if (a.foot == b.foot && a.start < b.end - 1e-4f && b.start < a.end - 1e-4f) {
+                error("contact segments " + std::to_string(i) + " and " +
+                      std::to_string(j) + " overlap on the same foot");
+            }
+        }
+        // A planted foot must not translate.
+        const FootTrack& track = clip.feet[static_cast<std::size_t>(a.foot & 1)];
+        if (track.position.size() == static_cast<std::size_t>(clip.keyCount)) {
+            const int k0 = std::clamp(static_cast<int>(std::ceil(a.start * clip.keysPerBeat - 1e-4)), 0,
+                                      clip.keyCount - 1);
+            const int k1 = std::clamp(static_cast<int>(std::floor(a.end * clip.keysPerBeat + 1e-4)), 0,
+                                      clip.keyCount - 1);
+            float worst = 0.0f;
+            for (int k = k0; k <= k1; ++k) {
+                const Vec3 d = track.position[static_cast<std::size_t>(k)] -
+                               track.position[static_cast<std::size_t>(k0)];
+                worst = std::max(worst, std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+            }
+            if (worst > 0.004f) {
+                warn("foot " + std::string(a.foot == 0 ? "left" : "right") +
+                     " moves " + std::to_string(worst) +
+                     " height-units during a planted contact (slide)");
+            }
+        }
+    }
+
+    // Loop seam.
+    if (clip.loop && clip.seamless) {
+        float rotWorst = 0.0f;
+        for (const auto& bone : clip.bones) {
+            if (bone.size() == static_cast<std::size_t>(clip.keyCount)) {
+                const float d = std::abs(math::dot(bone.front(), bone.back()));
+                rotWorst = std::max(rotWorst, 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f)));
+            }
+        }
+        float posWorst = 0.0f;
+        const auto check = [&](const std::vector<Vec3>& track) {
+            if (track.size() == static_cast<std::size_t>(clip.keyCount)) {
+                const Vec3 d = track.front() - track.back();
+                posWorst = std::max(posWorst, std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+            }
+        };
+        check(clip.hips);
+        check(clip.root);
+        check(clip.feet[0].position);
+        check(clip.feet[1].position);
+        if (rotWorst > 0.01f || posWorst > 0.002f) {
+            error("clip is marked seamless but the last key differs from the first (rot " +
+                  std::to_string(rotWorst * 57.29578f) + " deg, pos " +
+                  std::to_string(posWorst) + ")");
+        }
+    }
+}
+
+// --- library ---------------------------------------------------------------
+
+bool DanceLibrary::add(HumanoidClip clip) {
+    if (find(clip.id)) {
+        diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,
+                                "duplicate clip id '" + clip.id + "'"});
+        return false;
+    }
+    clips_.push_back(std::move(clip));
+    return true;
+}
+
+void DanceLibrary::loadDirectory(const std::filesystem::path& directory) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(directory, ec)) {
+        diagnostics_.push_back({ClipDiagnostic::Severity::Error, directory.string(),
+                                "dance directory does not exist"});
+        return;
+    }
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& file : files) {
+        ClipLoadResult loaded = loadClipFile(file);
+        for (const ClipDiagnostic& d : loaded.diagnostics) {
+            diagnostics_.push_back(d);
+        }
+        if (loaded.ok) {
+            (void)add(std::move(loaded.clip));
+        }
+    }
+}
+
+const HumanoidClip* DanceLibrary::find(const std::string& id) const {
+    for (const HumanoidClip& clip : clips_) {
+        if (clip.id == id) return &clip;
+    }
+    return nullptr;
+}
+
+const HumanoidClip* DanceLibrary::forStyle(DanceStyle style) const {
+    for (const HumanoidClip& clip : clips_) {
+        if (clip.style == style) return &clip;
+    }
+    return nullptr;
+}
+
+} // namespace bgmedia::motion

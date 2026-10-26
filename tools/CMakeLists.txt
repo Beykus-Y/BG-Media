@@ -35,3 +35,9 @@ if(BGMEDIA_BUILD_MINIAUDIO)
         target_link_libraries(bgmedia_analyze PRIVATE shell32)
     endif()
 endif()
+
+add_executable(bgmedia_motion_qa
+    motion_qa/main.cpp
+)
+target_link_libraries(bgmedia_motion_qa PRIVATE bgmedia_rig)
+target_compile_options(bgmedia_motion_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})

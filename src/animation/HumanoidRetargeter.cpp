@@ -82,6 +82,9 @@ struct HumanoidRetargeter::Impl {
     int rightLowerArm = -1;
     int rightHand = -1;
 
+    // fingers[side][finger][joint]: side 0 left, finger 0..4 thumb/index/middle/ring/little
+    int fingers[2][5][3];
+
     float height = 1.0f;
     float floorY = 0.0f;
 
@@ -95,7 +98,7 @@ struct HumanoidRetargeter::Impl {
                                       int node) const;
     void solveLeg(const LegRig& leg, const std::vector<Mat4>& globals,
                   std::vector<Mat4>& locals, Vec3 target, Vec3 pole, float& footError,
-                  float& lowestY) const;
+                  float& lowestY, const Quat& footWorldDelta = Quat::identity()) const;
 };
 
 bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
@@ -193,6 +196,30 @@ bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
             return false;
         }
     }
+    for (auto& side : fingers) {
+        for (auto& finger : side) {
+            for (int& joint : finger) {
+                joint = -1;
+            }
+        }
+    }
+    {
+        static constexpr const char* kSides[2] = {"left", "right"};
+        static constexpr const char* kFingers[5] = {"Thumb", "Index", "Middle", "Ring", "Little"};
+        static constexpr const char* kJoints[3] = {"Proximal", "Intermediate", "Distal"};
+        for (const vrm::HumanoidEntry& entry : source.humanoidEntries) {
+            for (int sd = 0; sd < 2; ++sd) {
+                for (int fg = 0; fg < 5; ++fg) {
+                    for (int jt = 0; jt < 3; ++jt) {
+                        const std::string name = std::string(kSides[sd]) + kFingers[fg] + kJoints[jt];
+                        if (entry.name == name) {
+                            fingers[sd][fg][jt] = entry.node;
+                        }
+                    }
+                }
+            }
+        }
+    }
     height = std::max(0.05f, source.height);
     floorY = source.bounds.valid ? source.bounds.min.y : 0.0f;
     valid = true;
@@ -251,7 +278,8 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
                                         const std::vector<Mat4>& globals,
                                         std::vector<Mat4>& locals, Vec3 target,
                                         Vec3 pole, float& footError,
-                                        float& lowestY) const {
+                                        float& lowestY,
+                                        const Quat& footWorldDelta) const {
     if (leg.upper < 0 || leg.lower < 0 || leg.foot < 0 || leg.parent < 0) {
         return;
     }
@@ -327,7 +355,9 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
     // Keep the sole level in world space. This removes the visible foot pitch
     // that would otherwise appear when the knee bends.
     const Quat footBindWorld =
-        model->bindGlobalRotations[static_cast<std::size_t>(leg.foot)];
+        (footWorldDelta *
+         model->bindGlobalRotations[static_cast<std::size_t>(leg.foot)])
+            .normalized();
     const Quat footLocal = (calfWorld.conjugate() * footBindWorld).normalized();
     locals[static_cast<std::size_t>(leg.foot)] =
         Mat4::fromTRS(bindLocals[static_cast<std::size_t>(leg.foot)].translationPart(),
@@ -560,6 +590,202 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
         }
     }
     return out;
+}
+
+RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
+                                             double mediaTime,
+                                             const RetargetOptions& options) const {
+    (void)mediaTime;
+    (void)options;
+    RetargetedPose out;
+    if (!impl_ || !impl_->valid) {
+        return out;
+    }
+    const auto started = Clock::now();
+    const vrm::VrmModel& model = *impl_->model;
+    const float height = impl_->height;
+    const Vec3 up = model.up;
+    const Vec3 forward = model.forward;
+    const Vec3 left = -model.right;  // clip frame: +X is the character's left
+
+    // Clip frame -> model axes (a proper rotation, so quaternion vector parts
+    // map directly).
+    const auto toModel = [&](Vec3 v) { return left * v.x + up * v.y + forward * v.z; };
+    const auto quatToModel = [&](const Quat& q) {
+        const Vec3 axis = toModel({q.x, q.y, q.z});
+        return Quat{axis.x, axis.y, axis.z, q.w}.normalized();
+    };
+
+    std::vector<Mat4> locals = impl_->bindLocals;
+    std::vector<Mat4> globals;
+
+    for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+        const auto bone = static_cast<HumanoidBone>(b);
+        if (bone == HumanoidBone::LeftUpperLeg || bone == HumanoidBone::LeftLowerLeg ||
+            bone == HumanoidBone::LeftFoot || bone == HumanoidBone::RightUpperLeg ||
+            bone == HumanoidBone::RightLowerLeg || bone == HumanoidBone::RightFoot) {
+            continue;  // legs are solved by IK from the foot targets
+        }
+        const Quat q = pose.bone[b];
+        if (std::abs(q.w) > 0.99999f) {
+            continue;
+        }
+        impl_->applyLocalDelta(locals, impl_->boneNode[b], quatToModel(q));
+    }
+
+    // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade.
+    {
+        static constexpr float kFlex[5][3] = {{22.0f, 30.0f, 20.0f}, {38.0f, 52.0f, 34.0f},
+                                              {40.0f, 56.0f, 36.0f}, {38.0f, 54.0f, 34.0f},
+                                              {36.0f, 50.0f, 32.0f}};
+        for (int sd = 0; sd < 2; ++sd) {
+            const float curl = std::clamp(pose.hand[static_cast<std::size_t>(sd)], 0.0f, 1.0f);
+            for (int fg = 0; fg < 5; ++fg) {
+                for (int jt = 0; jt < 3; ++jt) {
+                    const int node = impl_->fingers[sd][fg][jt];
+                    if (node < 0) {
+                        continue;
+                    }
+                    // Fingers lie along +/-X of the hand; curling toward the palm is a
+                    // rotation about the forward axis, mirrored between the hands.
+                    const float angle = kFlex[fg][jt] * curl * (kPi / 180.0f) * (sd == 0 ? -1.0f : 1.0f);
+                    impl_->applyLocalDelta(
+                        locals, node,
+                        quatToModel(math::fromAxisAngle({0.0f, 0.0f, 1.0f}, angle * (fg == 0 ? 0.6f : 1.0f))));
+                }
+            }
+        }
+    }
+
+    const std::size_t hipsIndex = impl_->hips >= 0 ? static_cast<std::size_t>(impl_->hips) : 0;
+    const int hipsParent = impl_->hips >= 0 ? impl_->parents[hipsIndex] : -1;
+    const auto addHipsOffset = [&](Vec3 modelOffset) {
+        Vec3 offset = modelOffset;
+        if (hipsParent >= 0) {
+            offset = math::rotate(
+                model.bindGlobalRotations[static_cast<std::size_t>(hipsParent)].conjugate(),
+                offset);
+        }
+        locals[hipsIndex].m[12] += offset.x;
+        locals[hipsIndex].m[13] += offset.y;
+        locals[hipsIndex].m[14] += offset.z;
+    };
+    const Vec3 authoredHips = toModel(pose.hips) * height;
+    if (impl_->hips >= 0) {
+        addHipsOffset(authoredHips);
+    }
+    impl_->evaluate(locals, globals);
+
+    // --- root and stage-space foot targets ---------------------------------
+    const float yaw = safeClamp(pose.rootYaw, -4.0f, 4.0f) * 2.0f * kPi;
+    const Quat rootRot = math::fromAxisAngle(up, yaw);
+    const Quat rootRotInv = rootRot.conjugate();
+    Vec3 pivot = (impl_->legs[0].bindAnkle + impl_->legs[1].bindAnkle) * 0.5f;
+    pivot = pivot - up * math::dot(pivot, up);
+    const Vec3 rootPos = (left * pose.rootX + forward * pose.rootZ) * height;
+
+    Vec3 targets[2];
+    Quat footDelta[2];
+    Vec3 poles[2];
+    for (int f = 0; f < 2; ++f) {
+        const motion::ClipPose::Foot& foot = pose.foot[static_cast<std::size_t>(f)];
+        const Vec3 stage = impl_->legs[f].bindAnkle + toModel(foot.position) * height;
+        const Vec3 rel = stage - pivot - rootPos;
+        targets[f] = pivot + math::rotate(rootRotInv, rel);
+        const float footYaw = foot.yaw * 2.0f * kPi - yaw;
+        const float lift = std::max(0.0f, foot.position.y);
+        const float pointed = (1.0f - foot.contact) *
+                              std::clamp(lift / 0.05f, 0.0f, 1.0f) * 0.42f;
+        const Quat yawQuat = math::fromAxisAngle(up, footYaw);
+        footDelta[f] = (yawQuat * math::fromAxisAngle(left, pointed)).normalized();
+        // The knee points where the toes point (half-way, so it stays natural).
+        poles[f] = math::normalize(forward * 0.6f + math::rotate(yawQuat, forward) * 0.4f);
+    }
+
+    // --- make the planted feet reachable ------------------------------------
+    // The bind legs are almost straight, so lowering the pelvis is how a wide
+    // stance or a lateral weight shift is paid for. Without this a stance foot
+    // would be pulled off the floor by the IK reach clamp.
+    float extraDrop = 0.0f;
+    if (impl_->hips >= 0) {
+        float need[2] = {0.0f, 0.0f};
+        for (int f = 0; f < 2; ++f) {
+            const LegRig& leg = impl_->legs[f];
+            if (leg.upper < 0) continue;
+            const Vec3 hip = impl_->actualPosition(globals, leg.upper);
+            const Vec3 d = hip - targets[f];
+            const float dv = math::dot(d, up);
+            const Vec3 dh = d - up * dv;
+            const float reach = 0.972f * (leg.upperLength + leg.lowerLength);
+            const float dhLen = dh.length();
+            if (dhLen < reach) {
+                need[f] = std::max(0.0f, dv - std::sqrt(reach * reach - dhLen * dhLen));
+            } else {
+                need[f] = std::max(0.0f, dv);
+            }
+        }
+        const float eps = 0.004f * height;
+        extraDrop = 0.5f * (need[0] + need[1] +
+                            std::sqrt((need[0] - need[1]) * (need[0] - need[1]) + eps * eps)) -
+                    0.5f * eps;
+        extraDrop = std::max(0.0f, extraDrop);
+        if (extraDrop > 0.0f) {
+            addHipsOffset(up * (-extraDrop));
+            impl_->evaluate(locals, globals);
+        }
+    }
+
+    float footError = 0.0f;
+    float lowest = std::numeric_limits<float>::max();
+    for (int f = 0; f < 2; ++f) {
+        impl_->solveLeg(impl_->legs[f], globals, locals, targets[f], poles[f], footError,
+                        lowest, footDelta[f]);
+    }
+    impl_->evaluate(locals, globals);
+
+    out.modelTransform = Mat4::fromQuat(rootRot);
+    out.rootOffset = rootPos;
+    out.rootPivot = pivot;
+    out.nodeGlobals = std::move(globals);
+    out.stats.valid = true;
+    out.stats.clipDriven = true;
+    out.stats.footIK = true;
+    out.stats.height = height;
+    out.stats.hipDrop = extraDrop;
+    out.stats.reachHipDrop = extraDrop;
+    out.stats.requestedHipDrop = -math::dot(authoredHips, up);
+    out.stats.maxFootError = footError;
+    out.stats.footReachDeficit = footError;
+    out.stats.lowestFootY = lowest - impl_->floorY;
+    for (int node : impl_->boneNode) {
+        if (node >= 0) {
+            ++out.stats.resolvedBones;
+        } else {
+            ++out.stats.missingBones;
+        }
+    }
+    out.stats.retargetMilliseconds =
+        std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    for (const Mat4& matrix : out.nodeGlobals) {
+        if (!matrix.finite()) {
+            out.stats.valid = false;
+            std::vector<Mat4> fallback;
+            impl_->evaluate(impl_->bindLocals, fallback);
+            out.nodeGlobals = std::move(fallback);
+            out.stats.footIK = false;
+            break;
+        }
+    }
+    return out;
+}
+
+Vec3 HumanoidRetargeter::stagePosition(const RetargetedPose& pose, int node) {
+    if (node < 0 || static_cast<std::size_t>(node) >= pose.nodeGlobals.size()) {
+        return {};
+    }
+    const Vec3 local = pose.nodeGlobals[static_cast<std::size_t>(node)].translationPart();
+    return pose.rootOffset + pose.rootPivot +
+           pose.modelTransform.transformVector(local - pose.rootPivot);
 }
 
 Vec3 RetargetedPose::bonePosition(HumanoidBone bone,

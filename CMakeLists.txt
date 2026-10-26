@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(BGMedia
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "BG Media - music analysis and choreography synchronization engine"
     LANGUAGES C CXX
 )
@@ -109,12 +109,17 @@ endif()
 
 add_library(bgmedia_rig STATIC
     src/animation/HumanoidRetargeter.cpp
+    src/motion3/DanceClip.cpp
+    src/motion3/DanceDirector.cpp
+    src/motion3/DancePlayer.cpp
 )
 add_library(BGMedia::Rig ALIAS bgmedia_rig)
 target_include_directories(bgmedia_rig
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/motion3
 )
 target_link_libraries(bgmedia_rig PUBLIC bgmedia_core bgmedia_vrm)
 target_compile_features(bgmedia_rig PUBLIC cxx_std_20)

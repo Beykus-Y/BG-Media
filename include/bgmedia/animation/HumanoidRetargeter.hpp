@@ -9,6 +9,7 @@
 // pose by HumanoidRetargeter's constructor.
 
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/DanceClip.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
 #include <cstdint>
@@ -54,6 +55,12 @@ struct RetargetStats {
     float lowestFootY = 0.0f;
     int resolvedBones = 0;
     int missingBones = 0;
+
+    // BG Motion 3.0 (applyClip) diagnostics.
+    bool clipDriven = false;
+    float requestedHipDrop = 0.0f;  // authored, metres
+    float reachHipDrop = 0.0f;      // extra drop added so planted feet are reachable
+    float footReachDeficit = 0.0f;  // metres a target stayed unreachable (0 = ok)
 };
 
 struct RetargetedPose {
@@ -62,6 +69,13 @@ struct RetargetedPose {
     std::vector<Mat4> nodeGlobals;
     // Whole-character yaw from CharacterPose::rotation, in turns.
     Mat4 modelTransform = Mat4::identity();
+    // BG Motion 3.0: the character root. The renderer places the model as
+    //   T(rootOffset * scale) * T(rootPivot * scale) * modelTransform *
+    //   T(-rootPivot * scale) * S
+    // so root translation follows the user's model scale. Legacy poses leave
+    // both at zero.
+    Vec3 rootOffset{};
+    Vec3 rootPivot{};
     RetargetStats stats;
 
     [[nodiscard]] Vec3 bonePosition(HumanoidBone bone,
@@ -85,6 +99,16 @@ public:
     [[nodiscard]] RetargetedPose apply(
         const CharacterPose& pose, double mediaTime,
         const RetargetOptions& options = {}) const;
+
+    // BG Motion 3.0: poses a model from a sampled dance clip. Foot targets are
+    // stage-space, so planted feet stay planted while the root turns or moves.
+    [[nodiscard]] RetargetedPose applyClip(
+        const motion::ClipPose& pose, double mediaTime,
+        const RetargetOptions& options = {}) const;
+
+    // Stage-space (world, before the renderer's user scale) position of a node
+    // of a pose produced by applyClip(): includes root yaw and translation.
+    [[nodiscard]] static Vec3 stagePosition(const RetargetedPose& pose, int node);
 
 private:
     struct Impl;

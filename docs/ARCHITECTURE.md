@@ -42,6 +42,10 @@ apps/desktop (SDL3 window + SDL_Renderer UI + miniaudio playback)
          ├── sync       : TransportSnapshot + PlaybackClock
          ├── choreography: DanceCue + CharacterPose, media-time sampling
          └── render     : ICharacterPresenter (no SDL types)
+
+bgmedia_rig
+   ├── motion3   : BG Motion 3.0 DanceClip / BeatClock / DancePlayer
+   └── animation : HumanoidRetargeter (CharacterPose и ClipPose, foot IK)
 ```
 
 Правила:
@@ -68,7 +72,8 @@ apps/desktop (SDL3 window + SDL_Renderer UI + miniaudio playback)
 | **BG Audio** | декодирование, аудиовыход, микширование | decode adapter; воспроизведение в host-приложении |
 | **BG Video** | видео-треки и синхронизация кадров | не реализовано (точки расширения есть) |
 | **BG Beat** | BPM, удары, onset, бас, тишина | `bgmedia_core/analysis` |
-| **BG Motion** | хореография, cues, позы | `bgmedia_core/choreography` |
+| **BG Motion 2.0** | хореография, cues, CharacterPose | `bgmedia_core/choreography` |
+| **BG Motion 3.0** | авторские клипы, BeatClock, расписание, Auto | `bgmedia_rig/motion3` |
 | **BG Sync** | общая модель времени, latency, seek, rate | `bgmedia_core/sync` |
 | **BG VRM** | GLB/VRM 0.x, humanoid rig, textures | `bgmedia_vrm` |
 | **BG Rig** | retargeting BG Motion в humanoid-кости, IK | `bgmedia_rig` |
@@ -84,9 +89,16 @@ apps/desktop (SDL3 window + SDL_Renderer UI + miniaudio playback)
 ### 3.1 3D-конвейер
 
 ```text
-media PCM → Analyzer → CharacterPose (media time)
-    → HumanoidRetargeter (generic, no model indices)
-    → node globals + foot IK
+media PCM → Analyzer → BeatClock ─────────────────────┐
+                           │                          │
+                     BG Motion 3.0 schedule           │
+                           ▼                          │
+                     ClipPose (musical beats)         │
+                           │                          │
+media PCM → Analyzer → CharacterPose (2.0 fallback) ──┤
+                           ▼                          │
+    → HumanoidRetargeter (generic, no model indices) ─┘
+    → node globals + root transform + foot IK
     → skin palette = model * jointGlobal * inverseBind
     → SDL_GPU offscreen (color + D32) → readback
     → SDL_Texture in existing SDL_Renderer UI
@@ -292,6 +304,47 @@ SDL-демо рисует робота из примитивов, но это л
 Anticipation начинается до удара, целевая поза достигается на ударе,
 follow-through/инерция продолжаются после него.
 
+## 7.2 BG Motion 3.0
+
+BG Motion 3.0 — отдельный слой, а не замена 2.0. Публичные типы лежат в
+`include/bgmedia/motion3/`, реализация — в `src/motion3/`, и она собрана в
+`bgmedia_rig`, потому что клипы адресуются humanoid-костями:
+
+```text
+BG Beat analysis ─► BeatClock ─► DanceDirector ─► DanceSchedule
+                                                  │
+                                    DancePlayer ◄─┘
+                                        │
+                                        ▼
+                                    ClipPose
+                                        │
+                             HumanoidRetargeter.applyClip
+                                        │
+                             root transform + foot IK
+```
+
+Ключевые границы:
+
+- `HumanoidClip` — данные, не код: JSON `bgmotion.clip`, кватернионы и
+  height-relative позиции. Нет индексов узлов конкретной VRM.
+- `BeatClock` — единственная связь времени и музыки; клип не имеет своего
+  таймера.
+- `DanceSchedule` — чистая функция media time; crossfade является частью
+  расписания, поэтому seek/pause не ломают переход.
+- `DancePlayer` — фасад для host: library + mode + grid + update(time).
+- `HumanoidRetargeter::applyClip` — отдельный путь ретаргетинга: ноги решаются
+  IK из stage-space целей, а root вынесен в `modelTransform/rootOffset` и
+  применяется рендерером.
+- `bgmedia_core` не знает про VRM, SDL и GPU; BG Beat и BG Sync не изменены.
+
+Планировщик Auto строит расписание целиком из `AnalysisResult`; он не
+мутирует анализ и не запускает второй плеер. Manual и Auto используют один и
+тот же `DanceSchedule`, поэтому переходы, seek и one-shot ведут себя
+одинаково.
+
+Подробный формат, хореография, QA и ограничения:
+[docs/BG_MOTION_3.md](BG_MOTION_3.md).
+
 ## 8. Точки расширения под BG Video / BG Effects
 
 Сейчас видео не реализовано. Чтобы добавить его без переписывания ядра:
@@ -352,5 +405,7 @@ follow-through/инерция продолжаются после него.
   time-stretch.
 - Latency оценивается по периодам устройства; в UI есть sync trim ±150 мс.
 - Нет Android/iOS сборки, видео, эффектов и Telegram-интеграции.
+- BG Motion 3.0 поддерживает VRM 0.x humanoid; VRM 1.0, morph/blink, spring
+  bones и floor collision не входят в текущий этап.
 - In-memory decoder ограничен 1 GiB; для очень длинных файлов нужен стриминговый
   анализ (следующий этап).

@@ -8,6 +8,7 @@ add_executable(bgmedia_tests
     test_motion.cpp
     test_vrm.cpp
     test_retarget.cpp
+    test_dance.cpp
 )
 target_link_libraries(bgmedia_tests PRIVATE
     bgmedia_core
@@ -24,8 +25,11 @@ target_compile_definitions(bgmedia_tests PRIVATE
     BGMEDIA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 target_compile_options(bgmedia_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
+if(MSVC)
+    target_compile_definitions(bgmedia_tests PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+endif()
 
-foreach(test_name audio analysis cache sync choreography motion vrm retarget)
+foreach(test_name audio analysis cache sync choreography motion vrm retarget dance)
     add_test(NAME bgmedia.${test_name} COMMAND bgmedia_tests ${test_name}.)
     set_tests_properties(bgmedia.${test_name} PROPERTIES
         TIMEOUT 120

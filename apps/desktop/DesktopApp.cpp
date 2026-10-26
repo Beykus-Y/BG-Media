@@ -9,6 +9,7 @@
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/version.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
@@ -27,6 +28,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <deque>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -96,6 +98,14 @@ std::string formatMs(double milliseconds) {
     out << std::fixed << std::setprecision(milliseconds < 10.0 ? 1 : 0) << milliseconds
         << " ms";
     return out.str();
+}
+
+const char* modeLabel(motion::DanceMode mode) {
+    return mode == motion::DanceMode::Auto ? "AUTO" : "MANUAL";
+}
+
+std::string clipTitle(const motion::DanceFrame& frame) {
+    return frame.clipName.empty() ? std::string("IDLE") : frame.clipName;
 }
 
 std::string moveName(MoveKind move) {
@@ -248,6 +258,18 @@ struct Layout {
     Rect vrmLoadStage{};
     Rect vrmEmptyLoad{};
     Rect vrmRightLoad{};
+
+    // BG Motion 3.0 controls (3D view).
+    Rect danceManual{};
+    Rect danceAuto{};
+    Rect danceLoop{};
+    Rect danceTest{};
+    Rect danceStyle[5]{};
+    Rect danceBpmMinus{};
+    Rect danceBpmPlus{};
+    Rect dbgFeetBtn{};
+    Rect dbgSkelBtn{};
+    Rect dbgRootBtn{};
 
     Rect ruler{};
     Rect wave{};
@@ -620,6 +642,7 @@ struct DesktopApp::Impl {
         vrmCamera.fov = 0.56f;
         vrm.renderSettings().modelScale = std::clamp(options.vrmScale, 0.2f, 5.0f);
         vrm.renderSettings().modelOffset.y = options.vrmOffsetY;
+        initDance();
 
         // Preserve the old 2D startup path: the SDL_GPU device and private VRM
         // are loaded lazily on the first switch to 3D. Explicit --vrm/--3d or
@@ -884,6 +907,7 @@ struct DesktopApp::Impl {
             title += " - " + track->displayName;
         }
         SDL_SetWindowTitle(window, title.c_str());
+        onTrackChangedForDance();
         if (!captureMode) {
             showToast(track->fromCache ? "Analysis loaded from cache"
                                        : "Analysis complete");
@@ -900,6 +924,9 @@ struct DesktopApp::Impl {
     // ---------------------------------------------------------------------
     void draw3DStage();
     void draw3DRightPanels();
+    void drawDancePanels();
+    void drawDanceDebug(const Rect& stage);
+    void drawPresentation();
     void drawModeChip(const Rect& rect, std::string_view labelText, bool active,
                       SDL_Color color);
 
@@ -1111,6 +1138,15 @@ struct DesktopApp::Impl {
         vrmCamera.pitch = 0.10f;
         vrmCamera.distanceScale = 1.0f;
         vrmCamera.fov = 0.56f;
+        if (options.hasCameraYaw) {
+            vrmCamera.yaw = options.cameraYawDegrees * kPi / 180.0f;
+        }
+        vrmCamera.distanceScale = options.cameraZoom;
+        if (presentation) {
+            // Whole body incl. side steps and turns, centred, a little farther away.
+            vrmCamera.pitch = 0.07f;
+            vrmCamera.distanceScale = options.cameraZoom * 1.26f;
+        }
         if (announce) {
             showToast("Camera reset");
         }
@@ -1166,6 +1202,9 @@ struct DesktopApp::Impl {
     }
 
     void updateDemo(double deltaSeconds) {
+        if (!track && danceLabRunning && !captureMode) {
+            danceLabTime += deltaSeconds;
+        }
         if (!syntheticDemo || track) {
             return;
         }
@@ -1197,6 +1236,19 @@ struct DesktopApp::Impl {
             std::clamp(vrm.renderSettings().modelScale, 0.25f, 3.0f);
         vrm.renderSettings().modelOffset.y =
             std::clamp(vrm.renderSettings().modelOffset.y, -0.5f, 0.5f);
+        if (danceUi()) {
+            const double danceNow = danceTime();
+            updateDance();
+            std::string danceError;
+            if (!vrm.renderClip(danceFrame.pose, danceNow, vrmCamera, vrm.renderSettings(),
+                                &danceError)) {
+                vrmFrameError = danceError;
+            } else {
+                vrmFrameError = vrm.renderError();
+                recordDanceTrails();
+            }
+            return;
+        }
         const double time = vrmMediaTime();
         const CharacterPose pose = sampleActiveAt(time);
         std::string error;
@@ -1205,6 +1257,202 @@ struct DesktopApp::Impl {
         } else {
             vrmFrameError = vrm.renderError();
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // BG Motion 3.0: authored dance clips
+    // ---------------------------------------------------------------------
+    motion::DancePlayer dance;
+    motion::DanceFrame danceFrame;
+    bool useClips = true;
+    double danceLabTime = 0.0;
+    bool danceLabRunning = true;
+    int danceLabBpm = 100;
+    bool dbgFeet = false;
+    bool dbgSkeleton = false;
+    bool dbgRoot = false;
+    bool presentation = false;
+    double presentationSince = 0.0;
+    struct TrailPoint {
+        float x = 0.0f;
+        float z = 0.0f;
+        motion::FootPhase phase = motion::FootPhase::Stance;
+    };
+    std::deque<TrailPoint> footTrail[2];
+    std::deque<std::pair<float, float>> rootTrail;
+
+    [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
+    [[nodiscard]] double danceTime() const {
+        return track ? currentPosition() : danceLabTime;
+    }
+
+    [[nodiscard]] motion::BeatClock danceGrid() const {
+        if (track) {
+            if (motionLabBpm > 0) {
+                return motion::BeatClock::constant(motionLabBpm, 0.45, 4);
+            }
+            return motion::BeatClock::fromAnalysis(track->analysis);
+        }
+        return motion::BeatClock::constant(danceLabBpm, 0.0, 4);
+    }
+
+    void refreshDanceGrid() { dance.setGrid(danceGrid(), danceTime()); }
+
+    void onTrackChangedForDance() {
+        dance.setAnalysis(track ? activeAnalysis() : nullptr);
+        dance.setGrid(danceGrid(), danceTime());
+        if (dance.mode() == motion::DanceMode::Auto && track) {
+            std::fprintf(stderr, "BG Motion Auto plan:\n%s",
+                         dance.director().describeSchedule().c_str());
+        }
+        footTrail[0].clear();
+        footTrail[1].clear();
+        rootTrail.clear();
+    }
+
+    void initDance() {
+        std::filesystem::path directory = options.dancesDirectory;
+        if (directory.empty()) {
+            directory = assetsDirectory / "dances";
+        }
+        const std::size_t count = dance.loadLibrary(directory);
+        for (const motion::ClipDiagnostic& d : dance.library().diagnostics()) {
+            std::fprintf(stderr, "dance %s: %s: %s\n",
+                         d.severity == motion::ClipDiagnostic::Severity::Error ? "error"
+                                                                               : "warning",
+                         d.file.c_str(), d.message.c_str());
+        }
+        std::fprintf(stderr, "BG Motion 3.0: %zu dance clip(s) loaded from %s\n", count,
+                     toUtf8(directory).c_str());
+        useClips = count > 0 && !options.legacyMotion;
+        if (options.danceBpm > 0) {
+            danceLabBpm = std::clamp(options.danceBpm, 40, 220);
+        } else if (options.motionLabBpm > 0) {
+            danceLabBpm = options.motionLabBpm;
+        }
+        dbgFeet = options.debugFeet;
+        dbgSkeleton = options.debugSkeleton;
+        dbgRoot = options.debugRoot;
+        presentation = options.presentation;
+        dance.setGrid(danceGrid(), 0.0);
+        if (!useClips) {
+            return;
+        }
+        if (!options.dancePlan.empty()) {
+            std::vector<motion::DanceStyle> styles;
+            std::stringstream list(options.dancePlan);
+            std::string item;
+            while (std::getline(list, item, ',')) {
+                styles.push_back(motion::styleFromName(item));
+            }
+            dance.startSequence(styles, 0.0, options.danceSpan, /*immediate=*/true);
+            return;
+        }
+        const std::string& name = options.dance;
+        if (name == "test") {
+            dance.startTestDance(0.0);
+        } else if (name == "auto") {
+            dance.setMode(motion::DanceMode::Auto, 0.0);
+        } else if (!name.empty()) {
+            const motion::DanceStyle style = motion::styleFromName(name);
+            dance.select(style, 0.0, /*immediate=*/true);
+        }
+    }
+
+    void selectDance(motion::DanceStyle style) {
+        if (!danceUi()) {
+            showToast("No dance clips loaded");
+            return;
+        }
+        dance.select(style, danceTime());
+        const motion::HumanoidClip* clip = dance.library().forStyle(style);
+        showToast(std::string("Dance: ") + (clip ? clip->name : motion::styleName(style)) +
+                  (track ? "  ·  on the next beat" : ""));
+    }
+
+    void setDanceMode(motion::DanceMode mode) {
+        if (!danceUi()) {
+            return;
+        }
+        dance.setMode(mode, danceTime());
+        if (mode == motion::DanceMode::Auto) {
+            showToast(dance.autoNote().empty() ? "Auto dance" : dance.autoNote());
+        } else {
+            showToast("Manual dance");
+        }
+    }
+
+    void changeDanceBpm(int delta) {
+        if (track) {
+            if (motionLabBpm > 0) {
+                setMotionLab(std::clamp(motionLabBpm + delta, 40, 220));
+                onTrackChangedForDance();
+            } else {
+                showToast("BPM comes from BG Beat; use LAB to override");
+            }
+            return;
+        }
+        danceLabBpm = std::clamp(danceLabBpm + delta, 40, 220);
+        refreshDanceGrid();
+        showToast("Motion Lab " + std::to_string(danceLabBpm) + " BPM");
+    }
+
+    void startTestDance() {
+        if (!danceUi()) {
+            return;
+        }
+        dance.startTestDance(danceTime());
+        showToast("TEST DANCE: Groove > Hip-Hop > Side Step > Energetic");
+    }
+
+    void togglePresentation() {
+        presentation = !presentation;
+        presentationSince = animationTime;
+        if (presentation) {
+            vrmCamera.yaw = kPi;
+            vrmCamera.pitch = 0.07f;
+            vrmCamera.distanceScale = 1.26f;
+            vrmCamera.fov = 0.56f;
+        }
+    }
+
+    void updateDance() {
+        danceFrame = dance.update(danceTime());
+    }
+
+    void recordDanceTrails() {
+        const vrm::VrmModel* loaded = vrm.model();
+        const animation::RetargetedPose& pose = vrm.lastPose();
+        if (!loaded || pose.nodeGlobals.empty()) {
+            return;
+        }
+        const vrm::HumanoidBone ankles[2] = {vrm::HumanoidBone::LeftFoot,
+                                             vrm::HumanoidBone::RightFoot};
+        for (int f = 0; f < 2; ++f) {
+            const int node = loaded->nodeFor(ankles[f]);
+            const math::Vec3 p = animation::HumanoidRetargeter::stagePosition(pose, node);
+            auto& trail = footTrail[f];
+            trail.push_back({p.x, p.z, danceFrame.pose.foot[static_cast<std::size_t>(f)].phase});
+            while (trail.size() > 180) {
+                trail.pop_front();
+            }
+        }
+        rootTrail.emplace_back(pose.rootOffset.x + pose.rootPivot.x,
+                               pose.rootOffset.z + pose.rootPivot.z);
+        while (rootTrail.size() > 240) {
+            rootTrail.pop_front();
+        }
+    }
+
+    [[nodiscard]] static SDL_Color phaseColor(motion::FootPhase phase) {
+        switch (phase) {
+        case motion::FootPhase::Stance: return theme::accent;
+        case motion::FootPhase::Plant: return SDL_Color{150, 255, 120, 255};
+        case motion::FootPhase::Release: return SDL_Color{255, 232, 120, 255};
+        case motion::FootPhase::Pivot: return theme::violet;
+        case motion::FootPhase::Swing: return theme::amber;
+        }
+        return theme::muted;
     }
 
     // ---------------------------------------------------------------------
@@ -1422,6 +1670,11 @@ struct DesktopApp::Impl {
     }
 
     void togglePlay() {
+        if (!track && characterView == CharacterView::Vrm3D && danceUi()) {
+            danceLabRunning = !danceLabRunning;
+            showToast(danceLabRunning ? "Motion Lab running" : "Motion Lab paused");
+            return;
+        }
         if (!track) {
             if (syntheticDemo) {
                 syntheticPlaying = !syntheticPlaying;
@@ -1742,7 +1995,61 @@ struct DesktopApp::Impl {
                 resetVrmCamera();
             }
             break;
+        case SDLK_1:
+        case SDLK_4:
+        case SDLK_0:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                selectDance(key.key == SDLK_1   ? motion::DanceStyle::Groove
+                            : key.key == SDLK_4 ? motion::DanceStyle::Energetic
+                                                : motion::DanceStyle::Idle);
+            }
+            break;
+        case SDLK_5:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                selectDance(motion::DanceStyle::Idle);
+            }
+            break;
+        case SDLK_A:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                setDanceMode(dance.mode() == motion::DanceMode::Auto ? motion::DanceMode::Manual
+                                                                    : motion::DanceMode::Auto);
+            }
+            break;
+        case SDLK_N:
+            if (danceUi()) {
+                dance.setOneShot(!dance.oneShot());
+                showToast(dance.oneShot() ? "ONE SHOT: dance plays once, then Idle" : "LOOP");
+            }
+            break;
+        case SDLK_P:
+            if (characterView == CharacterView::Vrm3D) {
+                togglePresentation();
+            }
+            break;
+        case SDLK_UP:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                changeDanceBpm(shift ? 10 : 5);
+            }
+            break;
+        case SDLK_DOWN:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                changeDanceBpm(shift ? -10 : -5);
+            }
+            break;
+        case SDLK_F5:
+            dbgFeet = !dbgFeet;
+            break;
+        case SDLK_F6:
+            dbgSkeleton = !dbgSkeleton;
+            break;
+        case SDLK_F7:
+            dbgRoot = !dbgRoot;
+            break;
         case SDLK_T:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                startTestDance();
+                break;
+            }
             if (!track) {
                 setSyntheticDemo(syntheticDemo ? 0 : 123, true);
             } else {
@@ -1750,9 +2057,17 @@ struct DesktopApp::Impl {
             }
             break;
         case SDLK_2:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                selectDance(motion::DanceStyle::HipHop);
+                break;
+            }
             setCharacterView(CharacterView::Robot2D, true);
             break;
         case SDLK_3:
+            if (characterView == CharacterView::Vrm3D && danceUi()) {
+                selectDance(motion::DanceStyle::SideStep);
+                break;
+            }
             setCharacterView(CharacterView::Vrm3D, true);
             break;
         case SDLK_F2:
@@ -1789,6 +2104,10 @@ struct DesktopApp::Impl {
             (void)SDL_SetWindowFullscreen(window, fullscreen);
             break;
         case SDLK_ESCAPE:
+            if (presentation) {
+                presentation = false;
+                break;
+            }
             if (fullscreen) {
                 fullscreen = false;
                 (void)SDL_SetWindowFullscreen(window, false);
@@ -1839,6 +2158,58 @@ struct DesktopApp::Impl {
             return;
         }
 
+        if (characterView == CharacterView::Vrm3D && danceUi()) {
+            if (layout.danceManual.contains(x, y)) {
+                setDanceMode(motion::DanceMode::Manual);
+                return;
+            }
+            if (layout.danceAuto.contains(x, y)) {
+                setDanceMode(motion::DanceMode::Auto);
+                return;
+            }
+            if (layout.danceLoop.contains(x, y)) {
+                dance.setOneShot(!dance.oneShot());
+                return;
+            }
+            if (layout.danceTest.contains(x, y)) {
+                startTestDance();
+                return;
+            }
+            static constexpr motion::DanceStyle kStyles[5] = {
+                motion::DanceStyle::Groove, motion::DanceStyle::HipHop,
+                motion::DanceStyle::SideStep, motion::DanceStyle::Energetic,
+                motion::DanceStyle::Idle};
+            for (int i = 0; i < 5; ++i) {
+                if (layout.danceStyle[i].contains(x, y)) {
+                    selectDance(kStyles[i]);
+                    return;
+                }
+            }
+            if (layout.danceBpmMinus.contains(x, y)) {
+                changeDanceBpm(-5);
+                return;
+            }
+            if (layout.danceBpmPlus.contains(x, y)) {
+                changeDanceBpm(5);
+                return;
+            }
+            if (layout.dbgFeetBtn.contains(x, y)) {
+                dbgFeet = !dbgFeet;
+                return;
+            }
+            if (layout.dbgSkelBtn.contains(x, y)) {
+                dbgSkeleton = !dbgSkeleton;
+                return;
+            }
+            if (layout.dbgRootBtn.contains(x, y)) {
+                dbgRoot = !dbgRoot;
+                return;
+            }
+            if (layout.vrmDemoButton.contains(x, y)) {
+                togglePresentation();
+                return;
+            }
+        }
         if (characterView == CharacterView::Vrm3D) {
             if (layout.vrmLoadStage.contains(x, y) ||
                 layout.vrmEmptyLoad.contains(x, y) ||
@@ -1971,6 +2342,22 @@ struct DesktopApp::Impl {
         layout.vrmScalePlus = {right4.x + 104.0f, right4.y + 82.0f, 26.0f, 24.0f};
         layout.vrmOffsetMinus = {right4.x + 268.0f, right4.y + 82.0f, 26.0f, 24.0f};
         layout.vrmOffsetPlus = {right4.x + 298.0f, right4.y + 82.0f, 26.0f, 24.0f};
+
+        const Rect r1 = layout.right1;
+        layout.danceManual = {r1.x + 18.0f, r1.y + 38.0f, 78.0f, 26.0f};
+        layout.danceAuto = {r1.x + 100.0f, r1.y + 38.0f, 78.0f, 26.0f};
+        layout.danceLoop = {r1.x + 182.0f, r1.y + 38.0f, 78.0f, 26.0f};
+        layout.danceTest = {r1.x + 264.0f, r1.y + 38.0f, 90.0f, 26.0f};
+        for (int i = 0; i < 5; ++i) {
+            layout.danceStyle[i] = {r1.x + 18.0f + static_cast<float>(i) * 68.0f, r1.y + 72.0f,
+                                    64.0f, 28.0f};
+        }
+        layout.danceBpmMinus = {r1.x + 120.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceBpmPlus = {r1.x + 150.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        const Rect r3 = layout.right3;
+        layout.dbgFeetBtn = {r3.x + 18.0f, r3.y + 34.0f, 106.0f, 24.0f};
+        layout.dbgSkelBtn = {r3.x + 130.0f, r3.y + 34.0f, 104.0f, 24.0f};
+        layout.dbgRootBtn = {r3.x + 240.0f, r3.y + 34.0f, 114.0f, 24.0f};
     }
 
     // ---------------------------------------------------------------------
@@ -3480,14 +3867,25 @@ void DesktopApp::Impl::draw3DStage() {
     const float bottom = stage.bottom();
     const double pos = vrmMediaTime();
     const double total = duration();
-    const CharacterPose pose = sampleActiveAt(pos);
-    const std::string move = moveName(pose.move);
-    const auto [bar, beat] = currentBarBeat();
+    CharacterPose pose = sampleActiveAt(pos);
+    std::string move = moveName(pose.move);
+    auto [bar, beat] = currentBarBeat();
+    if (danceUi()) {
+        move = clipTitle(danceFrame);
+        pose.accented = danceFrame.pose.accent > 0.5f;
+        const double beatPosition = std::floor(dance.director().beatClock().beatAt(pos));
+        bar = static_cast<int>(std::floor(beatPosition / 4.0)) + 1;
+        beat = dance.director().beatClock().beatInBar(beatPosition) + 1;
+    }
     text->draw(move, left, bottom - 96.0f, 28, FontWeight::SemiBold,
                pose.accented ? theme::amber : theme::text);
     std::string syncState;
     SDL_Color stateColor = theme::accent;
-    if (!track && syntheticDemo) {
+    if (danceUi() && !track) {
+        syncState = std::string("MOTION LAB  ·  NO MUSIC  ·  ") + std::to_string(danceLabBpm) +
+                    " BPM  ·  " + (danceLabRunning ? "RUNNING" : "PAUSED");
+        stateColor = theme::pink;
+    } else if (!track && syntheticDemo) {
         syncState = "SYNTHETIC BEAT GRID  ·  " + std::to_string(motionLabBpm) +
                 " BPM  ·  BG MOTION";
         stateColor = theme::pink;
@@ -3553,8 +3951,11 @@ void DesktopApp::Impl::draw3DStage() {
                             FontWeight::SemiBold),
               left, bottom - 24.0f, 9, theme::red, 0.5f);
     }
-    label("DRAG ORBIT   ·   WHEEL ZOOM   ·   C RESET   ·   G 2D/3D",
+    label("DRAG ORBIT   ·   WHEEL ZOOM   ·   C RESET   ·   G 2D/3D   ·   P PRESENT",
           left, bottom - 14.0f, 8, theme::dim, 0.8f);
+    if (danceUi() && (dbgFeet || dbgSkeleton || dbgRoot)) {
+        drawDanceDebug(stage);
+    }
 
     if (total > 0.001) {
         const Rect trackBar{stage.x + 22.0f, stage.bottom() - 7.0f,
@@ -3590,7 +3991,7 @@ void DesktopApp::Impl::draw3DRightPanels() {
     const vrm::VrmModel* loaded = vrm.model();
 
     // 1. Character / import.
-    {
+    if (!danceUi()) {
         const Rect card = layout.right1;
         panelCard(card);
         text->draw("VRM CHARACTER", card.x + 18.0f, card.y + 14.0f, 11,
@@ -3665,7 +4066,7 @@ void DesktopApp::Impl::draw3DRightPanels() {
     }
 
     // 2. BG Sync and motion.
-    {
+    if (!danceUi()) {
         const Rect card = layout.right2;
         panelCard(card);
         text->draw("BG SYNC / MOTION", card.x + 18.0f, card.y + 14.0f, 11,
@@ -3724,7 +4125,7 @@ void DesktopApp::Impl::draw3DRightPanels() {
     }
 
     // 3. Renderer.
-    {
+    if (!danceUi()) {
         const Rect card = layout.right3;
         panelCard(card);
         text->draw("SDL_GPU RENDERER", card.x + 18.0f, card.y + 14.0f, 11,
@@ -3777,7 +4178,11 @@ void DesktopApp::Impl::draw3DRightPanels() {
         std::string demoLabel;
         bool demoActive = false;
         SDL_Color demoColor = theme::pink;
-        if (track) {
+        if (danceUi()) {
+            demoLabel = "PRESENT (P)";
+            demoActive = presentation;
+            demoColor = theme::accent;
+        } else if (track) {
             demoLabel = motionLabBpm > 0 ? "LAB " + std::to_string(motionLabBpm)
                                          : "MOTION LAB";
             demoActive = motionLabBpm > 0;
@@ -3934,12 +4339,19 @@ void DesktopApp::Impl::renderFrame() {
     if (characterView == CharacterView::Vrm3D) {
         updateVrmFrame();
     }
+    if (presentation && characterView == CharacterView::Vrm3D && danceUi()) {
+        drawPresentation();
+        return;
+    }
     drawBackground();
     drawHeader();
     drawToolbar();
 
     if (characterView == CharacterView::Vrm3D) {
         draw3DStage();
+        if (danceUi()) {
+            drawDancePanels();
+        }
         draw3DRightPanels();
     } else if (state == AppState::Empty) {
         drawEmptyState();
@@ -3951,6 +4363,340 @@ void DesktopApp::Impl::renderFrame() {
 
     drawFooter();
     drawOverlays();
+}
+
+// -------------------------------------------------------------------------
+// BG Motion 3.0 panels, debug views and presentation mode
+// -------------------------------------------------------------------------
+void DesktopApp::Impl::drawDancePanels() {
+    const auto panelCard = [&](const Rect& rect) {
+        ui::fillRoundedRect(renderer, rect, 12.0f, theme::panel);
+        ui::strokeRoundedRect(renderer, rect, 12.0f, theme::border, 1.0f);
+    };
+    const auto button = [&](const Rect& rect, const std::string& caption, bool active,
+                            SDL_Color color) {
+        ui::fillRoundedRect(renderer, rect, 6.0f,
+                            theme::alpha(color, hover(rect) ? 0.20f : (active ? 0.16f : 0.045f)));
+        ui::strokeRoundedRect(renderer, rect, 6.0f,
+                              theme::alpha(color, active ? 0.55f : 0.16f), 1.0f);
+        text->drawCentered(caption, rect.centerX(), rect.y + rect.h * 0.5f - 5.0f, 8,
+                           FontWeight::SemiBold, active ? color : theme::muted);
+    };
+
+    // 1. Dance selector -----------------------------------------------------
+    {
+        const Rect card = layout.right1;
+        panelCard(card);
+        text->draw("DANCE", card.x + 18.0f, card.y + 12.0f, 11, FontWeight::SemiBold,
+                   theme::text);
+        label("BG MOTION 3.0", card.right() - 112.0f, card.y + 15.0f, 8, theme::accent, 1.2f);
+        const bool autoMode = dance.mode() == motion::DanceMode::Auto;
+        button(layout.danceManual, "MANUAL", !autoMode, theme::accent);
+        button(layout.danceAuto, "AUTO", autoMode, theme::violet);
+        button(layout.danceLoop, dance.oneShot() ? "ONE SHOT" : "LOOP", dance.oneShot(),
+               theme::amber);
+        button(layout.danceTest, "TEST DANCE", false, theme::pink);
+
+        static constexpr const char* kStyleLabels[5] = {"GROOVE", "HIP-HOP", "SIDE STEP",
+                                                        "ENERGETIC", "IDLE"};
+        static constexpr motion::DanceStyle kStyles[5] = {
+            motion::DanceStyle::Groove, motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+            motion::DanceStyle::Energetic, motion::DanceStyle::Idle};
+        for (int i = 0; i < 5; ++i) {
+            const bool active =
+                !autoMode ? (dance.selectedStyle() == kStyles[i])
+                          : (danceFrame.style == kStyles[i]);
+            const bool missing = dance.library().forStyle(kStyles[i]) == nullptr;
+            button(layout.danceStyle[i], std::string(kStyleLabels[i]), active && !missing,
+                   missing ? theme::dim : theme::accent);
+        }
+        label(track ? "TEMPO  BG BEAT" : "MOTION LAB", card.x + 18.0f, card.y + 120.0f, 8,
+              theme::dim, 1.1f);
+        button(layout.danceBpmMinus, "-", false, theme::muted);
+        button(layout.danceBpmPlus, "+", false, theme::muted);
+        const int shownBpm =
+            track ? static_cast<int>(std::lround(dance.director().beatClock().bpmAt(danceTime())))
+                  : danceLabBpm;
+        body(std::to_string(shownBpm) + " BPM", card.x + 188.0f, card.y + 116.0f, 12,
+             theme::text, FontWeight::SemiBold);
+        label("1-4 STYLE · 0 IDLE · A AUTO", card.x + 18.0f, card.bottom() - 40.0f, 8,
+              theme::dim, 0.6f);
+        label("N ONE SHOT · T TEST · P PRESENT · UP/DN BPM", card.x + 18.0f,
+              card.bottom() - 26.0f, 8, theme::dim, 0.6f);
+    }
+
+    // 2. Clip state ---------------------------------------------------------
+    {
+        const Rect card = layout.right2;
+        panelCard(card);
+        text->draw("CLIP STATE", card.x + 18.0f, card.y + 12.0f, 11, FontWeight::SemiBold,
+                   theme::text);
+        labelRight(modeLabel(dance.mode()), card.right() - 18.0f, card.y + 15.0f, 8,
+                   dance.mode() == motion::DanceMode::Auto ? theme::violet : theme::accent, 1.0f);
+        float y = card.y + 36.0f;
+        label("CURRENT", card.x + 18.0f, y + 4.0f, 8, theme::dim, 1.1f);
+        text->draw(ellipsize(*text, clipTitle(danceFrame), card.w - 120.0f, 20,
+                             FontWeight::SemiBold),
+                   card.x + 92.0f, y - 2.0f, 20, FontWeight::SemiBold,
+                   danceFrame.pose.accent > 0.5f ? theme::amber : theme::text);
+        y += 30.0f;
+        label("NEXT", card.x + 18.0f, y + 1.0f, 8, theme::dim, 1.1f);
+        std::string nextName = "none";
+        if (!danceFrame.nextClipId.empty()) {
+            if (const motion::HumanoidClip* next = dance.library().find(danceFrame.nextClipId)) {
+                nextName = next->name;
+            }
+        }
+        body(nextName, card.x + 92.0f, y - 2.0f, 11, theme::muted);
+        y += 22.0f;
+        label("PHASE", card.x + 18.0f, y + 1.0f, 8, theme::dim, 1.1f);
+        const Rect phaseBar{card.x + 92.0f, y + 2.0f, card.w - 112.0f, 8.0f};
+        ui::fillRoundedRect(renderer, phaseBar, 4.0f, theme::alpha(theme::white, 0.07f));
+        ui::fillRoundedRect(renderer,
+                            {phaseBar.x, phaseBar.y,
+                             std::max(2.0f, phaseBar.w * std::clamp(danceFrame.phase, 0.0f, 1.0f)),
+                             phaseBar.h},
+                            4.0f, theme::accent);
+        if (const motion::HumanoidClip* clip = dance.library().find(danceFrame.clipId)) {
+            const int beats = std::max(1, static_cast<int>(std::lround(clip->beats)));
+            for (int b = 0; b <= beats; ++b) {
+                const float tx = phaseBar.x + phaseBar.w * static_cast<float>(b) / beats;
+                ui::thickLine(renderer, tx, phaseBar.y - 2.0f, tx,
+                              phaseBar.bottom() + (b % clip->beatsPerBar == 0 ? 4.0f : 1.0f),
+                              1.0f, theme::alpha(theme::white, b % clip->beatsPerBar == 0 ? 0.35f : 0.15f),
+                              false);
+            }
+            for (const motion::AccentMark& mark : clip->accents) {
+                ui::diamond(renderer, phaseBar.x + phaseBar.w * mark.beat / clip->beats,
+                            phaseBar.bottom() + 9.0f, 2.6f, theme::alpha(theme::amber, 0.9f));
+            }
+            body("beat " + formatNumber(std::fmod(std::max(0.0, danceFrame.clipBeat),
+                                                  static_cast<double>(clip->beats)), 1) +
+                     " / " + std::to_string(beats),
+                 phaseBar.x, phaseBar.bottom() + 16.0f, 8, theme::dim);
+        }
+        y += 40.0f;
+        label("SPEED", card.x + 18.0f, y + 1.0f, 8, theme::dim, 1.1f);
+        body(formatNumber(danceFrame.playbackSpeed, 2) + "x  ·  " +
+                 formatNumber(danceFrame.bpm, 0) + " BPM",
+             card.x + 92.0f, y - 2.0f, 11, danceFrame.speedLimited ? theme::amber : theme::muted);
+        if (danceFrame.speedLimited) {
+            labelRight("RANGE LIMIT", card.right() - 18.0f, y, 8, theme::amber, 0.8f);
+        }
+        y += 22.0f;
+        label("BLEND", card.x + 18.0f, y + 1.0f, 8, theme::dim, 1.1f);
+        const Rect blendBar{card.x + 92.0f, y + 2.0f, card.w - 112.0f, 6.0f};
+        ui::fillRoundedRect(renderer, blendBar, 3.0f, theme::alpha(theme::white, 0.07f));
+        if (danceFrame.transitionProgress >= 0.0f) {
+            ui::fillRoundedRect(renderer,
+                                {blendBar.x, blendBar.y,
+                                 std::max(2.0f, blendBar.w * danceFrame.transitionProgress),
+                                 blendBar.h},
+                                3.0f, theme::pink);
+            labelRight(formatNumber(danceFrame.transitionProgress * 100.0f, 0) + "%",
+                       card.right() - 18.0f, y - 2.0f, 8, theme::pink, 0.5f);
+        } else {
+            body("steady", blendBar.x, y + 10.0f, 8, theme::dim);
+        }
+        const std::string reason = !dance.autoNote().empty() ? dance.autoNote()
+                                                             : danceFrame.reason;
+        body(ellipsize(*text, reason.empty() ? std::string("—") : reason, card.w - 36.0f, 8,
+                       FontWeight::Regular),
+             card.x + 18.0f, card.bottom() - 18.0f, 8, theme::dim);
+    }
+
+    // 3. Debug --------------------------------------------------------------
+    {
+        const Rect card = layout.right3;
+        panelCard(card);
+        text->draw("DEBUG", card.x + 18.0f, card.y + 12.0f, 11, FontWeight::SemiBold,
+                   theme::text);
+        button(layout.dbgFeetBtn, "FOOT CONTACT", dbgFeet, theme::accent);
+        button(layout.dbgSkelBtn, "SKELETON", dbgSkeleton, theme::violet);
+        button(layout.dbgRootBtn, "ROOT MOTION", dbgRoot, theme::pink);
+        const auto& stats = vrm.lastPose().stats;
+        float y = card.y + 68.0f;
+        const char* names[2] = {"L", "R"};
+        for (int f = 0; f < 2; ++f) {
+            const auto& foot = danceFrame.pose.foot[static_cast<std::size_t>(f)];
+            ui::fillCircle(renderer, card.x + 24.0f + f * 118.0f, y + 6.0f, 4.0f,
+                           phaseColor(foot.phase));
+            body(std::string(names[f]) + "  " + motion::footPhaseName(foot.phase),
+                 card.x + 34.0f + f * 118.0f, y, 10, theme::muted);
+        }
+        body("ROOT  yaw " + formatNumber(danceFrame.pose.rootYaw * 360.0f, 0) + "°  ·  x " +
+                 formatNumber(danceFrame.pose.rootX * 160.0f, 0) + " z " +
+                 formatNumber(danceFrame.pose.rootZ * 160.0f, 0) + " cm",
+             card.x + 18.0f, y + 20.0f, 9, theme::muted);
+        body("HIPS  +" + formatNumber(stats.reachHipDrop * 100.0f, 1) + " cm reach  ·  IK err " +
+                 formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  " +
+                 formatNumber(vrm.lastRetargetMs(), 2) + " ms",
+             card.x + 18.0f, y + 36.0f, 9, theme::muted);
+    }
+}
+
+void DesktopApp::Impl::drawDanceDebug(const Rect& stage) {
+    const vrm::VrmModel* loaded = vrm.model();
+    const animation::RetargetedPose& pose = vrm.lastPose();
+    if (!loaded || pose.nodeGlobals.empty()) {
+        return;
+    }
+    using vrm::HumanoidBone;
+    const float boxW = 164.0f;
+    const float boxH = 172.0f;
+    const float x0 = stage.right() - boxW - 14.0f;
+    const float y0 = stage.y + 84.0f;
+    static constexpr const char* kTitles[3] = {"FRONT", "SIDE", "TOP"};
+
+    const auto position = [&](HumanoidBone bone, bool* ok) {
+        const int node = loaded->nodeFor(bone);
+        if (ok) {
+            *ok = node >= 0;
+        }
+        return animation::HumanoidRetargeter::stagePosition(pose, node);
+    };
+    static const std::vector<std::vector<HumanoidBone>> kChains = {
+        {HumanoidBone::Hips, HumanoidBone::Spine, HumanoidBone::Chest, HumanoidBone::UpperChest,
+         HumanoidBone::Neck, HumanoidBone::Head},
+        {HumanoidBone::UpperChest, HumanoidBone::LeftShoulder, HumanoidBone::LeftUpperArm,
+         HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand},
+        {HumanoidBone::UpperChest, HumanoidBone::RightShoulder, HumanoidBone::RightUpperArm,
+         HumanoidBone::RightLowerArm, HumanoidBone::RightHand},
+        {HumanoidBone::Hips, HumanoidBone::LeftUpperLeg, HumanoidBone::LeftLowerLeg,
+         HumanoidBone::LeftFoot, HumanoidBone::LeftToes},
+        {HumanoidBone::Hips, HumanoidBone::RightUpperLeg, HumanoidBone::RightLowerLeg,
+         HumanoidBone::RightFoot, HumanoidBone::RightToes},
+    };
+
+    for (int v = 0; v < 3; ++v) {
+        const Rect box{x0, y0 + static_cast<float>(v) * (boxH + 6.0f), boxW, boxH};
+        ui::fillRoundedRect(renderer, box, 8.0f, theme::alpha(theme::panel, 0.82f));
+        ui::strokeRoundedRect(renderer, box, 8.0f, theme::alpha(theme::borderBright, 0.7f), 1.0f);
+        label(kTitles[v], box.x + 8.0f, box.y + 6.0f, 8, theme::dim, 1.2f);
+        const float scale = v == 2 ? 100.0f : (boxH - 40.0f) / std::max(0.5f, loaded->height);
+        const float floorPx = box.bottom() - 12.0f;
+        const float cx = box.centerX();
+        const float cy = box.centerY() + 6.0f;
+        const auto map = [&](math::Vec3 p) {
+            if (v == 0) return SDL_FPoint{cx - p.x * scale, floorPx - p.y * scale};
+            if (v == 1) return SDL_FPoint{cx - p.z * scale, floorPx - p.y * scale};
+            return SDL_FPoint{cx - p.x * scale, cy + p.z * scale};
+        };
+        if (v < 2) {
+            ui::thickLine(renderer, box.x + 8.0f, floorPx, box.right() - 8.0f, floorPx, 1.0f,
+                          theme::alpha(theme::white, 0.18f), false);
+        } else {
+            ui::thickLine(renderer, box.x + 8.0f, cy, box.right() - 8.0f, cy, 1.0f,
+                          theme::alpha(theme::white, 0.08f), false);
+            ui::thickLine(renderer, cx, box.y + 22.0f, cx, box.bottom() - 6.0f, 1.0f,
+                          theme::alpha(theme::white, 0.08f), false);
+        }
+        if (dbgSkeleton && v < 2) {
+            for (const auto& chain : kChains) {
+                bool havePrev = false;
+                SDL_FPoint prev{};
+                for (HumanoidBone bone : chain) {
+                    bool ok = false;
+                    const math::Vec3 p = position(bone, &ok);
+                    if (!ok) {
+                        continue;
+                    }
+                    const SDL_FPoint q = map(p);
+                    if (havePrev) {
+                        ui::thickLine(renderer, prev.x, prev.y, q.x, q.y, 2.0f,
+                                      theme::alpha(theme::white, 0.85f), true);
+                    }
+                    ui::fillCircle(renderer, q.x, q.y, 2.0f, theme::alpha(theme::accent, 0.95f));
+                    prev = q;
+                    havePrev = true;
+                }
+            }
+        }
+        if (dbgFeet) {
+            for (int f = 0; f < 2; ++f) {
+                const auto& trail = footTrail[f];
+                if (v == 2) {
+                    std::size_t index = 0;
+                    for (const TrailPoint& point : trail) {
+                        const float age = static_cast<float>(index++) / std::max<std::size_t>(1, trail.size());
+                        const SDL_FPoint q = map({point.x, 0.0f, point.z});
+                        ui::fillCircle(renderer, q.x, q.y, 1.6f,
+                                       theme::alpha(phaseColor(point.phase), 0.15f + 0.6f * age));
+                    }
+                }
+                bool ok = false;
+                const math::Vec3 ankle =
+                    position(f == 0 ? HumanoidBone::LeftFoot : HumanoidBone::RightFoot, &ok);
+                if (ok) {
+                    const auto phase = danceFrame.pose.foot[static_cast<std::size_t>(f)].phase;
+                    const SDL_FPoint q = map(ankle);
+                    ui::fillCircle(renderer, q.x, q.y, 5.0f, theme::alpha(phaseColor(phase), 0.9f));
+                    text->drawCentered(f == 0 ? "L" : "R", q.x, q.y - 4.0f, 7,
+                                       FontWeight::SemiBold, SDL_Color{6, 10, 14, 255});
+                }
+            }
+        }
+        if (dbgRoot) {
+            if (v == 2) {
+                bool first = true;
+                SDL_FPoint prev{};
+                for (const auto& point : rootTrail) {
+                    const SDL_FPoint q = map({point.first, 0.0f, point.second});
+                    if (!first) {
+                        ui::thickLine(renderer, prev.x, prev.y, q.x, q.y, 1.5f,
+                                      theme::alpha(theme::pink, 0.7f), false);
+                    }
+                    prev = q;
+                    first = false;
+                }
+                const math::Vec3 centre = pose.rootOffset + pose.rootPivot;
+                const SDL_FPoint c = map(centre);
+                const math::Vec3 forward = pose.modelTransform.transformVector(loaded->forward);
+                const SDL_FPoint tip = map({centre.x + forward.x * 0.25f, 0.0f,
+                                            centre.z + forward.z * 0.25f});
+                ui::thickLine(renderer, c.x, c.y, tip.x, tip.y, 2.0f, theme::pink, true);
+                ui::fillCircle(renderer, c.x, c.y, 3.0f, theme::pink);
+            } else {
+                bool ok = false;
+                const math::Vec3 hips = position(HumanoidBone::Hips, &ok);
+                if (ok) {
+                    const SDL_FPoint q = map(hips);
+                    ui::ring(renderer, q.x, q.y, 5.0f, 1.5f, theme::pink);
+                }
+            }
+        }
+    }
+}
+
+void DesktopApp::Impl::drawPresentation() {
+    ui::fillRect(renderer, {0.0f, 0.0f, 1440.0f, 900.0f}, SDL_Color{5, 7, 12, 255});
+    const Rect full{0.0f, 0.0f, 1440.0f, 900.0f};
+    std::string error;
+    const bool ok = vrm.ready() && vrm.renderable() && vrm.draw(renderer, ui::fr(full), &error, true);
+    if (!ok) {
+        ui::verticalGradient(renderer, full, SDL_Color{16, 24, 38, 255}, SDL_Color{4, 6, 10, 255});
+        text->drawCentered("Load a VRM model to present", 720.0f, 430.0f, 16, FontWeight::SemiBold,
+                           theme::muted);
+    }
+    // soft vignette so the picture sits on the screen without UI chrome
+    ui::verticalGradient(renderer, {0.0f, 0.0f, 1440.0f, 120.0f}, SDL_Color{5, 7, 12, 150},
+                         SDL_Color{5, 7, 12, 0});
+    ui::verticalGradient(renderer, {0.0f, 740.0f, 1440.0f, 160.0f}, SDL_Color{5, 7, 12, 0},
+                         SDL_Color{5, 7, 12, 190});
+    const std::string caption = clipTitle(danceFrame) + (track ? "" : "  ·  " + std::to_string(danceLabBpm) + " BPM");
+    text->drawCentered(caption, 720.0f, 842.0f, 18, FontWeight::SemiBold,
+                       theme::alpha(theme::text, 0.88f));
+    const double since = animationTime - presentationSince;
+    if (since < 4.0 && !captureMode) {
+        const float a = static_cast<float>(std::clamp(1.0 - (since - 2.5) / 1.5, 0.0, 1.0));
+        text->drawCentered("P / ESC to leave presentation  ·  1-4 change dance", 720.0f, 872.0f, 10,
+                           FontWeight::Regular, theme::alpha(theme::muted, a));
+    }
+    if (!toast.empty() && animationTime < toastUntil) {
+        const float alpha = static_cast<float>(std::clamp((toastUntil - animationTime) / 0.4, 0.0, 1.0));
+        text->drawCentered(toast, 720.0f, 40.0f, 11, FontWeight::SemiBold,
+                           theme::alpha(theme::text, alpha * 0.8f));
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -4041,6 +4787,9 @@ int DesktopApp::Impl::runCapture() {
             capturePosition = std::clamp(options.captureTime, 0.0, duration());
         }
         animationTime = options.captureTime;
+        if (!track) {
+            danceLabTime = options.captureTime;
+        }
     }
     if (characterView == CharacterView::Vrm3D && vrm.ready()) {
         // Warm up the GPU upload/pipeline state so the captured frame is the
