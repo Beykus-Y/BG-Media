@@ -99,6 +99,9 @@ struct HumanoidRetargeter::Impl {
     // hips and legs are untouched, so foot IK is unaffected.
     void refineArms(std::vector<Mat4>& locals, std::vector<Mat4>& globals,
                     float margin, RetargetStats& stats) const;
+    // Pushes the FREE foot's IK target away from the other leg (see RetargetOptions::legCollision).
+    void refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2], const Vec3 poles[2],
+                    const float contact[2], float margin, RetargetStats& stats) const;
     void evaluate(const std::vector<Mat4>& locals,
                   std::vector<Mat4>& globals) const;
     void applyLocalDelta(std::vector<Mat4>& locals, int node,
@@ -322,7 +325,7 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     }
 
     // Mesh calibration: classify skinned vertices by dominant joint.
-    enum : int { kNone = -1, kTorso = 0, kUpper = 1, kFore = 2, kHand = 3, kFinger = 4 };
+    enum : int { kNone = -1, kTorso = 0, kUpper = 1, kFore = 2, kHand = 3, kFinger = 4, kThigh = 5, kShin = 6, kFoot = 7 };
     std::vector<int> cls(m.nodes.size(), kNone);
     const auto mark = [&](int node, int c) {
         if (node >= 0 && static_cast<std::size_t>(node) < cls.size()) {
@@ -338,6 +341,12 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     mark(rightLowerArm, kFore);
     mark(leftHand, kHand);
     mark(rightHand, kHand);
+    for (int sd = 0; sd < 2; ++sd) {
+        mark(legs[sd].upper, kThigh);
+        mark(legs[sd].lower, kShin);
+        mark(legs[sd].foot, kFoot);
+        mark(legs[sd].toes, kFoot);
+    }
     for (int sd = 0; sd < 2; ++sd)
         for (int fg = 0; fg < 5; ++fg)
             for (int jt = 0; jt < 3; ++jt) mark(fingers[sd][fg][jt], kFinger);
@@ -367,7 +376,7 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
         int band;
     };
     std::vector<TorsoSample> torsoSamples;
-    std::vector<float> lateral[kProxyBands], front[kProxyBands], back[kProxyBands], rUpper, rFore, rHand, rFinger;
+    std::vector<float> lateral[kProxyBands], front[kProxyBands], back[kProxyBands], rUpper, rFore, rHand, rFinger, rThigh, rShin, rFoot;
     const float torsoSpan = (neckPos - hipsPos).length();
     const Vec3 right = m.right;
     const Vec3 forward = m.forward;
@@ -427,6 +436,18 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
                     rFore.push_back(distanceToSegment(
                         p, bindPosition(leftSide ? leftLowerArm : rightLowerArm),
                         bindPosition(leftSide ? leftHand : rightHand)));
+                } else if (c == kThigh || c == kShin || c == kFoot) {
+                    const int sd = (node == legs[0].upper || node == legs[0].lower || node == legs[0].foot || node == legs[0].toes) ? 0 : 1;
+                    const LegRig& lg = legs[sd];
+                    if (c == kThigh) {
+                        rThigh.push_back(distanceToSegment(p, bindPosition(lg.upper), bindPosition(lg.lower)));
+                    } else if (c == kShin) {
+                        rShin.push_back(distanceToSegment(p, bindPosition(lg.lower), bindPosition(lg.foot)));
+                    } else {
+                        const Vec3 ankle = bindPosition(lg.foot);
+                        const Vec3 toe = lg.toes >= 0 ? bindPosition(lg.toes) : ankle + forward * (0.05f * height);
+                        rFoot.push_back(distanceToSegment(p, ankle, ankle + (toe - ankle) * 1.6f));
+                    }
                 } else if (c == kFinger) {
                     Vec3 sa{}, sb{};
                     if (fingerSegment(node, sa, sb)) {
@@ -515,6 +536,63 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     }
     if (rFore.size() >= 50) {
         proxy.foreArmRadius = std::clamp(percentile(rFore, 0.95f), 0.010f * height, 0.060f * height);
+    }
+    proxy.thighRadius = 0.045f * height;
+    proxy.shinRadius = 0.032f * height;
+    proxy.footRadius = 0.026f * height;
+    {
+        const Vec3 ankle = bindPosition(legs[0].foot);
+        const Vec3 toe = legs[0].toes >= 0 ? bindPosition(legs[0].toes) : ankle + m.forward * (0.05f * height);
+        proxy.footLength = std::max(0.05f * height, 1.6f * (toe - ankle).length());
+    }
+    if (rThigh.size() >= 50) {
+        proxy.thighRadius = std::clamp(percentile(rThigh, 0.90f), 0.020f * height, 0.090f * height);
+    }
+    if (rShin.size() >= 50) {
+        proxy.shinRadius = std::clamp(percentile(rShin, 0.90f), 0.015f * height, 0.070f * height);
+    }
+    if (rFoot.size() >= 50) {
+        proxy.footRadius = std::clamp(percentile(rFoot, 0.90f), 0.012f * height, 0.060f * height);
+    }
+    {
+        // The proxy must not call the model's own standing pose a collision: neutral legs hang
+        // side by side and, with mesh-measured radii, thick thighs already overlap. Scale the
+        // three leg radii so that the bind stance keeps a small positive gap; legs that are
+        // spread wider than the radii keep their measured size (scale 1).
+        float scale = 1.0f;
+        const float fwdLen = proxy.footLength;
+        struct C {
+            Vec3 a, b;
+            float r, from;
+        };
+        C caps[2][3];
+        for (int f = 0; f < 2; ++f) {
+            caps[f][0] = {legs[f].bindUpper, legs[f].bindKnee, proxy.thighRadius, 0.45f};
+            caps[f][1] = {legs[f].bindKnee, legs[f].bindAnkle, proxy.shinRadius, 0.0f};
+            caps[f][2] = {legs[f].bindAnkle, legs[f].bindAnkle + m.forward * fwdLen, proxy.footRadius, 0.0f};
+        }
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                const float from = (i == 0 && j == 0) ? 0.45f : 0.0f;
+                for (int sa = 0; sa <= 6; ++sa) {
+                    const Vec3 pa = caps[0][i].a + (caps[0][i].b - caps[0][i].a) * (((i == 0) ? 0.45f : 0.0f) + (1.0f - ((i == 0) ? 0.45f : 0.0f)) * static_cast<float>(sa) / 6.0f);
+                    for (int sb = 0; sb <= 6; ++sb) {
+                        const Vec3 pb = caps[1][j].a + (caps[1][j].b - caps[1][j].a) * (((j == 0) ? 0.45f : 0.0f) + (1.0f - ((j == 0) ? 0.45f : 0.0f)) * static_cast<float>(sb) / 6.0f);
+                        const float radii = caps[0][i].r + caps[1][j].r;
+                        const float dist = (pa - pb).length();
+                        if (radii > 1.0e-5f) {
+                            scale = std::min(scale, (dist - 0.003f * height) / radii);
+                        }
+                    }
+                }
+                (void)from;
+            }
+        }
+        scale = std::clamp(scale, 0.35f, 1.0f);
+        proxy.thighRadius *= scale;
+        proxy.shinRadius *= scale;
+        proxy.footRadius *= scale;
+        proxy.legRadiusScale = scale;
     }
     if (rFinger.size() >= 50) {
         proxy.fingerRadius = std::clamp(percentile(rFinger, 0.90f), 0.004f * height, 0.030f * height);
@@ -799,6 +877,149 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
     }
     stats.armClearanceRaw = rawMin == std::numeric_limits<float>::max() ? 0.0f : rawMin;
     stats.armClearanceMin = finalMin == std::numeric_limits<float>::max() ? 0.0f : finalMin;
+}
+
+void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2],
+                                          const Vec3 poles[2], const float contact[2], float margin,
+                                          RetargetStats& stats) const {
+    if (!proxy.valid || proxy.thighRadius <= 0.0f || legs[0].upper < 0 || legs[1].upper < 0) {
+        return;
+    }
+    stats.legProxy = true;
+    const float gap = margin * height;
+    const float eps = 0.004f * height;
+    const float maxMove = 0.18f * height;
+    const Vec3 up = model->up;
+    const Vec3 forward = model->forward;
+    Vec3 hip[2] = {actualPosition(globals, legs[0].upper), actualPosition(globals, legs[1].upper)};
+    const Vec3 original[2] = {targets[0], targets[1]};
+
+    // The knee the two-bone solver will choose (same maths as solveLeg).
+    const auto kneeOf = [&](int f, Vec3 target) {
+        const LegRig& leg = legs[f];
+        Vec3 reach = target - hip[f];
+        float distance = reach.length();
+        if (distance < kTiny) {
+            reach = -up;
+            distance = kTiny;
+        }
+        const Vec3 direction = reach / distance;
+        const float maxReach = leg.upperLength + leg.lowerLength - 0.002f;
+        const float minReach = std::abs(leg.upperLength - leg.lowerLength) + 0.002f;
+        distance = std::clamp(distance, minReach, maxReach);
+        Vec3 bend = poles[f] - direction * math::dot(poles[f], direction);
+        if (bend.lengthSquared() < 1.0e-8f) bend = math::cross(model->right, direction);
+        bend = math::normalize(bend);
+        const float along = (leg.upperLength * leg.upperLength - leg.lowerLength * leg.lowerLength + distance * distance) /
+                            (2.0f * distance);
+        const float lift = std::sqrt(std::max(0.0f, leg.upperLength * leg.upperLength - along * along));
+        return hip[f] + direction * along + bend * lift;
+    };
+
+    struct Cap {
+        Vec3 a, b;
+        float r;
+        float from;  // first usable parameter (the thighs touch at the crotch by design)
+    };
+    struct Hit {
+        float clearance = 1.0e9f;
+        Vec3 p0, p1;
+        float u0 = 1.0f, u1 = 1.0f;  // position along each leg (0 hip .. 1 ankle)
+    };
+    const auto evaluate = [&]() {
+        Cap caps[2][3];
+        float legParam[2][3][2];  // leg parameter range of each capsule
+        for (int f = 0; f < 2; ++f) {
+            const Vec3 knee = kneeOf(f, targets[f]);
+            const float lenT = (knee - hip[f]).length(), lenS = (targets[f] - knee).length();
+            const float total = std::max(1.0e-4f, lenT + lenS);
+            caps[f][0] = {hip[f], knee, proxy.thighRadius, 0.45f};
+            caps[f][1] = {knee, targets[f], proxy.shinRadius, 0.0f};
+            caps[f][2] = {targets[f], targets[f] + forward * proxy.footLength, proxy.footRadius, 0.0f};
+            legParam[f][0][0] = 0.0f;
+            legParam[f][0][1] = lenT / total;
+            legParam[f][1][0] = lenT / total;
+            legParam[f][1][1] = 1.0f;
+            legParam[f][2][0] = legParam[f][2][1] = 1.0f;
+        }
+        Hit best;
+        constexpr int kSamples = 6;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                const Cap& A = caps[0][i];
+                const Cap& B = caps[1][j];
+                const float fromA = (i == 0 && j == 0) ? std::max(A.from, B.from) : (i == 0 ? A.from : 0.0f);
+                const float fromB = (i == 0 && j == 0) ? std::max(A.from, B.from) : (j == 0 ? B.from : 0.0f);
+                for (int s = 0; s <= kSamples; ++s) {
+                    const float ta = fromA + (1.0f - fromA) * static_cast<float>(s) / kSamples;
+                    const Vec3 pa = A.a + (A.b - A.a) * ta;
+                    for (int t = 0; t <= kSamples; ++t) {
+                        const float tb = fromB + (1.0f - fromB) * static_cast<float>(t) / kSamples;
+                        const Vec3 pb = B.a + (B.b - B.a) * tb;
+                        const float c = (pa - pb).length() - A.r - B.r - gap;
+                        if (c < best.clearance) {
+                            best.clearance = c;
+                            best.p0 = pa;
+                            best.p1 = pb;
+                            best.u0 = legParam[0][i][0] + (legParam[0][i][1] - legParam[0][i][0]) * ta;
+                            best.u1 = legParam[1][j][0] + (legParam[1][j][1] - legParam[1][j][0]) * tb;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    };
+
+    Hit hit = evaluate();
+    stats.legClearanceRaw = hit.clearance;
+    if (hit.clearance < 0.0f) {
+        // Only a foot that is off the floor may move; a planted foot is never dragged.
+        // (1 - contact)^1.5: the correction is made while the foot is really in the air and
+        // fades out before it lands, so it never drags a foot across the floor.
+        const float w0 = std::pow(1.0f - std::clamp(contact[0], 0.0f, 1.0f), 1.5f);
+        const float w1 = std::pow(1.0f - std::clamp(contact[1], 0.0f, 1.0f), 1.5f);
+        const float sum = w0 + w1;
+        if (sum < 0.15f) {
+            stats.legConflictPlanted = true;
+        }
+        // Mobility grows continuously with lift-off, so nothing switches at a contact change.
+        const float norm = std::max(sum, 0.6f);
+        const float a0 = w0 / norm;
+        const float a1 = w1 / norm;
+        if (a0 + a1 > 1.0e-3f) {
+            // A deterministic way round: the free LEFT foot steps forward (in front of the
+            // standing leg), the free RIGHT foot steps back (behind it), and both are raised
+            // a little. The separating direction never depends on which capsule pair happens to
+            // be the closest, which flips from frame to frame when legs lie on top of each other.
+            const auto place = [&](float t) {
+                targets[0] = original[0] + forward * (t * a0) + up * (0.4f * t * a0);
+                targets[1] = original[1] - forward * (t * a1) + up * (0.4f * t * a1);
+            };
+            // Smallest travel that clears the legs; linear interpolation inside the last step
+            // makes the result a continuous function of the pose.
+            const float step = 0.005f * height;
+            float previous = hit.clearance;
+            float travel = -1.0f;
+            for (float t = step; t <= maxMove + 1.0e-6f; t += step) {
+                place(t);
+                const Hit h = evaluate();
+                if (h.clearance >= 0.0f) {
+                    travel = (t - step) + step * (-previous) / std::max(1.0e-6f, h.clearance - previous);
+                    break;
+                }
+                previous = h.clearance;
+            }
+            if (travel < 0.0f) {
+                travel = maxMove;  // cannot clear within the bound: bounded fallback
+            }
+            place(travel);
+            stats.legCorrection = std::max(stats.legCorrection,
+                                           std::max((targets[0] - original[0]).length(), (targets[1] - original[1]).length()));
+            hit = evaluate();
+        }
+    }
+    stats.legClearanceMin = hit.clearance;
 }
 
 CollisionProxyInfo HumanoidRetargeter::collisionProxy() const {
@@ -1414,6 +1635,11 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
             addHipsOffset(up * (-extraDrop));
             impl_->evaluate(locals, globals);
         }
+    }
+
+    if (options.footIK && options.legCollision) {
+        const float contacts[2] = {pose.foot[0].contact, pose.foot[1].contact};
+        impl_->refineLegs(globals, targets, poles, contacts, options.legClearanceMargin, out.stats);
     }
 
     float footError = 0.0f;

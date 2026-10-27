@@ -346,5 +346,46 @@
       ]
     },
     "check": "bgmedia_skin_check --eye-occlusion"
+  },
+  "followup_nemesis_mp3": {
+    "commit": "7961a67",
+    "mode": "desktop crossfade, 0-44 s, skip 4 s",
+    "tests": {
+      "unit": 178,
+      "ctest": "16/16",
+      "asan": "178/178",
+      "sync_qa_3_1": "identical except timing"
+    },
+    "authored_leg_crossings": {
+      "Nemesis": {
+        "hiphop": {
+          "frames": 110,
+          "max_tris": 601
+        },
+        "sidestep": {
+          "frames": 73,
+          "max_tris": 340
+        }
+      },
+      "Model1": {
+        "hiphop": {
+          "frames": 44,
+          "max_tris": 531
+        },
+        "sidestep": {
+          "frames": 34,
+          "max_tris": 350
+        }
+      }
+    },
+    "procedural_leg_crossings_Model1": 0,
+    "leg_proxy_experiment": {
+      "default": false,
+      "best_tris_hiphop": 238,
+      "ankle_speed_ms": "9-25 vs 1.2 baseline",
+      "ground_drag_cm": "170-720 vs 0",
+      "verdict": "rejected"
+    },
+    "hand_peaks": "periodic authored accents (energetic phase 0.75, neon 0.118); no discontinuity"
   }
 }

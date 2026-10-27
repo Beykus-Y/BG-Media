@@ -46,6 +46,7 @@ struct Options {
     bool spring = false, immediate = false;
     double fps = 60.0, from = 0.0, to = 30.0, selectAt = 0.0, mesh_hz = 15.0, focus = -1.0, seek = -1.0;
     bool legMesh = true, armMesh = true;
+    bool legProxy = false, armProxy = true;
     double skip = 0.0;  // ignore the first seconds in the summaries (clip fade-in transient)
 };
 
@@ -77,6 +78,8 @@ struct Frame {
     float springDisp = 0;
     int legCross = -1, armCross = -1;    // -1 = not sampled
     float ikError = 0;
+    float legCorr = 0, legClear = 0;
+    bool legConflict = false;
 };
 
 double angleBetween(const math::Quat& a, const math::Quat& b) {
@@ -127,6 +130,9 @@ int main(int argc, char** argv) {
         else if (a == "--mesh-hz") o.mesh_hz = std::atof(next().c_str());
         else if (a == "--focus") o.focus = std::atof(next().c_str());
         else if (a == "--seek") o.seek = std::atof(next().c_str());
+        else if (a == "--no-leg-proxy") o.legProxy = false;
+        else if (a == "--leg-proxy") o.legProxy = true;
+        else if (a == "--no-arm-proxy") o.armProxy = false;
         else if (a == "--skip") o.skip = std::atof(next().c_str());
         else if (a == "--no-leg-mesh") o.legMesh = false;
         else if (a == "--no-arm-mesh") o.armMesh = false;
@@ -227,7 +233,10 @@ int main(int argc, char** argv) {
             selected = true;
         }
         const motion::DanceFrame df = player.update(t);
-        animation::RetargetedPose pose = rig.applyClip(df.pose, t);
+        animation::RetargetOptions ropt;
+        ropt.legCollision = o.legProxy;
+        ropt.armCollision = o.armProxy;
+        animation::RetargetedPose pose = rig.applyClip(df.pose, t, ropt);
         if (o.spring) {
             if (f == 0) spring.reset(pose);
             spring.update(pose, f == 0 ? 0.0 : t - lastMedia, springSettings);
@@ -266,6 +275,9 @@ int main(int argc, char** argv) {
         fr.hipsOffset = df.pose.hips;
         fr.springDisp = spring.stats().maxDisplacement;
         fr.ikError = pose.stats.maxFootError;
+        fr.legCorr = pose.stats.legCorrection;
+        fr.legClear = pose.stats.legClearanceRaw;
+        fr.legConflict = pose.stats.legConflictPlanted;
         if (f % meshEvery == 0) {
             meshProbe.skin(pose);
             if (o.legMesh) fr.legCross = static_cast<int>(meshProbe.crossings(probe::Region::LegL, probe::Region::LegR).size());
@@ -408,6 +420,18 @@ int main(int argc, char** argv) {
     }
     std::printf("MESH (sampled %d frames @%.0f Hz): leg-vs-leg triangle crossings in %d frames (max %d tris); arm-vs-torso crossings in %d frames (max %d tris)\n",
                 sampled, o.mesh_hz, legFrames, legMax, armFrames, armMax);
+    {
+        double maxCorr = 0;
+        int corrected = 0, conflicts = 0;
+        for (const Frame& f : frames) {
+            if (f.t < o.skip) continue;
+            maxCorr = std::max<double>(maxCorr, f.legCorr);
+            corrected += f.legCorr > 1e-5f;
+            conflicts += f.legConflict;
+        }
+        std::printf("LEG PROXY: %d frames corrected, max foot-target move %.1f mm, %d frames with both feet planted and overlapping (not movable)\n",
+                    corrected, maxCorr * 1000.0, conflicts);
+    }
     // list leg-crossing time ranges
     {
         std::string ranges;
