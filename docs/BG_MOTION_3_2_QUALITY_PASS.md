@@ -129,7 +129,7 @@ keeping all joint positions (`reorientNode`). Checked at root yaw 0 / 0.25 / −
 
 ## F. Mesh clipping
 
-**Status: the reported mesh clipping was not reproduced on the frames I sampled, and not solved.**
+**Status: not reproduced by the proxy or on my first sampled frames; a later mesh-level tool (F.1) does find candidate overlap frames. Not solved.**
 
 What I did:
 
@@ -158,6 +158,32 @@ CPU-vs-GPU skinning agreement, wireframe/opaque passes. `adapters/sdlgpu` was no
 transparency or depth-sorting explanation for what you saw is **open**. The next useful step is a mesh-level
 penetration measurement (CPU skinning of arm-dominant vertices against nearest torso/hair vertices), which was
 not built.
+
+### F.1 Mesh-level diagnostic (follow-up): `bgmedia_mesh_clip`
+
+Built after the first pass, diagnosis only; no new collision system. It CPU-skins all 100 816 vertices of Model1
+with the retargeted pose and counts forearm/hand/finger vertices behind the nearest torso vertex's normal
+(vertex-vs-nearest-vertex, so an approximation that can over- or under-report), and arm vertices within 4 mm of hair.
+Upper-arm skin is only tested against hair, because a hanging upper arm lies against the torso by construction
+(a first version without that rule flagged 400/400 frames). Command: `bgmedia_mesh_clip [--clips a,b] [--depth-mm 8]`.
+
+Result, 3 dances × 40 s at 10 Hz, overlays Full, spring off, depth threshold 8 mm, "frame" = at least 5 vertices:
+
+| dance | frames with forearm/hand behind torso | worst depth | frames with arm within 4 mm of hair |
+|---|---|---|---|
+| neonPulse | 79 / 400 | 24 mm | 4 |
+| streetCurrent | 90 / 400 | 29 mm | 6 (up to 70 vertices at t = 9.6 s) |
+| fluidSignal | 31 / 400 | 16 mm | 0 |
+
+Worst frames (renders in `artifacts/qa/mesh_clip_candidates.png`): streetCurrent t = 5.1 s (left thumb/hand, up to 690
+vertices), neonPulse t = 7.3 s (right forearm), fluidSignal t = 4.8 s. In the stills the hand rests on the opposite
+shoulder / upper chest with the sleeve pressed into the vest, which is consistent with a real, shallow (1.5–3 cm)
+overlap. At streetCurrent t = 9.6 s a raised arm lies behind the hanging hair strands.
+
+Reading: this **contradicts the earlier "no clipping" conclusion**, which came from the proxy. Likely reason
+(hypothesis, not tested): the proxy fades out above the neck base, so hands on the shoulder or upper chest are not
+covered. Not done: a proxy-vs-mesh comparison on these exact frames, any fix, any check of mesh-level numbers after the
+arm refinement, and any validation of the vertex-normal depth against a true triangle test.
 
 ## G. Collision-aware refinement
 
@@ -297,8 +323,7 @@ Stills do not show temporal artifacts; foot/transition improvements come from th
     itself fails here (`vswhere` is not on PATH), so an equivalent invocation was used. The last three tests
     (two signed wrist/thumb checks and the 60-vs-120-FPS dance test) were added afterwards and have **not**
     run under ASan.
-12. **Desktop:** `bgmedia_desktop.exe` compiled but could not be relinked because the running app held the file;
-    I did not terminate it. The Desktop UI therefore was not rebuilt or exercised.
+12. **Desktop:** `bgmedia_desktop.exe` now builds and links (rebuilt after the app was closed); it was not launched or exercised.
 13. Spring: dance-level 60 vs 120 FPS divergence of up to 49 mm at isolated instants (H); not root-caused.
 14. The crossfade residual (item 1) was not ablated cue by cue.
 
