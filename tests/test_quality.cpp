@@ -4,6 +4,7 @@
 
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/motion3/MotionPrimitive.hpp"
+#include "FootworkTrack.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -402,4 +403,115 @@ TEST_CASE(quality.time_warp_carries_the_detailed_hand_pose) {
     std::cout << "\n            warped frames checked=" << checked << " worst hand delta=" << worst;
     CHECK(checked > 5);
     CHECK(worst < 1.0e-4f);
+}
+
+namespace {
+
+// Foot position as seen by the clip baker: stage-space x/z (cm) and yaw.
+struct FootSample {
+    float x, z, yaw, lift;
+};
+
+FootSample sampleFoot(const motion::detail::Footwork& foot, float t) {
+    const auto s = foot.at(t);
+    return {s.x, s.z, s.yaw, s.lift};
+}
+
+float footDistance(const FootSample& a, const FootSample& b) {
+    return std::abs(a.x - b.x) + std::abs(a.z - b.z) + std::abs(a.yaw - b.yaw);
+}
+
+}  // namespace
+
+TEST_CASE(quality.footwork_close_applies_the_loop_correction) {
+    constexpr float kPeriod = 8.0f;
+    // The authored pattern ends 3 cm away from where it started (a bug in a
+    // pattern, or a rounding drift): the loop must still return home smoothly.
+    for (const float lastMoveEnd : {5.0f, 6.5f, 7.4f, 7.97f}) {
+        motion::detail::Footwork foot(kPeriod, 0);
+        foot.setStart(0.0f, 0.0f, 0.0f);
+        foot.step(lastMoveEnd - 1.0f, lastMoveEnd, 3.0f, 1.0f, 10.0f);
+        foot.close();
+        CHECK(foot.segmentsAreDisjoint());
+        const FootSample start = sampleFoot(foot, 0.0f);
+        // The last instant of the loop is the start pose: no jump at the seam.
+        const FootSample end = sampleFoot(foot, kPeriod - 1.0e-4f);
+        CHECK(footDistance(start, end) < 0.02f);
+        // And the correction really happens: shortly before the end the foot is
+        // still mid-way, not already home and not frozen at the old position.
+        const FootSample before = sampleFoot(foot, kPeriod - 0.02f);
+        CHECK(footDistance(before, start) < footDistance(sampleFoot(foot, lastMoveEnd + 1.0e-3f), start) + 1.0e-4f);
+        // Velocity is bounded around the wrap (no one-frame slide).
+        float maxStep = 0.0f;
+        const float dt = 1.0f / 64.0f;
+        for (float t = 0.0f; t + dt <= kPeriod; t += dt) {
+            maxStep = std::max(maxStep, footDistance(sampleFoot(foot, t), sampleFoot(foot, t + dt)));
+        }
+        const float seamStep = footDistance(sampleFoot(foot, kPeriod - dt), sampleFoot(foot, 0.0f));
+        CHECK(seamStep <= maxStep + 1.0e-4f);
+    }
+}
+
+TEST_CASE(quality.footwork_close_is_a_no_op_for_a_closed_pattern) {
+    motion::detail::Footwork foot(8.0f, 1);
+    foot.setStart(1.0f, 2.0f, 5.0f);
+    foot.step(2.0f, 3.0f, 4.0f, 2.0f, 5.0f);
+    foot.step(5.0f, 6.0f, 1.0f, 2.0f, 5.0f);  // back home
+    const std::size_t before = foot.segmentCount();
+    foot.close();
+    CHECK(foot.segmentsAreDisjoint());
+    CHECK(foot.segmentCount() == before + 1);  // only the closing hold
+    const FootSample end = sampleFoot(foot, 7.99f);
+    CHECK_NEAR(end.x, 1.0, 1e-4);
+    CHECK_NEAR(end.z, 2.0, 1e-4);
+}
+
+TEST_CASE(quality.footwork_arguments_keep_their_meaning) {
+    // step(x, z, yaw) used to come back as z <- yaw and yaw <- z.
+    motion::detail::Footwork stepper(8.0f, 0);
+    stepper.setStart(0.0f, 0.0f, 0.0f);
+    stepper.step(1.0f, 2.0f, 5.0f, 3.0f, 40.0f);
+    const auto landed = stepper.at(3.0f);
+    CHECK_NEAR(landed.x, 5.0, 1e-4);
+    CHECK_NEAR(landed.z, 3.0, 1e-4);
+    CHECK_NEAR(landed.yaw, 40.0, 1e-4);
+
+    // A pivot turns the foot in place: yaw changes, position does not, and the
+    // planted foot is not displaced when the pivot ends.
+    motion::detail::Footwork pivoter(8.0f, 1);
+    pivoter.setStart(2.0f, 1.0f, 0.0f);
+    pivoter.pivot(1.0f, 2.0f, 22.0f);
+    const auto mid = pivoter.at(1.5f);
+    const auto after = pivoter.at(2.5f);
+    CHECK_NEAR(mid.yaw, 11.0, 1e-3);
+    CHECK_NEAR(after.yaw, 22.0, 1e-4);
+    CHECK_NEAR(after.x, 2.0, 1e-4);
+    CHECK_NEAR(after.z, 1.0, 1e-4);
+    CHECK_NEAR(pivoter.at(1.999f).z, pivoter.at(2.001f).z, 1e-3);
+}
+
+TEST_CASE(quality.showcase_dances_have_no_foot_teleports) {
+    for (const auto& dance : motion::ProceduralChoreography::showcase()) {
+        float worstStep = 0.0f;
+        float worstPlantedStep = 0.0f;
+        for (int f = 0; f < 2; ++f) {
+            const auto& track = dance.clip.feet[static_cast<std::size_t>(f)];
+            for (std::size_t i = 1; i < track.position.size(); ++i) {
+                const float step = (track.position[i] - track.position[i - 1]).length();
+                worstStep = std::max(worstStep, step);
+                // A foot that is on the floor in both keys must not travel at all.
+                const bool planted =
+                    track.position[i].y < 1.0e-4f && track.position[i - 1].y < 1.0e-4f;
+                if (planted) {
+                    // Planted-to-planted motion is only legal while a step lands, which
+                    // is a smooth arc; a teleport is orders of magnitude larger.
+                    worstPlantedStep = std::max(worstPlantedStep, step);
+                }
+            }
+        }
+        std::cout << std::fixed << std::setprecision(4) << "\n            " << dance.clip.id
+                  << ": max foot step per key=" << worstStep << " (height units)";
+        // The old pivot bug moved a planted foot 22 cm (0.1375) in a single key.
+        CHECK(worstStep < 0.08f);
+    }
 }
