@@ -29,6 +29,81 @@ inline float footSmootherstep(float t) {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Reference lower-body proxy (centimetres at the generator's 160 cm reference height,
+// clip frame: +x = the character's left, +y up, +z forward). It lets the footwork
+// planner reject steps in which one leg would pass through the other. It is a
+// planning aid in reference units, not the runtime collision test (that one is
+// calibrated per model in HumanoidRetargeter).
+// ---------------------------------------------------------------------------
+struct LegProxy {
+    float hipHalf = 8.5f;   // hip joint to the pelvis centre
+    float hipY = 88.0f;     // hip height
+    float ankleY = 7.0f;    // ankle height above the floor
+    float thighR = 7.0f;    // thigh radius at the hip
+    float kneeR = 5.4f;
+    float ankleR = 4.4f;
+    float footLen = 13.0f;  // ankle to toe
+    float footR = 3.6f;
+};
+
+struct LegPose {
+    float x = 0.0f, lift = 0.0f, z = 0.0f;  // Footwork::Sample coordinates (offset from the bind ankle)
+};
+
+namespace legproxy_detail {
+
+struct Cap {
+    Vec3 a, b;
+    float ra, rb;
+};
+
+inline float segmentSamples(const Cap& p, const Cap& q, int n, float fromP, float fromQ) {
+    float best = 1.0e9f;
+    for (int i = 0; i <= n; ++i) {
+        const float tp = fromP + (1.0f - fromP) * static_cast<float>(i) / static_cast<float>(n);
+        const Vec3 pp = p.a + (p.b - p.a) * tp;
+        const float rp = p.ra + (p.rb - p.ra) * tp;
+        for (int j = 0; j <= n; ++j) {
+            const float tq = fromQ + (1.0f - fromQ) * static_cast<float>(j) / static_cast<float>(n);
+            const Vec3 qq = q.a + (q.b - q.a) * tq;
+            const float rq = q.ra + (q.rb - q.ra) * tq;
+            best = std::min(best, (pp - qq).length() - rp - rq);
+        }
+    }
+    return best;
+}
+
+}  // namespace legproxy_detail
+
+// Smallest gap in cm between the two legs (thigh, shin and foot capsules of each side
+// against all of the other side; the thighs are compared away from the crotch, where
+// they touch by design). Negative = one leg is inside the other.
+inline float legClearanceCm(const LegPose& left, const LegPose& right, const LegProxy& body = {}) {
+    using legproxy_detail::Cap;
+    const auto build = [&](const LegPose& pose, float side, Cap out[3]) {
+        const Vec3 hip{side * body.hipHalf, body.hipY, 0.0f};
+        const Vec3 ankle{side * kFootHalfCm + pose.x, body.ankleY + pose.lift, pose.z};
+        // The knee sits half way and a little forward (the IK bends it forward).
+        const Vec3 knee = (hip + ankle) * 0.5f + Vec3{0.0f, 0.0f, 3.0f};
+        out[0] = {hip, knee, body.thighR, body.kneeR};
+        out[1] = {knee, ankle, body.kneeR, body.ankleR};
+        out[2] = {ankle, ankle + Vec3{0.0f, -1.5f, body.footLen}, body.footR, body.footR * 0.8f};
+    };
+    Cap l[3], r[3];
+    build(left, 1.0f, l);
+    build(right, -1.0f, r);
+    float best = 1.0e9f;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            // thigh-thigh only away from the crotch
+            const float fromL = (i == 0 && j == 0) ? 0.45f : 0.0f;
+            best = std::min(best, legproxy_detail::segmentSamples(l[i], r[j], 6, fromL, fromL));
+        }
+    }
+    return best;
+}
+
 class Footwork {
 public:
     struct Sample {
@@ -41,6 +116,11 @@ public:
     };
 
     Footwork(float period, int side) : period_(period), side_(side) {}
+
+    // The other foot of the same dancer. With it, step() plans against the other leg.
+    void setOther(const Footwork* other) { other_ = other; }
+    // Minimum clearance (cm) a planned step must keep from the other leg.
+    static constexpr float kMinLegGapCm = 1.0f;
 
     void setStart(float x, float z, float yaw) {
         start_ = pack(x, z, yaw);
@@ -60,11 +140,16 @@ public:
         if (!(end > begin + 1.0e-5f)) {
             return;
         }
+        float bump = 0.0f;
+        planClearance(begin, end, x, z, lift, bump);
         Vec3 next = pack(x, z, yaw);
-        segments_.push_back({"arc", begin, end, current_, next, lift, toe});
+        segments_.push_back({"arc", begin, end, current_, next, lift, toe, bump});
         current_ = next;
         time_ = end;
     }
+
+    // Planned-step statistics (how many steps had to be adjusted), for tests/diagnostics.
+    [[nodiscard]] int adjustedSteps() const { return adjusted_; }
 
     void pivot(float begin, float end, float yaw) {
         hold(begin);
@@ -176,8 +261,10 @@ public:
         }
         const float lift = s.lift * std::pow(std::max(0.0f, std::sin(3.14159265f * u)), 0.85f);
         const float toe = s.toe * std::sin(3.14159265f * u);
+        // `bump` bends the path sideways (forward/back) so a swing foot passes around the
+        // standing leg instead of through it; it is zero at both ends.
         return {s.from.x + (s.to.x - s.from.x) * smooth, lift,
-                s.from.z + (s.to.z - s.from.z) * smooth,
+                s.from.z + (s.to.z - s.from.z) * smooth + s.bump * std::sin(3.14159265f * u),
                 s.from.y + (s.to.y - s.from.y) * smooth, toe, "swing"};
     }
 
@@ -249,7 +336,79 @@ private:
         Vec3 to{};
         float lift = 0.0f;
         float toe = 0.0f;
+        float bump = 0.0f;  // sideways bend of the swing path (cm)
     };
+
+    // Smallest clearance to the other leg over a candidate swing (cm).
+    float swingClearance(float begin, float end, float x, float z, float lift, float bump) const {
+        if (!other_) {
+            return 1.0e9f;
+        }
+        Segment candidate{"arc", begin, end, current_, pack(x, z, 0.0f), lift, 0.0f, bump};
+        float best = 1.0e9f;
+        for (int i = 1; i <= 10; ++i) {
+            const float u = static_cast<float>(i) / 10.0f;
+            const float t = begin + (end - begin) * u;
+            const float smooth = footSmootherstep(u);
+            const float lf = lift * std::pow(std::max(0.0f, std::sin(3.14159265f * u)), 0.85f);
+            LegPose mine{candidate.from.x + (candidate.to.x - candidate.from.x) * smooth, lf,
+                         candidate.from.z + (candidate.to.z - candidate.from.z) * smooth +
+                             bump * std::sin(3.14159265f * u)};
+            const Sample o = other_->at(t);
+            const LegPose theirs{o.x, o.lift, o.z};
+            best = std::min(best, side_ == 0 ? legClearanceCm(mine, theirs) : legClearanceCm(theirs, mine));
+        }
+        return best;
+    }
+
+    // The authored target (x, z) is a request. When it would drive this leg through the
+    // other one, find the smallest change that does not: shorten the lateral reach, shift
+    // the landing forward/back, and bend the swing path around the standing leg.
+    void planClearance(float begin, float end, float& x, float& z, float lift, float& bump) {
+        if (!other_ || swingClearance(begin, end, x, z, lift, 0.0f) >= kMinLegGapCm) {
+            return;
+        }
+        static constexpr float kShrink[] = {0.0f, 3.0f, 6.0f, 9.0f, 12.0f};
+        static constexpr float kShift[] = {0.0f, 4.0f, -4.0f, 8.0f, -8.0f, 12.0f, -12.0f, 16.0f, -16.0f, 20.0f, -20.0f, 26.0f, -26.0f, 34.0f, -34.0f};
+        static constexpr float kBump[] = {0.0f, 5.0f, -5.0f, 10.0f, -10.0f, 15.0f, -15.0f};
+        float bestCost = 1.0e9f, bestClear = -1.0e9f;
+        float bx = x, bz = z, bb = 0.0f;
+        for (float shrink : kShrink) {
+            const float cx = x > 0.0f ? std::max(0.0f, x - shrink) : std::min(0.0f, x + shrink);
+            for (float shift : kShift) {
+                for (float b : kBump) {
+                    const float cz = z + shift;
+                    const float clear = swingClearance(begin, end, cx, cz, lift, b);
+                    // Prefer the smallest change to the authored step; a shift towards the
+                    // back or a bump behind the standing leg costs slightly more than a
+                    // forward one (crossing in front is the natural cross-step).
+                    const float cost = 1.3f * shrink + std::abs(shift) + 0.8f * std::abs(b) +
+                                       (shift < 0.0f ? 0.5f : 0.0f) + (b < 0.0f ? 0.4f : 0.0f);
+                    if (clear >= kMinLegGapCm) {
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            bx = cx;
+                            bz = cz;
+                            bb = b;
+                            bestClear = clear;
+                        }
+                    } else if (bestCost > 1.0e8f && clear > bestClear) {
+                        bestClear = clear;  // remember the least bad option if nothing is feasible
+                        bx = cx;
+                        bz = cz;
+                        bb = b;
+                    }
+                }
+            }
+        }
+        x = bx;
+        z = bz;
+        bump = bb;
+        ++adjusted_;
+    }
+
+    const Footwork* other_ = nullptr;
+    int adjusted_ = 0;
 
     float period_ = 1.0f;
     int side_ = 0;

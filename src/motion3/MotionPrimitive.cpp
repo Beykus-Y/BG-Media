@@ -743,10 +743,17 @@ namespace {
 
 constexpr int kRegionCount = 13;  // one per body:: bit
 
+// Minimum time (in beats) over which a stronger cue may take a region from a weaker one.
+constexpr float kYieldBeats = 0.5f;
+
 struct ActiveCue {
     const PrimitiveCue* cue = nullptr;
     PrimitivePose pose;
     float weight = 0.0f;
+    // How strongly this cue makes weaker cues yield. It follows the cue's weight but never
+    // faster than kYieldBeats at either end: a one-beat accent with a 2-frame attack must
+    // not pull a large arm gesture back by 45 degrees in 2 frames.
+    float influence = 0.0f;
     BodyMask mask = body::None;
     // Per-region share of the cue that survives stronger cues. 1 = untouched.
     // Conflicts fade a weaker cue out by (1 - winner weight) instead of cutting
@@ -853,6 +860,15 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         entry.cue = &cue;
         entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
         entry.weight = weight;
+        {
+            const auto smooth = [](float x) {
+                x = std::clamp(x, 0.0f, 1.0f);
+                return x * x * (3.0f - 2.0f * x);
+            };
+            const float into = smooth(local / kYieldBeats);
+            const float outOf = smooth((cue.durationBeats - local) / kYieldBeats);
+            entry.influence = std::min(weight, std::min(into, outOf));
+        }
         entry.mask = mask;
         entry.pose.mask = mask;
         candidates.push_back(std::move(entry));
@@ -899,7 +915,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                 if ((shared & bit) == 0u) {
                     continue;
                 }
-                const float winner = std::clamp(other.weight * regionShare(other, bit), 0.0f, 1.0f);
+                const float winner = std::clamp(other.influence * regionShare(other, bit), 0.0f, 1.0f);
                 entry.share[static_cast<std::size_t>(r)] *= 1.0f - winner;
                 conflicted = true;
             }
@@ -940,7 +956,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                     best = std::max(best, entry.share[static_cast<std::size_t>(r)]);
                 }
             }
-            upperLayerLoad += entry.weight * best;
+            upperLayerLoad += entry.influence * best;
         }
         active.push_back(std::move(entry));
     }

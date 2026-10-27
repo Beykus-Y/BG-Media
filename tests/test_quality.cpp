@@ -7,6 +7,7 @@
 #include "FootworkTrack.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <cmath>
 #include <iomanip>
@@ -514,4 +515,145 @@ TEST_CASE(quality.showcase_dances_have_no_foot_teleports) {
         // The old pivot bug moved a planted foot 22 cm (0.1375) in a single key.
         CHECK(worstStep < 0.08f);
     }
+}
+
+// Overlays are the only thing that changes between "base clip" and "dancing with
+// layers". Their contribution must never jump from one frame to the next, whichever
+// cues overlap: a weaker gesture yields to a stronger accent over at least half a
+// beat, not over the accent's own two-frame attack. This test measures the per-frame
+// change of the overlay contribution (composed pose minus base pose, per bone) over the
+// whole loop, including the loop seam, at several tempi and frame rates.
+TEST_CASE(quality.overlay_contribution_never_jumps_between_frames) {
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    float worstEver = 0.0f;
+    int violations = 0;
+    for (const char* id : {"neonPulse", "streetCurrent", "fluidSignal"}) {
+        const motion::HumanoidClip* clip = player.library().find(id);
+        REQUIRE(clip != nullptr);
+        const auto& cues = player.overlaysFor(id);
+        for (double bpm : {80.0, 136.0, 170.0}) {
+            for (double fps : {30.0, 60.0, 120.0}) {
+                const double beatsPerFrame = bpm / 60.0 / fps;
+                std::array<math::Quat, vrm::kHumanoidBoneCount> prevDelta{};
+                bool havePrev = false;
+                float worst = 0.0f;
+                double worstBeat = 0.0;
+                std::size_t worstBone = 0;
+                for (double beat = 0.0; beat < 2.0 * clip->beats; beat += beatsPerFrame) {
+                    const auto base = motion::sampleClip(*clip, beat);
+                    const auto out = motion::composeMotion(base, cues, beat, clip->beats, clip->loop);
+                    std::array<math::Quat, vrm::kHumanoidBoneCount> delta;
+                    for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+                        delta[b] = (out.pose.bone[b] * base.bone[b].conjugate()).normalized();
+                        // The wrists carry the deliberate HandFlick snap; they are bounded
+                        // separately below.
+                        const bool isHand = b == static_cast<std::size_t>(vrm::HumanoidBone::LeftHand) ||
+                                            b == static_cast<std::size_t>(vrm::HumanoidBone::RightHand);
+                        if (havePrev && !isHand) {
+                            const float d = std::abs(math::dot(delta[b], prevDelta[b]));
+                            const float step = 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f));
+                            if (step > worst) {
+                                worst = step;
+                                worstBeat = beat;
+                                worstBone = b;
+                            }
+                        }
+                    }
+                    prevDelta = delta;
+                    havePrev = true;
+                }
+                // Same physical limit at every frame rate: rad per second.
+                const float radPerSecond = worst * static_cast<float>(fps);
+                worstEver = std::max(worstEver, radPerSecond);
+                // 20 rad/s for everything but the wrists: the loop-seam yank this test was
+                // written for measured 46 rad/s (0.78 rad in one 60 FPS frame) in the arm.
+                if (radPerSecond > 20.0f) {
+                    ++violations;
+                    std::cout << "\n            " << id << " @" << bpm << " BPM, " << fps << " FPS: overlay contribution changes at "
+                              << radPerSecond << " rad/s (" << vrm::humanoidBoneName(static_cast<vrm::HumanoidBone>(worstBone))
+                              << " at beat " << worstBeat << ")";
+                }
+            }
+        }
+    }
+    std::cout << std::fixed << std::setprecision(2) << "\n            worst overlay-contribution rate over all runs: " << worstEver << " rad/s";
+    CHECK(violations == 0);
+}
+
+// Reference-body leg clearance of a pair of foot tracks (cm).
+namespace {
+
+float loopMinLegClearance(const motion::detail::Footwork& left, const motion::detail::Footwork& right, float period) {
+    float best = 1.0e9f;
+    for (float t = 0.0f; t < period; t += 1.0f / 16.0f) {
+        const auto l = left.at(t);
+        const auto r = right.at(t);
+        best = std::min(best, motion::detail::legClearanceCm({l.x, l.lift, l.z}, {r.x, r.lift, r.z}));
+    }
+    return best;
+}
+
+}  // namespace
+
+TEST_CASE(quality.footwork_planner_keeps_one_leg_out_of_the_other) {
+    // The Fluid Signal cross-step: one foot lands 24 cm across the other, with no
+    // forward/back offset. Authored naively the legs occupy the same space.
+    const float period = 16.0f;
+    // Case 0: the right foot crosses to the character's left (+x); case 1: the left foot
+    // crosses to the right (-x).
+    for (int crossing = 0; crossing < 2; ++crossing) {
+        const float reach = crossing == 0 ? 24.0f : -24.0f;
+        motion::detail::Footwork naiveL(period, 0), naiveR(period, 1);
+        naiveL.setStart(0, 0, 0);
+        naiveR.setStart(0, 0, 0);
+        motion::detail::Footwork& naiveMover = crossing == 0 ? naiveR : naiveL;
+        naiveMover.step(2.0f, 3.0f, reach, 0.0f, 0.0f, 10.0f, 0.0f);   // no knowledge of the other foot
+        naiveR.hold(period);
+        naiveL.hold(period);
+        CHECK(loopMinLegClearance(naiveL, naiveR, period) < 0.0f);       // the defect, reproduced
+
+        motion::detail::Footwork planL(period, 0), planR(period, 1);
+        planL.setStart(0, 0, 0);
+        planR.setStart(0, 0, 0);
+        planL.setOther(&planR);
+        planR.setOther(&planL);
+        motion::detail::Footwork& mover = crossing == 0 ? planR : planL;
+        mover.step(2.0f, 3.0f, reach, 0.0f, 0.0f, 10.0f, 0.0f);
+        planR.hold(period);
+        planL.hold(period);
+        CHECK(mover.adjustedSteps() == 1);
+        CHECK(loopMinLegClearance(planL, planR, period) >= motion::detail::Footwork::kMinLegGapCm - 0.01f);
+        // The planned step is still a step: the foot lands across the other one, in front or behind it.
+        const auto landed = mover.at(period - 0.5f);
+        CHECK(std::abs(landed.x) > 10.0f);
+        CHECK(std::abs(landed.z) > 4.0f);
+    }
+}
+
+TEST_CASE(quality.generated_dances_never_put_one_leg_through_the_other) {
+    int clips = 0;
+    float worst = 1.0e9f;
+    for (const char* profile : {"neon", "street", "fluid"}) {
+        for (int seed = 1; seed <= 40; ++seed) {
+            motion::ChoreographyRequest request;
+            request.profile = profile;
+            request.seed = seed;
+            request.bars = 8;
+            request.intensity = 0.4f + 0.6f * static_cast<float>(seed % 5) / 4.0f;
+            const auto dance = motion::ProceduralChoreography::generate(request);
+            const auto& clip = dance.clip;
+            for (int k = 0; k < clip.keyCount; ++k) {
+                const auto& pl = clip.feet[0].position[static_cast<std::size_t>(k)];
+                const auto& pr = clip.feet[1].position[static_cast<std::size_t>(k)];
+                // clip positions are in height units (160 cm reference)
+                const float clear = motion::detail::legClearanceCm({pl.x * 160.0f, pl.y * 160.0f, pl.z * 160.0f},
+                                                                   {pr.x * 160.0f, pr.y * 160.0f, pr.z * 160.0f});
+                worst = std::min(worst, clear);
+            }
+            ++clips;
+        }
+    }
+    std::cout << std::fixed << std::setprecision(2) << "\n            " << clips << " generated clips, worst reference leg clearance " << worst << " cm";
+    CHECK(worst >= motion::detail::Footwork::kMinLegGapCm - 0.5f);
 }

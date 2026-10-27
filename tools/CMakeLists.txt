@@ -60,3 +60,16 @@ add_executable(bgmedia_mesh_clip
 )
 target_link_libraries(bgmedia_mesh_clip PRIVATE bgmedia_rig)
 target_compile_options(bgmedia_mesh_clip PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+if(BGMEDIA_BUILD_MINIAUDIO)
+    # Instrumented playback of a model + real track through the Desktop path (QA only).
+    add_executable(bgmedia_motion_diag
+        motion_diag/main.cpp
+    )
+    target_link_libraries(bgmedia_motion_diag PRIVATE bgmedia_rig bgmedia_miniaudio)
+    target_include_directories(bgmedia_motion_diag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(bgmedia_motion_diag PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_motion_diag PRIVATE shell32)
+    endif()
+endif()

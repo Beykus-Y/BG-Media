@@ -374,6 +374,9 @@ public:
         }
         left_.setStart(0.0f, 0.0f, 0.0f);
         right_.setStart(0.0f, 0.0f, 0.0f);
+        // Each foot plans its steps against the other leg.
+        left_.setOther(&right_);
+        right_.setOther(&left_);
     }
 
     void pose(float beat, bool hit, float tension,
@@ -453,10 +456,17 @@ void Choreographer::bothArms(float beat, std::array<float, 4> leftArm,
 
 void Choreographer::addSideTouch(float begin, float direction, float size) {
     const float yaw = 12.0f * direction;
-    left_.step(begin + 0.6f, begin + 1.4f, size * direction, 0.0f, yaw, 9.0f, 0.15f);
-    right_.step(begin + 2.2f, begin + 3.0f, size * direction, 0.0f, yaw, 8.0f, 0.1f);
-    left_.step(begin + 4.4f, begin + 5.2f, 0.0f, 0.0f, 0.0f, 8.0f, 0.0f);
-    right_.step(begin + 6.0f, begin + 6.8f, 0.0f, 0.0f, 0.0f, 8.0f, 0.0f);
+    // The lead foot is the one on the side of travel (left foot when travelling to the
+    // character's left), the trailing foot closes beside it. On the way back the TRAILING
+    // foot returns first: if the outer (lead) foot went home first it would have to
+    // cross the inner one, which is still standing out, and a leg would pass through
+    // the other.
+    Footwork& lead = direction > 0.0f ? left_ : right_;
+    Footwork& trail = direction > 0.0f ? right_ : left_;
+    lead.step(begin + 0.6f, begin + 1.4f, size * direction, 0.0f, yaw, 9.0f, 0.15f);
+    trail.step(begin + 2.2f, begin + 3.0f, size * direction, 0.0f, yaw, 8.0f, 0.1f);
+    trail.step(begin + 4.4f, begin + 5.2f, 0.0f, 0.0f, 0.0f, 8.0f, 0.0f);
+    lead.step(begin + 6.0f, begin + 6.8f, 0.0f, 0.0f, 0.0f, 8.0f, 0.0f);
     left_.hold(begin + 8.0f);
     right_.hold(begin + 8.0f);
 }
