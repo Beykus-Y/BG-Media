@@ -312,8 +312,10 @@ b251fa6 Fix motion composition: deterministic selection, soft conflicts, masks, 
 9db8c38 Add mesh-calibrated arm/torso proxy refinement with clearance diagnostics
 e4d324d Fix secondary dynamics: Verlet units, character-space rotations, OFF/ON/teleport, branching, collider indices
 a04191f Fix footwork: loop-closing correction, step/pivot z-yaw packing (removes 22 cm foot teleport)
+d7dda88 Document the quality pass; add QA metrics; rename spatial tests for CTest filtering
+c952f61 Follow-ups: signed wrist/thumb checks, sync_qa regression diff, dance-level spring FPS test,
+        --hide-material preview aid, corrected mesh-clipping findings
 ```
 
-A final commit adds this report, the metrics JSON, the QA output and the test renaming. The
-working tree otherwise contains only the two pre-existing untracked archives (`BG Media.zip`,
+The working tree otherwise contains only the two pre-existing untracked archives (`BG Media.zip`,
 `src.zip`), which were not touched. No push, no PR, no merge.
