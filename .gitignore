@@ -2,6 +2,10 @@
 /build*/
 /out/
 /cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeUserPresets.json
 *.user
 .vs/
 .vscode/
@@ -37,6 +41,49 @@ tests/fixtures/generated/
 # Generated shader binaries; the C headers are committed and rebuilt from HLSL.
 adapters/sdlgpu/shaders/generated/*.dxil
 adapters/sdlgpu/shaders/generated/*.spv
+
+# Private music. The only committed audio is the synthetic decoder fixture;
+# real tracks must stay local.
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+!tests/fixtures/decode_123.mp3
+!tests/fixtures/decode_123.wav
+!tests/fixtures/decode_123.flac
+
+# Screen recordings / diagnostic video.
+*.mp4
+*.mov
+*.webm
+*.mkv
+
+# Local archives and source dumps (BG Media.zip, src.zip, exports).
+*.zip
+*.7z
+*.rar
+
+# Secrets and local machine configuration.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+
+# Python caches used by tools/dancegen.
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Scratch space for coding agents and ad-hoc diagnostics.
+.cache/
+.tmp/
+*.tmp
+*.log
 
 # OS
 .DS_Store
