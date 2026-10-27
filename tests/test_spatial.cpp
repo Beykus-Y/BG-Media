@@ -451,3 +451,97 @@ TEST_CASE(spatial.arm_refinement_never_touches_feet_and_is_inert_when_clear) {
         CHECK(c.stats.footSolverError < 0.003f);
     }
 }
+
+// The detailed hand layer and the clip's own hand-bone rotation must agree on
+// axis AND sign, on any model basis: a wrist channel is just a clip-frame
+// rotation of the hand bone with a fixed gain.
+TEST_CASE(spatial.wrist_channels_match_the_clip_bone_path_with_sign) {
+    struct Basis {
+        const char* name;
+        bgmedia::math::Vec3 forward;
+        bgmedia::math::Vec3 right;
+    };
+    const Basis bases[] = {
+        {"standard", {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}},
+        {"faces +X", {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}},
+        {"faces -Z (Model1)", {0.0f, 0.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}},
+    };
+    struct Channel {
+        int index;
+        bgmedia::math::Vec3 clipAxis;
+        float gain;
+    };
+    const Channel channels[] = {{0, {-1.0f, 0.0f, 0.0f}, 0.26f},  // pitch (established sign)
+                                {1, {0.0f, 1.0f, 0.0f}, 0.30f},   // yaw
+                                {2, {0.0f, 0.0f, 1.0f}, 0.34f}};  // roll
+    for (const Basis& basis : bases) {
+        auto model = loadMinimal(false);
+        REQUIRE(model != nullptr);
+        model->forward = basis.forward;
+        model->right = basis.right;
+        HumanoidRetargeter rig(*model);
+        for (const HumanoidBone handBone : {HumanoidBone::LeftHand, HumanoidBone::RightHand}) {
+            const int sd = handBone == HumanoidBone::LeftHand ? 0 : 1;
+            const int node = model->nodeFor(handBone);
+            for (const Channel& channel : channels) {
+                auto viaBone = bgmedia::motion::neutralClipPose();
+                viaBone.bone[static_cast<std::size_t>(handBone)] =
+                    bgmedia::math::fromAxisAngle(channel.clipAxis, channel.gain);
+                auto viaHandPose = bgmedia::motion::neutralClipPose();
+                viaHandPose.detailedHands = true;
+                viaHandPose.handPose[static_cast<std::size_t>(sd)].wrist[static_cast<std::size_t>(channel.index)] = 1.0f;
+                const auto a = rig.applyClip(viaBone, 0.0);
+                const auto b = rig.applyClip(viaHandPose, 0.0);
+                const auto qa = a.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                const auto qb = b.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                // |dot| = 1 means the same rotation; a flipped sign would give cos(2*angle).
+                CHECK(std::abs(bgmedia::math::dot(qa, qb)) > 0.99999f);
+            }
+        }
+    }
+}
+
+TEST_CASE(spatial.thumb_opposition_follows_the_curl_axis_and_sign) {
+    const bgmedia::math::Vec3 forwards[] = {{0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+    const bgmedia::math::Vec3 rights[] = {{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}};
+    // The minimal fixture has no finger bones, so this needs the optional private
+    // model (the basis override only changes the axes the retargeter uses).
+    if (!std::filesystem::exists(realModelPath())) {
+        return;
+    }
+    int checkedThumbs = 0;
+    for (int basis = 0; basis < 3; ++basis) {
+        auto loaded = VrmLoader::load(realModelPath());
+        REQUIRE(loaded.ok());
+        auto model = std::move(loaded.model);
+        model->forward = forwards[basis];
+        model->right = rights[basis];
+        HumanoidRetargeter rig(*model);
+        for (int sd = 0; sd < 2; ++sd) {
+            const int thumb = model->fingerNode(sd, 0, 0);
+            if (thumb < 0) {
+                continue;
+            }
+            ++checkedThumbs;
+            auto neutral = bgmedia::motion::neutralClipPose();
+            neutral.detailedHands = true;
+            auto curled = neutral;
+            curled.handPose[static_cast<std::size_t>(sd)].curl[0] = {1.0f, 1.0f, 1.0f};
+            auto opposed = neutral;
+            opposed.handPose[static_cast<std::size_t>(sd)].thumbOpposition = 1.0f;
+            const auto rest = rig.applyClip(neutral, 0.0).nodeGlobals[static_cast<std::size_t>(thumb)].rotationQuat();
+            const auto axisOf = [&](const bgmedia::motion::ClipPose& pose) {
+                auto q = (rig.applyClip(pose, 0.0).nodeGlobals[static_cast<std::size_t>(thumb)].rotationQuat() *
+                          rest.conjugate()).normalized();
+                if (q.w < 0.0f) {
+                    q = {-q.x, -q.y, -q.z, -q.w};
+                }
+                return bgmedia::math::normalize(bgmedia::math::Vec3{q.x, q.y, q.z});
+            };
+            // Both thumb motions rotate about the model forward axis, same direction.
+            CHECK(bgmedia::math::dot(axisOf(curled), axisOf(opposed)) > 0.99f);
+            CHECK(std::abs(bgmedia::math::dot(axisOf(opposed), model->forward)) > 0.99f);
+        }
+    }
+    CHECK(checkedThumbs == 6);
+}

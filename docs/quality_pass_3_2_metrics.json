@@ -3,7 +3,7 @@
   "base_commit": "aacdeeb",
   "tests": {
     "before": 141,
-    "after": 170,
+    "after": 173,
     "ctest_groups_before": 13,
     "ctest_groups_after": 16
   },
@@ -92,6 +92,11 @@
       "nodes": 116,
       "branching_nodes": 0,
       "single_node_chains": 0
+    },
+    "dance_60_vs_120_fps": {
+      "mean_diff_m": 0.00207,
+      "max_diff_m": 0.0491,
+      "samples_over_2cm": "40 of 15156"
     }
   },
   "footwork": {
@@ -152,5 +157,32 @@
     "video",
     "second_real_vrm",
     "desktop_ui_diagnostics"
-  ]
+  ],
+  "regression_3_1": {
+    "sync_qa_vs_docs_sync_qa_3_1.json": {
+      "values": 693,
+      "differences": "analysis/timeline/sampling timings and footErrorMm only",
+      "footErrorMm": "0.00015 -> 0.00024 (measurement now on evaluated skeleton)"
+    },
+    "authored_clips_motion_qa": "identical"
+  },
+  "mesh_clipping": {
+    "reproduced": false,
+    "sampled_frames_neonPulse_t4_7_8_raw_proxy_clearance_m": [
+      0.112,
+      0.167,
+      0.087
+    ],
+    "wrist_forward_of_hips_m": [
+      0.28,
+      0.3
+    ],
+    "discriminator": "--hide-material in bgmedia_vrm_preview"
+  },
+  "asan": {
+    "run": true,
+    "tests": 170,
+    "result": "all passed, no reports",
+    "note": "newer 3 tests not under ASan"
+  }
 }

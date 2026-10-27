@@ -455,3 +455,67 @@ TEST_CASE(spring.result_is_frame_rate_independent_and_finite) {
     CHECK(!dynamics.stats().nonFinite);
     CHECK(dynamics.stats().maxDisplacement <= settings.maxDisplacement * 2.0f + 1.0e-4f);
 }
+
+// A dance (not a single head-bob instant): the same choreography simulated at 60
+// and at 120 FPS must trace the same spring trajectories.
+TEST_CASE(spring.dance_trajectories_agree_between_60_and_120_fps) {
+    const auto path = realModelPath();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    auto loaded = vrm::VrmLoader::load(path);
+    REQUIRE(loaded.ok());
+    animation::HumanoidRetargeter rig(*loaded.model);
+    std::vector<int> nodes;
+    for (const auto& chain : loaded.model->springChains) {
+        nodes.push_back(chain.nodes.back());
+    }
+    const auto run = [&](double fps) {
+        motion::DancePlayer player;
+        player.loadLibrary(std::filesystem::path(BGMEDIA_SOURCE_DIR) / "assets" / "dances");
+        player.setOverlayMode(motion::OverlayMode::Full);
+        (void)player.selectClip("neonPulse", 0.0, true);
+        animation::SecondaryDynamics dynamics(*loaded.model);
+        animation::SecondarySettings settings;
+        std::vector<std::vector<math::Vec3>> samples;  // per 1/60 s tick
+        const int frames = static_cast<int>(8.0 * fps);
+        for (int i = 0; i <= frames; ++i) {
+            const double t = 1.0 + i / fps;
+            const auto frame = player.update(t);
+            auto pose = rig.applyClip(frame.pose, t);
+            dynamics.update(pose, i == 0 ? 0.0 : 1.0 / fps, settings);
+            if (i % static_cast<int>(fps / 60.0) == 0) {
+                std::vector<math::Vec3> row;
+                for (int n : nodes) row.push_back(animation::HumanoidRetargeter::stagePosition(pose, n));
+                samples.push_back(std::move(row));
+            }
+        }
+        return samples;
+    };
+    const auto a = run(60.0);
+    const auto b = run(120.0);
+    REQUIRE(a.size() == b.size());
+    float worst = 0.0f;
+    std::size_t worstI = 0, worstK = 0, over = 0;
+    double mean = 0.0;
+    std::size_t count = 0;
+    for (std::size_t i = 60; i < a.size(); ++i) {  // skip the first second (start-up)
+        for (std::size_t k = 0; k < a[i].size(); ++k) {
+            const float d = (a[i][k] - b[i][k]).length();
+            if (d > worst) { worstI = i; worstK = k; }
+            if (d > 0.02f) ++over;
+            worst = std::max(worst, d);
+            mean += d;
+            ++count;
+        }
+    }
+    std::cout << std::fixed << std::setprecision(5)
+              << "\n            neonPulse tip trajectories, 60 vs 120 FPS: max diff=" << worst
+              << " m, mean diff=" << mean / static_cast<double>(count) << " m at tick " << worstI << " chain " << worstK
+              << "; samples over 2 cm: " << over << " of " << count;
+    // Contact with collider spheres can amplify a tiny phase difference for a
+    // moment; it must stay an isolated event, not a systematic frame-rate dependence.
+    CHECK(mean / static_cast<double>(count) < 0.005);
+    CHECK(static_cast<double>(over) < 0.005 * static_cast<double>(count));
+    CHECK(worst <= 0.0501f);  // never beyond the authored displacement cap
+}

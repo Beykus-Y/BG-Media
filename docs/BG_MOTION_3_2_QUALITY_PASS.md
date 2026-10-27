@@ -28,9 +28,30 @@ and did **not** make a video. Section M lists everything that remains.
 | Crossfade | Overlay set flipped at 50 % of the blend | Overlays composed per segment before the blend |
 | Spring bones | Wrong space for rotations, dimensionally inconsistent integrator, stale state on OFF→ON, no teleport handling, branches and leaf bones lost, collider index shift | All fixed and covered by tests |
 | Footwork | **Foot `z` and `yaw` arguments were swapped; every shipped dance had a 22 cm single-key foot teleport** (not in the audit) | Fixed; peak foot step per key 0.1375 → 0.04–0.05 height units |
-| Mesh clipping | Visible arm/hair overlap with Spring OFF | Arm↔torso proxy refinement added; rigid-hair overlap is a different class and is **not** solved |
+| Mesh clipping | Reported arm/hair/clothing overlap with Spring OFF | **Not reproduced** on the frames I sampled (F). An arm↔torso proxy refinement was added and verified on forced gestures; hair/cloth overlap is neither confirmed nor solved |
 
-Tests: 141 before → 170 after (all pass; CTest 16/16 groups).
+Tests: 141 before → 173 after (all pass; CTest 16/16 groups). Some of the new tests need the private
+`models/Model1.vrm` and return early without it; they are listed in J.
+
+**BG Motion 3.1 did not regress.** `bgmedia_sync_qa` was re-run and diffed against the committed
+`docs/sync_qa_3_1.json`: of 693 values only analysis/timeline/sampling *timings* and `footErrorMm`
+(0.00015 → 0.00024 mm, now measured on the evaluated skeleton) differ; every beat, downbeat, accent-approach,
+phase speed/jerk, slide and NaN metric is identical. In `bgmedia_motion_qa` the five authored clips
+(energetic, groove, hiphop, idle, sidestep) are byte-identical to `docs/motion_qa_3_2.txt`.
+
+### Behaviour changes you will see
+
+1. **All three generated dances change** (neonPulse, streetCurrent, fluidSignal): planted feet no longer
+   jump 22 cm at pivots, steps carry their real yaw/forward offset, so footwork is visibly different.
+2. **Spring bones now actually move** (3–5 cm peak). The previous integrator was scaled by `dt`; hair and
+   skirt will look livelier and earlier spring tuning is not comparable.
+3. **Wrist roll/pitch and thumb opposition on Model1 change direction.** Model1 faces −Z; the old
+   double axis conversion rotated those channels about reversed axes there, while a standard-axes rig was
+   already correct. They now follow the same clip-frame contract on every rig (signed tests below). No
+   primitive sign was retuned; if a gesture looked right on Model1 *because of* the old behaviour it will
+   now be mirrored at the wrist and should be re-checked by eye.
+4. Overlay selection is deterministic and continuous; some cues that used to win by array order now lose.
+5. Arms may be nudged away from the torso when the proxy is violated (not in any shipped dance).
 
 ---
 
@@ -46,8 +67,8 @@ exists and passes, but the failing-on-baseline run was **not** performed.
 | C02 | Spring rotations mix stage/character space | **Confirmed, reproduced** | root yaw 0/90/180/−90: character-space rotation response differed by **2.22 rad** on baseline, 0.0014 rad now | Fixed |
 | C03 | Stale state OFF→ON | **Confirmed, reproduced** | first ON frame jumped to the 50 mm clamp on baseline; now only the animation's own frame motion | Fixed |
 | C04 | Primitive priority/selection order | **Confirmed (logic)** | priority comparison direction + `std::sort` without tiebreak; 720-permutation test passes | Fixed |
-| C05 | Time warp ignores detailed hand pose | **Confirmed (logic)** | `adaptPose` copied only the scalar `hand`; test compares to `sampleClip` at the warped beat (29 frames, delta 0) | Fixed |
-| C06 | Double axis conversion for wrist/thumb | **Confirmed, reproduced** | fails on baseline when model axes ≠ clip axes. Model1 faces −Z, so this was real on the actual model | Fixed |
+| C05 | Time warp ignores detailed hand pose | **Confirmed, reproduced** | with the two `adaptPose` hand lines reverted the test fails (worst curl/wrist delta 0.0209 vs 1e-4); with the fix 29 warped frames match `sampleClip` exactly | Fixed |
+| C06 | Double axis conversion for wrist/thumb | **Confirmed, reproduced** | fails on baseline when model axes ≠ clip axes. Model1 faces −Z, so this was real on the actual model. Signed checks added: pitch/yaw/roll through the detailed path equal the same rotation through the clip hand-bone path (axis **and** sign) on three model bases incl. Model1's; thumb opposition rotates about the same axis and direction as the curl path (6 thumbs on Model1) | Fixed (visible direction change on Model1, see above) |
 | C07 | Calf direction with non-identity bind | **Confirmed, reproduced** | knee position differed between a rig and the same rig with re-oriented leg axes | Fixed |
 | C08 | Spring unit mixing | **Confirmed, reproduced** | velocity was a per-step displacement, then `+ gravity*dt` (m/s) and `* dt` again; step response never settled (25 mm residual) and the 12 m/s cap compared metres per step | Fixed (Verlet) |
 | C09 | First child only | **Conditional** | Model1 has *no* branches and no leaf chains (0/116 nodes missed). Synthetic test (Head → two eyes) failed on baseline | Fixed |
@@ -91,7 +112,7 @@ keeping all joint positions (`reorientNode`). Checked at root yaw 0 / 0.25 / −
   acceptance. 720 permutations of six cues give identical poses and counters.
 * **Conflicts are continuous.** A weaker cue keeps `(1 − winner weight)` of a shared region
   instead of being cut. The upper-body layer cap is a *capacity* that every cue consumes with
-  its weight. (First attempt used hard cuts; they produced 1 rad pops, found and removed.)
+  its weight. (A first version used hard cuts; it popped visibly in the crossfade measurement and was replaced.)
 * **Options** (`allowHands`, …) remove a region instead of rejecting the whole gesture.
 * **Bilateral primitives** (`WeightShift`, `KneeBounce`, `StepTouch`) are no longer narrowed by `side`.
 * **Mask audit of all 27 primitives** (`quality.primitive_touched_channels_fit_the_effective_mask`).
@@ -108,19 +129,35 @@ keeping all joint positions (`reorientNode`). Checked at root yaw 0 / 0.25 / −
 
 ## F. Mesh clipping
 
-What was reproduced (Model1, spring OFF, overlays FULL, zoomed renders in `artifacts/qa/`):
+**Status: the reported mesh clipping was not reproduced on the frames I sampled, and not solved.**
 
-1. **Rigid hair over chest/arms.** The ponytail and front strands are skinned to head/neck bones;
-   with Spring OFF they cannot move and arms pass through them. This is *rigid-skin behaviour*,
-   not a pose error. Arm/torso capsules cannot fix it. **Not solved.**
-2. **Forearms/hands near the torso.** Measured with the proxy below. Over three generated
-   dances (2403 frames at 20 Hz, overlays Full) the raw proxy clearance never went below
-   **+0.023 m**, so no proxy penetration occurs in the shipped dances. A forced cross-body gesture
-   does penetrate (34 of 201 frames, worst −41 mm) and is corrected (G).
-3. **Not investigated (honest):** the GPU renderer (skin matrices, inverse-bind order, alpha
-   sorting, depth writes), CPU-vs-GPU skinning agreement, wireframe/opaque-override
-   passes. I did not review `adapters/sdlgpu`. Whether some visible “clipping” is a transparency
-   or depth-sorting artifact is therefore **unknown**.
+What I did:
+
+1. Rendered neonPulse/streetCurrent on Model1 (Spring OFF, overlays FULL) from several camera yaws and
+   noticed forearms and hands that look as if they are inside the chest.
+2. Added `--hide-material <substr>` to `bgmedia_vrm_preview` and re-rendered the same frames with hair
+   hidden and with hair + clothing hidden (`artifacts/qa/hide_material_discriminator.png`,
+   `artifacts/qa/hair_hidden_chest_zoom.png`, not committed). Model1 has `HAIR_01/02`, `CLOTH` (tops, one-piece,
+   shoes) and `SKIN` materials.
+3. Measured the same frames on the skeleton. At t = 4, 7, 8 s the wrists are 0.28–0.30 m **in front of** the
+   hips while the calibrated torso half-depth is 0.116 m; raw proxy clearance at those frames is +0.112,
+   +0.167 and +0.087 m. The camera sits in front of the model, so the “hands vanish into the chest” impression
+   is occlusion and foreshortening of arms that point at the camera, not interpenetration.
+4. Swept three dances × 40 s at 20 Hz (2403 frames, overlays Full): minimum proxy clearance +0.023 m,
+   zero violations. (My first proxy was a single wide cylinder that flagged 54 % of frames; those were false
+   positives from hanging arms next to the shoulder line, which is why the proxy is banded and ignores the
+   upper-arm midpoint. The zero is a property of the redesigned proxy, not a pose change.)
+
+What this does **not** show: whether a hand or sleeve intersects hair, a vest pouch or a skirt in some frame
+I did not render. Hair is skinned rigidly to head/neck with Spring OFF, so hair passing through an arm that
+reaches toward the face is *plausible* but **unconfirmed**; I did not find such a frame. The earlier statement
+that “it is rigid hair” is a hypothesis.
+
+Not investigated (honest): the GPU renderer (skin matrices, inverse-bind order, alpha sorting, depth writes),
+CPU-vs-GPU skinning agreement, wireframe/opaque passes. `adapters/sdlgpu` was not reviewed, so a
+transparency or depth-sorting explanation for what you saw is **open**. The next useful step is a mesh-level
+penetration measurement (CPU skinning of arm-dominant vertices against nearest torso/hair vertices), which was
+not built.
 
 ## G. Collision-aware refinement
 
@@ -161,7 +198,11 @@ What was reproduced (Model1, spring OFF, overlays FULL, zoomed renders in `artif
   simulated branch point and the anchor is written once); leaf spring bones get the VRM 0.x
   7 cm virtual tail.
 * **Results.** Yaw invariance 2.22 → 0.0014 rad; step response settles to 1 mm (baseline 25 mm);
-  tip spread across 30/60/120/180 FPS 0.72 mm; max stretch ≤ 0.2 %; OFF→ON first-frame displacement
+  tip spread across 30/60/120/180 FPS 0.72 mm *for a single head-bob instant*; on the neonPulse dance, 60 vs
+  120 FPS tip trajectories differ by 2.1 mm on average, but by up to **49 mm** at one instant on one chain and
+  by more than 2 cm in 0.26 % of samples (40 of 15 156), i.e. collision contact can amplify tiny phase
+  differences (not root-caused; it never exceeds the 5 cm cap); `bgmedia_motion_qa` shows streetCurrent peak
+  displacement of 3.0–3.8 cm and neonPulse pinned at the 5.00 cm cap at 120/180 FPS; max stretch ≤ 0.2 %; OFF→ON first-frame displacement
   18.5 mm against 19.5 mm of animation motion in that frame (baseline 50 mm = stale clamp).
   Spring chains now actually move (3–5 cm peak displacement) — the old integrator was
   effectively scaled by `dt`, so earlier visual tuning of spring parameters is **not**
@@ -188,9 +229,17 @@ is therefore **not addressed** by this pass beyond the foot/transition fixes.
 
 | | before | after |
 |---|---|---|
-| `bgmedia_tests` | 141 | 170 |
+| `bgmedia_tests` | 141 | 173 |
 | CTest groups | 13 | 16 |
 | New files | | `test_quality.cpp`, `test_spatial.cpp`, `test_spring.cpp` |
+
+Tests that **return early without `models/Model1.vrm`** (so "all pass" includes skips on a clone without it):
+`spatial.model1_arm_proxy_clearance_report`, `spatial.arm_refinement_reduces_forced_penetration_smoothly`,
+`spatial.thumb_opposition_follows_the_curl_axis_and_sign`, `spring.response_is_independent_of_root_yaw`,
+`spring.enabling_after_a_pose_change_does_not_pop`, `spring.teleport_and_hitch_snap_to_the_pose`,
+`spring.result_is_frame_rate_independent_and_finite`, `spring.dance_trajectories_agree_between_60_and_120_fps`
+(plus the existing `retarget.model1_if_available` and Model1 spring tests). The branching, single-node, collider-index,
+step-response, IK, wrist and footwork tests use only the committed fixture.
 
 New tests that fail on the original code: C01, C06, C07, C11 (spatial); C02, C03, C08, C09 (spring);
 `footwork_arguments_keep_their_meaning` and `showcase_dances_have_no_foot_teleports`.
@@ -212,19 +261,18 @@ mismatch (stale test object) once.
 
 ## L. Visual QA
 
-Tools used: `bgmedia_vrm_preview` (SDL_GPU renderer, one frame), images opened with the image
-reader. Files are in `artifacts/qa/` (not committed): `zoom_neonPulse_o1.png`,
-`final_overlay_spring.png`, plus per-frame BMPs.
+Tools: `bgmedia_vrm_preview` (SDL_GPU renderer, one still per run) and the image reader. Files are in
+`artifacts/qa/` (not committed).
 
-Reviewed: Model1, streetCurrent/neonPulse, overlays off/full, spring off/on, camera yaw ±35–40°, zoomed
-on chest and arms at 8 time points. Observed: arms clear of the torso, no folded elbows or inverted
-hands, spring on/off differing only slightly in the hair tips. Rigid hair crossing arms with Spring
-OFF was **seen** (F.1).
+Reviewed: Model1, neonPulse/streetCurrent, overlays off/full, spring off/on, camera yaw ±35–40°, hair
+hidden / hair + clothing hidden, at 8 time points. Seen: arms clear of the torso, no folded elbows, no
+inverted hands; the hidden-material views make the occlusion explanation in F visible.
 
-**Not done:** video capture or review of motion, Desktop capture, a bind-pose scenario (the preview
-tool has no bind-pose option), an explicit root-yaw render, a stress-test sequence, a render of a
-crossfade, the second real VRM. Stills do not show temporal artifacts; the foot/transition numbers
-above come from the QA tool, not from watching.
+**Not done:** video capture/review, Desktop capture, a bind-pose scenario (the preview tool has none), an
+explicit root-yaw render, a stress-test sequence, a crossfade render, a **spring-on sequence** (a single cold-start
+frame cannot show spring behaviour, so the spring on/off stills prove nothing about spring motion; the evidence for
+spring is numerical, section H), a close-up of a roll/point/thumb frame after the C06 sign change, the second real VRM.
+Stills do not show temporal artifacts; foot/transition improvements come from the QA tool, not from watching.
 
 ## M. Remaining limitations
 
@@ -244,6 +292,15 @@ above come from the QA tool, not from watching.
 9. Spring parameter tuning (stiffness → ω, damping → drag) was derived analytically and checked for
    stability, not tuned by eye; hair may now look livelier than before.
 10. C09 leaf chains use a virtual tail but only synthetic data exercises it.
+11. **ASan:** AddressSanitizer Debug build (`/fsanitize=address`, tests + tools) of the test suite as it stood at
+    commit `d7dda88` (170 tests): all passed, no ASan reports. The repo script `scripts/run_asan_windows.ps1`
+    itself fails here (`vswhere` is not on PATH), so an equivalent invocation was used. The last three tests
+    (two signed wrist/thumb checks and the 60-vs-120-FPS dance test) were added afterwards and have **not**
+    run under ASan.
+12. **Desktop:** `bgmedia_desktop.exe` compiled but could not be relinked because the running app held the file;
+    I did not terminate it. The Desktop UI therefore was not rebuilt or exercised.
+13. Spring: dance-level 60 vs 120 FPS divergence of up to 49 mm at isolated instants (H); not root-caused.
+14. The crossfade residual (item 1) was not ablated cue by cue.
 
 ## N. Git
 
