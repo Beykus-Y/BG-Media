@@ -769,10 +769,10 @@ TEST_CASE(motion32.seek_and_rebase_keep_generated_dance_finite) {
     }
 }
 
-// BG Motion 3.3 (#8): the opt-in inertial transition keeps upper-body poses continuous
+// BG Motion 3.2 suite (registered in CTest), #8: the opt-in inertial transition keeps upper-body poses continuous
 // at both ends of a segment fade, is a pure function of media time (seek equals playback),
 // and leaves the default blend untouched.
-TEST_CASE(motion33.inertial_transition_is_continuous_and_seek_stable) {
+TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
     const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
     const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
     const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);

@@ -21,7 +21,9 @@
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
 #include <functional>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -123,9 +125,13 @@ public:
                                                 double* deviation = nullptr);
 
 private:
+    // Pose of one segment at one time, memoized per sample() call: with overlapping
+    // fades the recursion would otherwise revisit the same (segment, time) pairs.
+    using PoseMemo = std::map<std::pair<std::size_t, double>, ClipPose>;
     [[nodiscard]] ClipPose poseOf(std::size_t index, double mediaTime,
                                   const MusicalTimeline& timeline,
-                                  const WarpProfile& warp, float* transition) const;
+                                  const WarpProfile& warp, float* transition,
+                                  PoseMemo& memo) const;
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;
