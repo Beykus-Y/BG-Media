@@ -31,6 +31,7 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -130,7 +131,9 @@ Replay replay(const vrm::VrmModel& model, const animation::HumanoidRetargeter& r
 
     motion::DancePlayer player;
     configurePlayer(player, rig, o.dances, overlay);
-    (void)player.selectClip(clip, o.from, true);
+    if (!player.selectClip(clip, o.from, true)) {
+        throw std::runtime_error("clip not found in the library: " + clip);
+    }
 
     animation::SecondaryDynamics dynamics(model);
     animation::SecondarySettings settings;
@@ -227,7 +230,12 @@ Scenario runScenario(const std::string& modelName, const vrm::VrmModel& model,
         for (std::size_t j = 0; j < seekAt.size(); ++j) {
             motion::DancePlayer jumper;
             configurePlayer(jumper, rig, o.dances, overlay);
-            (void)jumper.selectClip(clip, o.from, true);
+            if (!jumper.selectClip(clip, o.from, true)) {
+                throw std::runtime_error("clip not found in the library: " + clip);
+            }
+            // Start from the replay's first time so the jump goes through the seek path
+            // (DancePlayer only reseeds when it has an earlier update to compare with).
+            jumper.update(o.from);
             const double t = o.from + seekAt[j] / fps;
             const std::vector<Vec3> nodes = nodePositions(
                 rig.applyClip(jumper.update(t).pose, t), model.nodes.size());
@@ -309,7 +317,12 @@ int main(int argc, char** argv) {
             for (double fps : o.fps) {
                 for (const std::string& overlay : o.overlays) {
                     for (int spring : o.springs) {
-                        results.push_back(runScenario(modelName, *loaded.model, rig, o, clip, fps, overlay, spring != 0));
+                        try {
+                            results.push_back(runScenario(modelName, *loaded.model, rig, o, clip, fps, overlay, spring != 0));
+                        } catch (const std::exception& error) {
+                            std::fprintf(stderr, "%s\n", error.what());
+                            return 1;
+                        }
                         printScenario(results.back());
                     }
                 }

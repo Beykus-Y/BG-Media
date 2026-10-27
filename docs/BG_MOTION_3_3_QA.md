@@ -34,6 +34,12 @@ models and `bgmedia_motion_diag`/`bgmedia_qa_matrix` run against them.
 
 ## Tools
 
+- `bgmedia_qa_matrix` seek column: the largest node error between a fresh player that
+  jumps to a sampled time (after one update at the start time, so the jump takes the
+  seek path) and the sequential replay. `DancePlayer` reseeds on a jump, and
+  `bgmedia_motion_diag` already notes that a jump re-aligns the schedule. The baseline
+  therefore shows large values; read it as how far a seek moves the pose, not as a
+  pass/fail number. An unknown `--clip` is an error (exit 1).
 - `bgmedia_qa_matrix` (`tools/qa_matrix/main.cpp`): replays each clip at 240 Hz
   (truth) and at the scenario fps, for overlay off/full and spring off/on. It reports
   ground drag from both replays, the per-sample legacy figure, planted-run slide,
