@@ -447,3 +447,14 @@ ClipPose → HumanoidRetargeter → foot IK → renderer
   bones и floor collision не входят в текущий этап.
 - In-memory decoder ограничен 1 GiB; для очень длинных файлов нужен стриминговый
   анализ (следующий этап).
+
+
+## BG Motion 3.2 additions
+
+BG Motion 3.2 adds three stages after the 3.1 clip sampler and before skinning:
+
+1. composeMotion() applies independent motion primitives on masked body regions with priority, contact and support-foot checks.
+2. HumanoidRetargeter::applyClip() applies detailed per-finger hand poses and toe roll in addition to the core humanoid and foot IK solve.
+3. SecondaryDynamics simulates VRM 0.x spring chains (hair, coat/skirt, supported soft-tissue chains) on the final retargeted node globals, then the renderer builds skinning matrices.
+
+The musical chain (BG Beat -> BG Sync -> BG Motion) is unchanged. Procedural choreography bakes a model-independent gmotion.clip v2, so runtime sampling remains a pure function of musical time. See docs/BG_MOTION_3_2.md.

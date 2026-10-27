@@ -1,14 +1,18 @@
 #include "framework.hpp"
 
 #include "bgmedia/animation/HumanoidRetargeter.hpp"
+#include "bgmedia/motion3/DanceClip.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <vector>
 #include <string>
 
 namespace {
@@ -312,3 +316,4 @@ TEST_CASE(retarget.model1_if_available) {
               << " footError=" << neutral.stats.maxFootError
               << " bones=" << neutral.stats.resolvedBones;
 }
+

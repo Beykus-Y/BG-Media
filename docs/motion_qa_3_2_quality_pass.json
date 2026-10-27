@@ -1,0 +1,29 @@
+{
+  "tool": "bgmedia_motion_qa",
+  "version": "3.2",
+  "clips": [
+    {"id":"energetic","loopRotationDeg":0,"loopPositionHeight":1.50991e-07,"loopVelocityJumpDegPerSec":11.4745,"maxAngularSpeedDegPerSec":465.637,"maxAngularAccelerationDegPerSec2":8801.6,"fastestBone":"leftUpperArm","maxHipsSpeed":0.590701,"maxFootSpeed":2.95929,"slideMm":2.24485,"stanceRuns":18,"footErrorMm":0.000308817,"reachDropCm":0,"swings":12,"swingMaxHeightUnits":0.745994,"footPathLength":3.69629,"maxRootExcursion":0.237535,"maxRootYawDeg":180.15},
+    {"id":"groove","loopRotationDeg":0,"loopPositionHeight":1.45286e-07,"loopVelocityJumpDegPerSec":2.6164,"maxAngularSpeedDegPerSec":103.219,"maxAngularAccelerationDegPerSec2":742.382,"fastestBone":"leftLowerArm","maxHipsSpeed":0.346611,"maxFootSpeed":0.697376,"slideMm":2.14604,"stanceRuns":10,"footErrorMm":0.000284906,"reachDropCm":0,"swings":8,"swingMaxHeightUnits":0.15012,"footPathLength":1.204,"maxRootExcursion":0,"maxRootYawDeg":0},
+    {"id":"hiphop","loopRotationDeg":0,"loopPositionHeight":1.49088e-07,"loopVelocityJumpDegPerSec":5.17289,"maxAngularSpeedDegPerSec":260,"maxAngularAccelerationDegPerSec2":10160.4,"fastestBone":"rightLowerArm","maxHipsSpeed":0.338006,"maxFootSpeed":0.972986,"slideMm":2.24706,"stanceRuns":15,"footErrorMm":0.000310721,"reachDropCm":0,"swings":9,"swingMaxHeightUnits":0.212661,"footPathLength":1.48441,"maxRootExcursion":0.0641459,"maxRootYawDeg":40.0124},
+    {"id":"idle","loopRotationDeg":0,"loopPositionHeight":2.22558e-09,"loopVelocityJumpDegPerSec":0.0523022,"maxAngularSpeedDegPerSec":2.24406,"maxAngularAccelerationDegPerSec2":8.38013,"fastestBone":"head","maxHipsSpeed":0.00512064,"maxFootSpeed":0,"slideMm":0.000210734,"stanceRuns":2,"footErrorMm":0.000212603,"reachDropCm":0.908016,"swings":0,"swingMaxHeightUnits":0,"footPathLength":0,"maxRootExcursion":0,"maxRootYawDeg":0},
+    {"id":"sidestep","loopRotationDeg":0,"loopPositionHeight":1.68574e-07,"loopVelocityJumpDegPerSec":5.33763,"maxAngularSpeedDegPerSec":255.673,"maxAngularAccelerationDegPerSec2":1804.13,"fastestBone":"rightUpperArm","maxHipsSpeed":0.474391,"maxFootSpeed":2.09274,"slideMm":2.50999,"stanceRuns":16,"footErrorMm":0.000265308,"reachDropCm":0,"swings":14,"swingMaxHeightUnits":0.212408,"footPathLength":1.85314,"maxRootExcursion":0,"maxRootYawDeg":0},
+    {"id":"neonPulse","loopRotationDeg":0,"loopPositionHeight":7.50856e-09,"loopVelocityJumpDegPerSec":3.95044,"maxAngularSpeedDegPerSec":606.82,"maxAngularAccelerationDegPerSec2":15080.5,"fastestBone":"rightLowerArm","maxHipsSpeed":0.41145,"maxFootSpeed":0.551089,"slideMm":0.180751,"stanceRuns":21,"footErrorMm":0.000295427,"reachDropCm":0,"swings":10,"swingMaxHeightUnits":0.136048,"footPathLength":1.24422,"maxRootExcursion":0.0392917,"maxRootYawDeg":22.0853},
+    {"id":"streetCurrent","loopRotationDeg":0,"loopPositionHeight":1.49302e-08,"loopVelocityJumpDegPerSec":2.90001,"maxAngularSpeedDegPerSec":355.805,"maxAngularAccelerationDegPerSec2":5678.01,"fastestBone":"rightUpperArm","maxHipsSpeed":0.427439,"maxFootSpeed":0.67272,"slideMm":0.204086,"stanceRuns":22,"footErrorMm":0.000280091,"reachDropCm":0,"swings":10,"swingMaxHeightUnits":0.179928,"footPathLength":1.53174,"maxRootExcursion":0.0508434,"maxRootYawDeg":22.0855},
+    {"id":"fluidSignal","loopRotationDeg":0,"loopPositionHeight":3.83994e-09,"loopVelocityJumpDegPerSec":3.86833,"maxAngularSpeedDegPerSec":521.328,"maxAngularAccelerationDegPerSec2":7320.67,"fastestBone":"leftUpperArm","maxHipsSpeed":0.359982,"maxFootSpeed":0.65883,"slideMm":0.144124,"stanceRuns":21,"footErrorMm":0.000231838,"reachDropCm":1.3653,"swings":10,"swingMaxHeightUnits":0.151028,"footPathLength":1.34237,"maxRootExcursion":0.044218,"maxRootYawDeg":22.085}
+  ],
+  "compositionMicroseconds": 1.17915,
+  "spring": [
+    {"clip":"neonPulse","fps":30,"chains":36,"bones":116,"maxDisplacementCm":3.98293,"maxStretchPercent":0.0645348,"maxSimulateMs":0.1041,"maxSubsteps":4,"finite":true},
+    {"clip":"neonPulse","fps":60,"chains":36,"bones":116,"maxDisplacementCm":4.62257,"maxStretchPercent":0.080214,"maxSimulateMs":0.0764,"maxSubsteps":2,"finite":true},
+    {"clip":"neonPulse","fps":120,"chains":36,"bones":116,"maxDisplacementCm":5,"maxStretchPercent":0.197596,"maxSimulateMs":0.0547,"maxSubsteps":1,"finite":true},
+    {"clip":"neonPulse","fps":180,"chains":36,"bones":116,"maxDisplacementCm":5,"maxStretchPercent":0.191386,"maxSimulateMs":0.0646,"maxSubsteps":1,"finite":true},
+    {"clip":"streetCurrent","fps":30,"chains":36,"bones":116,"maxDisplacementCm":2.96916,"maxStretchPercent":0.0513042,"maxSimulateMs":0.1171,"maxSubsteps":4,"finite":true},
+    {"clip":"streetCurrent","fps":60,"chains":36,"bones":116,"maxDisplacementCm":3.4577,"maxStretchPercent":0.0488859,"maxSimulateMs":0.0904,"maxSubsteps":2,"finite":true},
+    {"clip":"streetCurrent","fps":120,"chains":36,"bones":116,"maxDisplacementCm":3.8369,"maxStretchPercent":0.200386,"maxSimulateMs":0.0581,"maxSubsteps":1,"finite":true},
+    {"clip":"streetCurrent","fps":180,"chains":36,"bones":116,"maxDisplacementCm":3.75384,"maxStretchPercent":0.194926,"maxSimulateMs":0.0584,"maxSubsteps":1,"finite":true},
+    {"clip":"fluidSignal","fps":30,"chains":36,"bones":116,"maxDisplacementCm":3.67116,"maxStretchPercent":0.0440636,"maxSimulateMs":0.1141,"maxSubsteps":4,"finite":true},
+    {"clip":"fluidSignal","fps":60,"chains":36,"bones":116,"maxDisplacementCm":4.3267,"maxStretchPercent":0.0544621,"maxSimulateMs":0.0854,"maxSubsteps":2,"finite":true},
+    {"clip":"fluidSignal","fps":120,"chains":36,"bones":116,"maxDisplacementCm":4.55919,"maxStretchPercent":0.199606,"maxSimulateMs":0.0478,"maxSubsteps":1,"finite":true},
+    {"clip":"fluidSignal","fps":180,"chains":36,"bones":116,"maxDisplacementCm":4.76935,"maxStretchPercent":0.194066,"maxSimulateMs":0.06,"maxSubsteps":1,"finite":true}
+  ]
+}

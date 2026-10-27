@@ -186,7 +186,8 @@ TEST_CASE(dance.library_ships_the_four_dances) {
     for (const motion::HumanoidClip& clip : lib.clips()) {
         CHECK(!clip.id.empty() && !clip.name.empty() && clip.bpm > 0.0);
         CHECK(clip.bpmMin < clip.bpmMax);
-        CHECK(clip.formatVersion == motion::kClipFormatVersion);
+        CHECK(clip.formatVersion >= 1 &&
+              clip.formatVersion <= motion::kClipFormatVersion);
         CHECK(!clip.origin.empty());
         if (clip.style != motion::DanceStyle::Idle) {
             CHECK(!clip.accents.empty());

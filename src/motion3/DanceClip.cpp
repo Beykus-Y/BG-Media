@@ -246,6 +246,37 @@ bool vec3Track(Reader& reader, const Value& arr, const std::string& what, int ke
     return true;
 }
 
+bool footTrack(Reader& reader, const Value& arr, const std::string& what, int keyCount,
+               FootTrack& dst) {
+    std::vector<float> flat;
+    if (!reader.floats(arr, what, flat)) {
+        return false;
+    }
+    const std::size_t keys = static_cast<std::size_t>(keyCount);
+    if (flat.size() != keys * 4 && flat.size() != keys * 5) {
+        reader.error(what + " has " + std::to_string(flat.size()) +
+                     " values, expected " + std::to_string(keyCount) +
+                     " keys x 4 or 5 (x, y, z, yaw[, toe])");
+        return false;
+    }
+    const std::size_t stride = flat.size() / keys;
+    dst.position.resize(keys);
+    dst.yaw.resize(keys);
+    dst.toe.clear();
+    if (stride == 5) {
+        dst.toe.resize(keys);
+    }
+    for (std::size_t i = 0; i < keys; ++i) {
+        const std::size_t base = i * stride;
+        dst.position[i] = {flat[base], flat[base + 1], flat[base + 2]};
+        dst.yaw[i] = flat[base + 3];
+        if (stride == 5) {
+            dst.toe[i] = flat[base + 4];
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 const char* styleName(DanceStyle style) {
@@ -287,7 +318,72 @@ const char* footPhaseName(FootPhase phase) {
 ClipPose neutralClipPose() {
     ClipPose pose;
     pose.bone.fill(Quat::identity());
+    pose.handPose[0] = relaxedHandPose(pose.hand[0]);
+    pose.handPose[1] = relaxedHandPose(pose.hand[1]);
     return pose;
+}
+
+HandPose relaxedHandPose(float curl) {
+    HandPose pose;
+    curl = std::clamp(curl, 0.0f, 1.0f);
+    // The resting hand is not a flat blade: the middle and ring fingers relax
+    // slightly more than the index, and the little finger trails a little.
+    static constexpr float kRelax[5] = {0.65f, 0.90f, 1.0f, 0.95f, 0.80f};
+    for (int finger = 0; finger < 5; ++finger) {
+        for (int joint = 0; joint < 3; ++joint) {
+            pose.curl[static_cast<std::size_t>(finger)][static_cast<std::size_t>(joint)] =
+                std::clamp(curl * kRelax[finger], 0.0f, 1.0f);
+        }
+    }
+    return pose;
+}
+
+namespace {
+float clamp01(float value) {
+    return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+}
+float clampSigned(float value) {
+    return std::isfinite(value) ? std::clamp(value, -1.0f, 1.0f) : 0.0f;
+}
+}  // namespace
+
+void clampHandPose(HandPose& pose) {
+    for (auto& finger : pose.curl) {
+        for (float& value : finger) {
+            value = clamp01(value);
+        }
+    }
+    for (float& value : pose.spread) {
+        value = clampSigned(value);
+    }
+    pose.thumbOpposition = clamp01(pose.thumbOpposition);
+    for (float& value : pose.wrist) {
+        value = clampSigned(value);
+    }
+}
+
+HandPose blendHandPose(const HandPose& a, const HandPose& b, float w) {
+    w = std::clamp(w, 0.0f, 1.0f);
+    HandPose out;
+    for (int finger = 0; finger < 5; ++finger) {
+        for (int joint = 0; joint < 3; ++joint) {
+            out.curl[static_cast<std::size_t>(finger)][static_cast<std::size_t>(joint)] =
+                a.curl[static_cast<std::size_t>(finger)][static_cast<std::size_t>(joint)] *
+                    (1.0f - w) +
+                b.curl[static_cast<std::size_t>(finger)][static_cast<std::size_t>(joint)] * w;
+        }
+        out.spread[static_cast<std::size_t>(finger)] =
+            a.spread[static_cast<std::size_t>(finger)] * (1.0f - w) +
+            b.spread[static_cast<std::size_t>(finger)] * w;
+    }
+    out.thumbOpposition = a.thumbOpposition * (1.0f - w) + b.thumbOpposition * w;
+    for (int axis = 0; axis < 3; ++axis) {
+        out.wrist[static_cast<std::size_t>(axis)] =
+            a.wrist[static_cast<std::size_t>(axis)] * (1.0f - w) +
+            b.wrist[static_cast<std::size_t>(axis)] * w;
+    }
+    clampHandPose(out);
+    return out;
 }
 
 void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out) {
@@ -336,12 +432,59 @@ void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out) {
         if (track.yaw.size() == static_cast<std::size_t>(clip.keyCount)) {
             foot.yaw = scalar(track.yaw);
         }
+        if (track.toe.size() == static_cast<std::size_t>(clip.keyCount)) {
+            foot.toePitch = std::clamp(scalar(track.toe), -1.0f, 1.0f);
+        }
         foot.phase = footPhaseAt(clip, f, clipBeat, foot.contact);
     }
     for (int h = 0; h < 2; ++h) {
         const auto& track = clip.hands[static_cast<std::size_t>(h)];
         if (track.size() == static_cast<std::size_t>(clip.keyCount)) {
             out.hand[static_cast<std::size_t>(h)] = std::clamp(scalar(track), 0.0f, 1.0f);
+        }
+        const auto& detailed = clip.handPoses[static_cast<std::size_t>(h)];
+        if (detailed.size() == static_cast<std::size_t>(clip.keyCount)) {
+            const HandPose& h0 = detailed[static_cast<std::size_t>(w.i0)];
+            const HandPose& hm1 = detailed[static_cast<std::size_t>(w.im1)];
+            const HandPose& h2 = detailed[static_cast<std::size_t>(w.i2)];
+            const HandPose& h3 = detailed[static_cast<std::size_t>(w.i3)];
+            HandPose sampled;
+            for (int finger = 0; finger < 5; ++finger) {
+                for (int joint = 0; joint < 3; ++joint) {
+                    sampled.curl[static_cast<std::size_t>(finger)]
+                                [static_cast<std::size_t>(joint)] =
+                        catmullF(hm1.curl[static_cast<std::size_t>(finger)]
+                                      [static_cast<std::size_t>(joint)],
+                                 h0.curl[static_cast<std::size_t>(finger)]
+                                      [static_cast<std::size_t>(joint)],
+                                 h2.curl[static_cast<std::size_t>(finger)]
+                                      [static_cast<std::size_t>(joint)],
+                                 h3.curl[static_cast<std::size_t>(finger)]
+                                      [static_cast<std::size_t>(joint)],
+                                 w.u);
+                }
+                sampled.spread[static_cast<std::size_t>(finger)] =
+                    catmullF(hm1.spread[static_cast<std::size_t>(finger)],
+                             h0.spread[static_cast<std::size_t>(finger)],
+                             h2.spread[static_cast<std::size_t>(finger)],
+                             h3.spread[static_cast<std::size_t>(finger)], w.u);
+            }
+            sampled.thumbOpposition =
+                catmullF(hm1.thumbOpposition, h0.thumbOpposition,
+                         h2.thumbOpposition, h3.thumbOpposition, w.u);
+            for (int axis = 0; axis < 3; ++axis) {
+                sampled.wrist[static_cast<std::size_t>(axis)] =
+                    catmullF(hm1.wrist[static_cast<std::size_t>(axis)],
+                             h0.wrist[static_cast<std::size_t>(axis)],
+                             h2.wrist[static_cast<std::size_t>(axis)],
+                             h3.wrist[static_cast<std::size_t>(axis)], w.u);
+            }
+            clampHandPose(sampled);
+            out.handPose[static_cast<std::size_t>(h)] = sampled;
+            out.detailedHands = true;
+        } else {
+            out.handPose[static_cast<std::size_t>(h)] =
+                relaxedHandPose(out.hand[static_cast<std::size_t>(h)]);
         }
     }
     out.energy = clip.energy;
@@ -378,12 +521,15 @@ ClipPose blendPoses(const ClipPose& a, const ClipPose& b, float w) {
     for (std::size_t f = 0; f < 2; ++f) {
         out.foot[f].position = math::lerp(a.foot[f].position, b.foot[f].position, w);
         out.foot[f].yaw = arc(a.foot[f].yaw, b.foot[f].yaw);
+        out.foot[f].toePitch = a.foot[f].toePitch + (b.foot[f].toePitch - a.foot[f].toePitch) * w;
         out.foot[f].contact = a.foot[f].contact + (b.foot[f].contact - a.foot[f].contact) * w;
         out.foot[f].phase = w < 0.5f ? a.foot[f].phase : b.foot[f].phase;
     }
     for (std::size_t h = 0; h < 2; ++h) {
         out.hand[h] = a.hand[h] + (b.hand[h] - a.hand[h]) * w;
+        out.handPose[h] = blendHandPose(a.handPose[h], b.handPose[h], w);
     }
+    out.detailedHands = a.detailedHands || b.detailedHands;
     out.energy = a.energy + (b.energy - a.energy) * w;
     out.accent = std::max(a.accent * (1.0f - w), b.accent * w);
     return out;
@@ -414,7 +560,7 @@ ClipLoadResult parseClipJson(const std::string& text, const std::string& sourceN
     double version = 0;
     reader.number(root, "version", version, true);
     clip.formatVersion = static_cast<int>(version);
-    if (clip.formatVersion != kClipFormatVersion && version != 0) {
+    if ((clip.formatVersion != 1 && clip.formatVersion != kClipFormatVersion) && version != 0) {
         reader.error("unsupported clip format version " +
                      std::to_string(clip.formatVersion) + " (this build reads version " +
                      std::to_string(kClipFormatVersion) + ")");
@@ -576,8 +722,7 @@ ClipLoadResult parseClipJson(const std::string& text, const std::string& sourceN
             vec3Track(reader, *v, "tracks.root", clip.keyCount, 3, clip.root, nullptr);
         }
         if (const Value* v = tracks->find("footLeft")) {
-            vec3Track(reader, *v, "tracks.footLeft", clip.keyCount, 4, clip.feet[0].position,
-                      &clip.feet[0].yaw);
+            footTrack(reader, *v, "tracks.footLeft", clip.keyCount, clip.feet[0]);
         }
         for (int h = 0; h < 2; ++h) {
             if (const Value* v = tracks->find(h == 0 ? "handLeft" : "handRight")) {
@@ -592,10 +737,45 @@ ClipLoadResult parseClipJson(const std::string& text, const std::string& sourceN
                     }
                 }
             }
+            const char* detailedKey = h == 0 ? "handPoseLeft" : "handPoseRight";
+            if (const Value* v = tracks->find(detailedKey)) {
+                std::vector<float> flat;
+                constexpr int kHandStride = 15 + 5 + 1 + 3;  // curls, spreads, opposition, wrist
+                if (reader.floats(*v, std::string("tracks.") + detailedKey, flat)) {
+                    if (flat.size() != static_cast<std::size_t>(clip.keyCount) * kHandStride) {
+                        reader.error(std::string("tracks.") + detailedKey + " has " +
+                                     std::to_string(flat.size()) + " values, expected " +
+                                     std::to_string(clip.keyCount) + " keys x " +
+                                     std::to_string(kHandStride));
+                    } else {
+                        auto& track = clip.handPoses[static_cast<std::size_t>(h)];
+                        track.resize(static_cast<std::size_t>(clip.keyCount));
+                        for (int k = 0; k < clip.keyCount; ++k) {
+                            const float* row = flat.data() + static_cast<std::size_t>(k) * kHandStride;
+                            HandPose pose;
+                            int at = 0;
+                            for (int finger = 0; finger < 5; ++finger) {
+                                for (int joint = 0; joint < 3; ++joint) {
+                                    pose.curl[static_cast<std::size_t>(finger)]
+                                              [static_cast<std::size_t>(joint)] = row[at++];
+                                }
+                            }
+                            for (int finger = 0; finger < 5; ++finger) {
+                                pose.spread[static_cast<std::size_t>(finger)] = row[at++];
+                            }
+                            pose.thumbOpposition = row[at++];
+                            for (int axis = 0; axis < 3; ++axis) {
+                                pose.wrist[static_cast<std::size_t>(axis)] = row[at++];
+                            }
+                            clampHandPose(pose);
+                            track[static_cast<std::size_t>(k)] = pose;
+                        }
+                    }
+                }
+            }
         }
         if (const Value* v = tracks->find("footRight")) {
-            vec3Track(reader, *v, "tracks.footRight", clip.keyCount, 4, clip.feet[1].position,
-                      &clip.feet[1].yaw);
+            footTrack(reader, *v, "tracks.footRight", clip.keyCount, clip.feet[1]);
         }
     }
 
@@ -627,6 +807,235 @@ ClipLoadResult loadClipFile(const std::filesystem::path& path) {
     std::ostringstream buffer;
     buffer << file.rdbuf();
     return parseClipJson(buffer.str(), name);
+}
+
+namespace {
+
+void writeNumber(std::ostream& out, double value) {
+    if (!std::isfinite(value)) {
+        value = 0.0;
+    }
+    out << value;
+}
+
+void writeFloatArray(std::ostream& out, const float* values, std::size_t count) {
+    out << '[';
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) out << ',';
+        writeNumber(out, values[i]);
+    }
+    out << ']';
+}
+
+void writeQuatArray(std::ostream& out, const std::vector<Quat>& track) {
+    out << '[';
+    for (std::size_t i = 0; i < track.size(); ++i) {
+        if (i) out << ',';
+        const Quat& q = track[i];
+        writeNumber(out, q.x);
+        out << ',';
+        writeNumber(out, q.y);
+        out << ',';
+        writeNumber(out, q.z);
+        out << ',';
+        writeNumber(out, q.w);
+    }
+    out << ']';
+}
+
+void writeVec3Array(std::ostream& out, const std::vector<Vec3>& track) {
+    out << '[';
+    for (std::size_t i = 0; i < track.size(); ++i) {
+        if (i) out << ',';
+        writeNumber(out, track[i].x);
+        out << ',';
+        writeNumber(out, track[i].y);
+        out << ',';
+        writeNumber(out, track[i].z);
+    }
+    out << ']';
+}
+
+void writeFootTrack(std::ostream& out, const FootTrack& track, int keyCount) {
+    const bool hasToe = track.toe.size() == static_cast<std::size_t>(keyCount);
+    const bool hasPos = track.position.size() == static_cast<std::size_t>(keyCount);
+    const bool hasYaw = track.yaw.size() == static_cast<std::size_t>(keyCount);
+    out << '[';
+    for (int i = 0; i < keyCount; ++i) {
+        if (i) out << ',';
+        const Vec3 p = hasPos ? track.position[static_cast<std::size_t>(i)] : Vec3{};
+        writeNumber(out, p.x);
+        out << ',';
+        writeNumber(out, p.y);
+        out << ',';
+        writeNumber(out, p.z);
+        out << ',';
+        writeNumber(out, hasYaw ? track.yaw[static_cast<std::size_t>(i)] : 0.0f);
+        if (hasToe) {
+            out << ',';
+            writeNumber(out, track.toe[static_cast<std::size_t>(i)]);
+        }
+    }
+    out << ']';
+}
+
+void writeHandPoseTrack(std::ostream& out, const std::vector<HandPose>& track) {
+    out << '[';
+    bool first = true;
+    for (const HandPose& pose : track) {
+        float row[24];
+        int at = 0;
+        for (int finger = 0; finger < 5; ++finger) {
+            for (int joint = 0; joint < 3; ++joint) {
+                row[at++] = pose.curl[static_cast<std::size_t>(finger)]
+                                      [static_cast<std::size_t>(joint)];
+            }
+        }
+        for (int finger = 0; finger < 5; ++finger) {
+            row[at++] = pose.spread[static_cast<std::size_t>(finger)];
+        }
+        row[at++] = pose.thumbOpposition;
+        for (int axis = 0; axis < 3; ++axis) {
+            row[at++] = pose.wrist[static_cast<std::size_t>(axis)];
+        }
+        for (float value : row) {
+            if (!first) out << ',';
+            first = false;
+            writeNumber(out, value);
+        }
+    }
+    out << ']';
+}
+
+std::string escapeJson(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += ' ';
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string clipToJson(const HumanoidClip& clip) {
+    std::ostringstream out;
+    out.precision(6);
+    out << "{\"format\":\"" << kClipFormatName << "\","
+        << "\"version\":" << kClipFormatVersion << ','
+        << "\"id\":\"" << escapeJson(clip.id) << "\","
+        << "\"name\":\"" << escapeJson(clip.name) << "\","
+        << "\"style\":\"" << styleName(clip.style) << "\","
+        << "\"author\":\"" << escapeJson(clip.author) << "\","
+        << "\"origin\":\"" << escapeJson(clip.origin) << "\","
+        << "\"description\":\"" << escapeJson(clip.description) << "\","
+        << "\"bpm\":" << clip.bpm << ','
+        << "\"bpmRange\":[" << clip.bpmMin << ',' << clip.bpmMax << "],"
+        << "\"beats\":" << clip.beats << ','
+        << "\"beatsPerBar\":" << clip.beatsPerBar << ','
+        << "\"keysPerBeat\":" << clip.keysPerBeat << ','
+        << "\"loop\":" << (clip.loop ? "true" : "false") << ','
+        << "\"seamless\":" << (clip.seamless ? "true" : "false") << ','
+        << "\"tempoSync\":" << (clip.tempoSync ? "true" : "false") << ','
+        << "\"energy\":" << clip.energy;
+    out << ",\"entryBeats\":";
+    writeFloatArray(out, clip.entryBeats.data(), clip.entryBeats.size());
+    out << ",\"exitBeats\":";
+    writeFloatArray(out, clip.exitBeats.data(), clip.exitBeats.size());
+    out << ",\"accents\":[";
+    for (std::size_t i = 0; i < clip.accents.size(); ++i) {
+        if (i) out << ',';
+        const AccentMark& mark = clip.accents[i];
+        out << "{\"beat\":" << mark.beat << ",\"strength\":" << mark.strength
+            << ",\"confidence\":" << mark.confidence << ",\"kind\":\""
+            << escapeJson(mark.kind) << "\"}";
+    }
+    out << "],\"contacts\":[";
+    for (std::size_t i = 0; i < clip.contacts.size(); ++i) {
+        if (i) out << ',';
+        const ContactSegment& seg = clip.contacts[i];
+        out << "{\"foot\":\"" << (seg.foot == 0 ? "left" : "right")
+            << "\",\"start\":" << seg.start << ",\"end\":" << seg.end
+            << ",\"kind\":\"" << (seg.pivot ? "pivot" : "stance") << "\"}";
+    }
+    out << "],\"tracks\":{\"bones\":{";
+    bool first = true;
+    const auto beginTrack = [&](std::string_view name) {
+        if (!first) out << ',';
+        first = false;
+        out << '"' << name << "\":";
+    };
+    for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+        const auto& track = clip.bones[b];
+        if (track.size() != static_cast<std::size_t>(clip.keyCount)) {
+            continue;
+        }
+        beginTrack(vrm::humanoidBoneName(static_cast<vrm::HumanoidBone>(b)));
+        writeQuatArray(out, track);
+    }
+    out << "},\"hips\":";
+    if (clip.hips.size() == static_cast<std::size_t>(clip.keyCount)) {
+        writeVec3Array(out, clip.hips);
+    } else {
+        out << "[]";
+    }
+    out << ",\"root\":";
+    if (clip.root.size() == static_cast<std::size_t>(clip.keyCount)) {
+        writeVec3Array(out, clip.root);
+    } else {
+        out << "[]";
+    }
+    first = false;
+    for (int f = 0; f < 2; ++f) {
+        beginTrack(f == 0 ? "footLeft" : "footRight");
+        writeFootTrack(out, clip.feet[static_cast<std::size_t>(f)], clip.keyCount);
+    }
+    for (int h = 0; h < 2; ++h) {
+        if (clip.hands[static_cast<std::size_t>(h)].size() ==
+            static_cast<std::size_t>(clip.keyCount)) {
+            beginTrack(h == 0 ? "handLeft" : "handRight");
+            writeFloatArray(out, clip.hands[static_cast<std::size_t>(h)].data(),
+                            clip.hands[static_cast<std::size_t>(h)].size());
+        }
+        if (clip.handPoses[static_cast<std::size_t>(h)].size() ==
+            static_cast<std::size_t>(clip.keyCount)) {
+            beginTrack(h == 0 ? "handPoseLeft" : "handPoseRight");
+            writeHandPoseTrack(out, clip.handPoses[static_cast<std::size_t>(h)]);
+        }
+    }
+    out << "}}";
+    return out.str();
+}
+
+bool saveClipFile(const HumanoidClip& clip, const std::filesystem::path& path,
+                  std::string* error) {
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        if (error) *error = "cannot open " + path.string();
+        return false;
+    }
+    file << clipToJson(clip) << '\n';
+    if (!file) {
+        if (error) *error = "failed to write " + path.string();
+        return false;
+    }
+    return true;
 }
 
 void validateClip(const HumanoidClip& clip, const std::string& sourceName,
@@ -694,6 +1103,36 @@ void validateClip(const HumanoidClip& clip, const std::string& sourceName,
         }
     }
 
+    // BG Motion 3.2 detailed hand tracks must match the key count and stay in
+    // their documented ranges; a malformed hand pose is a hard error because it
+    // would otherwise be silently clamped into a different gesture.
+    for (int h = 0; h < 2; ++h) {
+        const auto& track = clip.handPoses[static_cast<std::size_t>(h)];
+        if (track.empty()) {
+            continue;
+        }
+        if (track.size() != static_cast<std::size_t>(clip.keyCount)) {
+            error(std::string("hand pose ") + (h == 0 ? "left" : "right") +
+                  " track does not match the key count");
+            continue;
+        }
+        for (const HandPose& pose : track) {
+            bool finite = true;
+            for (const auto& finger : pose.curl) {
+                for (float v : finger) finite = finite && std::isfinite(v) && v >= 0.0f && v <= 1.0f;
+            }
+            for (float v : pose.spread) finite = finite && std::isfinite(v) && v >= -1.0f && v <= 1.0f;
+            for (float v : pose.wrist) finite = finite && std::isfinite(v) && v >= -1.0f && v <= 1.0f;
+            finite = finite && std::isfinite(pose.thumbOpposition) &&
+                     pose.thumbOpposition >= 0.0f && pose.thumbOpposition <= 1.0f;
+            if (!finite) {
+                error(std::string("hand pose ") + (h == 0 ? "left" : "right") +
+                      " has values outside 0..1 / -1..1");
+                break;
+            }
+        }
+    }
+
     // Loop seam.
     if (clip.loop && clip.seamless) {
         float rotWorst = 0.0f;
@@ -714,15 +1153,54 @@ void validateClip(const HumanoidClip& clip, const std::string& sourceName,
         check(clip.root);
         check(clip.feet[0].position);
         check(clip.feet[1].position);
-        if (rotWorst > 0.01f || posWorst > 0.002f) {
+        float scalarWorst = 0.0f;
+        for (const auto& foot : clip.feet) {
+            if (foot.toe.size() == static_cast<std::size_t>(clip.keyCount)) {
+                scalarWorst = std::max(scalarWorst, std::abs(foot.toe.front() - foot.toe.back()));
+            }
+        }
+        for (int h = 0; h < 2; ++h) {
+            const auto& track = clip.handPoses[static_cast<std::size_t>(h)];
+            if (track.size() == static_cast<std::size_t>(clip.keyCount)) {
+                const HandPose& first = track.front();
+                const HandPose& last = track.back();
+                for (int finger = 0; finger < 5; ++finger) {
+                    for (int joint = 0; joint < 3; ++joint) {
+                        scalarWorst = std::max(
+                            scalarWorst,
+                            std::abs(first.curl[static_cast<std::size_t>(finger)]
+                                          [static_cast<std::size_t>(joint)] -
+                                     last.curl[static_cast<std::size_t>(finger)]
+                                         [static_cast<std::size_t>(joint)]));
+                    }
+                    scalarWorst = std::max(
+                        scalarWorst,
+                        std::abs(first.spread[static_cast<std::size_t>(finger)] -
+                                 last.spread[static_cast<std::size_t>(finger)]));
+                }
+                scalarWorst = std::max(scalarWorst,
+                                       std::abs(first.thumbOpposition - last.thumbOpposition));
+            }
+        }
+        if (rotWorst > 0.01f || posWorst > 0.002f || scalarWorst > 0.005f) {
             error("clip is marked seamless but the last key differs from the first (rot " +
                   std::to_string(rotWorst * 57.29578f) + " deg, pos " +
-                  std::to_string(posWorst) + ")");
+                  std::to_string(posWorst) + ", scalar " + std::to_string(scalarWorst) + ")");
         }
     }
 }
 
 // --- library ---------------------------------------------------------------
+
+bool DanceLibrary::replace(const HumanoidClip& clip) {
+    for (HumanoidClip& existing : clips_) {
+        if (existing.id == clip.id) {
+            existing = clip;
+            return true;
+        }
+    }
+    return false;
+}
 
 bool DanceLibrary::add(HumanoidClip clip) {
     if (find(clip.id)) {

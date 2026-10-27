@@ -1,3 +1,5 @@
+> Historical document. BG Motion 3.2 keeps this musical architecture and adds procedural choreography, motion layers, fingers and VRM spring bones. See docs/BG_MOTION_3_2.md.
+
 # BG Motion 3.1 — музыкальная синхронизация
 
 BG Motion 3.1 — реализованный слой поверх BG Motion 3.0. Задача этапа: связать

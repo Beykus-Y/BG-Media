@@ -566,3 +566,6 @@ VRM-модель с разрешающей лицензией. Код загру
 - [VRM_INTEGRATION.md](VRM_INTEGRATION.md) — VRM 0.x, SDL_GPU, retargeting.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — место BG Motion 3.0 в движке.
 - [MEASUREMENTS.md](MEASUREMENTS.md) — измерения и условия экспериментов.
+
+
+> BG Motion 3.2 extends this format with optional clip v2 lanes: toe pitch, detailed hand pose and per-key finger/wrist channels. Version 1 files remain readable. See docs/BG_MOTION_3_2.md.

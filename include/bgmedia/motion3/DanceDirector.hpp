@@ -20,6 +20,7 @@
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,13 @@ struct ScheduleSegment {
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
 };
 
+// Optional per-segment pose post-process (BG Motion 3.2 overlays). It is applied
+// to each segment's own pose *before* segments are crossfaded, so an outgoing
+// clip keeps its own overlays while it fades and an incoming clip fades its
+// overlays in, instead of the overlay set flipping mid-transition.
+using PoseDecorator =
+    std::function<void(ClipPose& pose, const ScheduleSegment& segment, double clipBeat)>;
+
 struct DanceFrame {
     ClipPose pose;
     std::string clipId;
@@ -56,6 +64,12 @@ struct DanceFrame {
     double bpm = 0.0;
     bool oneShotFinished = false;
     std::string reason;
+
+    // --- BG Motion 3.2 motion layer diagnostics ---------------------------
+    int overlayActive = 0;
+    int overlayRejected = 0;
+    float overlayWeight = 0.0f;
+    bool overlayHands = false;
 
     // --- BG Motion 3.1 musical diagnostics --------------------------------
     double musicBeat = 0.0;        // absolute musical beat at this media time
@@ -77,6 +91,7 @@ struct DanceFrame {
 class DanceSchedule {
 public:
     void clear() { segments_.clear(); }
+    void setPoseDecorator(PoseDecorator decorator) { decorator_ = std::move(decorator); }
     void append(ScheduleSegment segment);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
@@ -107,6 +122,7 @@ private:
                                   const MusicalTimeline& timeline,
                                   const WarpProfile& warp, float* transition) const;
     std::vector<ScheduleSegment> segments_;
+    PoseDecorator decorator_;
 };
 
 enum class DanceMode { Manual, Auto };
@@ -143,6 +159,10 @@ public:
     // is trusted, otherwise on the next entry beat. `oneShot` plays the clip
     // once and returns to Idle.
     void select(DanceStyle style, double now, bool oneShot = false, bool immediate = false);
+    // Manual switch to a specific clip id (used by generated and authoring
+    // previews). The style is updated to the clip's style.
+    void selectClip(const std::string& clipId, double now, bool oneShot = false,
+                    bool immediate = false);
     // Starts the all-styles showcase (Groove -> HipHop -> SideStep -> Energetic -> Idle).
     void startTestDance(double now, double beatsPerStyle = 16.0);
     // Plays `styles` one after another, `beatsPerStyle` music beats each, on the beat.

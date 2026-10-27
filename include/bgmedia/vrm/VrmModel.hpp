@@ -66,6 +66,65 @@ inline constexpr std::size_t kHumanoidBoneCount =
 [[nodiscard]] std::optional<HumanoidBone> humanoidBoneFromVrmName(
     std::string_view name);
 
+// VRM 0.x finger bones are optional. They are kept separate from the stable
+// core enum above because every clip track and retarget path is sized by
+// kHumanoidBoneCount; expanding that enum would silently invalidate existing
+// clips. The retargeter discovers these nodes through humanoidEntries and this
+// table is the shared capability report for the UI, QA and hand layer.
+enum class Finger : std::uint8_t {
+    Thumb,
+    Index,
+    Middle,
+    Ring,
+    Little,
+    Count
+};
+
+inline constexpr int kFingerCount = static_cast<int>(Finger::Count);
+inline constexpr int kFingerJointCount = 3;
+
+// BG Motion 3.2 secondary animation. The importer stores the authored VRM 0.x
+// parameters verbatim; SecondaryDynamics expands `springGroups` into linear
+// chains (`springChains`) once, because the runtime simulates chains, not the
+// original group graph.
+struct SpringCollider {
+    Vec3 offset{};
+    float radius = 0.0f;
+};
+
+struct SpringColliderGroup {
+    int node = -1;
+    std::vector<SpringCollider> colliders;
+};
+
+struct SpringBoneGroup {
+    std::string comment;
+    int center = -1;
+    std::vector<int> roots;             // nodes listed in secondaryAnimation.boneGroups[].bones
+    std::vector<int> colliderGroups;    // indices into springColliderGroups
+    float stiffness = 0.5f;             // VRM 0.x spelling: stiffiness
+    float gravityPower = 0.0f;
+    float dragForce = 0.1f;
+    float hitRadius = 0.01f;
+    Vec3 gravityDir{0.0f, -1.0f, 0.0f};
+};
+
+struct SpringBoneChain {
+    int group = -1;
+    // root -> tip, parent/child order. A branch chain (parentChain >= 0) starts
+    // with its *anchor*: the branch point, which belongs to - and is written by -
+    // the parent chain; it must not be simulated or written a second time.
+    std::vector<int> nodes;
+    int parentChain = -1;               // index into springChains, -1 = root chain
+    int parentIndex = 0;                // index of the anchor inside the parent chain
+    std::vector<int> colliderGroups;
+    float stiffness = 0.5f;
+    float gravityPower = 0.0f;
+    float dragForce = 0.1f;
+    float hitRadius = 0.01f;
+    Vec3 gravityDir{0.0f, -1.0f, 0.0f};
+};
+
 struct Bounds {
     Vec3 min{};
     Vec3 max{};
@@ -210,6 +269,13 @@ struct Diagnostics {
     int jointCount = 0;
     int humanoidCount = 0;
     int humanoidCoreCount = 0;
+    int fingerBoneCount = 0;
+    int springGroupCount = 0;
+    int springBoneCount = 0;
+    int springChainCount = 0;
+    int springColliderGroupCount = 0;
+    int springColliderCount = 0;
+    int blendShapeCount = 0;
     int estimatedCpuTextureBytes = 0;
     double loadMilliseconds = 0.0;
 };
@@ -231,6 +297,21 @@ public:
     std::vector<Texture> textures;
     std::vector<HumanoidEntry> humanoidEntries;
     std::array<int, kHumanoidBoneCount> humanoidNodes{};
+
+    // [side][finger][joint] node indices, -1 when the model has no such bone.
+    // Side 0 = left, 1 = right; joint 0 = proximal, 1 = intermediate,
+    // 2 = distal. VRM 0.x may omit any or all of them.
+    std::array<std::array<std::array<int, kFingerJointCount>, kFingerCount>, 2>
+        fingerNodes{};
+
+    // Secondary animation, parsed from extensions.VRM.secondaryAnimation
+    // (VRM 0.x) or VRMC_springBone (VRM 1.0). Empty vectors mean the model
+    // has no authored soft-body rig.
+    std::vector<SpringBoneGroup> springGroups;
+    std::vector<SpringColliderGroup> springColliderGroups;
+    std::vector<SpringBoneChain> springChains;
+    std::string springSource;  // "VRM.secondaryAnimation", "VRMC_springBone" or empty
+
     Metadata metadata;
     Diagnostics diagnostics;
 
@@ -254,6 +335,11 @@ public:
 
     [[nodiscard]] int nodeFor(HumanoidBone bone) const;
     [[nodiscard]] bool hasBone(HumanoidBone bone) const;
+    [[nodiscard]] int fingerNode(int side, int finger, int joint) const;
+    [[nodiscard]] int fingerBoneCount() const;
+    [[nodiscard]] bool hasFingers() const;
+    [[nodiscard]] int springBoneCount() const;
+    [[nodiscard]] bool hasSpringBones() const { return !springChains.empty(); }
     [[nodiscard]] const Skin* skinForNode(int nodeIndex) const;
     [[nodiscard]] const Material* materialForPrimitive(int mesh, int primitive) const;
     [[nodiscard]] Vec3 boneBindPosition(HumanoidBone bone) const;

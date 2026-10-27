@@ -7,8 +7,8 @@
 // to analysis semantics must bump kAnalyzerVersion.
 #define BGMEDIA_VERSION_MAJOR 0
 #define BGMEDIA_VERSION_MINOR 3
-#define BGMEDIA_VERSION_PATCH 1
-#define BGMEDIA_VERSION_STRING "0.3.1"
+#define BGMEDIA_VERSION_PATCH 2
+#define BGMEDIA_VERSION_STRING "0.3.2"
 
 namespace bgmedia {
 

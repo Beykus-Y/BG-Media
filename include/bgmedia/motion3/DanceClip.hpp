@@ -33,7 +33,7 @@ using math::Quat;
 using math::Vec3;
 using vrm::HumanoidBone;
 
-inline constexpr int kClipFormatVersion = 1;
+inline constexpr int kClipFormatVersion = 2;
 inline constexpr const char* kClipFormatName = "bgmotion.clip";
 
 enum class DanceStyle : std::uint8_t {
@@ -77,7 +77,26 @@ struct FootTrack {
     // relative to the bind ankle position, in STAGE space (not root space).
     std::vector<Vec3> position;
     std::vector<float> yaw;  // turns, stage space
+    // Optional BG Motion 3.2 toe roll, -1..1. Positive lifts the toes (heel
+    // roll), negative presses the toes down (toe-off). Empty = 0.
+    std::vector<float> toe;
 };
+
+// BG Motion 3.2 hand layer. Curl is per finger and per joint so a gesture can
+// ripple through the fingers instead of closing the whole hand at once. Values
+// are 0 (open) .. 1 (closed); spread is -1..1 (negative = toward the middle
+// finger); thumbOpposition bends the thumb across the palm. Wrist values are
+// normalised -1..1 and are applied on top of the clip's hand-bone rotation.
+struct HandPose {
+    std::array<std::array<float, 3>, 5> curl{};
+    std::array<float, 5> spread{};
+    float thumbOpposition = 0.0f;
+    std::array<float, 3> wrist{};  // pitch, yaw, roll
+};
+
+[[nodiscard]] HandPose relaxedHandPose(float curl = 0.30f);
+[[nodiscard]] HandPose blendHandPose(const HandPose& a, const HandPose& b, float w);
+void clampHandPose(HandPose& pose);
 
 struct HumanoidClip {
     // --- metadata ---
@@ -113,6 +132,7 @@ struct HumanoidClip {
     std::vector<Vec3> root;            // x (left), z (forward), yaw (turns)
     std::array<FootTrack, 2> feet;     // [0] left, [1] right
     std::array<std::vector<float>, 2> hands;  // finger curl 0 (open) .. 1 (fist); empty = relaxed
+    std::array<std::vector<HandPose>, 2> handPoses;  // optional detailed hand layer
 
     [[nodiscard]] double durationAt(double bpmValue) const {
         return beats * 60.0 / bpmValue;
@@ -130,12 +150,15 @@ struct ClipPose {
     struct Foot {
         Vec3 position{};  // stage space offset from bind ankle
         float yaw = 0.0f; // turns, stage space
+        float toePitch = 0.0f;  // -1..1; positive = toes up (heel roll)
         float contact = 0.0f;  // 0 swing .. 1 fully planted
         FootPhase phase = FootPhase::Stance;
     };
     std::array<Foot, 2> foot;
 
     std::array<float, 2> hand{0.3f, 0.3f};  // finger curl, left / right
+    std::array<HandPose, 2> handPose;       // detailed finger/wrist layer
+    bool detailedHands = false;
     float energy = 0.0f;
     float accent = 0.0f;  // 0..1 envelope of the nearest authored accent
 };
@@ -172,6 +195,14 @@ struct ClipLoadResult {
                                            const std::string& sourceName = {});
 [[nodiscard]] ClipLoadResult loadClipFile(const std::filesystem::path& path);
 
+// BG Motion 3.2 authoring round-trip. The writer emits format version 2 and
+// includes optional toe and detailed hand tracks. The reader accepts version 1
+// (BG Motion 3.0/3.1 clips) and version 2.
+[[nodiscard]] std::string clipToJson(const HumanoidClip& clip);
+[[nodiscard]] bool saveClipFile(const HumanoidClip& clip,
+                                const std::filesystem::path& path,
+                                std::string* error = nullptr);
+
 // Structural validation (key counts, finite numbers, quaternion norms, loop
 // seam, contact segments). Used by the loader and by the QA tool.
 void validateClip(const HumanoidClip& clip, const std::string& sourceName,
@@ -185,6 +216,8 @@ public:
     bool add(HumanoidClip clip);
 
     [[nodiscard]] const HumanoidClip* find(const std::string& id) const;
+    // Replaces a loaded clip in place (same address, so running schedules stay valid).
+    bool replace(const HumanoidClip& clip);
     [[nodiscard]] const HumanoidClip* forStyle(DanceStyle style) const;
     [[nodiscard]] const std::deque<HumanoidClip>& clips() const { return clips_; }
     [[nodiscard]] const std::vector<ClipDiagnostic>& diagnostics() const {

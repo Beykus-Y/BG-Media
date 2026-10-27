@@ -1,0 +1,435 @@
+{
+  "branch": "fix/bg-motion-3.2-quality-stabilization",
+  "base_commit": "aacdeeb",
+  "tests": {
+    "before": 141,
+    "after": 175,
+    "ctest_groups_before": 13,
+    "ctest_groups_after": 16
+  },
+  "motion_composition": {
+    "crossfade_peak_bone_step_rad_per_4.17ms": {
+      "legacy_emulated": 0.482194,
+      "fixed": 0.103925,
+      "base_only": 0.027396,
+      "steady_state_overlay": 0.027344
+    },
+    "primitive_mask_offenders_before": [
+      "armWave",
+      "armSwing",
+      "armReach",
+      "shoulderAccent",
+      "hipSway",
+      "weightShift",
+      "sideStep",
+      "stepTouch",
+      "heelTap",
+      "kneeBounce",
+      "fingerRipple"
+    ],
+    "primitive_mask_offenders_after": [],
+    "primitives_with_no_visible_effect": 0,
+    "permutations_checked": 720,
+    "composition_us_per_frame": {
+      "before": 1.72,
+      "after": 1.25
+    }
+  },
+  "arm_collision_proxy_model1": {
+    "torso_half_width_m": 0.108,
+    "torso_half_front_m": 0.116,
+    "torso_half_back_m": 0.076,
+    "fore_arm_radius_m": 0.033,
+    "hand_radius_m": 0.039,
+    "from_mesh": true,
+    "dance_sweep": {
+      "frames": 2403,
+      "violating_frames": 0,
+      "min_clearance_m": 0.023
+    },
+    "forced_cross_body_sweep": {
+      "frames": 201,
+      "violating_frames": 34,
+      "worst_clearance_before_m": -0.0412,
+      "worst_clearance_after_m": -0.0029,
+      "max_wrist_step_refined_m": 0.0059,
+      "max_wrist_step_unrefined_m": 0.0056
+    },
+    "apply_clip_ms": {
+      "with_refinement": 0.0187,
+      "without": 0.0187
+    },
+    "note": "proxy clearance, not a mesh intersection test"
+  },
+  "spring": {
+    "root_yaw_rotation_diff_rad": {
+      "baseline": 2.221722,
+      "fixed": 0.001381
+    },
+    "root_yaw_position_diff_m": {
+      "baseline": 2e-06,
+      "fixed": 1.6e-05
+    },
+    "off_on_first_frame_displacement_m": {
+      "baseline": 0.05,
+      "fixed": 0.01854,
+      "animation_motion_that_frame_m": 0.0195
+    },
+    "step_response_settled_m": {
+      "baseline": 0.0252,
+      "fixed": 0.001
+    },
+    "step_response_peak_m": 0.0497,
+    "fps_30_60_120_180_tip_spread_m": 0.00072,
+    "max_stretch_percent": 0.2,
+    "sim_ms_per_frame": [
+      0.05,
+      0.16
+    ],
+    "model1_structure": {
+      "groups": 25,
+      "chains": 36,
+      "nodes": 116,
+      "branching_nodes": 0,
+      "single_node_chains": 0
+    },
+    "dance_60_vs_120_fps": {
+      "mean_diff_m": 0.00207,
+      "max_diff_m": 0.0491,
+      "samples_over_2cm": "40 of 15156"
+    }
+  },
+  "footwork": {
+    "max_foot_step_per_key_height_units": {
+      "baseline": 0.1375,
+      "fixed": {
+        "neonPulse": 0.038,
+        "streetCurrent": 0.0502,
+        "fluidSignal": 0.0422
+      }
+    },
+    "motion_qa_generated_dances": {
+      "foot_slide_mm": {
+        "baseline": [
+          2.58,
+          3.57
+        ],
+        "fixed": [
+          0.13,
+          0.2
+        ]
+      },
+      "foot_speed_mps": {
+        "baseline": [
+          1.76,
+          3.2
+        ],
+        "fixed": [
+          0.44,
+          0.84
+        ]
+      },
+      "hip_speed_mps": {
+        "baseline": [
+          0.54,
+          0.97
+        ],
+        "fixed": [
+          0.29,
+          0.53
+        ]
+      },
+      "swings": {
+        "baseline": [
+          6,
+          8
+        ],
+        "fixed": [
+          10,
+          10
+        ]
+      }
+    }
+  },
+  "not_measured": [
+    "gpu_renderer",
+    "cpu_gpu_skinning",
+    "video",
+    "second_real_vrm",
+    "desktop_ui_diagnostics"
+  ],
+  "regression_3_1": {
+    "sync_qa_vs_docs_sync_qa_3_1.json": {
+      "values": 693,
+      "differences": "analysis/timeline/sampling timings and footErrorMm only",
+      "footErrorMm": "0.00015 -> 0.00024 (measurement now on evaluated skeleton)"
+    },
+    "authored_clips_motion_qa": "identical"
+  },
+  "mesh_clipping": {
+    "reproduced_at_mesh_level": true,
+    "corrections": [
+      "earlier proxy sweep measured neonPulse 3x (shared DancePlayer); corrected: 20 violating frames, raw min -0.046 m, final ~0",
+      "earlier stills used a seek pose"
+    ],
+    "frames_>=5_verts_behind_torso_8mm": {
+      "neonPulse": 79,
+      "streetCurrent": 90,
+      "fluidSignal": 31
+    },
+    "worst_depth_mm": {
+      "neonPulse": 24,
+      "streetCurrent": 29,
+      "fluidSignal": 16
+    },
+    "triangle_crossings": {
+      "streetCurrent_5.1": 57,
+      "fluidSignal_4.8": 6,
+      "neonPulse_7.3": 0
+    },
+    "proxy_gaps": [
+      "hand is one palm sphere (fingers ~9cm away uncovered)",
+      "torso surface P85 under-sizes pouches/straps by up to ~2cm"
+    ],
+    "cpu_gpu_silhouette_iou_dance": [
+      0.974,
+      0.956,
+      0.958,
+      0.931,
+      0.969
+    ],
+    "cpu_gpu_gpu_only_px": "0-2"
+  },
+  "asan": {
+    "run": true,
+    "tests": 170,
+    "result": "all passed, no reports",
+    "note": "newer 3 tests not under ASan"
+  },
+  "arm_torso_fix": {
+    "method": "bgmedia_mesh_clip, fresh DancePlayer per clip, sequential from t=0, 10 Hz penetration / 60 Hz smoothness, overlays Full, spring off",
+    "triangle_crossing_frames_of_400": {
+      "neonPulse(control)": {
+        "before": 0,
+        "after": 0
+      },
+      "streetCurrent": {
+        "before": 16,
+        "after": 0
+      },
+      "fluidSignal": {
+        "before": 11,
+        "after": 2
+      }
+    },
+    "max_crossing_triangles": {
+      "neonPulse": [
+        0,
+        0
+      ],
+      "streetCurrent": [
+        57,
+        0
+      ],
+      "fluidSignal": [
+        39,
+        6
+      ]
+    },
+    "sum_crossing_triangles": {
+      "streetCurrent": [
+        700,
+        0
+      ],
+      "fluidSignal": [
+        132,
+        12
+      ]
+    },
+    "proxy_violations_raw_frames": {
+      "neonPulse": [
+        0,
+        32
+      ],
+      "streetCurrent": [
+        10,
+        48
+      ],
+      "fluidSignal": [
+        0,
+        18
+      ]
+    },
+    "max_correction_mm": {
+      "neonPulse": [
+        0,
+        9.6
+      ],
+      "streetCurrent": [
+        49.3,
+        125.7
+      ],
+      "fluidSignal": [
+        0,
+        24.4
+      ]
+    },
+    "max_acceleration_m_s2": {
+      "neonPulse": [
+        800.3,
+        800.3
+      ],
+      "streetCurrent": [
+        67.8,
+        67.8
+      ],
+      "fluidSignal": [
+        84.9,
+        84.9
+      ]
+    },
+    "vertex_behind_surface_frames": {
+      "neonPulse": [
+        79,
+        79
+      ],
+      "streetCurrent": [
+        90,
+        86
+      ],
+      "fluidSignal": [
+        31,
+        31
+      ]
+    },
+    "apply_clip_ms_worst_case_pose": {
+      "refinement_off": 0.019,
+      "before": 0.019,
+      "after": 0.042
+    },
+    "proxy_model1": {
+      "halfWidth_m": 0.12,
+      "front_m": 0.133,
+      "back_m": 0.082,
+      "foreArm_m": 0.035,
+      "bands": 5
+    },
+    "solver_variants_tried_for_deep_frames": [
+      "frozen direction (126 mm)",
+      "weighted mean normal (142 mm)",
+      "half-space projection (148 mm, 4x acceleration)"
+    ]
+  },
+  "eyes_through_head": {
+    "cause": "blend pipelines used COMPAREOP_ALWAYS",
+    "fix": "COMPAREOP_LESS_OR_EQUAL, depth write off",
+    "px_changed_when_eye_layers_hidden": {
+      "front_180": [
+        500,
+        220
+      ],
+      "behind_0": [
+        387,
+        0
+      ],
+      "behind_20": [
+        386,
+        0
+      ],
+      "behind_-20": [
+        382,
+        0
+      ],
+      "side_90": [
+        157,
+        0
+      ]
+    },
+    "check": "bgmedia_skin_check --eye-occlusion"
+  },
+  "followup_nemesis_mp3": {
+    "commit": "7961a67",
+    "mode": "desktop crossfade, 0-44 s, skip 4 s",
+    "tests": {
+      "unit": 184,
+      "ctest": "16/16",
+      "asan": "184/184",
+      "sync_qa_3_1": "identical except timing"
+    },
+    "authored_leg_crossings": {
+      "Nemesis": {
+        "hiphop": {
+          "frames": 110,
+          "max_tris": 601
+        },
+        "sidestep": {
+          "frames": 73,
+          "max_tris": 340
+        }
+      },
+      "Model1": {
+        "hiphop": {
+          "frames": 44,
+          "max_tris": 531
+        },
+        "sidestep": {
+          "frames": 34,
+          "max_tris": 350
+        }
+      }
+    },
+    "procedural_leg_crossings_Model1": 0,
+    "leg_proxy_experiment": {
+      "default": false,
+      "best_tris_hiphop": 238,
+      "ankle_speed_ms": "9-25 vs 1.2 baseline",
+      "ground_drag_cm": "170-720 vs 0",
+      "verdict": "rejected"
+    },
+    "hand_peaks": "periodic authored accents (energetic phase 0.75, neon 0.118); no discontinuity",
+    "footwork_prepass": {
+      "default_gap_cm": 2.5,
+      "max_axis_shift_cm": 26,
+      "leg_proxy_runtime": "off",
+      "authored_leg_crossings_after": {
+        "Model1": {
+          "hiphop": {
+            "frames": 0,
+            "max_tris": 0
+          },
+          "sidestep": {
+            "frames": "2-4",
+            "max_tris": "11-19"
+          }
+        },
+        "Nemesis": {
+          "hiphop": {
+            "frames": "42-95",
+            "max_tris": "19-40"
+          },
+          "sidestep": {
+            "frames": "25-52",
+            "max_tris": "28-33"
+          }
+        }
+      },
+      "ankle_speed_ms_before_after": {
+        "Model1_hiphop": [
+          1.15,
+          1.77
+        ],
+        "Nemesis_hiphop": [
+          1.17,
+          1.26
+        ],
+        "sidestep": [
+          4.07,
+          4.07
+        ]
+      },
+      "ankle_accel_identical_30_60_120fps": true,
+      "planted_slide_mm_max": 0.3,
+      "overlay_spring_independent": true
+    }
+  }
+}

@@ -197,6 +197,11 @@ ClipPose adaptPose(const ClipPose& stable, const ClipPose& warped, bool fullBody
     out.rootYaw = stable.rootYaw;
     out.foot = stable.foot;
     out.hand = warped.hand;
+    // The detailed hand layer (fingers + wrist) is a time-varying channel just
+    // like the scalar curl: it must come from the same warped sample, otherwise
+    // the hand and its fingers sit in different musical phases.
+    out.handPose = warped.handPose;
+    out.detailedHands = warped.detailedHands;
     out.energy = stable.energy;
     out.accent = std::max(stable.accent, warped.accent);
     return out;
@@ -283,6 +288,9 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
             const ClipPose warped = sampleClip(*segment.clip, mapped.beat);
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
+    }
+    if (decorator_) {
+        decorator_(own, segment, mapped.beat);
     }
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
@@ -693,6 +701,48 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
     segment.reason = oneShot ? "manual one-shot" : "manual";
     schedule_.append(segment);
 
+    if (oneShot && clip->tempoSync) {
+        const ScheduleSegment& placed = schedule_.segments().back();
+        const double endBeat =
+            clock_.beatAt(placed.alignTime) + (clip->beats - placed.entryClipBeat) / placed.rate;
+        const double endTime = clock_.timeAtBeat(endBeat);
+        if (const HumanoidClip* idle = clipFor(DanceStyle::Idle)) {
+            const double idleFade = fadeFor(endTime);
+            ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
+                                               idleFade);
+            back.reason = "one-shot finished";
+            schedule_.append(back);
+        }
+    }
+    schedule_.pruneBefore(now);
+}
+
+void DanceDirector::selectClip(const std::string& clipId, double now, bool oneShot,
+                               bool immediate) {
+    const HumanoidClip* clip = library_ ? library_->find(clipId) : nullptr;
+    if (!clip) {
+        return;
+    }
+    if (schedule_.empty()) {
+        reset(now - 0.01);
+    }
+    selected_ = clip->style;
+    schedule_.truncateAfter(now);
+
+    double align = now;
+    bool aligned = false;
+    double alignmentError = 0.0;
+    if (!immediate && clip->tempoSync) {
+        align = entryTimeFor(*clip, now, &aligned, &alignmentError);
+    }
+    const double fade = immediate ? 0.0 : fadeFor(align);
+    const double start = std::max(now, align - fade * 0.5);
+    ScheduleSegment segment = makeSegment(*clip, start, align, fade);
+    segment.loop = !oneShot;
+    segment.alignedToDownbeat = aligned || segment.alignedToDownbeat;
+    segment.alignmentErrorSeconds = alignmentError;
+    segment.reason = "manual clip";
+    schedule_.append(segment);
     if (oneShot && clip->tempoSync) {
         const ScheduleSegment& placed = schedule_.segments().back();
         const double endBeat =
