@@ -84,6 +84,7 @@ struct HumanoidRetargeter::Impl {
 
     // fingers[side][finger][joint]: side 0 left, finger 0..4 thumb/index/middle/ring/little
     int fingers[2][5][3];
+    int fingerBones = 0;
 
     float height = 1.0f;
     float floorY = 0.0f;
@@ -215,6 +216,18 @@ bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
                         if (entry.name == name) {
                             fingers[sd][fg][jt] = entry.node;
                         }
+                    }
+                }
+            }
+        }
+        for (int sd = 0; sd < 2; ++sd) {
+            for (int fg = 0; fg < 5; ++fg) {
+                for (int jt = 0; jt < 3; ++jt) {
+                    if (fingers[sd][fg][jt] < 0) {
+                        fingers[sd][fg][jt] = source.fingerNode(sd, fg, jt);
+                    }
+                    if (fingers[sd][fg][jt] >= 0) {
+                        ++fingerBones;
                     }
                 }
             }
@@ -576,6 +589,7 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
             ++out.stats.missingBones;
         }
     }
+    out.stats.fingerBones = impl_->fingerBones;
     out.stats.retargetMilliseconds =
         std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 
@@ -634,24 +648,77 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     }
 
     // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade.
+    // BG Motion 3.2 uses the detailed per-finger pose when the clip, an overlay
+    // or the hand layer provides one; otherwise the v1 scalar is preserved
+    // exactly so old clips keep their authored look.
     {
         static constexpr float kFlex[5][3] = {{22.0f, 30.0f, 20.0f}, {38.0f, 52.0f, 34.0f},
                                               {40.0f, 56.0f, 36.0f}, {38.0f, 54.0f, 34.0f},
                                               {36.0f, 50.0f, 32.0f}};
         for (int sd = 0; sd < 2; ++sd) {
-            const float curl = std::clamp(pose.hand[static_cast<std::size_t>(sd)], 0.0f, 1.0f);
+            const bool detailed = pose.detailedHands;
+            const motion::HandPose& handPose =
+                pose.handPose[static_cast<std::size_t>(sd)];
+            if (detailed) {
+                const int handNode = sd == 0 ? impl_->leftHand : impl_->rightHand;
+                const Quat wrist =
+                    (math::fromAxisAngle(left, handPose.wrist[0] * 0.26f) *
+                     math::fromAxisAngle(up, handPose.wrist[1] * 0.30f) *
+                     math::fromAxisAngle(forward, handPose.wrist[2] * 0.34f))
+                        .normalized();
+                impl_->applyLocalDelta(locals, handNode, quatToModel(wrist));
+            }
+            const float curl =
+                std::clamp(pose.hand[static_cast<std::size_t>(sd)], 0.0f, 1.0f);
             for (int fg = 0; fg < 5; ++fg) {
                 for (int jt = 0; jt < 3; ++jt) {
                     const int node = impl_->fingers[sd][fg][jt];
                     if (node < 0) {
                         continue;
                     }
-                    // Fingers lie along +/-X of the hand; curling toward the palm is a
-                    // rotation about the forward axis, mirrored between the hands.
-                    const float angle = kFlex[fg][jt] * curl * (kPi / 180.0f) * (sd == 0 ? -1.0f : 1.0f);
+                    float amount = 0.0f;
+                    if (detailed) {
+                        amount = handPose.curl[static_cast<std::size_t>(fg)]
+                                             [static_cast<std::size_t>(jt)];
+                        if (fg == 0) {
+                            amount = std::min(1.0f, amount +
+                                                        0.22f * handPose.thumbOpposition);
+                        }
+                    } else {
+                        amount = curl;
+                    }
+                    const float angle =
+                        kFlex[fg][jt] * amount * (kPi / 180.0f) *
+                        (sd == 0 ? -1.0f : 1.0f);
                     impl_->applyLocalDelta(
                         locals, node,
-                        quatToModel(math::fromAxisAngle({0.0f, 0.0f, 1.0f}, angle * (fg == 0 ? 0.6f : 1.0f))));
+                        quatToModel(math::fromAxisAngle({0.0f, 0.0f, 1.0f},
+                                                        angle * (fg == 0 ? 0.6f : 1.0f))));
+                }
+                // Spread fans the fingers in the palm plane. It is deliberately
+                // small: a large value reads as a broken hand, not a gesture.
+                if (detailed && fg > 0) {
+                    const float fan = handPose.spread[static_cast<std::size_t>(fg)] *
+                                      (static_cast<float>(fg) - 2.0f) * 0.10f;
+                    const Quat spreadQuat = quatToModel(
+                        math::fromAxisAngle(up, fan * (sd == 0 ? -1.0f : 1.0f)));
+                    for (int jt = 0; jt < 3; ++jt) {
+                        const int node = impl_->fingers[sd][fg][jt];
+                        if (node >= 0) {
+                            impl_->applyLocalDelta(locals, node, spreadQuat);
+                        }
+                    }
+                }
+            }
+            if (detailed && handPose.thumbOpposition > 0.0f) {
+                const Quat opposition = quatToModel(math::fromAxisAngle(
+                    forward, handPose.thumbOpposition * 0.34f *
+                                 (sd == 0 ? -1.0f : 1.0f)));
+                for (int jt = 0; jt < 3; ++jt) {
+                    const int node = impl_->fingers[sd][0][jt];
+                    if (node >= 0) {
+                        impl_->applyLocalDelta(locals, node, opposition);
+                    }
                 }
             }
         }
@@ -741,6 +808,17 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         impl_->solveLeg(impl_->legs[f], globals, locals, targets[f], poles[f], footError,
                         lowest, footDelta[f]);
     }
+    // Heel / toe roll: rotate the toe bone after the ankle IK so the sole does
+    // not detach from the floor target. Small (0.30 rad at full strength).
+    for (int f = 0; f < 2; ++f) {
+        const float toePitch = std::clamp(
+            pose.foot[static_cast<std::size_t>(f)].toePitch, -1.0f, 1.0f);
+        if (impl_->legs[f].toes >= 0 && std::abs(toePitch) > 1.0e-4f) {
+            impl_->applyLocalDelta(
+                locals, impl_->legs[f].toes,
+                quatToModel(math::fromAxisAngle(left, toePitch * 0.30f)));
+        }
+    }
     impl_->evaluate(locals, globals);
 
     out.modelTransform = Mat4::fromQuat(rootRot);
@@ -750,6 +828,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     out.stats.valid = true;
     out.stats.clipDriven = true;
     out.stats.footIK = true;
+    out.stats.detailedHands = pose.detailedHands && impl_->fingerBones > 0;
     out.stats.height = height;
     out.stats.hipDrop = extraDrop;
     out.stats.reachHipDrop = extraDrop;
@@ -764,6 +843,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
             ++out.stats.missingBones;
         }
     }
+    out.stats.fingerBones = impl_->fingerBones;
     out.stats.retargetMilliseconds =
         std::chrono::duration<double, std::milli>(Clock::now() - started).count();
     for (const Mat4& matrix : out.nodeGlobals) {

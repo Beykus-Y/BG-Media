@@ -386,3 +386,8 @@ SDL_Renderer backend на этой машине не ограничивает с
 4. Vulkan/Metal shader variants (SPIR-V/MSL) и Linux/iOS проверка.
 5. Более точный порядок MToon renderQueue и per-material cull/ZWrite.
 6. Android-интеграция — отдельный этап, вне текущей задачи.
+
+
+## BG Motion 3.2: secondary animation and fingers
+
+The importer now also reads extensions.VRM.secondaryAnimation: 25 bone groups, 36 linear chains and 22 collider spheres on the local test model. SecondaryDynamics simulates those chains after humanoid retargeting and writes the node globals consumed by the existing skinning path. Finger bones (30 on the test model) are mapped into VrmModel::fingerNodes and driven by motion::HandPose; models without them report zero finger bones instead of receiving fake motion. VRM 1.0 VRMC_springBone is not parsed by this VRM 0.x importer.

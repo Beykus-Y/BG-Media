@@ -57,6 +57,12 @@ struct DanceFrame {
     bool oneShotFinished = false;
     std::string reason;
 
+    // --- BG Motion 3.2 motion layer diagnostics ---------------------------
+    int overlayActive = 0;
+    int overlayRejected = 0;
+    float overlayWeight = 0.0f;
+    bool overlayHands = false;
+
     // --- BG Motion 3.1 musical diagnostics --------------------------------
     double musicBeat = 0.0;        // absolute musical beat at this media time
     double warpDeviationBeats = 0.0;
@@ -143,6 +149,10 @@ public:
     // is trusted, otherwise on the next entry beat. `oneShot` plays the clip
     // once and returns to Idle.
     void select(DanceStyle style, double now, bool oneShot = false, bool immediate = false);
+    // Manual switch to a specific clip id (used by generated and authoring
+    // previews). The style is updated to the clip's style.
+    void selectClip(const std::string& clipId, double now, bool oneShot = false,
+                    bool immediate = false);
     // Starts the all-styles showcase (Groove -> HipHop -> SideStep -> Energetic -> Idle).
     void startTestDance(double now, double beatsPerStyle = 16.0);
     // Plays `styles` one after another, `beatsPerStyle` music beats each, on the beat.

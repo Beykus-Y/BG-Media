@@ -55,6 +55,9 @@ struct RetargetStats {
     float lowestFootY = 0.0f;
     int resolvedBones = 0;
     int missingBones = 0;
+    int fingerBones = 0;       // finger nodes present on the model
+    bool detailedHands = false;  // per-finger pose was applied
+    bool secondaryApplied = false;
 
     // BG Motion 3.0 (applyClip) diagnostics.
     bool clipDriven = false;

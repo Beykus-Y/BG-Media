@@ -60,8 +60,8 @@ void printUsage() {
 
         << "  --motion-debug         show joints, trails and keyframe diagnostics\n"
         << "  --motion-stepped       use the legacy stepped sampler (A/B compare)\n"
-        << "  --dance <name>         BG Motion 3.0 start dance: groove|hiphop|sidestep|\n"
-        << "                         energetic|idle|auto|test (works without music)\n"
+        << "  --dance <name>         BG Motion 3.2 dance: groove|hiphop|sidestep|\n"
+        << "                         energetic|idle|neonPulse|streetCurrent|fluidSignal|auto|test\n"
         << "  --dance-plan <a,b,..>  play styles in sequence (--dance-span beats each, default 16)\n"
         << "  --dance-bpm <bpm>      Motion Lab tempo when no music is loaded (default 100)\n"
         << "  --dance-expression <mode>  musical warp: off|soft|expressive (default soft)\n"

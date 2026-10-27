@@ -1,16 +1,170 @@
 #include "bgmedia/motion3/DancePlayer.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <sstream>
 
 namespace bgmedia::motion {
+
+const char* overlayModeName(OverlayMode mode) {
+    switch (mode) {
+    case OverlayMode::Off: return "OFF";
+    case OverlayMode::Light: return "LIGHT";
+    case OverlayMode::Full: return "FULL";
+    case OverlayMode::HandsOnly: return "HANDS";
+    }
+    return "FULL";
+}
+
+namespace {
+
+std::string trimmed(const std::string& text) {
+    const std::size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const std::size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+std::string lower(std::string text) {
+    for (char& c : text) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+OverlayMode overlayFromInt(int value) {
+    switch (value) {
+    case 0: return OverlayMode::Off;
+    case 1: return OverlayMode::Light;
+    case 3: return OverlayMode::HandsOnly;
+    default: return OverlayMode::Full;
+    }
+}
+
+}  // namespace
+
+bool saveMotion32Profile(const std::filesystem::path& path,
+                         const Motion32Profile& profile, std::string* error) {
+    if (path.empty()) {
+        if (error) *error = "empty profile path";
+        return false;
+    }
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        if (error) *error = "cannot open motion32 profile";
+        return false;
+    }
+    out << "# BG Motion 3.2 host profile v1\n";
+    out << "overlay=" << static_cast<int>(profile.overlayMode) << "\n";
+    out << "spring=" << (profile.springEnabled ? 1 : 0) << "\n";
+    out << "springIntensity=" << std::clamp(profile.springIntensity, 0.0f, 2.0f) << "\n";
+    out << "springDamping=" << std::clamp(profile.springDamping, 0.0f, 1.0f) << "\n";
+    out.flush();
+    if (!out) {
+        if (error) *error = "failed to write motion32 profile";
+        return false;
+    }
+    return true;
+}
+
+bool loadMotion32Profile(const std::filesystem::path& path, Motion32Profile& profile,
+                         std::string* error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        if (error) *error = "cannot open motion32 profile";
+        return false;
+    }
+    Motion32Profile loaded;
+    int parsed = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trimmed(line);
+        if (line.empty() || line[0] == '#') continue;
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = lower(trimmed(line.substr(0, eq)));
+        const std::string value = trimmed(line.substr(eq + 1));
+        try {
+            if (key == "overlay") {
+                loaded.overlayMode = overlayFromInt(std::stoi(value));
+                ++parsed;
+            } else if (key == "spring") {
+                loaded.springEnabled = !(value == "0" || lower(value) == "false");
+                ++parsed;
+            } else if (key == "springintensity") {
+                loaded.springIntensity = std::clamp(std::stof(value), 0.0f, 2.0f);
+                ++parsed;
+            } else if (key == "springdamping") {
+                loaded.springDamping = std::clamp(std::stof(value), 0.0f, 1.0f);
+                ++parsed;
+            }
+        } catch (...) {
+            continue;
+        }
+    }
+    if (parsed == 0) {
+        if (error) *error = "motion32 profile has no recognised keys";
+        return false;
+    }
+    profile = loaded;
+    return true;
+}
 
 std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     library_ = DanceLibrary{};
     library_.loadDirectory(directory);
+    generated_ = ProceduralChoreography::showcase();
+    for (GeneratedDance& dance : generated_) {
+        overlays_[dance.clip.id] = dance.overlays;
+        if (!library_.find(dance.clip.id)) {
+            library_.add(dance.clip);
+        }
+    }
     director_.setLibrary(&library_);
     director_.reset(0.0);
     lastTime_ = -1.0e9;
     return library_.clips().size();
+}
+
+void DancePlayer::setOverlayMode(OverlayMode mode) {
+    overlayMode_ = mode;
+}
+
+const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& clipId) {
+    auto it = overlays_.find(clipId);
+    if (it != overlays_.end()) {
+        return it->second;
+    }
+    std::vector<PrimitiveCue> plan;
+    if (const HumanoidClip* clip = library_.find(clipId)) {
+        const std::uint32_t seed =
+            overlaySeed_ ^ static_cast<std::uint32_t>(clipId.size() * 2654435761u);
+        const float density = std::clamp(0.25f + clip->energy * 0.8f, 0.25f, 1.0f);
+        plan = planPrimitiveOverlays(*clip, seed, density, true);
+    }
+    return overlays_.emplace(clipId, std::move(plan)).first->second;
+}
+
+bool DancePlayer::selectClip(const std::string& clipId, double now, bool immediate) {
+    if (!library_.find(clipId)) {
+        return false;
+    }
+    if (mode_ != DanceMode::Manual) {
+        const DanceFrame frame = director_.sample(now);
+        director_.dropFuture(now);
+        director_.setSelectedStyle(frame.style);
+        mode_ = DanceMode::Manual;
+        autoNote_.clear();
+    }
+    director_.selectClip(clipId, now, oneShot_, immediate);
+    return true;
 }
 
 void DancePlayer::setGrid(BeatClock clock, double now) {
@@ -117,7 +271,35 @@ DanceFrame DancePlayer::update(double mediaTime) {
         director_.reseed(mediaTime);
     }
     lastTime_ = mediaTime;
-    return director_.sample(mediaTime);
+    DanceFrame frame = director_.sample(mediaTime);
+    if (overlayMode_ == OverlayMode::Off || frame.clipId.empty()) {
+        return frame;
+    }
+    const HumanoidClip* clip = library_.find(frame.clipId);
+    if (!clip) {
+        return frame;
+    }
+    const std::vector<PrimitiveCue>& cues = overlaysFor(frame.clipId);
+    if (cues.empty()) {
+        return frame;
+    }
+    CompositionOptions options;
+    options.allowFootwork = overlayMode_ == OverlayMode::Full;
+    options.allowHands = true;
+    options.allowTorso = overlayMode_ != OverlayMode::HandsOnly;
+    options.allowHead = overlayMode_ != OverlayMode::HandsOnly;
+    options.maxUpperBodyLayers = overlayMode_ == OverlayMode::Light ? 2 : 3;
+    ComposedPose composed = composeMotion(frame.pose, cues, frame.clipBeat,
+                                          clip->beats, clip->loop, options);
+    frame.pose = composed.pose;
+    frame.overlayActive = composed.diagnostics.acceptedCues;
+    frame.overlayRejected = composed.diagnostics.rejectedByConflict +
+                            composed.diagnostics.rejectedByContact +
+                            composed.diagnostics.rejectedBySupport +
+                            composed.diagnostics.rejectedByMask;
+    frame.overlayWeight = composed.diagnostics.maxWeight;
+    frame.overlayHands = composed.pose.detailedHands;
+    return frame;
 }
 
 } // namespace bgmedia::motion

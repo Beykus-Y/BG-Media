@@ -523,3 +523,38 @@ const auto& a = report.result;
 - Inter — SIL Open Font License (UI-шрифт).
 
 Тексты лицензий: `third_party/licenses/` и `assets/fonts/Inter-LICENSE.txt`.
+
+
+## BG Motion 3.2 — procedural choreography и character dynamics
+
+Версия 3.2 сохраняет musical timeline, BeatClock, accent map и time warp из
+3.1 и добавляет:
+
+- процедурный генератор полноценных танцев `Motif → Phrase → Section → Full Dance`
+  (три детерминированных танца по 32 бита: Neon Pulse, Street Current,
+  Fluid Signal);
+- библиотеку из 27 motion primitives (руки, кисти, корпус, плечи, голова,
+  footwork) и compositor с масками, приоритетами, joint limits и защитой
+  контакта стопы;
+- детальную анимацию пальцев VRM 0.x (30 костей у тестовой модели) с честным
+  fallback при их отсутствии;
+- VRM 0.x secondary animation: 36 spring chains, 116 spring bones, 22 collider
+  сферы у тестовой модели, фиксированный timestep 120 Гц, damping, collision,
+  reset при seek;
+- Desktop-переключатели `LAYER`, `GEN`, `SPRING`, диагностику слоёв и spring
+  chains;
+- `docs/BG_MOTION_3_2.md`, `docs/motion_qa_3_2.txt` и
+  `docs/motion_qa_3_2.json`.
+
+Новые команды:
+
+```powershell
+build/windows/bin/bgmedia_procedural_dance.exe
+build/windows/bin/bgmedia_motion_qa.exe --dances assets/dances ^
+  --model models/Model1.vrm --json docs/motion_qa_3_2.json
+build/windows/bin/bgmedia_desktop.exe --vrm models/Model1.vrm --3d ^
+  --dance neonPulse --dance-bpm 104 --debug-skeleton
+```
+
+Полное описание, ограничения и измеренные результаты — в
+`docs/BG_MOTION_3_2.md`.

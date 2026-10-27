@@ -312,3 +312,26 @@ XZ-координаты стоп совпадают с bind-позициями �
 `artifacts/desktop3d_playing.png` (локально, не коммитится из-за лицензии
 модели). Он снят с окна реального `bgmedia_desktop.exe` во время Play, а не
 получен из внешнего 3D-просмотрщика.
+
+
+## BG Motion 3.2 measurements
+
+Measured on the same local Windows desktop, Release build, Model1.vrm.
+
+| Measurement | Result |
+|---|---|
+| Procedural dance generation (32 beats, 257 keys, 14 bone tracks) | 7.5–9 ms |
+| Motion overlay composition (57 cues) | 1.3–1.7 µs/frame |
+| Spring simulation (36 chains / 116 bones) | 0.08–0.21 ms/frame |
+| Retargeting per frame | ~0.01 ms |
+| Spring stability at 30 / 60 / 120 / 180 FPS | finite, max stretch < 0.25% |
+| Spring collider penetration (worst, 150 frames) | < 8 mm |
+| Planted-foot slide, neonPulse at 104 BPM | 3.43 mm |
+| Foot IK error, neonPulse | 0.00 mm |
+| Loop seam, neonPulse | 0.000 deg / 0.0000 height units |
+| ASan | 141 passed, 0 failed, sanitizer clean |
+| Release tests | 141 passed, 0 failed |
+| Demo reel | 52 s, 720×450, 30 FPS |
+
+The generated-dance CPU cost is one-time at library load; runtime composition
+and spring simulation together stay below 0.2 ms/frame on the test machine.

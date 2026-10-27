@@ -709,6 +709,48 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
     schedule_.pruneBefore(now);
 }
 
+void DanceDirector::selectClip(const std::string& clipId, double now, bool oneShot,
+                               bool immediate) {
+    const HumanoidClip* clip = library_ ? library_->find(clipId) : nullptr;
+    if (!clip) {
+        return;
+    }
+    if (schedule_.empty()) {
+        reset(now - 0.01);
+    }
+    selected_ = clip->style;
+    schedule_.truncateAfter(now);
+
+    double align = now;
+    bool aligned = false;
+    double alignmentError = 0.0;
+    if (!immediate && clip->tempoSync) {
+        align = entryTimeFor(*clip, now, &aligned, &alignmentError);
+    }
+    const double fade = immediate ? 0.0 : fadeFor(align);
+    const double start = std::max(now, align - fade * 0.5);
+    ScheduleSegment segment = makeSegment(*clip, start, align, fade);
+    segment.loop = !oneShot;
+    segment.alignedToDownbeat = aligned || segment.alignedToDownbeat;
+    segment.alignmentErrorSeconds = alignmentError;
+    segment.reason = "manual clip";
+    schedule_.append(segment);
+    if (oneShot && clip->tempoSync) {
+        const ScheduleSegment& placed = schedule_.segments().back();
+        const double endBeat =
+            clock_.beatAt(placed.alignTime) + (clip->beats - placed.entryClipBeat) / placed.rate;
+        const double endTime = clock_.timeAtBeat(endBeat);
+        if (const HumanoidClip* idle = clipFor(DanceStyle::Idle)) {
+            const double idleFade = fadeFor(endTime);
+            ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
+                                               idleFade);
+            back.reason = "one-shot finished";
+            schedule_.append(back);
+        }
+    }
+    schedule_.pruneBefore(now);
+}
+
 void DanceDirector::startTestDance(double now, double beatsPerStyle) {
     startSequence({DanceStyle::Groove, DanceStyle::HipHop, DanceStyle::SideStep,
                    DanceStyle::Energetic, DanceStyle::Idle},

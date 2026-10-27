@@ -42,6 +42,12 @@ add_executable(bgmedia_motion_qa
 target_link_libraries(bgmedia_motion_qa PRIVATE bgmedia_rig)
 target_compile_options(bgmedia_motion_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
+add_executable(bgmedia_procedural_dance
+    procedural_dance/main.cpp
+)
+target_link_libraries(bgmedia_procedural_dance PRIVATE bgmedia_rig)
+target_compile_options(bgmedia_procedural_dance PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
 add_executable(bgmedia_sync_qa
     sync_qa/main.cpp
 )

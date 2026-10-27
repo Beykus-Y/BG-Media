@@ -63,6 +63,11 @@ std::optional<HumanoidBone> humanoidBoneFromVrmName(std::string_view name) {
 
 VrmModel::VrmModel() {
     humanoidNodes.fill(-1);
+    for (auto& side : fingerNodes) {
+        for (auto& finger : side) {
+            finger.fill(-1);
+        }
+    }
 }
 
 int VrmModel::nodeFor(HumanoidBone bone) const {
@@ -72,6 +77,40 @@ int VrmModel::nodeFor(HumanoidBone bone) const {
 
 bool VrmModel::hasBone(HumanoidBone bone) const {
     return nodeFor(bone) >= 0;
+}
+
+int VrmModel::fingerNode(int side, int finger, int joint) const {
+    if (side < 0 || side > 1 || finger < 0 || finger >= kFingerCount ||
+        joint < 0 || joint >= kFingerJointCount) {
+        return -1;
+    }
+    return fingerNodes[static_cast<std::size_t>(side)]
+                      [static_cast<std::size_t>(finger)]
+                      [static_cast<std::size_t>(joint)];
+}
+
+int VrmModel::fingerBoneCount() const {
+    int count = 0;
+    for (const auto& side : fingerNodes) {
+        for (const auto& finger : side) {
+            for (int node : finger) {
+                count += node >= 0 ? 1 : 0;
+            }
+        }
+    }
+    return count;
+}
+
+bool VrmModel::hasFingers() const {
+    return fingerBoneCount() > 0;
+}
+
+int VrmModel::springBoneCount() const {
+    int count = 0;
+    for (const SpringBoneChain& chain : springChains) {
+        count += static_cast<int>(chain.nodes.size());
+    }
+    return count;
 }
 
 const Skin* VrmModel::skinForNode(int nodeIndex) const {
