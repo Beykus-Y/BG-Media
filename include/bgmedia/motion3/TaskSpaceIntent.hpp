@@ -31,7 +31,9 @@ namespace bgmedia::motion {
 
 // Upper arm plus forearm length of the reference skeleton (height units).
 // ArmIntent::reach is the shoulder-to-wrist distance divided by this value.
-inline constexpr float kReferenceArmReach = 0.32f;
+inline constexpr float kReferenceUpperArm = 0.17f;  // shoulder joint to elbow
+inline constexpr float kReferenceForearm = 0.15f;   // elbow to wrist
+inline constexpr float kReferenceArmReach = kReferenceUpperArm + kReferenceForearm;
 
 enum class ArmIntentSource : std::uint8_t {
     None,       // no intent (invalid arm)
