@@ -28,7 +28,7 @@ and did **not** make a video. Section M lists everything that remains.
 | Crossfade | Overlay set flipped at 50 % of the blend | Overlays composed per segment before the blend |
 | Spring bones | Wrong space for rotations, dimensionally inconsistent integrator, stale state on OFF→ON, no teleport handling, branches and leaf bones lost, collider index shift | All fixed and covered by tests |
 | Footwork | **Foot `z` and `yaw` arguments were swapped; every shipped dance had a 22 cm single-key foot teleport** (not in the audit) | Fixed; peak foot step per key 0.1375 → 0.04–0.05 height units |
-| Mesh clipping | Reported arm/hair/clothing overlap with Spring OFF | **Not reproduced** on the frames I sampled (F). An arm↔torso proxy refinement was added and verified on forced gestures; hair/cloth overlap is neither confirmed nor solved |
+| Mesh clipping | Reported arm/hair/clothing overlap with Spring OFF | Confirmed at mesh level on two of the three dances (F.1: hands/fingers and a forearm cross the torso by 1.6–2.9 cm; CPU and GPU skinning agree). The arm↔torso proxy refinement does not catch these (hand and torso under-modelled); not fixed. Hair overlap unconfirmed |
 
 Tests: 141 before → 173 after (all pass; CTest 16/16 groups). Some of the new tests need the private
 `models/Model1.vrm` and return early without it; they are listed in J.
@@ -143,10 +143,16 @@ What I did:
    hips while the calibrated torso half-depth is 0.116 m; raw proxy clearance at those frames is +0.112,
    +0.167 and +0.087 m. The camera sits in front of the model, so the “hands vanish into the chest” impression
    is occlusion and foreshortening of arms that point at the camera, not interpenetration.
-4. Swept three dances × 40 s at 20 Hz (2403 frames, overlays Full): minimum proxy clearance +0.023 m,
-   zero violations. (My first proxy was a single wide cylinder that flagged 54 % of frames; those were false
-   positives from hanging arms next to the shoulder line, which is why the proxy is banded and ignores the
-   upper-arm midpoint. The zero is a property of the redesigned proxy, not a pose change.)
+4. ~~Swept three dances × 40 s: minimum proxy clearance +0.023 m, zero violations.~~ **This claim was wrong.**
+   The sweep test reused one `DancePlayer` for the three clips; re-selecting at t = 0 keeps the first schedule, so it
+   measured neonPulse three times. With a fresh player per clip (fixed) the sweep over 2403 frames gives **20 frames
+   with proxy penetration, raw minimum −0.046 m**, which the refinement brings to ≈ 0. See F.1 for why that is still
+   not enough at mesh level. (My first proxy was a single wide cylinder that flagged 54 % of frames; those were false
+   positives from hanging arms, which is why the proxy is banded and ignores the upper-arm midpoint.)
+
+Caveat on items 1–3: the stills and the skeleton numbers for "t = 4/7/8 s" were produced with a direct jump to that time
+(`--time`, `update(t)`), which makes the dance player seek and re-align its schedule, so those poses are not the ones a
+sequential playback reaches at the same time. They are internally consistent with each other but not representative.
 
 What this does **not** show: whether a hand or sleeve intersects hair, a vest pouch or a skirt in some frame
 I did not render. Hair is skinned rigidly to head/neck with Spring OFF, so hair passing through an arm that
@@ -180,10 +186,71 @@ vertices), neonPulse t = 7.3 s (right forearm), fluidSignal t = 4.8 s. In the st
 shoulder / upper chest with the sleeve pressed into the vest, which is consistent with a real, shallow (1.5–3 cm)
 overlap. At streetCurrent t = 9.6 s a raised arm lies behind the hanging hair strands.
 
-Reading: this **contradicts the earlier "no clipping" conclusion**, which came from the proxy. Likely reason
-(hypothesis, not tested): the proxy fades out above the neck base, so hands on the shoulder or upper chest are not
-covered. Not done: a proxy-vs-mesh comparison on these exact frames, any fix, any check of mesh-level numbers after the
-arm refinement, and any validation of the vertex-normal depth against a true triangle test.
+**Method caveat found while doing the three checks below:** an earlier version of this tool re-requested poses with a
+backwards `update(t)`, which seeks and re-aligns the schedule (poses differ from the sweep; its first "explain" output was
+meaningless). The tool now reuses the poses of the sweep itself, and the renders in
+`artifacts/qa/mesh_clip_confirmed_frames.png` were made by stepping sequentially from t = 0 at 10 FPS
+(`bgmedia_vrm_preview --time 0 --frames N --fps 10`).
+
+#### The three checks
+
+**1. Why the proxy reported a positive clearance while the mesh crossed.** Per worst frame the tool prints the proxy's
+own clearance and where the deepest vertex lies relative to the proxy samples (elbow, forearm midpoint, wrist, palm
+centre; spheres of the calibrated radii):
+
+| frame | proxy raw clearance | deepest vertex | nearest proxy sample | covered? |
+|---|---|---|---|---|
+| streetCurrent 5.1 s | −0.020 m (flagged; refinement corrected it) | 29 mm, spine position 0.84 | palm, 9.0 cm away (radius 3.9 cm) | **no** (a finger) |
+| fluidSignal 4.8 s | +0.020 m | 16 mm, spine position 0.57 | forearm-mid, 3.4 cm (radius 3.3 cm) | borderline |
+| neonPulse 7.3 s | +0.038 m | 22 mm, spine position 0.59 | elbow/forearm, 5.2 cm (radius 3.3 cm) | **no** |
+
+So the earlier hypothesis ("the proxy fades above the neck base") is **wrong**: the offending vertices lie at spine
+position 0.57–0.86, inside the torso span. Two real gaps: (a) the hand is a single sphere at the palm centre although the
+hand extends about 9 cm further, so fingers and thumbs are not covered; (b) the torso surface is the 85th percentile of the
+rest vertices, so pouches and straps stick out up to ~2 cm beyond it.
+
+**2. Real triangle crossings vs close contact.** Arm-skinned triangles (forearm, hand, fingers, sleeve, glove) against torso-skinned
+triangles, all-edges-vs-triangle test with a grid broad phase, crossings that already exist in the neutral pose masked
+(there were none):
+
+* streetCurrent 5.1 s and 24.3 s: **57 arm triangles cross torso triangles** (45 at 24.4 s), spine position 0.76–0.86. Confirmed
+  penetration: in the render the hand/fingers and sleeve sink into the chest rig.
+* fluidSignal 4.8 / 15.6 / 1.2 s: **6 crossing triangles**, forearm into the mid-torso, 16 mm.
+* neonPulse 7.3 / 7.4 / 26.6 s: **0 crossings** although the vertex test says 22 mm. That is near contact or a fold (or a hand fully
+  inside the shell, which this test cannot see); it is not confirmed clipping.
+
+Limits: triangles are checked only against triangles of the torso-skinned group (not hair, not other clothing layers); an arm
+that is entirely inside a closed surface gives no crossing; sleeve-over-vest layering authored by the artist counts as a
+crossing.
+
+**3. Is the CPU geometry the geometry that is drawn?** `bgmedia_skin_check` renders the SKIN and CLOTH materials on the GPU (second
+render with everything hidden gives the background), skins the same vertices on the CPU with `model · nodeGlobals[joint] ·
+inverseBind` (the shader's palette formula), projects them with a copy of the renderer's camera (including that the camera
+ignores root translation: my first copy used the model matrix and produced IoU 0.55 on two root-moving frames, a harness error,
+not a skinning error) and compares silhouettes:
+
+| pose / camera | IoU neutral | IoU dance | GPU-only px (dance) | CPU-only px |
+|---|---|---|---|---|
+| neonPulse 7.3, front | 0.973 | 0.974 | 2 (0.01 %) | 2.7 % |
+| streetCurrent 5.1, +35° | 0.952 | 0.956 | 0 | 4.6 % |
+| neonPulse 7.3, −35° | 0.962 | 0.958 | 0 | 4.4 % |
+| fluidSignal 4.8, +60° | 0.936 | 0.931 | 0 | 7.4 % |
+| streetCurrent 24.3, front | 0.973 | 0.969 | 1 | 3.2 % |
+
+The dance pose agrees as well as the neutral pose, GPU-only pixels are ≈ 0, i.e. everything the GPU draws is covered by the CPU
+geometry; the CPU-only 3–7 % are alpha-cut-out regions that the GPU discards and my rasteriser does not. Skins have at most 171
+joints (palette limit 192). Limits: silhouette level (about 3 mm per pixel at this distance), not per-vertex; only SKIN/CLOTH
+materials (hair not checked); depth ordering and alpha blending are not examined.
+
+#### What this changes
+
+* The renderer is **not** the cause of the measured penetration: CPU and GPU skinning agree.
+* Penetration is **real** for streetCurrent (hand/fingers into the upper chest) and fluidSignal (forearm into mid-torso), shallow
+  (1.6–2.9 cm), and **not confirmed** for neonPulse.
+* The refinement does what it was designed for (proxy clearance ≈ 0 after correction) but the proxy is too coarse: hand
+  modelled as one sphere, torso at P85. No fix was made here; candidates are more hand samples (fingertips, thumb) and a larger
+  torso percentile, to be judged with this tool.
+* Not done: arm-vs-hair triangle test (hair sheets), arm-vs-skirt/one-piece layers, a second model.
 
 ## G. Collision-aware refinement
 

@@ -167,17 +167,38 @@
     "authored_clips_motion_qa": "identical"
   },
   "mesh_clipping": {
-    "reproduced": false,
-    "sampled_frames_neonPulse_t4_7_8_raw_proxy_clearance_m": [
-      0.112,
-      0.167,
-      0.087
+    "reproduced_at_mesh_level": true,
+    "corrections": [
+      "earlier proxy sweep measured neonPulse 3x (shared DancePlayer); corrected: 20 violating frames, raw min -0.046 m, final ~0",
+      "earlier stills used a seek pose"
     ],
-    "wrist_forward_of_hips_m": [
-      0.28,
-      0.3
+    "frames_>=5_verts_behind_torso_8mm": {
+      "neonPulse": 79,
+      "streetCurrent": 90,
+      "fluidSignal": 31
+    },
+    "worst_depth_mm": {
+      "neonPulse": 24,
+      "streetCurrent": 29,
+      "fluidSignal": 16
+    },
+    "triangle_crossings": {
+      "streetCurrent_5.1": 57,
+      "fluidSignal_4.8": 6,
+      "neonPulse_7.3": 0
+    },
+    "proxy_gaps": [
+      "hand is one palm sphere (fingers ~9cm away uncovered)",
+      "torso surface P85 under-sizes pouches/straps by up to ~2cm"
     ],
-    "discriminator": "--hide-material in bgmedia_vrm_preview"
+    "cpu_gpu_silhouette_iou_dance": [
+      0.974,
+      0.956,
+      0.958,
+      0.931,
+      0.969
+    ],
+    "cpu_gpu_gpu_only_px": "0-2"
   },
   "asan": {
     "run": true,

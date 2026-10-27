@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
             }
 
     std::vector<SkinVertex> verts;
+    std::vector<std::array<int, 3>> tris;  // indices into `verts`
     for (const vrm::MeshInstance& inst : model.meshInstances) {
         if (inst.mesh < 0) continue;
         const vrm::Skin* skin = model.skinForNode(inst.node);
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
             const bool hair = prim.material >= 0 &&
                               model.materials[static_cast<std::size_t>(prim.material)].name.find("HAIR") !=
                                   std::string::npos;
+            const std::size_t base = verts.size();
             for (const vrm::Vertex& v : prim.vertices) {
                 SkinVertex s;
                 s.position = v.position;
@@ -180,6 +182,10 @@ int main(int argc, char** argv) {
                     s.group = static_cast<Group>(nodeGroup[static_cast<std::size_t>(skin->joints[v.joints[best]])]);
                 }
                 verts.push_back(s);
+            }
+            for (std::size_t t = 0; t + 2 < prim.indices.size(); t += 3) {
+                tris.push_back({static_cast<int>(base + prim.indices[t]), static_cast<int>(base + prim.indices[t + 1]),
+                                static_cast<int>(base + prim.indices[t + 2])});
             }
         }
     }
@@ -265,8 +271,159 @@ int main(int argc, char** argv) {
         return out;
     };
 
+    // --- triangle-level test (uses the vertices skinned by the last measure()) ----
+    const auto segTri = [](Vec3 p, Vec3 q, Vec3 a, Vec3 b, Vec3 c) {
+        const Vec3 e1 = b - a, e2 = c - a, d = q - p;
+        const Vec3 h = math::cross(d, e2);
+        const float det = math::dot(e1, h);
+        if (std::abs(det) < 1e-12f) return false;
+        const float f = 1.0f / det;
+        const Vec3 s = p - a;
+        const float u = f * math::dot(s, h);
+        if (u < 0.0f || u > 1.0f) return false;
+        const Vec3 qv = math::cross(s, e1);
+        const float v = f * math::dot(d, qv);
+        if (v < 0.0f || u + v > 1.0f) return false;
+        const float t = f * math::dot(e2, qv);
+        return t >= 0.0f && t <= 1.0f;
+    };
+    const auto triTri = [&](const std::array<int, 3>& A, const std::array<int, 3>& B) {
+        const Vec3 a[3] = {skinned[static_cast<std::size_t>(A[0])], skinned[static_cast<std::size_t>(A[1])],
+                           skinned[static_cast<std::size_t>(A[2])]};
+        const Vec3 b[3] = {skinned[static_cast<std::size_t>(B[0])], skinned[static_cast<std::size_t>(B[1])],
+                           skinned[static_cast<std::size_t>(B[2])]};
+        for (int e = 0; e < 3; ++e) {
+            if (segTri(a[e], a[(e + 1) % 3], b[0], b[1], b[2])) return true;
+            if (segTri(b[e], b[(e + 1) % 3], a[0], a[1], a[2])) return true;
+        }
+        return false;
+    };
+    std::vector<int> armTris, torsoTris;
+    for (std::size_t t = 0; t < tris.size(); ++t) {
+        const auto& tr = tris[t];
+        const Group g0 = verts[static_cast<std::size_t>(tr[0])].group;
+        if (g0 != verts[static_cast<std::size_t>(tr[1])].group || g0 != verts[static_cast<std::size_t>(tr[2])].group) continue;
+        if (g0 == kArm) armTris.push_back(static_cast<int>(t));
+        else if (g0 == kTorso) torsoTris.push_back(static_cast<int>(t));
+    }
+    std::vector<unsigned char> neutralTriHit(tris.size(), 0);
+    // Returns arm triangles crossing a torso triangle (excluding rest-pose crossings).
+    const auto crossingArmTris = [&](bool recordNeutral) {
+        constexpr float cell = 0.03f;
+        std::unordered_map<long long, std::vector<int>> grid;
+        const auto cellKey = [](int x, int y, int z) {
+            return (static_cast<long long>(x) * 73856093LL) ^ (static_cast<long long>(y) * 19349663LL) ^
+                   (static_cast<long long>(z) * 83492791LL);
+        };
+        const auto bounds = [&](int t, Vec3& lo, Vec3& hi) {
+            lo = hi = skinned[static_cast<std::size_t>(tris[static_cast<std::size_t>(t)][0])];
+            for (int k = 1; k < 3; ++k) {
+                const Vec3 p = skinned[static_cast<std::size_t>(tris[static_cast<std::size_t>(t)][static_cast<std::size_t>(k)])];
+                lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+                hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+            }
+        };
+        for (int t : torsoTris) {
+            Vec3 lo, hi;
+            bounds(t, lo, hi);
+            for (int x = (int)std::floor(lo.x / cell); x <= (int)std::floor(hi.x / cell); ++x)
+                for (int y = (int)std::floor(lo.y / cell); y <= (int)std::floor(hi.y / cell); ++y)
+                    for (int z = (int)std::floor(lo.z / cell); z <= (int)std::floor(hi.z / cell); ++z)
+                        grid[cellKey(x, y, z)].push_back(t);
+        }
+        std::vector<int> hits;
+        std::vector<int> stamp(tris.size(), -1);
+        for (int a : armTris) {
+            Vec3 lo, hi;
+            bounds(a, lo, hi);
+            bool hit = false;
+            for (int x = (int)std::floor(lo.x / cell); x <= (int)std::floor(hi.x / cell) && !hit; ++x)
+                for (int y = (int)std::floor(lo.y / cell); y <= (int)std::floor(hi.y / cell) && !hit; ++y)
+                    for (int z = (int)std::floor(lo.z / cell); z <= (int)std::floor(hi.z / cell) && !hit; ++z) {
+                        const auto it = grid.find(cellKey(x, y, z));
+                        if (it == grid.end()) continue;
+                        for (int b : it->second) {
+                            if (stamp[static_cast<std::size_t>(b)] == a) continue;
+                            stamp[static_cast<std::size_t>(b)] = a;
+                            if (triTri(tris[static_cast<std::size_t>(a)], tris[static_cast<std::size_t>(b)])) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+            if (hit) {
+                if (recordNeutral) neutralTriHit[static_cast<std::size_t>(a)] = 1;
+                else if (!neutralTriHit[static_cast<std::size_t>(a)]) hits.push_back(a);
+            }
+        }
+        return hits;
+    };
+
     // Neutral (arms out) pose defines vertices that already touch at rest.
     (void)measure(rig.applyClip(motion::neutralClipPose(), 0.0), true);
+    (void)crossingArmTris(true);
+    std::printf("arm triangles %zu, torso triangles %zu, rest-pose crossings masked: %zu\n", armTris.size(),
+                torsoTris.size(), static_cast<std::size_t>(std::count(neutralTriHit.begin(), neutralTriHit.end(), 1)));
+
+    // --- explanation of one frame (call right after measure() on the same pose) ---------
+    const auto explain = [&](const animation::RetargetedPose& pose, const Measurement& m, double t) {
+        const vrm::HumanoidBone hb = vrm::HumanoidBone::Hips;
+        const Vec3 hips = pose.bonePosition(hb, model);
+        const Vec3 neck = pose.bonePosition(vrm::HumanoidBone::Neck, model);
+        const float torsoLen = (neck - hips).length();
+        const Vec3 up = math::normalize(neck - hips);
+        const Vec3 w = m.worstAt - hips;
+        const float along = math::dot(w, up) / torsoLen;
+        const auto info = rig.collisionProxy();
+        struct Sample {
+            const char* name;
+            Vec3 p;
+            float r;
+        };
+        std::vector<Sample> samples;
+        for (int sd = 0; sd < 2; ++sd) {
+            const auto lower = sd == 0 ? vrm::HumanoidBone::LeftLowerArm : vrm::HumanoidBone::RightLowerArm;
+            const auto hand = sd == 0 ? vrm::HumanoidBone::LeftHand : vrm::HumanoidBone::RightHand;
+            const Vec3 e = pose.bonePosition(lower, model), wr = pose.bonePosition(hand, model);
+            const int prox = model.fingerNode(sd, 2, 0);
+            const float off = prox >= 0 ? 0.5f * (pose.nodeGlobals[static_cast<std::size_t>(prox)].translationPart() - wr).length()
+                                        : 0.045f * model.height;
+            samples.push_back({"elbow", e, info.foreArmRadius});
+            samples.push_back({"forearm-mid", (e + wr) * 0.5f, info.foreArmRadius});
+            samples.push_back({"wrist", wr, info.handRadius});
+            samples.push_back({"palm", wr + math::normalize(wr - e) * off, info.handRadius});
+        }
+        const Sample* nearest = nullptr;
+        float nd = 1e9f;
+        for (const Sample& s : samples) {
+            const float d = (s.p - m.worstAt).length();
+            if (d < nd) {
+                nd = d;
+                nearest = &s;
+            }
+        }
+        const std::vector<int> hits = crossingArmTris(false);
+        float tMin = 9.0f, tMax = -9.0f;
+        for (int a : hits) {
+            Vec3 c{};
+            for (int k = 0; k < 3; ++k) c = c + skinned[static_cast<std::size_t>(tris[static_cast<std::size_t>(a)][static_cast<std::size_t>(k)])];
+            c = c * (1.0f / 3.0f);
+            const float tt = math::dot(c - hips, up) / torsoLen;
+            tMin = std::min(tMin, tt);
+            tMax = std::max(tMax, tt);
+        }
+        std::printf("  explain t=%.2f s: proxy raw clearance %+.3f m | deepest vertex %.1f mm at spine position %.2f "
+                    "(1.0 = neck base) | nearest proxy sample '%s' %.1f cm away (sphere radius %.1f cm) -> %s\n",
+                    t, pose.stats.armClearanceRaw, m.maxDepth * 1000.0f, along, nearest ? nearest->name : "-", nd * 100.0f,
+                    nearest ? nearest->r * 100.0f : 0.0f,
+                    nearest && nd <= nearest->r + 0.0065f ? "covered by a proxy sphere" : "NOT covered by any proxy sphere");
+        if (hits.empty())
+            std::printf("           triangle test: 0 arm triangles cross a torso triangle (vertices behind the surface without a crossing = "
+                        "near contact / inside a fold)\n");
+        else
+            std::printf("           triangle test: %zu arm triangles cross torso triangles, spine position %.2f..%.2f\n",
+                        hits.size(), tMin, tMax);
+    };
     std::size_t masked = 0;
     for (unsigned char m : mask) masked += m;
     std::printf("rest-contact vertices masked: %zu\n", masked);
@@ -274,6 +431,7 @@ int main(int argc, char** argv) {
     struct Row {
         double t;
         Measurement m;
+        std::size_t index;
     };
     for (const std::string& clip : clips) {
         motion::DancePlayer player;  // fresh per clip: a reused player keeps the first schedule
@@ -284,11 +442,14 @@ int main(int argc, char** argv) {
             continue;
         }
         std::vector<Row> rows;
+        std::vector<animation::RetargetedPose> poses;
+        poses.reserve(static_cast<std::size_t>(seconds * hz) + 1);
         const int frames = static_cast<int>(seconds * hz);
         for (int f = 0; f < frames; ++f) {
             const double t = f / hz;
             const auto frame = player.update(t);
-            rows.push_back({t, measure(rig.applyClip(frame.pose, t), false)});
+            poses.push_back(rig.applyClip(frame.pose, t));
+            rows.push_back({t, measure(poses.back(), false), poses.size() - 1});
         }
         int torsoFrames = 0, hairFrames = 0;
         float worst = 0.0f;
@@ -309,6 +470,15 @@ int main(int argc, char** argv) {
             std::printf("  worst t=%6.2f s: %4d verts, depth %.1f mm at joint '%s'\n", r.t, r.m.penetrating,
                         r.m.maxDepth * 1000.0f,
                         r.m.worstNode >= 0 ? model.nodes[static_cast<std::size_t>(r.m.worstNode)].name.c_str() : "-");
+        }
+        for (std::size_t i = 0; i < std::min<std::size_t>(3, rows.size()); ++i) {
+            if (rows[i].m.penetrating < 5) break;
+            const double t = rows[i].t;
+            // Use the pose from the sweep itself: a backwards update() would seek and
+            // re-align the schedule, giving a different pose for the same time.
+            const auto& pose = poses[rows[i].index];
+            const Measurement m = measure(pose, false);  // re-skins this pose
+            explain(pose, m, t);
         }
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.m.hairTouch > b.m.hairTouch; });
         for (std::size_t i = 0; i < std::min<std::size_t>(3, rows.size()); ++i)

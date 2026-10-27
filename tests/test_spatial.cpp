@@ -273,10 +273,12 @@ ClearanceSweep sweepClearance(const std::filesystem::path& model, bool useMesh) 
     if (!rig.valid()) {
         return sweep;
     }
-    motion::DancePlayer player;
-    player.loadLibrary(std::filesystem::path(BGMEDIA_SOURCE_DIR) / "assets" / "dances");
-    player.setOverlayMode(motion::OverlayMode::Full);
     for (const char* id : {"neonPulse", "streetCurrent", "fluidSignal"}) {
+        // A fresh player per clip: re-selecting on a reused player at t=0 keeps the
+        // first schedule (this loop used to measure neonPulse three times).
+        motion::DancePlayer player;
+        player.loadLibrary(std::filesystem::path(BGMEDIA_SOURCE_DIR) / "assets" / "dances");
+        player.setOverlayMode(motion::OverlayMode::Full);
         if (!player.selectClip(id, 0.0, true)) continue;
         for (double t = 0.0; t < 40.0; t += 1.0 / 20.0) {
             const motion::DanceFrame frame = player.update(t);
