@@ -28,9 +28,10 @@ and did **not** make a video. Section M lists everything that remains.
 | Crossfade | Overlay set flipped at 50 % of the blend | Overlays composed per segment before the blend |
 | Spring bones | Wrong space for rotations, dimensionally inconsistent integrator, stale state on OFF→ON, no teleport handling, branches and leaf bones lost, collider index shift | All fixed and covered by tests |
 | Footwork | **Foot `z` and `yaw` arguments were swapped; every shipped dance had a 22 cm single-key foot teleport** (not in the audit) | Fixed; peak foot step per key 0.1375 → 0.04–0.05 height units |
-| Mesh clipping | Reported arm/hair/clothing overlap with Spring OFF | Confirmed at mesh level on two of the three dances (F.1: hands/fingers and a forearm cross the torso by 1.6–2.9 cm; CPU and GPU skinning agree). The arm↔torso proxy refinement does not catch these (hand and torso under-modelled); not fixed. Hair overlap unconfirmed |
+| Eyes through the back of the head | Blended face layers were drawn with a depth compare of ALWAYS, i.e. over everything | **Fixed** (G3): one-line renderer change plus a GPU regression check |
+| Mesh clipping | Confirmed at mesh level with Spring OFF | Confirmed at mesh level on two of the three dances (F.1: hands/fingers and a forearm cross the torso by 1.6–2.9 cm; CPU and GPU skinning agree). After the targeted proxy fix (G2) the confirmed triangle crossings drop from 16 to 0 frames (streetCurrent) and from 11 to 2 (fluidSignal), neonPulse control stays 0; hair overlap unconfirmed |
 
-Tests: 141 before → 173 after (all pass; CTest 16/16 groups). Some of the new tests need the private
+Tests: 141 before → 175 after (all pass; CTest 16/16 groups). Some of the new tests need the private
 `models/Model1.vrm` and return early without it; they are listed in J.
 
 **BG Motion 3.1 did not regress.** `bgmedia_sync_qa` was re-run and diffed against the committed
@@ -275,6 +276,111 @@ materials (hair not checked); depth ordering and alpha blending are not examined
   heuristic. Diagnostics: `armProxy`, `armClearanceRaw`, `armClearanceMin`, `armCorrection`,
   `armCorrectionClamped`, `collisionProxy()`. They are **not yet shown in the Desktop UI**.
 
+## G2. Targeted fix of the confirmed arm/torso crossings
+
+Scope: improve the existing proxy refinement, no new collision engine. All measurements use `bgmedia_mesh_clip`: one fresh
+`DancePlayer` per clip, sequential playback from t = 0 (10 Hz for penetration, 60 Hz for smoothness), whole dances (40 s),
+Spring OFF, overlays Full. "Crossing" = an arm-skinned triangle (forearm, hand, fingers, sleeve, glove) crossing a torso-skinned
+triangle (rest-pose crossings masked: none).
+
+**What was wrong, per the diagnostics (F.1):** (a) the hand was one sphere at the palm centre, so fingers and thumbs were not
+covered; (b) the torso cross-section was an ellipse, but the vest is boxy: its front corners (lateral 9 cm, forward 7 cm at
+mid-torso) lie outside the ellipse yet inside the mesh, which is exactly where a forearm folded across the body ends up;
+(c) the torso envelope was P85 of the vertices (pouches and straps stick out); (d) the refinement rotated the hand with the forearm.
+
+**Changes (`HumanoidRetargeter.cpp`, all calibrated from the model's own mesh, with the skeleton fallback kept):**
+
+* **Hand control points:** palm centre, index and little knuckles, middle joint, distal joint and extended tip of every finger
+  (including the thumb), carried rigidly with the wrist. Finger radius is the P90 distance of finger-skinned vertices to their bone
+  segment (Model1: measured, smaller than the palm radius).
+* **Torso shape fitted to the mesh:** 5 height bands with correct band centres (the old 3-band interpolation put band centres at the
+  wrong heights), P95 per band for half-width / front / back, and a cross-section exponent `p` (|x/a|^p + |z/b|^p = 1) chosen as the
+  smallest value in 2…4 for which at most 6 % of the torso vertices lie outside. The general radius was **not** increased blindly:
+  the forearm radius went from P85 to P95 (3.3 → 3.5 cm), the torso extents are shape-fitted.
+* **Minimal correction:** a forearm point is cleared by translating elbow and wrist together (the old rule pivoted about a fixed
+  elbow and needed twice the wrist move); the wrist follows the deepest hand point's normal; the **world orientation of the hand is
+  preserved** (its local rotation is re-derived), as are the twist of the upper arm and forearm.
+* **Cost guard:** the finger samples are skipped when the wrist is farther from the torso than the whole hand can reach.
+
+**Results** (before = previous proxy, after = this change; same sequential playback):
+
+| dance | frames with triangle crossings | max / total crossing triangles | proxy violations (raw) | max correction | max acceleration of hands/elbows @60 Hz |
+|---|---|---|---|---|---|
+| neonPulse (**negative control**) | 0 → 0 | 0 → 0 | 0 → 32 | 0 → 9.6 mm | 800 → 800 m/s² (unchanged) |
+| streetCurrent | **16 → 0** of 400 | 57 → 0 / 700 → 0 | 10 → 48 | 49 → 126 mm | 67.8 → 67.8 m/s² |
+| fluidSignal | **11 → 2** of 400 | 39 → 6 / 132 → 12 | 0 → 18 | 0 → 24 mm | 84.9 → 84.9 m/s² |
+
+* Peak hand/elbow speed and the maximum hand-orientation step per frame are unchanged in all three dances (3.63 / 3.51 m/s,
+  0.381 / 0.231 rad); the correction itself changes by at most 13.5 mm (streetCurrent) between 60 Hz frames, with a smooth onset.
+* After the correction the proxy clearance is ≥ −1 mm in every frame of every dance (it was already ≥ 0 after correction before,
+  so the metric alone showed no problem: the proxy was too coarse, not the solver).
+* Forced cross-body test gesture: 42 of 201 frames violate the proxy, all improve, worst −45.7 mm → −2.3 mm; the wrist step of that
+  deliberately extreme sweep grew from 5.9 mm to 15.2 mm per 1/200 sweep (limit in the test: 3× the unrefined step + 10 mm).
+* Sequential before/after stills of the same four poses (streetCurrent 5.1 s and 24.5 s, fluidSignal 10.8 s, neonPulse 7.3 s):
+  `artifacts/qa/arm_fix_before_after.png` (not committed). The change is small by eye (arm moved a few cm out of the chest rig, hand
+  orientation and pose character kept); neonPulse looks the same.
+* Cost: `applyClip` on the worst-case cross-body pose 0.019 ms without → 0.042 ms with the refinement (before this change 0.019 → 0.019);
+  frames with the arm away from the torso take the early out.
+
+**Honest caveats**
+
+* The *vertex*-behind-surface count (nearest-vertex normal) barely moved (streetCurrent 90 → 86 frames, depth 29 → 24 mm;
+  neonPulse and fluidSignal unchanged). That metric measures near contact and folds (it reports 79 frames on neonPulse where no
+  triangle crosses), so the confirmed measure is the triangle test, not this count.
+* **Residual:** fluidSignal still has 2 frames (t = 10.8 s, 30.0 s) with 6 crossing triangles, 16 mm. The forearm sphere touches the
+  proxy there (clearance ≈ 0) but the mesh has a local protrusion beyond the P95 envelope; growing the envelope further would push
+  arms off the body in ordinary poses (neonPulse already receives 32 small, unneeded corrections of up to 9.6 mm). Not pursued.
+* **Large corrections:** streetCurrent has about 5 frames (around t = 24.5 s) where the authored hand is buried 3–4.6 cm in the chest
+  and the wrist moves up to 126 mm (p90 115 mm) although the deficit is 46 mm. I tried three alternative solvers for these frames
+  (a push direction frozen at the first iteration, the push-weighted mean normal of all violating hand points, and a least-norm
+  solution of all violated half-spaces by alternating projections). None beat the plain deepest-point normal (the last gave 148 mm
+  and a 4× higher acceleration), so I kept the simplest one and stopped rather than add iterations or radius. The reason is
+  geometric: a hand buried near the medial axis of the torso has no consistent exit normal, so any linearised push either detours or
+  oscillates. Whether 126 mm for 0.5 s is acceptable artistically is open; the 35 %-of-arm-length clamp was not triggered.
+* neonPulse (hand/elbow max speed 13.4 m/s, acceleration 800 m/s², hand orientation step 0.67 rad/frame) is unrelated to this change
+  (it is identical with the refinement off) and points at a pre-existing discontinuity in that clip's playback; not investigated.
+* Only arm-vs-torso triangles were tested, not hair or other clothing layers, and only one model.
+
+## G3. Eyes visible through the back of the head (separate defect)
+
+**Reproduced** with a neutral pose (so it is not a head turn) and identical cameras. From behind (`bgmedia_vrm_preview --player idle
+--yaw 0`) the eyes, irises and brows were drawn on top of the back of the head and the hair, also with the hair hidden; with every material
+forced opaque (`--opaque`) they disappeared. Images: `artifacts/qa/eyes_idle_front_back_BEFORE.png` and `..._AFTER.png`
+(rows: normal, hair hidden, opaque override, opaque + hair hidden; columns: camera behind / in front), `eyes_front_face_before_after.png`.
+
+Investigation, in the order requested:
+
+| item | finding |
+|---|---|
+| Head/eye orientation | Not the cause: the defect is identical in the neutral pose; the front/back cameras differ by exactly 180° |
+| Skinning | Not the cause: eye, brow, lash, eye-line and skin layers share the face vertex buffer (4419 vertices), 99 %+ weighted to Head/Neck and, for the lids, the eye bones; hair 19 664 of 19 664 vertices on head/neck/hair chains (test) |
+| Materials / alpha | Eye layers (iris, highlight, brows, lashes, eye line) are BLEND; face skin, eye white and hair are MASK. Forcing everything opaque removed the defect, which points at the blended layers, not at an alpha-cutout hole in the head |
+| Depth test | **Cause.** `makeMeshPipeline` used `compare_op = SDL_GPU_COMPAREOP_ALWAYS` for blended pipelines (depth test "enabled" but never rejecting), so those layers ignore the opaque depth buffer entirely. The code comment claimed the opposite |
+| Depth write | Correctly off for blended layers (kept) |
+| Render order | Opaque pass first, then blended primitives sorted back-to-front by bind centroid (fine; kept) |
+| Culling | `CULLMODE_NONE` for all pipelines; the material's `doubleSided` flag is ignored (unused-parameter warning), so single-sided materials are drawn double-sided. Not the cause here; noted, not changed |
+
+**Fix (local):** blended pipelines now use `COMPAREOP_LESS_OR_EQUAL` with depth write still off (`SdlGpuVrmRenderer.cpp`). Nothing else changed, no
+depth bias.
+
+**Check, permanent:** `bgmedia_skin_check --eye-occlusion` renders the neutral pose with and without the eye/brow/lash/eye-line layers from seven camera
+yaws and counts changed pixels. Behind the head the count must be 0, from the front it must be > 100.
+
+| camera | before fix (px changed when eye layers hidden) | after fix |
+|---|---|---|
+| front 180° / 160° | 500 / 491 | 220 / 221 |
+| behind 0° / +20° / −20° | **387 / 386 / 382 (visible through the head)** | **0 / 0 / 0** |
+| side +90° / −90° | 157 / 148 | 0 / 0 |
+
+Side effects seen: from the front the eyes, irises, lashes and brows are still fully visible, with no z-fighting; the faint green rims below the
+eyes that the old renderer drew over the eyelid skin are gone (they were part of the same artifact); some other blended clothing/face layers are
+now correctly occluded too (about 1 000 pixels differ in the idle view). The IoU check (G of the CPU/GPU section) did not cover this defect, as
+expected: it compared silhouettes of skin and clothing, not depth or transparency.
+
+Not done: other blended materials in other models (a model with a legitimately see-through blended layer behind opaque geometry would now
+be occluded, which is the correct behaviour but unverified), GPU timing before/after (one frame at ~4 ms on this machine, not compared), the
+Desktop app was rebuilt but not launched.
+
 ## H. Spring physics
 
 * **Integrator.** Position Verlet with the fixed 120 Hz step and explicit units: displacement per
@@ -322,7 +428,7 @@ is therefore **not addressed** by this pass beyond the foot/transition fixes.
 
 | | before | after |
 |---|---|---|
-| `bgmedia_tests` | 141 | 173 |
+| `bgmedia_tests` | 141 | 175 |
 | CTest groups | 13 | 16 |
 | New files | | `test_quality.cpp`, `test_spatial.cpp`, `test_spring.cpp` |
 

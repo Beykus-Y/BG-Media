@@ -3,7 +3,7 @@
   "base_commit": "aacdeeb",
   "tests": {
     "before": 141,
-    "after": 173,
+    "after": 175,
     "ctest_groups_before": 13,
     "ctest_groups_after": 16
   },
@@ -205,5 +205,146 @@
     "tests": 170,
     "result": "all passed, no reports",
     "note": "newer 3 tests not under ASan"
+  },
+  "arm_torso_fix": {
+    "method": "bgmedia_mesh_clip, fresh DancePlayer per clip, sequential from t=0, 10 Hz penetration / 60 Hz smoothness, overlays Full, spring off",
+    "triangle_crossing_frames_of_400": {
+      "neonPulse(control)": {
+        "before": 0,
+        "after": 0
+      },
+      "streetCurrent": {
+        "before": 16,
+        "after": 0
+      },
+      "fluidSignal": {
+        "before": 11,
+        "after": 2
+      }
+    },
+    "max_crossing_triangles": {
+      "neonPulse": [
+        0,
+        0
+      ],
+      "streetCurrent": [
+        57,
+        0
+      ],
+      "fluidSignal": [
+        39,
+        6
+      ]
+    },
+    "sum_crossing_triangles": {
+      "streetCurrent": [
+        700,
+        0
+      ],
+      "fluidSignal": [
+        132,
+        12
+      ]
+    },
+    "proxy_violations_raw_frames": {
+      "neonPulse": [
+        0,
+        32
+      ],
+      "streetCurrent": [
+        10,
+        48
+      ],
+      "fluidSignal": [
+        0,
+        18
+      ]
+    },
+    "max_correction_mm": {
+      "neonPulse": [
+        0,
+        9.6
+      ],
+      "streetCurrent": [
+        49.3,
+        125.7
+      ],
+      "fluidSignal": [
+        0,
+        24.4
+      ]
+    },
+    "max_acceleration_m_s2": {
+      "neonPulse": [
+        800.3,
+        800.3
+      ],
+      "streetCurrent": [
+        67.8,
+        67.8
+      ],
+      "fluidSignal": [
+        84.9,
+        84.9
+      ]
+    },
+    "vertex_behind_surface_frames": {
+      "neonPulse": [
+        79,
+        79
+      ],
+      "streetCurrent": [
+        90,
+        86
+      ],
+      "fluidSignal": [
+        31,
+        31
+      ]
+    },
+    "apply_clip_ms_worst_case_pose": {
+      "refinement_off": 0.019,
+      "before": 0.019,
+      "after": 0.042
+    },
+    "proxy_model1": {
+      "halfWidth_m": 0.12,
+      "front_m": 0.133,
+      "back_m": 0.082,
+      "foreArm_m": 0.035,
+      "bands": 5
+    },
+    "solver_variants_tried_for_deep_frames": [
+      "frozen direction (126 mm)",
+      "weighted mean normal (142 mm)",
+      "half-space projection (148 mm, 4x acceleration)"
+    ]
+  },
+  "eyes_through_head": {
+    "cause": "blend pipelines used COMPAREOP_ALWAYS",
+    "fix": "COMPAREOP_LESS_OR_EQUAL, depth write off",
+    "px_changed_when_eye_layers_hidden": {
+      "front_180": [
+        500,
+        220
+      ],
+      "behind_0": [
+        387,
+        0
+      ],
+      "behind_20": [
+        386,
+        0
+      ],
+      "behind_-20": [
+        382,
+        0
+      ],
+      "side_90": [
+        157,
+        0
+      ]
+    },
+    "check": "bgmedia_skin_check --eye-occlusion"
   }
 }

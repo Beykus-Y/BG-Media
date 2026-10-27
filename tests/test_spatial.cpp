@@ -571,3 +571,47 @@ TEST_CASE(spatial.proxy_is_calibrated_from_the_mesh_including_fingers_and_shape)
     CHECK(small.collisionProxy().valid);
     CHECK(!small.collisionProxy().fromMesh);
 }
+
+TEST_CASE(spatial.face_layers_are_skinned_to_the_head_and_eyes) {
+    const auto path = realModelPath();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    vrm::LoadResult loaded = vrm::VrmLoader::load(path);
+    REQUIRE(loaded.ok());
+    const auto& m = *loaded.model;
+    struct Layer {
+        const char* needle;
+        bool allowEyes;
+    };
+    const Layer layers[] = {{"_EYE", true}, {"FaceBrow", true}, {"FaceEyelash", true},
+                            {"FaceEyeline", true}, {"_Face_00_SKIN", true}, {"HAIR", false}};
+    for (const Layer& layer : layers) {
+        long total = 0, onHead = 0, onEyes = 0;
+        for (const vrm::MeshInstance& inst : m.meshInstances) {
+            const vrm::Skin* skin = m.skinForNode(inst.node);
+            if (!skin) continue;
+            for (const vrm::Primitive& prim : m.meshes[static_cast<std::size_t>(inst.mesh)].primitives) {
+                if (prim.material < 0 ||
+                    m.materials[static_cast<std::size_t>(prim.material)].name.find(layer.needle) == std::string::npos) {
+                    continue;
+                }
+                for (const vrm::Vertex& v : prim.vertices) {
+                    std::size_t best = 0;
+                    for (std::size_t k = 1; k < 4; ++k) if (v.weights[k] > v.weights[best]) best = k;
+                    const std::string& joint = m.nodes[static_cast<std::size_t>(skin->joints[v.joints[best]])].name;
+                    ++total;
+                    onHead += joint.find("Head") != std::string::npos || joint.find("Neck") != std::string::npos ||
+                              joint.find("Hair") != std::string::npos || joint.find("J_Sec") != std::string::npos;
+                    onEyes += joint.find("Eye") != std::string::npos;
+                }
+            }
+        }
+        std::cout << "\n            " << layer.needle << ": " << total << " vertices, " << onHead << " on head/neck/hair chains, "
+                  << onEyes << " on eye bones";
+        CHECK(total > 0);
+        // Everything on the face is carried by the head. The eye layers, and the face mesh itself
+        // (brows, lashes and eye line share its vertex buffer; the lids), also use the eye bones.
+        CHECK(onHead + (layer.allowEyes ? onEyes : 0) >= total * 99 / 100);
+    }
+}

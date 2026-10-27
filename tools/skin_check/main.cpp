@@ -54,11 +54,13 @@ int main(int argc, char** argv) {
     double time = 7.3;
     std::vector<std::string> visible = {"_SKIN", "_CLOTH"};
     float camYaw = 3.14159265f;
+    bool eyeOcclusion = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) modelPath = argv[++i];
         else if (a == "--clip" && i + 1 < argc) clip = argv[++i];
         else if (a == "--time" && i + 1 < argc) time = std::atof(argv[++i]);
+        else if (a == "--eye-occlusion") eyeOcclusion = true;
         else if (a == "--yaw" && i + 1 < argc) camYaw = 3.14159265f + static_cast<float>(std::atof(argv[++i])) * 3.14159265f / 180.0f;
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
@@ -78,6 +80,51 @@ int main(int argc, char** argv) {
     std::size_t maxJoints = 0;
     for (const auto& s : model.skins) maxJoints = std::max(maxJoints, s.joints.size());
     std::printf("skins %zu, max joints per skin %zu (GPU palette limit 192)\n", model.skins.size(), maxJoints);
+
+    if (eyeOcclusion) {
+        // Depth/transparency regression check for the face layers (eyes, brows, lashes).
+        // Hiding them must change NOTHING when the camera is behind the head (they are
+        // behind opaque skin and hair), and must change the image from the front.
+        // Camera yaw: 180 deg = in front of the character, 0 = behind it.
+        const std::vector<std::string> eyeNeedles = {"_EYE", "FaceBrow", "FaceEyelash", "FaceEyeline"};
+        const auto pose = rig.applyClip(motion::neutralClipPose(), 0.0);
+        const auto saved = model.materials;
+        int failures = 0;
+        for (float yawDeg : {180.0f, 160.0f, 0.0f, 20.0f, -20.0f, 90.0f, -90.0f}) {
+            sdlgpu::Camera camera;
+            camera.yaw = yawDeg * 3.14159265f / 180.0f;
+            camera.pitch = 0.0f;
+            const sdlgpu::RenderSettings settings;
+            model.materials = saved;
+            if (!renderer.render(pose, camera, settings, &error)) return 1;
+            const std::vector<std::uint8_t> all = renderer.pixels();
+            for (auto& m : model.materials) {
+                if (nameMatches(m.name, eyeNeedles)) {
+                    m.alphaMode = vrm::AlphaMode::Mask;
+                    m.alphaCutoff = 0.5f;
+                    m.baseColorFactor.w = 0.0f;
+                    m.emissiveFactor.w = 0.0f;
+                }
+            }
+            if (!renderer.render(pose, camera, settings, &error)) return 1;
+            const std::vector<std::uint8_t>& noEyes = renderer.pixels();
+            long changed = 0;
+            for (std::size_t p = 0; p < all.size() / 4; ++p) {
+                int d = 0;
+                for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(int(all[p * 4 + k]) - int(noEyes[p * 4 + k])));
+                changed += d > 10;
+            }
+            const bool behind = std::abs(yawDeg) > 120.0f ? false : std::abs(yawDeg) < 60.0f;
+            const bool front = std::abs(yawDeg) > 120.0f;
+            const bool ok = behind ? changed == 0 : (front ? changed > 100 : true);
+            failures += ok ? 0 : 1;
+            std::printf("camera yaw %6.1f (%s): %ld pixels change when eyes/brows/lashes are hidden -> %s\n", yawDeg,
+                        front ? "front" : behind ? "behind" : "side", changed, ok ? "ok" : "FAIL (visible through the head)");
+        }
+        renderer.shutdown();
+        SDL_Quit();
+        return failures == 0 ? 0 : 2;
+    }
 
     motion::DancePlayer player;
     player.loadLibrary("assets/dances");

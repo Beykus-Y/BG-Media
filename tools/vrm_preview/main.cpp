@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
     std::string switchClip;
     double switchAt = 1.0e9;
     std::filesystem::path dancesDir = "assets/dances";
+    bool opaqueOverride = false;  // QA: draw every material opaque (no blend, no alpha test)
     std::vector<std::string> hideMaterials;  // QA: hide materials whose name contains any of these
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -133,6 +134,8 @@ int main(int argc, char** argv) {
             switchClip = argv[++i];
         } else if (arg == "--switch-at" && i + 1 < argc) {
             switchAt = std::atof(argv[++i]);
+        } else if (arg == "--opaque") {
+            opaqueOverride = true;
         } else if (arg == "--hide-material" && i + 1 < argc) {
             hideMaterials.push_back(argv[++i]);
         } else if (arg == "--dances" && i + 1 < argc) {
@@ -154,6 +157,10 @@ int main(int argc, char** argv) {
     // QA aid for telling apart "the pose is wrong" from "a rigid material overlaps
     // the body": a hidden material is fully transparent and alpha-tested away.
     for (bgmedia::vrm::Material& material : loaded.model->materials) {
+        if (opaqueOverride) {
+            material.alphaMode = bgmedia::vrm::AlphaMode::Opaque;
+            material.baseColorFactor.w = 1.0f;
+        }
         for (const std::string& needle : hideMaterials) {
             if (material.name.find(needle) != std::string::npos) {
                 material.alphaMode = bgmedia::vrm::AlphaMode::Mask;
