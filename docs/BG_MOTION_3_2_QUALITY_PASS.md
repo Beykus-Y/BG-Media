@@ -491,11 +491,9 @@ Stills do not show temporal artifacts; foot/transition improvements come from th
 9. Spring parameter tuning (stiffness → ω, damping → drag) was derived analytically and checked for
    stability, not tuned by eye; hair may now look livelier than before.
 10. C09 leaf chains use a virtual tail but only synthetic data exercises it.
-11. **ASan:** AddressSanitizer Debug build (`/fsanitize=address`, tests + tools) of the test suite as it stood at
-    commit `d7dda88` (170 tests): all passed, no ASan reports. The repo script `scripts/run_asan_windows.ps1`
-    itself fails here (`vswhere` is not on PATH), so an equivalent invocation was used. The last three tests
-    (two signed wrist/thumb checks and the 60-vs-120-FPS dance test) were added afterwards and have **not**
-    run under ASan.
+11. **ASan:** AddressSanitizer Debug build (`/fsanitize=address`, tests + tools; the Desktop/SDL targets are not part of that build, so
+    `bgmedia_skin_check` and the renderer change were not run under ASan) of the full suite at commit `1f7ab4c`: 175 tests passed, no ASan
+    reports. `scripts/run_asan_windows.ps1` itself fails here (`vswhere` not on PATH), so an equivalent invocation was used.
 12. **Desktop:** `bgmedia_desktop.exe` now builds and links (rebuilt after the app was closed); it was not launched or exercised.
 13. Spring: dance-level 60 vs 120 FPS divergence of up to 49 mm at isolated instants (H); not root-caused.
 14. The crossfade residual (item 1) was not ablated cue by cue.
