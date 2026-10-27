@@ -292,6 +292,10 @@ const std::string& VrmScene::renderError() const { return impl_->renderError; }
 
 double VrmScene::lastRetargetMs() const { return impl_->lastRetargetMs; }
 
+motion::LegGeometry VrmScene::legGeometry() const {
+    return impl_->retargeter ? impl_->retargeter->legGeometry() : motion::LegGeometry{};
+}
+
 bool VrmScene::secondaryAvailable() const {
     return impl_->secondary && impl_->secondary->available();
 }

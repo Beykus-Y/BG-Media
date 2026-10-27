@@ -481,19 +481,37 @@ Tooling: `bgmedia_motion_diag` (instrumented playback: per-joint speed/accelerat
 - Overlay yank at the 32-beat loop seam: a cue that ended exactly at the seam dropped its weight in one frame. Cue `influence` now ramps over `kYieldBeats = 0.5`; the regression test fails on the old code (34-82 rad/s non-hand steps), passes now (<= 20 rad/s at 30/60/120 FPS, 80/136/170 BPM).
 - Procedural leg-through-leg: footwork planner (`planClearance`, per-leg proxy `legClearanceCm`, `Footwork::setOther`) picks shrink/shift/bump per step; side-touch returns the trailing foot first. Procedural dances on Model1: 0 leg crossing frames. On Nemesis only 7-121 frames with <= 28 triangles (thigh skin contact, not penetration through the leg).
 
-### P.2 Not solved: authored Hip-Hop and Side Step
-Mesh crossings are unchanged from the baseline: Nemesis hiphop 110 frames / 601 tris, sidestep 73 / 340; Model1 hiphop 44 / 531, sidestep 34 / 350.
-Root cause (measured, Nemesis hiphop 6.0-6.5 s): the authored data plants the right foot at +16.3 cm, across the body midline, while the left foot swings through it. In 51 (hiphop) and 189 (sidestep) sampled frames BOTH feet are planted and overlapping, so moving a free foot cannot help.
-An experimental runtime corrector (`RetargetOptions::legCollision`, capsule thigh/shin/foot calibrated from the mesh, free-foot push) was built and evaluated in four variants. Best result: crossings 601 -> 238 tris but ankle speed 1.2 -> 9-25 m/s and ground drag 0 -> 170-720 cm. It fails the gates (corrected frames about equal to crossing frames; ankle speed <= 1.5x baseline; ground drag not above baseline), so it ships DISABLED (`legCollision = false`); `bgmedia_motion_diag --leg-proxy` enables it for experiments.
-Needed next: a stance-level pre-pass over the authored contact schedule (one lateral offset per landing, held for the planted run, ramped during the swing with a small lift, 0 if not clearable). Out of scope for this pass.
+### P.2 Authored Hip-Hop and Side Step: stance-level footwork pre-pass
+Root cause (measured): the authored contact schedule and the foot tracks disagree with the body. Some stances plant a foot across the other leg and some swings are dragged straight through the standing leg, so a runtime push on the free foot cannot help (both feet are marked planted while overlapping). The runtime corrector (`RetargetOptions::legCollision`, four variants) is rejected and stays OFF: crossings 601 -> 238 tris, but ankle speed 1.2 -> 9-25 m/s and ground drag 170-720 cm.
+
+Implemented instead: `planClipFootwork` (`include/bgmedia/motion3/ClipFootwork.hpp`, `src/motion3/ClipFootwork.cpp`), a deterministic pre-pass on the baked tracks of authored clips. `DancePlayer` serves the planned copy and keeps the authored clip (`authoredClip`, `setFootworkPlanning(false)` serves the original again); the desktop app and the tools re-plan on every model load with that model's leg geometry (`HumanoidRetargeter::legGeometry`: hip/ankle width and height, bone length, calibrated thigh/shin/foot radii).
+- Contact schedule: cyclic swings and stances per foot (a stance across the loop seam is one stance). Contact times, beats, accents, bones, root, hips-y and foot yaw/toe are untouched, so the BG Motion 3.1 phase and musical markers are preserved.
+- Detection: every key is tested with the bent-knee leg proxy (knee position from the real bone length and the lowered pelvis, same maths as the two-bone solver) in the character frame (root, yaw and hips included). Clips without a violation are returned bit-identical (Groove, Energetic, Idle).
+- Plan: violating steps are re-planned in time order. For each step the smallest landing change (lateral/forward, up to 26 cm per axis) that keeps the whole stance clear is searched first, then the smallest side bend and extra lift that clear the whole swing. If the foot that landed last cannot clear it, the other foot is re-planned. Gap 2.5 cm, 4 sweeps, deterministic candidate order.
+- Anchors: every stance gets ONE offset held for its whole duration (no slide by construction). The swing blends between the previous and the next stance offset with smootherstep, the side bend and lift use sin^2, so position and velocity are continuous at take-off and landing.
+- Weight transfer: the pelvis follows the moved stances in proportion to the weight each foot carries (share smoothed over half a beat, so the weight is on the standing leg before the other foot lifts), at most 6 cm, kept only if the clearance does not get worse.
+
+Results (real MP3, Desktop crossfade, 0-24/44 s, mesh crossings sampled at 10 Hz; `docs/quality_pass_3_2_metrics.json` has the grid):
+
+| clip / model | crossings before | crossings after | ankle speed (m/s) | ground drag |
+|---|---|---|---|---|
+| Hip-Hop / Model1 | 23-44 frames, max 499-531 tris | 0 frames | 1.15 -> 1.77 | 0 |
+| Side Step / Model1 | 17-34 frames, max 260-350 | 2-4 frames, max 11-19 tris | 4.07 -> 4.07 | 1 cm (as before) |
+| Hip-Hop / Nemesis | 53-110 frames, max 560-601 | 42-95 frames, max 19-40 tris | 1.17 -> 1.26 | 0 |
+| Side Step / Nemesis | 36-73 frames, max 274-340 | 25-52 frames, max 28-33 tris | 4.10 -> 4.10 | 1 cm (as before) |
+
+Ankle acceleration and jerk are identical to the authored clips at 30/60/120 FPS (e.g. Side Step 191.7 m/s^2 at 60 FPS before and after); the planted slide stays <= 0.3 mm; overlay OFF/FULL and spring OFF/ON do not change any leg number. Seek and crossfade are unaffected because the data is a static pre-pass and the contact schedule is unchanged. The Hip-Hop ankle speed increase (1.15 -> 1.77 m/s) is the wider real step.
+Limits: Nemesis keeps 19-33 triangles of inner-thigh skin contact during deep knee bends (the proxy radii are calibrated to keep the bind stance clear, so they underestimate that mesh); raising the gap to 5 cm reaches 4-9 triangles but needs 37 cm landing changes and side bends, which distorts the choreography, so 2.5 cm is the default. The knee pole direction of the retargeter is not changed. Renders: `artifacts/qa/footwork_prepass/*_before_after.mp4` (local, git-ignored), front view, legs visible; the before frames show the legs crossed and the after frames show a real, wider step.
+Tests (`tests/test_quality.cpp`): authored defect present and cleared, contacts/music/other tracks identical, stance offset constant (0.0 cm), foot step growth bounded, seam closed, deterministic, idempotent, clean clips untouched, player keeps the authored clip.
 
 ### P.3 Hand jerks (Neon Pulse, Energetic)
 After the seam fix the remaining acceleration peaks are periodic (once per 16 beats at a fixed clip phase: Energetic phase 0.75, Neon Pulse 0.118), with no overlay, crossfade or warp involved and zero angular step: they are authored accent gestures (Energetic RHand 10 m/s peak, Neon LHand 4.8 m/s), not discontinuities. No limiter added.
 
 ### P.4 Verification
-- Full build incl. `bgmedia_desktop.exe`, 178 unit tests, CTest 16/16, ASan 178/178 (exit 0).
+- Full build incl. `bgmedia_desktop.exe`, 184 unit tests, CTest 16/16, ASan 184/184 (exit 0).
 - BG Motion 3.1 sync QA re-run: identical to `docs/sync_qa_3_1.json` except timing fields.
-- Not done in this pass: video / frame-sequence review of the final build.
+- Procedural dances: leg crossings unchanged from the matrix before the pre-pass (Model1 0 frames; Nemesis max 8-28 tris).
+- Before/after videos and frame sequences of Hip-Hop and Side Step on both models were rendered and inspected frame by frame.
 
 ## M. Remaining limitations
 

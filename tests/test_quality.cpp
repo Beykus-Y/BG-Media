@@ -2,6 +2,7 @@
 // transitions. Spatial retarget tests live in test_retarget.cpp.
 #include "framework.hpp"
 
+#include "bgmedia/motion3/ClipFootwork.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/motion3/MotionPrimitive.hpp"
 #include "FootworkTrack.hpp"
@@ -656,4 +657,168 @@ TEST_CASE(quality.generated_dances_never_put_one_leg_through_the_other) {
     }
     std::cout << std::fixed << std::setprecision(2) << "\n            " << clips << " generated clips, worst reference leg clearance " << worst << " cm";
     CHECK(worst >= motion::detail::Footwork::kMinLegGapCm - 0.5f);
+}
+
+namespace {
+
+motion::HumanoidClip loadAuthored(const char* name) {
+    const auto loaded = motion::loadClipFile(dancesDir() / (std::string(name) + ".json"));
+    CHECK(loaded.ok);
+    return loaded.clip;
+}
+
+float maxFootStep(const motion::HumanoidClip& clip) {
+    float worst = 0.0f;
+    for (const auto& foot : clip.feet) {
+        for (std::size_t i = 1; i < foot.position.size(); ++i) {
+            const auto d = foot.position[i] - foot.position[i - 1];
+            worst = std::max(worst, d.length());
+        }
+    }
+    return worst;
+}
+
+}  // namespace
+
+TEST_CASE(quality.footwork_prepass_clears_the_authored_cross_over_steps) {
+    int fixedClips = 0;
+    for (const char* name : {"hiphop", "sidestep"}) {
+        const motion::HumanoidClip clip = loadAuthored(name);
+        motion::FootworkPlanReport report;
+        const motion::HumanoidClip planned = motion::planClipFootwork(clip, {}, &report);
+        std::cout << "\n            " << name << ": violation keys " << report.violationKeysBefore << " -> "
+                  << report.violationKeysAfter << ", min clearance " << report.minClearanceBeforeCm << " -> "
+                  << report.minClearanceAfterCm << " cm, " << report.stancesMoved << "/" << report.stances
+                  << " stances moved, max shift " << report.maxLandingShiftCm << " cm";
+        CHECK(report.violationKeysBefore > 0);  // the authored data really has the defect
+        CHECK(report.violationKeysAfter == 0);
+        CHECK(report.unresolved == 0);
+        CHECK(report.changed);
+        ++fixedClips;
+    }
+    CHECK(fixedClips == 2);
+}
+
+TEST_CASE(quality.footwork_prepass_keeps_the_music_and_every_other_track) {
+    for (const char* name : {"hiphop", "sidestep"}) {
+        const motion::HumanoidClip clip = loadAuthored(name);
+        const motion::HumanoidClip planned = motion::planClipFootwork(clip);
+        CHECK(planned.keyCount == clip.keyCount);
+        CHECK(planned.bpm == clip.bpm);
+        CHECK(planned.beats == clip.beats);
+        CHECK(planned.accents.size() == clip.accents.size());
+        CHECK(planned.contacts.size() == clip.contacts.size());
+        for (std::size_t i = 0; i < clip.contacts.size(); ++i) {
+            CHECK(planned.contacts[i].start == clip.contacts[i].start);
+            CHECK(planned.contacts[i].end == clip.contacts[i].end);
+            CHECK(planned.contacts[i].foot == clip.contacts[i].foot);
+        }
+        for (std::size_t b = 0; b < clip.bones.size(); ++b) {
+            CHECK(planned.bones[b].size() == clip.bones[b].size());
+        }
+        for (std::size_t i = 0; i < clip.root.size(); ++i) {
+            CHECK(planned.root[i].x == clip.root[i].x && planned.root[i].y == clip.root[i].y &&
+                  planned.root[i].z == clip.root[i].z);
+        }
+        for (int f = 0; f < 2; ++f) {
+            CHECK(planned.feet[static_cast<std::size_t>(f)].yaw == clip.feet[static_cast<std::size_t>(f)].yaw);
+            CHECK(planned.feet[static_cast<std::size_t>(f)].toe == clip.feet[static_cast<std::size_t>(f)].toe);
+        }
+    }
+}
+
+TEST_CASE(quality.footwork_prepass_holds_every_stance_without_sliding) {
+    for (const char* name : {"hiphop", "sidestep"}) {
+        const motion::HumanoidClip clip = loadAuthored(name);
+        const motion::HumanoidClip planned = motion::planClipFootwork(clip);
+        const int K = clip.keysPerBeat;
+        float worstSlideCm = 0.0f;
+        for (const motion::ContactSegment& seg : clip.contacts) {
+            const int a = static_cast<int>(std::ceil(seg.start * static_cast<float>(K) - 1.0e-3f));
+            const int b = std::min(static_cast<int>(std::floor(seg.end * static_cast<float>(K) + 1.0e-3f)),
+                                   clip.keyCount - 1);
+            const auto& orig = clip.feet[static_cast<std::size_t>(seg.foot)].position;
+            const auto& plan = planned.feet[static_cast<std::size_t>(seg.foot)].position;
+            // The applied change must be one constant offset over the whole stance.
+            const auto base = plan[static_cast<std::size_t>(a)] - orig[static_cast<std::size_t>(a)];
+            for (int i = a; i <= b; ++i) {
+                const auto d = plan[static_cast<std::size_t>(i)] - orig[static_cast<std::size_t>(i)];
+                const float dx = d.x - base.x, dz = d.z - base.z;
+                worstSlideCm = std::max(worstSlideCm, std::sqrt(dx * dx + dz * dz) * 160.0f);
+            }
+        }
+        std::cout << "\n            " << name << ": worst change of the stance offset inside a contact "
+                  << worstSlideCm << " cm";
+        CHECK(worstSlideCm < 0.01f);
+    }
+}
+
+TEST_CASE(quality.footwork_prepass_is_continuous_deterministic_and_idempotent) {
+    for (const char* name : {"hiphop", "sidestep"}) {
+        const motion::HumanoidClip clip = loadAuthored(name);
+        const motion::HumanoidClip a = motion::planClipFootwork(clip);
+        const motion::HumanoidClip b = motion::planClipFootwork(clip);
+        for (int f = 0; f < 2; ++f) {
+            const auto& pa = a.feet[static_cast<std::size_t>(f)].position;
+            const auto& pb = b.feet[static_cast<std::size_t>(f)].position;
+            CHECK(pa.size() == pb.size());
+            for (std::size_t i = 0; i < pa.size(); ++i) {
+                CHECK(pa[i].x == pb[i].x && pa[i].y == pb[i].y && pa[i].z == pb[i].z);
+            }
+            CHECK(pa.front().x == pa.back().x && pa.front().z == pa.back().z);  // the seam stays closed
+        }
+        const float before = maxFootStep(clip), after = maxFootStep(a);
+        std::cout << "\n            " << name << ": largest foot step per key " << before * 160.0f << " -> "
+                  << after * 160.0f << " cm";
+        CHECK(after <= before * 1.6f + 0.004f);
+        motion::FootworkPlanReport again;
+        const motion::HumanoidClip c = motion::planClipFootwork(a, {}, &again);
+        CHECK(again.violationKeysBefore == 0);
+        CHECK(!again.changed);
+        CHECK(c.feet[0].position.size() == a.feet[0].position.size());
+    }
+}
+
+TEST_CASE(quality.footwork_prepass_leaves_clean_clips_alone) {
+    for (const char* name : {"groove", "energetic", "idle"}) {
+        const motion::HumanoidClip clip = loadAuthored(name);
+        motion::FootworkPlanReport report;
+        const motion::HumanoidClip planned = motion::planClipFootwork(clip, {}, &report);
+        CHECK(report.violationKeysBefore == 0);
+        CHECK(!report.changed);
+        for (int f = 0; f < 2; ++f) {
+            const auto& po = clip.feet[static_cast<std::size_t>(f)].position;
+            const auto& pp = planned.feet[static_cast<std::size_t>(f)].position;
+            CHECK(po.size() == pp.size());
+            for (std::size_t i = 0; i < po.size(); ++i) {
+                CHECK(po[i].x == pp[i].x && po[i].y == pp[i].y && po[i].z == pp[i].z);
+            }
+        }
+    }
+}
+
+TEST_CASE(quality.dance_player_serves_planned_authored_clips_and_keeps_the_originals) {
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    const motion::HumanoidClip original = loadAuthored("hiphop");
+    const motion::HumanoidClip* served = player.library().find("hiphop");
+    const motion::HumanoidClip* kept = player.authoredClip("hiphop");
+    CHECK(served != nullptr && kept != nullptr);
+    if (served && kept) {
+        bool servedDiffers = false, keptEqual = true;
+        for (std::size_t i = 0; i < original.feet[0].position.size(); ++i) {
+            const auto& o = original.feet[0].position[i];
+            const auto& s = served->feet[0].position[i];
+            const auto& k = kept->feet[0].position[i];
+            servedDiffers = servedDiffers || std::abs(o.x - s.x) + std::abs(o.z - s.z) > 1.0e-6f;
+            keptEqual = keptEqual && o.x == k.x && o.z == k.z && o.y == k.y;
+        }
+        CHECK(servedDiffers);
+        CHECK(keptEqual);
+        const motion::FootworkPlanReport* report = player.footworkReport("hiphop");
+        CHECK(report != nullptr && report->violationKeysAfter == 0);
+        player.setFootworkPlanning(false);  // switching it off serves the authored data again
+        const motion::HumanoidClip* raw = player.library().find("hiphop");
+        CHECK(raw != nullptr && raw->feet[0].position[100].x == original.feet[0].position[100].x);
+    }
 }

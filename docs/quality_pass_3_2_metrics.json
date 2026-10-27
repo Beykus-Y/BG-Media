@@ -351,9 +351,9 @@
     "commit": "7961a67",
     "mode": "desktop crossfade, 0-44 s, skip 4 s",
     "tests": {
-      "unit": 178,
+      "unit": 184,
       "ctest": "16/16",
-      "asan": "178/178",
+      "asan": "184/184",
       "sync_qa_3_1": "identical except timing"
     },
     "authored_leg_crossings": {
@@ -386,6 +386,50 @@
       "ground_drag_cm": "170-720 vs 0",
       "verdict": "rejected"
     },
-    "hand_peaks": "periodic authored accents (energetic phase 0.75, neon 0.118); no discontinuity"
+    "hand_peaks": "periodic authored accents (energetic phase 0.75, neon 0.118); no discontinuity",
+    "footwork_prepass": {
+      "default_gap_cm": 2.5,
+      "max_axis_shift_cm": 26,
+      "leg_proxy_runtime": "off",
+      "authored_leg_crossings_after": {
+        "Model1": {
+          "hiphop": {
+            "frames": 0,
+            "max_tris": 0
+          },
+          "sidestep": {
+            "frames": "2-4",
+            "max_tris": "11-19"
+          }
+        },
+        "Nemesis": {
+          "hiphop": {
+            "frames": "42-95",
+            "max_tris": "19-40"
+          },
+          "sidestep": {
+            "frames": "25-52",
+            "max_tris": "28-33"
+          }
+        }
+      },
+      "ankle_speed_ms_before_after": {
+        "Model1_hiphop": [
+          1.15,
+          1.77
+        ],
+        "Nemesis_hiphop": [
+          1.17,
+          1.26
+        ],
+        "sidestep": [
+          4.07,
+          4.07
+        ]
+      },
+      "ankle_accel_identical_30_60_120fps": true,
+      "planted_slide_mm_max": 0.3,
+      "overlay_spring_independent": true
+    }
   }
 }

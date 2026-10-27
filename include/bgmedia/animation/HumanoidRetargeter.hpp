@@ -9,6 +9,7 @@
 // pose by HumanoidRetargeter's constructor.
 
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/ClipFootwork.hpp"
 #include "bgmedia/motion3/DanceClip.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
@@ -159,6 +160,9 @@ public:
 
     [[nodiscard]] bool valid() const;
     [[nodiscard]] CollisionProxyInfo collisionProxy() const;
+    // This model's lower body in the planner's reference units (cm at 160 cm height), for
+    // motion::planClipFootwork. Falls back to the reference body when the rig is incomplete.
+    [[nodiscard]] motion::LegGeometry legGeometry() const;
     [[nodiscard]] const std::string& error() const;
 
     // Deterministic: the output depends only on pose, mediaTime and options,

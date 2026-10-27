@@ -114,6 +114,7 @@ add_library(bgmedia_rig STATIC
     src/motion3/MusicalTimeline.cpp
     src/motion3/MusicalTimeWarp.cpp
     src/motion3/DanceClip.cpp
+    src/motion3/ClipFootwork.cpp
     src/motion3/MotionPrimitive.cpp
     src/motion3/ProceduralChoreography.cpp
     src/motion3/DanceDirector.cpp

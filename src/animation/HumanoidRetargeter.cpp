@@ -1022,6 +1022,37 @@ void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3
     stats.legClearanceMin = hit.clearance;
 }
 
+motion::LegGeometry HumanoidRetargeter::legGeometry() const {
+    motion::LegGeometry g;
+    if (!impl_ || !impl_->valid || impl_->legs[0].upper < 0 || impl_->legs[1].upper < 0 ||
+        impl_->height <= 0.0f) {
+        return g;
+    }
+    const Impl& m = *impl_;
+    const float k = 160.0f / m.height;
+    const Vec3 up = m.model->up;
+    const Vec3 left = -m.model->right;
+    const Vec3 hipL = m.legs[0].bindUpper, hipR = m.legs[1].bindUpper;
+    const Vec3 ankL = m.legs[0].bindAnkle, ankR = m.legs[1].bindAnkle;
+    g.legLen = 0.5f * (m.legs[0].upperLength + m.legs[0].lowerLength + m.legs[1].upperLength + m.legs[1].lowerLength) * k;
+    g.hipHalf = std::clamp(0.5f * std::abs(math::dot(hipL - hipR, left)) * k, 4.0f, 14.0f);
+    g.ankleHalf = std::clamp(0.5f * std::abs(math::dot(ankL - ankR, left)) * k, 4.0f, 16.0f);
+    g.hipY = std::clamp(0.5f * (math::dot(hipL, up) + math::dot(hipR, up)) * k, 60.0f, 110.0f);
+    g.ankleY = std::clamp(0.5f * (math::dot(ankL, up) + math::dot(ankR, up)) * k, 3.0f, 12.0f);
+    if (m.proxy.thighRadius > 0.0f) {
+        g.thighR = m.proxy.thighRadius * k;
+        g.kneeR = std::max(m.proxy.shinRadius, 0.6f * m.proxy.thighRadius) * k;
+        g.ankleR = 0.8f * g.kneeR;
+        if (m.proxy.footRadius > 0.0f) {
+            g.footR = m.proxy.footRadius * k;
+        }
+        if (m.proxy.footLength > 0.0f) {
+            g.footLen = m.proxy.footLength * k;
+        }
+    }
+    return g;
+}
+
 CollisionProxyInfo HumanoidRetargeter::collisionProxy() const {
     return impl_ ? impl_->proxy : CollisionProxyInfo{};
 }

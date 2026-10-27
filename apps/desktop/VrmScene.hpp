@@ -52,6 +52,8 @@ public:
     [[nodiscard]] const std::string& warning() const;
     [[nodiscard]] const std::string& renderError() const;
     [[nodiscard]] double lastRetargetMs() const;
+    // The loaded model's leg geometry (reference body when no model is loaded).
+    [[nodiscard]] motion::LegGeometry legGeometry() const;
 
     // BG Motion 3.2 secondary dynamics (VRM 0.x spring bones).
     [[nodiscard]] bool secondaryAvailable() const;

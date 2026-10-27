@@ -120,6 +120,9 @@ bool loadMotion32Profile(const std::filesystem::path& path, Motion32Profile& pro
 std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     library_ = DanceLibrary{};
     library_.loadDirectory(directory);
+    authored_.assign(library_.clips().begin(), library_.clips().end());
+    footworkReports_.clear();
+    replanAuthored();
     generated_ = ProceduralChoreography::showcase();
     for (GeneratedDance& dance : generated_) {
         overlays_[dance.clip.id] = dance.overlays;
@@ -131,6 +134,51 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     director_.reset(0.0);
     lastTime_ = -1.0e9;
     return library_.clips().size();
+}
+
+void DancePlayer::replanAuthored() {
+    footworkReports_.clear();
+    for (const HumanoidClip& raw : authored_) {
+        if (!footworkPlan_) {
+            library_.replace(raw);
+            continue;
+        }
+        FootworkPlanOptions options;
+        options.legs = legGeometry_;
+        options.minGapCm = footworkGapCm_;
+        FootworkPlanReport report;
+        library_.replace(planClipFootwork(raw, options, &report));
+        footworkReports_[raw.id] = report;
+    }
+}
+
+void DancePlayer::setLegGeometry(const LegGeometry& geometry) {
+    legGeometry_ = geometry;
+    replanAuthored();
+}
+
+void DancePlayer::setFootworkGap(float gapCm) {
+    footworkGapCm_ = std::clamp(gapCm, 0.0f, 8.0f);
+    replanAuthored();
+}
+
+void DancePlayer::setFootworkPlanning(bool enabled) {
+    if (footworkPlan_ != enabled) {
+        footworkPlan_ = enabled;
+        replanAuthored();
+    }
+}
+
+const HumanoidClip* DancePlayer::authoredClip(const std::string& clipId) const {
+    for (const HumanoidClip& clip : authored_) {
+        if (clip.id == clipId) return &clip;
+    }
+    return nullptr;
+}
+
+const FootworkPlanReport* DancePlayer::footworkReport(const std::string& clipId) const {
+    const auto it = footworkReports_.find(clipId);
+    return it == footworkReports_.end() ? nullptr : &it->second;
 }
 
 void DancePlayer::setOverlayMode(OverlayMode mode) {

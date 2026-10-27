@@ -38,6 +38,7 @@ inline float footSmootherstep(float t) {
 // ---------------------------------------------------------------------------
 struct LegProxy {
     float hipHalf = 8.5f;   // hip joint to the pelvis centre
+    float ankleHalf = kFootHalfCm;  // bind ankle to the pelvis centre
     float hipY = 88.0f;     // hip height
     float ankleY = 7.0f;    // ankle height above the floor
     float thighR = 7.0f;    // thigh radius at the hip
@@ -45,6 +46,7 @@ struct LegProxy {
     float ankleR = 4.4f;
     float footLen = 13.0f;  // ankle to toe
     float footR = 3.6f;
+    float legLen = 0.0f;    // hip to ankle along the bones (cm); 0 = knee fixed 3 cm forward
 };
 
 struct LegPose {
@@ -79,13 +81,31 @@ inline float segmentSamples(const Cap& p, const Cap& q, int n, float fromP, floa
 // Smallest gap in cm between the two legs (thigh, shin and foot capsules of each side
 // against all of the other side; the thighs are compared away from the crotch, where
 // they touch by design). Negative = one leg is inside the other.
-inline float legClearanceCm(const LegPose& left, const LegPose& right, const LegProxy& body = {}) {
+inline float legClearanceCm(const LegPose& left, const LegPose& right, const LegProxy& body = {},
+                            const Vec3& hipShift = {}) {
     using legproxy_detail::Cap;
     const auto build = [&](const LegPose& pose, float side, Cap out[3]) {
-        const Vec3 hip{side * body.hipHalf, body.hipY, 0.0f};
-        const Vec3 ankle{side * kFootHalfCm + pose.x, body.ankleY + pose.lift, pose.z};
-        // The knee sits half way and a little forward (the IK bends it forward).
-        const Vec3 knee = (hip + ankle) * 0.5f + Vec3{0.0f, 0.0f, 3.0f};
+        const Vec3 hip = Vec3{side * body.hipHalf, body.hipY, 0.0f} + hipShift;
+        const Vec3 ankle{side * body.ankleHalf + pose.x, body.ankleY + pose.lift, pose.z};
+        // The knee sits half way and forward (the IK bends it forward). With a known bone
+        // length the bend follows the real distance, so a lowered pelvis (deep knee bend)
+        // pushes the knee out like the retargeter's two-bone solver does.
+        Vec3 knee = (hip + ankle) * 0.5f + Vec3{0.0f, 0.0f, 3.0f};
+        if (body.legLen > 0.0f) {
+            const Vec3 axis = ankle - hip;
+            const float dist = axis.length();
+            const float reach = 0.972f * body.legLen;
+            if (dist > 1.0e-3f) {
+                const Vec3 unit = axis * (1.0f / dist);
+                Vec3 pole = Vec3{0.0f, 0.0f, 1.0f} - unit * unit.z;
+                const float pl = pole.length();
+                if (pl > 1.0e-3f) {
+                    pole = pole * (1.0f / pl);
+                    const float h2 = 0.25f * reach * reach - 0.25f * dist * dist;
+                    knee = (hip + ankle) * 0.5f + pole * std::sqrt(std::max(0.0f, h2));
+                }
+            }
+        }
         out[0] = {hip, knee, body.thighR, body.kneeR};
         out[1] = {knee, ankle, body.kneeR, body.ankleR};
         out[2] = {ankle, ankle + Vec3{0.0f, -1.5f, body.footLen}, body.footR, body.footR * 0.8f};

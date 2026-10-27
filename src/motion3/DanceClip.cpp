@@ -1192,6 +1192,16 @@ void validateClip(const HumanoidClip& clip, const std::string& sourceName,
 
 // --- library ---------------------------------------------------------------
 
+bool DanceLibrary::replace(const HumanoidClip& clip) {
+    for (HumanoidClip& existing : clips_) {
+        if (existing.id == clip.id) {
+            existing = clip;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool DanceLibrary::add(HumanoidClip clip) {
     if (find(clip.id)) {
         diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,

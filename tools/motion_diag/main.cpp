@@ -47,6 +47,8 @@ struct Options {
     double fps = 60.0, from = 0.0, to = 30.0, selectAt = 0.0, mesh_hz = 15.0, focus = -1.0, seek = -1.0;
     bool legMesh = true, armMesh = true;
     bool legProxy = false, armProxy = true;
+    float footworkGap = 2.5f;
+    std::string footwork = "model";  // off | ref | model (authored footwork pre-pass)
     double skip = 0.0;  // ignore the first seconds in the summaries (clip fade-in transient)
 };
 
@@ -132,6 +134,8 @@ int main(int argc, char** argv) {
         else if (a == "--seek") o.seek = std::atof(next().c_str());
         else if (a == "--no-leg-proxy") o.legProxy = false;
         else if (a == "--leg-proxy") o.legProxy = true;
+        else if (a == "--footwork") o.footwork = next();
+        else if (a == "--footwork-gap") o.footworkGap = static_cast<float>(std::atof(next().c_str()));
         else if (a == "--no-arm-proxy") o.armProxy = false;
         else if (a == "--skip") o.skip = std::atof(next().c_str());
         else if (a == "--no-leg-mesh") o.legMesh = false;
@@ -184,6 +188,9 @@ int main(int argc, char** argv) {
 
     const auto makePlayer = [&](motion::DancePlayer& player) {
         player.loadLibrary(o.dances);
+        if (o.footwork == "off") player.setFootworkPlanning(false);
+        else if (o.footwork == "model") player.setLegGeometry(rig.legGeometry());
+        if (o.footwork != "off") player.setFootworkGap(o.footworkGap);
         player.setOverlayMode(o.overlay == "off" ? motion::OverlayMode::Off : o.overlay == "light" ? motion::OverlayMode::Light
                               : o.overlay == "hands" ? motion::OverlayMode::HandsOnly : motion::OverlayMode::Full);
         player.setExpression(o.warp == "soft" ? motion::MotionExpression::Soft : o.warp == "expressive"
@@ -200,6 +207,18 @@ int main(int argc, char** argv) {
 
     motion::DancePlayer player;
     makePlayer(player);
+    if (const motion::FootworkPlanReport* fw = player.footworkReport(o.clip)) {
+        std::printf("FOOTWORK PLAN (%s): %d stances, %d moved; violation keys %d -> %d, min leg clearance %.2f -> %.2f cm; "
+                    "max landing shift %.1f cm, side bend %.1f cm, extra lift %.1f cm, unresolved %d\n",
+                    o.footwork.c_str(), fw->stances, fw->stancesMoved, fw->violationKeysBefore, fw->violationKeysAfter,
+                    fw->minClearanceBeforeCm, fw->minClearanceAfterCm, fw->maxLandingShiftCm, fw->maxSideBendCm,
+                    fw->maxExtraLiftCm, fw->unresolved);
+        if (!fw->unresolvedKeys.empty()) {
+            std::printf("  unresolved clip beats:");
+            for (int k : fw->unresolvedKeys) std::printf(" %.2f", k / 16.0);
+            std::printf("\n");
+        }
+    }
     bool selected = o.mode == "auto";
     animation::SecondaryDynamics spring(model);
     animation::SecondarySettings springSettings;

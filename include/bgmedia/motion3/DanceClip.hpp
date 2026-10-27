@@ -216,6 +216,8 @@ public:
     bool add(HumanoidClip clip);
 
     [[nodiscard]] const HumanoidClip* find(const std::string& id) const;
+    // Replaces a loaded clip in place (same address, so running schedules stay valid).
+    bool replace(const HumanoidClip& clip);
     [[nodiscard]] const HumanoidClip* forStyle(DanceStyle style) const;
     [[nodiscard]] const std::deque<HumanoidClip>& clips() const { return clips_; }
     [[nodiscard]] const std::vector<ClipDiagnostic>& diagnostics() const {

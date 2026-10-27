@@ -1091,6 +1091,9 @@ struct DesktopApp::Impl {
             }
             return false;
         }
+        if (dance.ready()) {
+            dance.setLegGeometry(vrm.legGeometry());  // re-plan the authored footwork for this body
+        }
         vrmError = vrm.renderError();
         vrmFrameError = vrmError;
         lastVrmDirectory = path.parent_path();
@@ -1377,6 +1380,9 @@ struct DesktopApp::Impl {
             directory = assetsDirectory / "dances";
         }
         const std::size_t count = dance.loadLibrary(directory);
+        if (vrm.model()) {
+            dance.setLegGeometry(vrm.legGeometry());
+        }
         for (const motion::ClipDiagnostic& d : dance.library().diagnostics()) {
             std::fprintf(stderr, "dance %s: %s: %s\n",
                          d.severity == motion::ClipDiagnostic::Severity::Error ? "error"

@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     int generatedIndex = -1;
     std::filesystem::path clipPath;
     bool overlay = true;
+    bool footworkPrepass = true;  // BG Motion 3.2 stance-level pre-pass for authored clips
     bool spring = false;
     float springIntensity = 1.0f;
     float springDamping = 0.5f;
@@ -128,6 +129,8 @@ int main(int argc, char** argv) {
             fps = std::max(1.0, std::atof(argv[++i]));
         } else if (arg == "--framedir" && i + 1 < argc) {
             frameDir = std::filesystem::path(argv[++i]);
+        } else if (arg == "--footwork" && i + 1 < argc) {
+            footworkPrepass = std::string(argv[++i]) != "off";
         } else if (arg == "--player" && i + 1 < argc) {
             playerClip = argv[++i];
         } else if (arg == "--switch-to" && i + 1 < argc) {
@@ -213,6 +216,11 @@ int main(int argc, char** argv) {
     if (!playerClip.empty() && frames >= 1) {
         bgmedia::motion::DancePlayer player;
         const std::size_t loadedCount = player.loadLibrary(dancesDir);
+        if (footworkPrepass) {
+            player.setLegGeometry(rig.legGeometry());
+        } else {
+            player.setFootworkPlanning(false);
+        }
         if (loadedCount == 0) {
             std::fprintf(stderr, "no dance clips in %s\n", dancesDir.string().c_str());
             renderer.shutdown();
