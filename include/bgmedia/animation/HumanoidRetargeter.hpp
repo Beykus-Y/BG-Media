@@ -51,7 +51,12 @@ struct RetargetStats {
     double retargetMilliseconds = 0.0;
     float height = 0.0f;
     float hipDrop = 0.0f;
+    // Largest distance, on the *evaluated* skeleton, between a foot joint and
+    // its requested target (reach deficit and solver error combined).
     float maxFootError = 0.0f;
+    // Largest distance between the evaluated foot joint and the closest point
+    // the leg chain can reach: error attributable to the solver/rig alone.
+    float footSolverError = 0.0f;
     float lowestFootY = 0.0f;
     int resolvedBones = 0;
     int missingBones = 0;
@@ -63,7 +68,7 @@ struct RetargetStats {
     bool clipDriven = false;
     float requestedHipDrop = 0.0f;  // authored, metres
     float reachHipDrop = 0.0f;      // extra drop added so planted feet are reachable
-    float footReachDeficit = 0.0f;  // metres a target stayed unreachable (0 = ok)
+    float footReachDeficit = 0.0f;  // metres a target lay beyond the legs' reach (0 = ok)
 };
 
 struct RetargetedPose {

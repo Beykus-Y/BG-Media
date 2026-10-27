@@ -97,9 +97,15 @@ struct HumanoidRetargeter::Impl {
     [[nodiscard]] Vec3 bindPosition(int node) const;
     [[nodiscard]] Vec3 actualPosition(const std::vector<Mat4>& globals,
                                       int node) const;
+    // Distance between each evaluated foot joint and its target / reachable
+    // target. Reads the final skeleton, not the solver's intermediate maths.
+    void measureFootError(const std::vector<Mat4>& globals, const Vec3 targets[2],
+                          const Vec3 reachable[2], float& actual,
+                          float& solver) const;
     void solveLeg(const LegRig& leg, const std::vector<Mat4>& globals,
                   std::vector<Mat4>& locals, Vec3 target, Vec3 pole, float& footError,
-                  float& lowestY, const Quat& footWorldDelta = Quat::identity()) const;
+                  float& lowestY, Vec3& reachableTarget,
+                  const Quat& footWorldDelta = Quat::identity()) const;
 };
 
 bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
@@ -287,12 +293,30 @@ void HumanoidRetargeter::Impl::applyLocalDelta(std::vector<Mat4>& locals, int no
                        bindLocals[index].axisZ().length()});
 }
 
+void HumanoidRetargeter::Impl::measureFootError(const std::vector<Mat4>& globals,
+                                                const Vec3 targets[2],
+                                                const Vec3 reachable[2], float& actual,
+                                                float& solver) const {
+    actual = 0.0f;
+    solver = 0.0f;
+    for (int f = 0; f < 2; ++f) {
+        const LegRig& leg = legs[f];
+        if (leg.foot < 0 || leg.upper < 0) {
+            continue;
+        }
+        const Vec3 ankle = actualPosition(globals, leg.foot);
+        actual = std::max(actual, (ankle - targets[f]).length());
+        solver = std::max(solver, (ankle - reachable[f]).length());
+    }
+}
+
 void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
                                         const std::vector<Mat4>& globals,
                                         std::vector<Mat4>& locals, Vec3 target,
                                         Vec3 pole, float& footError,
-                                        float& lowestY,
+                                        float& lowestY, Vec3& reachableTarget,
                                         const Quat& footWorldDelta) const {
+    reachableTarget = target;
     if (leg.upper < 0 || leg.lower < 0 || leg.foot < 0 || leg.parent < 0) {
         return;
     }
@@ -306,7 +330,13 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
         distance = kTiny;
     }
     const Vec3 direction = reach / distance;
+    const float requestedDistance = distance;
     distance = std::clamp(distance, minReach, maxReach);
+    // The closest point the two-bone chain can actually reach. Distance from
+    // the requested target to it is the (geometric) reach deficit; any further
+    // error measured on the evaluated skeleton is solver error.
+    reachableTarget = hip + direction * distance;
+    footError = std::max(footError, std::abs(requestedDistance - distance));
 
     Vec3 bendAxis = pole - direction * math::dot(pole, direction);
     if (bendAxis.lengthSquared() < 1.0e-8f) {
@@ -352,8 +382,13 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
         model->bindGlobalRotations[static_cast<std::size_t>(leg.upper)];
     const Quat currentCalfWorld =
         (thighWorld * (upperBindWorld.conjugate() * lowerBindWorld)).normalized();
+    // bindCalfDirection is a bind-pose *direction* (model space), so it must be
+    // carried by the rotation that moved the thigh (thighWorld * upperBind^-1),
+    // not by the absolute world rotation of the calf bone, which would apply
+    // the calf's own bind rotation a second time on non-identity rigs.
+    const Quat thighDeltaApplied = (thighWorld * upperBindWorld.conjugate()).normalized();
     const Vec3 currentCalfDirection =
-        math::rotate(currentCalfWorld, leg.bindCalfDirection);
+        math::rotate(thighDeltaApplied, leg.bindCalfDirection);
     const Quat calfDelta = math::fromTo(currentCalfDirection, calfDirection);
     const Quat calfWorld =
         (calfDelta * currentCalfWorld).normalized();
@@ -379,10 +414,10 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
                        bindLocals[static_cast<std::size_t>(leg.foot)].axisY().length(),
                        bindLocals[static_cast<std::size_t>(leg.foot)].axisZ().length()});
 
-    // Positions are exact if the target was reachable.
+    // lowestY is the analytic ankle height; the reported foot error is measured
+    // on the evaluated skeleton by the caller (see measureFootError).
     const Vec3 solvedAnkle = hip + thighDirection * leg.upperLength +
                              calfDirection * leg.lowerLength;
-    footError = std::max(footError, (solvedAnkle - target).length());
     lowestY = std::min(lowestY, solvedAnkle.y);
 }
 
@@ -542,13 +577,17 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
         const Vec3 pole = forward;
         float footError = 0.0f;
         float lowest = std::numeric_limits<float>::max();
+        Vec3 reachable[2];
         impl_->solveLeg(impl_->legs[0], globals, locals, targetLeft, pole,
-                        footError, lowest);
+                        footError, lowest, reachable[0]);
         impl_->solveLeg(impl_->legs[1], globals, locals, targetRight, pole,
-                        footError, lowest);
+                        footError, lowest, reachable[1]);
         impl_->evaluate(locals, globals);
+        const Vec3 wanted[2] = {targetLeft, targetRight};
+        impl_->measureFootError(globals, wanted, reachable, out.stats.maxFootError,
+                                out.stats.footSolverError);
+        out.stats.footReachDeficit = footError;
         out.stats.footIK = true;
-        out.stats.maxFootError = footError;
         out.stats.lowestFootY = lowest - impl_->floorY;
     } else {
         // A conservative fallback for custom rigs that should not use IK.
@@ -610,7 +649,6 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                                              double mediaTime,
                                              const RetargetOptions& options) const {
     (void)mediaTime;
-    (void)options;
     RetargetedPose out;
     if (!impl_ || !impl_->valid) {
         return out;
@@ -623,7 +661,12 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     const Vec3 left = -model.right;  // clip frame: +X is the character's left
 
     // Clip frame -> model axes (a proper rotation, so quaternion vector parts
-    // map directly).
+    // map directly). Contract: every rotation below is first *authored* about
+    // clip-frame axes (+X = character's left, +Y = up, +Z = forward) and then
+    // converted exactly once by quatToModel. Never build a rotation about the
+    // model-space vectors `left`/`up`/`forward` and then pass it through
+    // quatToModel as well; that converts the axis twice and is only correct on
+    // rigs whose model axes happen to equal the clip axes.
     const auto toModel = [&](Vec3 v) { return left * v.x + up * v.y + forward * v.z; };
     const auto quatToModel = [&](const Quat& q) {
         const Vec3 axis = toModel({q.x, q.y, q.z});
@@ -635,10 +678,12 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
 
     for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
         const auto bone = static_cast<HumanoidBone>(b);
-        if (bone == HumanoidBone::LeftUpperLeg || bone == HumanoidBone::LeftLowerLeg ||
+        if (options.footIK &&
+            (bone == HumanoidBone::LeftUpperLeg || bone == HumanoidBone::LeftLowerLeg ||
             bone == HumanoidBone::LeftFoot || bone == HumanoidBone::RightUpperLeg ||
-            bone == HumanoidBone::RightLowerLeg || bone == HumanoidBone::RightFoot) {
-            continue;  // legs are solved by IK from the foot targets
+            bone == HumanoidBone::RightLowerLeg || bone == HumanoidBone::RightFoot)) {
+            continue;  // legs are solved by IK from the foot targets (footIK off:
+                       // the clip's own leg rotations are applied instead)
         }
         const Quat q = pose.bone[b];
         if (std::abs(q.w) > 0.99999f) {
@@ -662,9 +707,11 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
             if (detailed) {
                 const int handNode = sd == 0 ? impl_->leftHand : impl_->rightHand;
                 const Quat wrist =
-                    (math::fromAxisAngle(left, handPose.wrist[0] * 0.26f) *
-                     math::fromAxisAngle(up, handPose.wrist[1] * 0.30f) *
-                     math::fromAxisAngle(forward, handPose.wrist[2] * 0.34f))
+                    // Pitch keeps the established convention (positive = about
+                    // the character's right, i.e. clip -X).
+                    (math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, handPose.wrist[0] * 0.26f) *
+                     math::fromAxisAngle({0.0f, 1.0f, 0.0f}, handPose.wrist[1] * 0.30f) *
+                     math::fromAxisAngle({0.0f, 0.0f, 1.0f}, handPose.wrist[2] * 0.34f))
                         .normalized();
                 impl_->applyLocalDelta(locals, handNode, quatToModel(wrist));
             }
@@ -701,7 +748,8 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                     const float fan = handPose.spread[static_cast<std::size_t>(fg)] *
                                       (static_cast<float>(fg) - 2.0f) * 0.10f;
                     const Quat spreadQuat = quatToModel(
-                        math::fromAxisAngle(up, fan * (sd == 0 ? -1.0f : 1.0f)));
+                        math::fromAxisAngle({0.0f, 1.0f, 0.0f},
+                                            fan * (sd == 0 ? -1.0f : 1.0f)));
                     for (int jt = 0; jt < 3; ++jt) {
                         const int node = impl_->fingers[sd][fg][jt];
                         if (node >= 0) {
@@ -712,8 +760,8 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
             }
             if (detailed && handPose.thumbOpposition > 0.0f) {
                 const Quat opposition = quatToModel(math::fromAxisAngle(
-                    forward, handPose.thumbOpposition * 0.34f *
-                                 (sd == 0 ? -1.0f : 1.0f)));
+                    {0.0f, 0.0f, 1.0f}, handPose.thumbOpposition * 0.34f *
+                                            (sd == 0 ? -1.0f : 1.0f)));
                 for (int jt = 0; jt < 3; ++jt) {
                     const int node = impl_->fingers[sd][0][jt];
                     if (node >= 0) {
@@ -774,7 +822,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     // stance or a lateral weight shift is paid for. Without this a stance foot
     // would be pulled off the floor by the IK reach clamp.
     float extraDrop = 0.0f;
-    if (impl_->hips >= 0) {
+    if (options.footIK && impl_->hips >= 0) {
         float need[2] = {0.0f, 0.0f};
         for (int f = 0; f < 2; ++f) {
             const LegRig& leg = impl_->legs[f];
@@ -804,9 +852,12 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
 
     float footError = 0.0f;
     float lowest = std::numeric_limits<float>::max();
-    for (int f = 0; f < 2; ++f) {
-        impl_->solveLeg(impl_->legs[f], globals, locals, targets[f], poles[f], footError,
-                        lowest, footDelta[f]);
+    Vec3 reachable[2] = {targets[0], targets[1]};
+    if (options.footIK) {
+        for (int f = 0; f < 2; ++f) {
+            impl_->solveLeg(impl_->legs[f], globals, locals, targets[f], poles[f],
+                            footError, lowest, reachable[f], footDelta[f]);
+        }
     }
     // Heel / toe roll: rotate the toe bone after the ankle IK so the sole does
     // not detach from the floor target. Small (0.30 rad at full strength).
@@ -816,10 +867,27 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         if (impl_->legs[f].toes >= 0 && std::abs(toePitch) > 1.0e-4f) {
             impl_->applyLocalDelta(
                 locals, impl_->legs[f].toes,
-                quatToModel(math::fromAxisAngle(left, toePitch * 0.30f)));
+                quatToModel(math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, toePitch * 0.30f)));
         }
     }
     impl_->evaluate(locals, globals);
+    if (options.footIK) {
+        impl_->measureFootError(globals, targets, reachable, out.stats.maxFootError,
+                                out.stats.footSolverError);
+    } else {
+        // No IK: report how far the carried feet are from the clip's targets so
+        // the number stays meaningful, and the lowest actual foot height.
+        float actual = 0.0f;
+        for (int f = 0; f < 2; ++f) {
+            const int foot = impl_->legs[f].foot;
+            if (foot >= 0) {
+                const Vec3 ankle = impl_->actualPosition(globals, foot);
+                actual = std::max(actual, (ankle - targets[f]).length());
+                lowest = std::min(lowest, ankle.y);
+            }
+        }
+        out.stats.maxFootError = actual;
+    }
 
     out.modelTransform = Mat4::fromQuat(rootRot);
     out.rootOffset = rootPos;
@@ -827,13 +895,12 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     out.nodeGlobals = std::move(globals);
     out.stats.valid = true;
     out.stats.clipDriven = true;
-    out.stats.footIK = true;
+    out.stats.footIK = options.footIK;
     out.stats.detailedHands = pose.detailedHands && impl_->fingerBones > 0;
     out.stats.height = height;
     out.stats.hipDrop = extraDrop;
     out.stats.reachHipDrop = extraDrop;
     out.stats.requestedHipDrop = -math::dot(authoredHips, up);
-    out.stats.maxFootError = footError;
     out.stats.footReachDeficit = footError;
     out.stats.lowestFootY = lowest - impl_->floorY;
     for (int node : impl_->boneNode) {
