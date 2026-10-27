@@ -129,7 +129,7 @@ bgmedia::motion::ClipPose legReachPose() {
 
 } // namespace
 
-TEST_CASE(retarget.foot_error_is_measured_on_the_evaluated_skeleton) {
+TEST_CASE(spatial.foot_error_is_measured_on_the_evaluated_skeleton) {
     for (const bool skewed : {false, true}) {
         auto model = loadMinimal(skewed);
         CHECK(model != nullptr);
@@ -159,7 +159,7 @@ TEST_CASE(retarget.foot_error_is_measured_on_the_evaluated_skeleton) {
     }
 }
 
-TEST_CASE(retarget.unreachable_foot_target_splits_deficit_from_solver_error) {
+TEST_CASE(spatial.unreachable_foot_target_splits_deficit_from_solver_error) {
     auto model = loadMinimal(true);
     CHECK(model != nullptr);
     HumanoidRetargeter rig(*model);
@@ -173,7 +173,7 @@ TEST_CASE(retarget.unreachable_foot_target_splits_deficit_from_solver_error) {
     CHECK(out.stats.footSolverError < 0.003f);
 }
 
-TEST_CASE(retarget.leg_pose_is_independent_of_bone_axis_orientation) {
+TEST_CASE(spatial.leg_pose_is_independent_of_bone_axis_orientation) {
     auto plain = loadMinimal(false);
     auto skew = loadMinimal(true);
     CHECK(plain != nullptr && skew != nullptr);
@@ -191,7 +191,7 @@ TEST_CASE(retarget.leg_pose_is_independent_of_bone_axis_orientation) {
     }
 }
 
-TEST_CASE(retarget.apply_clip_honours_foot_ik_option) {
+TEST_CASE(spatial.apply_clip_honours_foot_ik_option) {
     auto model = loadMinimal(false);
     CHECK(model != nullptr);
     HumanoidRetargeter rig(*model);
@@ -216,7 +216,7 @@ TEST_CASE(retarget.apply_clip_honours_foot_ik_option) {
     CHECK(noIk.stats.maxFootError > withIk.stats.maxFootError);
 }
 
-TEST_CASE(retarget.wrist_axes_are_converted_exactly_once) {
+TEST_CASE(spatial.wrist_axes_are_converted_exactly_once) {
     // The model's own axes differ from the clip axes (character faces +X).
     // Wrist roll/pitch authored in the clip frame must rotate the hand about the
     // model's forward / right axes: the axis is converted exactly once.
@@ -297,7 +297,7 @@ ClearanceSweep sweepClearance(const std::filesystem::path& model, bool useMesh) 
 
 }  // namespace
 
-TEST_CASE(retarget.model1_arm_proxy_clearance_report) {
+TEST_CASE(spatial.model1_arm_proxy_clearance_report) {
     const auto path = realModelPath();
     if (path.empty() || !std::filesystem::exists(path)) {
         return;
@@ -359,7 +359,7 @@ bgmedia::motion::ClipPose crossBodyPose(float sweep, bool left) {
 
 }  // namespace
 
-TEST_CASE(retarget.arm_refinement_reduces_forced_penetration_smoothly) {
+TEST_CASE(spatial.arm_refinement_reduces_forced_penetration_smoothly) {
     const auto path = realModelPath();
     if (!std::filesystem::exists(path)) {
         return;
@@ -419,7 +419,7 @@ TEST_CASE(retarget.arm_refinement_reduces_forced_penetration_smoothly) {
     CHECK(maxStep < 3.0f * maxPlainStep + 0.01f);
 }
 
-TEST_CASE(retarget.arm_refinement_never_touches_feet_and_is_inert_when_clear) {
+TEST_CASE(spatial.arm_refinement_never_touches_feet_and_is_inert_when_clear) {
     for (const bool useMinimal : {true, false}) {
         auto model = useMinimal ? loadMinimal(false) : [] {
             auto r = VrmLoader::load(realModelPath());
