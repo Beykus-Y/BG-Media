@@ -92,6 +92,11 @@ class DanceSchedule {
 public:
     void clear() { segments_.clear(); }
     void setPoseDecorator(PoseDecorator decorator) { decorator_ = std::move(decorator); }
+    // Opt-in (BG Motion 3.3, #8). Upper-body bones carry the outgoing pose through a
+    // segment crossfade as a decaying rotation offset instead of a smootherstep blend.
+    // Off by default: the blend stays the reference behaviour until A/B-tested.
+    void setInertialTransitions(bool enabled) { inertialTransitions_ = enabled; }
+    [[nodiscard]] bool inertialTransitions() const { return inertialTransitions_; }
     void append(ScheduleSegment segment);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
@@ -121,8 +126,12 @@ private:
     [[nodiscard]] ClipPose poseOf(std::size_t index, double mediaTime,
                                   const MusicalTimeline& timeline,
                                   const WarpProfile& warp, float* transition) const;
+    [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
+                                   const MusicalTimeline& timeline,
+                                   const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;
     PoseDecorator decorator_;
+    bool inertialTransitions_ = false;
 };
 
 enum class DanceMode { Manual, Auto };
