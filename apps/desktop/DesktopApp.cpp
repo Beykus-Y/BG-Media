@@ -1,4 +1,4 @@
-#include "DesktopApp.hpp"
+﻿#include "DesktopApp.hpp"
 
 #include "MiniaudioPlayer.hpp"
 #include "TextRenderer.hpp"
@@ -259,7 +259,7 @@ struct Layout {
     Rect vrmEmptyLoad{};
     Rect vrmRightLoad{};
 
-    // BG Motion 3.0 controls (3D view).
+    // BG MOTION 3.1 controls (3D view).
     Rect danceManual{};
     Rect danceAuto{};
     Rect danceLoop{};
@@ -267,9 +267,17 @@ struct Layout {
     Rect danceStyle[5]{};
     Rect danceBpmMinus{};
     Rect danceBpmPlus{};
+    Rect danceExpr{};
+    Rect danceLayer{};
+    Rect danceGen{};
+    Rect danceSpring{};
     Rect dbgFeetBtn{};
     Rect dbgSkelBtn{};
     Rect dbgRootBtn{};
+    Rect springMinusBtn{};
+    Rect springPlusBtn{};
+    Rect springDampBtn{};
+    Rect springResetBtn{};
 
     Rect ruler{};
     Rect wave{};
@@ -1083,6 +1091,9 @@ struct DesktopApp::Impl {
             }
             return false;
         }
+        if (dance.ready()) {
+            dance.setLegGeometry(vrm.legGeometry());  // re-plan the authored footwork for this body
+        }
         vrmError = vrm.renderError();
         vrmFrameError = vrmError;
         lastVrmDirectory = path.parent_path();
@@ -1260,7 +1271,7 @@ struct DesktopApp::Impl {
     }
 
     // ---------------------------------------------------------------------
-    // BG Motion 3.0: authored dance clips
+    // BG MOTION 3.1: authored dance clips
     // ---------------------------------------------------------------------
     motion::DancePlayer dance;
     motion::DanceFrame danceFrame;
@@ -1268,6 +1279,10 @@ struct DesktopApp::Impl {
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
     int danceLabBpm = 100;
+    bool musicDebug = false;
+    std::filesystem::path motionProfilePath;
+    std::filesystem::path motion32ProfilePath;
+    int generatedDanceIndex = -1;
     bool dbgFeet = false;
     bool dbgSkeleton = false;
     bool dbgRoot = false;
@@ -1299,8 +1314,13 @@ struct DesktopApp::Impl {
     void refreshDanceGrid() { dance.setGrid(danceGrid(), danceTime()); }
 
     void onTrackChangedForDance() {
-        dance.setAnalysis(track ? activeAnalysis() : nullptr);
-        dance.setGrid(danceGrid(), danceTime());
+        dance.setAnalysis(track ? activeAnalysis() : nullptr, danceTime());
+        // Only override the analysis timeline when the user explicitly asks for
+        // a Motion Lab tempo. Re-installing a grid-only clock here would throw
+        // away the downbeat confidence and the real accent map.
+        if (!track || motionLabBpm > 0) {
+            dance.setGrid(danceGrid(), danceTime());
+        }
         if (dance.mode() == motion::DanceMode::Auto && track) {
             std::fprintf(stderr, "BG Motion Auto plan:\n%s",
                          dance.director().describeSchedule().c_str());
@@ -1310,19 +1330,66 @@ struct DesktopApp::Impl {
         rootTrail.clear();
     }
 
+    [[nodiscard]] static const char* expressionLabel(motion::MotionExpression expression) {
+        switch (expression) {
+        case motion::MotionExpression::Off: return "EXPR OFF";
+        case motion::MotionExpression::Soft: return "EXPR SOFT";
+        case motion::MotionExpression::Expressive: return "EXPR EXP";
+        }
+        return "EXPR SOFT";
+    }
+
+    void saveMotion32Settings() {
+        if (motion32ProfilePath.empty()) {
+            return;
+        }
+        motion::Motion32Profile profile;
+        profile.overlayMode = dance.overlayMode();
+        profile.springEnabled = vrm.secondarySettings().enabled;
+        profile.springIntensity = vrm.secondarySettings().intensity;
+        profile.springDamping = vrm.secondarySettings().damping;
+        std::string error;
+        if (!motion::saveMotion32Profile(motion32ProfilePath, profile, &error)) {
+            std::fprintf(stderr, "motion32 profile save failed: %s\n", error.c_str());
+        }
+    }
+
+    void cycleExpression() {
+        if (!danceUi()) {
+            return;
+        }
+        motion::MotionExpression next = motion::MotionExpression::Soft;
+        switch (dance.expression()) {
+        case motion::MotionExpression::Off: next = motion::MotionExpression::Soft; break;
+        case motion::MotionExpression::Soft: next = motion::MotionExpression::Expressive; break;
+        case motion::MotionExpression::Expressive: next = motion::MotionExpression::Off; break;
+        }
+        dance.setExpression(next);
+        if (!motionProfilePath.empty()) {
+            std::string error;
+            if (!motion::saveWarpProfile(motionProfilePath, dance.warpProfile(), &error)) {
+                std::fprintf(stderr, "motion profile save failed: %s\n", error.c_str());
+            }
+        }
+        showToast(std::string("Expression: ") + expressionLabel(next));
+    }
+
     void initDance() {
         std::filesystem::path directory = options.dancesDirectory;
         if (directory.empty()) {
             directory = assetsDirectory / "dances";
         }
         const std::size_t count = dance.loadLibrary(directory);
+        if (vrm.model()) {
+            dance.setLegGeometry(vrm.legGeometry());
+        }
         for (const motion::ClipDiagnostic& d : dance.library().diagnostics()) {
             std::fprintf(stderr, "dance %s: %s: %s\n",
                          d.severity == motion::ClipDiagnostic::Severity::Error ? "error"
                                                                                : "warning",
                          d.file.c_str(), d.message.c_str());
         }
-        std::fprintf(stderr, "BG Motion 3.0: %zu dance clip(s) loaded from %s\n", count,
+        std::fprintf(stderr, "BG MOTION 3.2: %zu dance clip(s) loaded from %s\n", count,
                      toUtf8(directory).c_str());
         useClips = count > 0 && !options.legacyMotion;
         if (options.danceBpm > 0) {
@@ -1334,7 +1401,37 @@ struct DesktopApp::Impl {
         dbgSkeleton = options.debugSkeleton;
         dbgRoot = options.debugRoot;
         presentation = options.presentation;
+        musicDebug = options.motionDebug;
+        if (!cacheDirectory.empty()) {
+            motionProfilePath = cacheDirectory / "motion-profile.cfg";
+            motion::WarpProfile profile;
+            if (motion::loadWarpProfile(motionProfilePath, profile, nullptr)) {
+                dance.setWarpProfile(profile);
+            }
+            motion32ProfilePath = cacheDirectory / "motion32-profile.cfg";
+            motion::Motion32Profile runtimeProfile;
+            if (motion::loadMotion32Profile(motion32ProfilePath, runtimeProfile, nullptr)) {
+                dance.setOverlayMode(runtimeProfile.overlayMode);
+                vrm.secondarySettings().enabled = runtimeProfile.springEnabled;
+                vrm.secondarySettings().intensity = runtimeProfile.springIntensity;
+                vrm.secondarySettings().damping = runtimeProfile.springDamping;
+            }
+        }
+        if (!options.danceExpression.empty()) {
+            motion::WarpProfile profile = dance.warpProfile();
+            profile.expression = motion::expressionFromName(options.danceExpression);
+            dance.setWarpProfile(profile);
+            if (!motionProfilePath.empty()) {
+                std::string error;
+                if (!motion::saveWarpProfile(motionProfilePath, profile, &error)) {
+                    std::fprintf(stderr, "motion profile save failed: %s\n", error.c_str());
+                }
+            }
+        }
         dance.setGrid(danceGrid(), 0.0);
+        vrm.secondarySettings().enabled = true;
+        vrm.secondarySettings().intensity = 1.1f;
+        vrm.secondarySettings().damping = 0.5f;
         if (!useClips) {
             return;
         }
@@ -1354,8 +1451,12 @@ struct DesktopApp::Impl {
         } else if (name == "auto") {
             dance.setMode(motion::DanceMode::Auto, 0.0);
         } else if (!name.empty()) {
-            const motion::DanceStyle style = motion::styleFromName(name);
-            dance.select(style, 0.0, /*immediate=*/true);
+            if (dance.library().find(name)) {
+                (void)dance.selectClip(name, 0.0, true);
+            } else {
+                const motion::DanceStyle style = motion::styleFromName(name);
+                dance.select(style, 0.0, /*immediate=*/true);
+            }
         }
     }
 
@@ -1364,10 +1465,94 @@ struct DesktopApp::Impl {
             showToast("No dance clips loaded");
             return;
         }
+        generatedDanceIndex = -1;
         dance.select(style, danceTime());
         const motion::HumanoidClip* clip = dance.library().forStyle(style);
         showToast(std::string("Dance: ") + (clip ? clip->name : motion::styleName(style)) +
                   (track ? "  ·  on the next beat" : ""));
+    }
+
+    void cycleOverlay() {
+        if (!danceUi()) {
+            return;
+        }
+        motion::OverlayMode next = motion::OverlayMode::Off;
+        switch (dance.overlayMode()) {
+        case motion::OverlayMode::Off: next = motion::OverlayMode::Light; break;
+        case motion::OverlayMode::Light: next = motion::OverlayMode::Full; break;
+        case motion::OverlayMode::Full: next = motion::OverlayMode::HandsOnly; break;
+        case motion::OverlayMode::HandsOnly: next = motion::OverlayMode::Off; break;
+        }
+        dance.setOverlayMode(next);
+        saveMotion32Settings();
+        showToast(std::string("Motion layer: ") + motion::overlayModeName(next));
+    }
+
+    void cycleGenerated() {
+        if (!danceUi()) {
+            return;
+        }
+        const auto& generated = dance.generatedDances();
+        if (generated.empty()) {
+            showToast("No procedural dances generated");
+            return;
+        }
+        generatedDanceIndex =
+            (generatedDanceIndex + 1) % static_cast<int>(generated.size() + 1);
+        if (generatedDanceIndex == static_cast<int>(generated.size())) {
+            generatedDanceIndex = -1;
+            dance.select(motion::DanceStyle::Groove, danceTime());
+            showToast("Procedural: off");
+            return;
+        }
+        const auto& entry = generated[static_cast<std::size_t>(generatedDanceIndex)];
+        if (dance.selectClip(entry.clip.id, danceTime() + (track ? 0.10 : 0.0),
+                             !track)) {
+            showToast("Procedural: " + entry.clip.name);
+        }
+    }
+
+    void toggleSpring() {
+        if (!vrm.secondaryAvailable()) {
+            showToast("This model has no VRM spring bones");
+            return;
+        }
+        auto& settings = vrm.secondarySettings();
+        settings.enabled = !settings.enabled;
+        if (settings.enabled) {
+            vrm.resetSecondary();
+        }
+        showToast(std::string("Secondary dynamics: ") +
+                  (settings.enabled ? "ON" : "OFF"));
+        saveMotion32Settings();
+    }
+
+    void adjustSpringIntensity(float delta) {
+        if (!vrm.secondaryAvailable()) {
+            return;
+        }
+        auto& settings = vrm.secondarySettings();
+        settings.intensity = std::clamp(settings.intensity + delta, 0.0f, 2.0f);
+        vrm.resetSecondary();
+        showToast("Spring intensity " + formatNumber(settings.intensity, 1) + "x");
+        saveMotion32Settings();
+    }
+
+    void cycleSpringDamping() {
+        if (!vrm.secondaryAvailable()) {
+            return;
+        }
+        auto& settings = vrm.secondarySettings();
+        if (settings.damping < 0.35f) {
+            settings.damping = 0.5f;
+        } else if (settings.damping < 0.7f) {
+            settings.damping = 0.85f;
+        } else {
+            settings.damping = 0.2f;
+        }
+        vrm.resetSecondary();
+        showToast("Spring damping " + formatNumber(settings.damping, 2));
+        saveMotion32Settings();
     }
 
     void setDanceMode(motion::DanceMode mode) {
@@ -2021,6 +2206,30 @@ struct DesktopApp::Impl {
                 showToast(dance.oneShot() ? "ONE SHOT: dance plays once, then Idle" : "LOOP");
             }
             break;
+        case SDLK_E:
+            if (danceUi()) {
+                cycleExpression();
+            }
+            break;
+        case SDLK_Y:
+            if (danceUi()) {
+                cycleOverlay();
+            }
+            break;
+        case SDLK_J:
+            if (danceUi()) {
+                cycleGenerated();
+            }
+            break;
+        case SDLK_K:
+            if (characterView == CharacterView::Vrm3D) {
+                toggleSpring();
+            }
+            break;
+        case SDLK_M:
+            musicDebug = !musicDebug;
+            showToast(musicDebug ? "Music debug on" : "Music debug off");
+            break;
         case SDLK_P:
             if (characterView == CharacterView::Vrm3D) {
                 togglePresentation();
@@ -2193,6 +2402,22 @@ struct DesktopApp::Impl {
                 changeDanceBpm(5);
                 return;
             }
+            if (layout.danceExpr.contains(x, y)) {
+                cycleExpression();
+                return;
+            }
+            if (layout.danceLayer.contains(x, y)) {
+                cycleOverlay();
+                return;
+            }
+            if (layout.danceGen.contains(x, y)) {
+                cycleGenerated();
+                return;
+            }
+            if (layout.danceSpring.contains(x, y)) {
+                toggleSpring();
+                return;
+            }
             if (layout.dbgFeetBtn.contains(x, y)) {
                 dbgFeet = !dbgFeet;
                 return;
@@ -2203,6 +2428,23 @@ struct DesktopApp::Impl {
             }
             if (layout.dbgRootBtn.contains(x, y)) {
                 dbgRoot = !dbgRoot;
+                return;
+            }
+            if (layout.springMinusBtn.contains(x, y)) {
+                adjustSpringIntensity(-0.2f);
+                return;
+            }
+            if (layout.springPlusBtn.contains(x, y)) {
+                adjustSpringIntensity(0.2f);
+                return;
+            }
+            if (layout.springDampBtn.contains(x, y)) {
+                cycleSpringDamping();
+                return;
+            }
+            if (layout.springResetBtn.contains(x, y)) {
+                vrm.resetSecondary();
+                showToast("Secondary dynamics reset");
                 return;
             }
             if (layout.vrmDemoButton.contains(x, y)) {
@@ -2352,12 +2594,20 @@ struct DesktopApp::Impl {
             layout.danceStyle[i] = {r1.x + 18.0f + static_cast<float>(i) * 68.0f, r1.y + 72.0f,
                                     64.0f, 28.0f};
         }
-        layout.danceBpmMinus = {r1.x + 120.0f, r1.y + 110.0f, 26.0f, 24.0f};
-        layout.danceBpmPlus = {r1.x + 150.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceBpmMinus = {r1.x + 110.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceBpmPlus = {r1.x + 140.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceExpr = {r1.x + 244.0f, r1.y + 110.0f, 108.0f, 24.0f};
+        layout.danceLayer = {r1.x + 18.0f, r1.y + 142.0f, 104.0f, 24.0f};
+        layout.danceGen = {r1.x + 128.0f, r1.y + 142.0f, 96.0f, 24.0f};
+        layout.danceSpring = {r1.x + 230.0f, r1.y + 142.0f, 124.0f, 24.0f};
         const Rect r3 = layout.right3;
         layout.dbgFeetBtn = {r3.x + 18.0f, r3.y + 34.0f, 106.0f, 24.0f};
         layout.dbgSkelBtn = {r3.x + 130.0f, r3.y + 34.0f, 104.0f, 24.0f};
         layout.dbgRootBtn = {r3.x + 240.0f, r3.y + 34.0f, 114.0f, 24.0f};
+        layout.springMinusBtn = {r3.x + 18.0f, r3.y + 62.0f, 44.0f, 18.0f};
+        layout.springPlusBtn = {r3.x + 66.0f, r3.y + 62.0f, 44.0f, 18.0f};
+        layout.springDampBtn = {r3.x + 114.0f, r3.y + 62.0f, 92.0f, 18.0f};
+        layout.springResetBtn = {r3.x + 210.0f, r3.y + 62.0f, 144.0f, 18.0f};
     }
 
     // ---------------------------------------------------------------------
@@ -2908,6 +3158,32 @@ void DesktopApp::Impl::drawEvents() {
         lastAccentX = x;
         ui::diamond(renderer, static_cast<float>(x), accentY, 3.2f,
                     theme::alpha(theme::amber, 0.85f));
+    }
+
+    // BG Motion 3.1 accent map: real onset timestamps that are not simply the
+    // beat or the bass row (syncopations and subdivisions). The debug panel
+    // exposes the same map numerically.
+    {
+        const auto& accents = dance.timeline().accents();
+        int lastAccentRowX = -100;
+        for (const motion::AccentEvent& accent : accents) {
+            if (accent.time < viewStart || accent.time > viewEnd ||
+                accent.strength < 0.10f || accent.downbeat || accent.bass ||
+                accent.kind == motion::AccentKind::Beat) {
+                continue;
+            }
+            const int x = static_cast<int>(timeToX(accent.time, layout.plot));
+            if (x == lastAccentRowX) {
+                continue;
+            }
+            lastAccentRowX = x;
+            const Uint8 alpha = static_cast<Uint8>(
+                std::clamp(90.0f + 150.0f * accent.strength, 0.0f, 245.0f));
+            ui::diamond(renderer, static_cast<float>(x), beatY + 19.0f, 2.2f,
+                        SDL_Color{166, 132, 255, alpha});
+        }
+        label("ACC", rect.x + 6.0f, beatY + 12.0f, 7,
+              theme::alpha(theme::violet, 0.8f), 0.8f);
     }
 
     label("BEAT", rect.x + 6.0f, rect.y + 5.0f, 7, theme::dim, 0.8f);
@@ -4112,7 +4388,7 @@ void DesktopApp::Impl::draw3DRightPanels() {
                    FontWeight::SemiBold,
                    pose.accented ? theme::amber : theme::text);
         y += 30.0f;
-        body("ACCENT " + std::string(pose.accented ? "ON" : "—") +
+        body("ACCENT " + std::string(pose.accented ? "ON" : "вЂ”") +
                  "   ·   ENERGY " + formatNumber(pose.energy, 2) +
                  "   ·   IMPACT " + formatNumber(pose.impact, 2),
              card.x + 18.0f, y, 9, theme::muted);
@@ -4245,7 +4521,7 @@ void DesktopApp::Impl::drawFooter() {
              190.0f, bar.y + 13.0f, 9, theme::dim);
     }
 
-    text->drawCentered("SPACE PLAY/PAUSE   ←/→ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
+    text->drawCentered("SPACE PLAY/PAUSE   в†ђ/в†’ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
                        "V A/B   B LAB   R RATE",
                        720.0f, bar.y + 13.0f, 8, FontWeight::SemiBold,
                        theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
@@ -4366,7 +4642,7 @@ void DesktopApp::Impl::renderFrame() {
 }
 
 // -------------------------------------------------------------------------
-// BG Motion 3.0 panels, debug views and presentation mode
+// BG MOTION 3.1 panels, debug views and presentation mode
 // -------------------------------------------------------------------------
 void DesktopApp::Impl::drawDancePanels() {
     const auto panelCard = [&](const Rect& rect) {
@@ -4389,7 +4665,7 @@ void DesktopApp::Impl::drawDancePanels() {
         panelCard(card);
         text->draw("DANCE", card.x + 18.0f, card.y + 12.0f, 11, FontWeight::SemiBold,
                    theme::text);
-        label("BG MOTION 3.0", card.right() - 112.0f, card.y + 15.0f, 8, theme::accent, 1.2f);
+        label("BG MOTION 3.2", card.right() - 112.0f, card.y + 15.0f, 8, theme::accent, 1.2f);
         const bool autoMode = dance.mode() == motion::DanceMode::Auto;
         button(layout.danceManual, "MANUAL", !autoMode, theme::accent);
         button(layout.danceAuto, "AUTO", autoMode, theme::violet);
@@ -4417,12 +4693,30 @@ void DesktopApp::Impl::drawDancePanels() {
         const int shownBpm =
             track ? static_cast<int>(std::lround(dance.director().beatClock().bpmAt(danceTime())))
                   : danceLabBpm;
-        body(std::to_string(shownBpm) + " BPM", card.x + 188.0f, card.y + 116.0f, 12,
+        body(std::to_string(shownBpm) + " BPM", card.x + 176.0f, card.y + 116.0f, 12,
              theme::text, FontWeight::SemiBold);
-        label("1-4 STYLE · 0 IDLE · A AUTO", card.x + 18.0f, card.bottom() - 40.0f, 8,
-              theme::dim, 0.6f);
-        label("N ONE SHOT · T TEST · P PRESENT · UP/DN BPM", card.x + 18.0f,
-              card.bottom() - 26.0f, 8, theme::dim, 0.6f);
+        button(layout.danceExpr, expressionLabel(dance.expression()),
+               dance.expression() != motion::MotionExpression::Off,
+               dance.expression() == motion::MotionExpression::Expressive ? theme::pink
+                                                                          : theme::violet);
+        button(layout.danceLayer,
+               std::string("LAYER ") + motion::overlayModeName(dance.overlayMode()),
+               dance.overlayMode() != motion::OverlayMode::Off, theme::violet);
+        std::string genLabel = "GEN";
+        if (generatedDanceIndex >= 0 &&
+            static_cast<std::size_t>(generatedDanceIndex) < dance.generatedDances().size()) {
+            genLabel = dance.generatedDances()[static_cast<std::size_t>(generatedDanceIndex)]
+                           .clip.name;
+        }
+        button(layout.danceGen, genLabel, generatedDanceIndex >= 0, theme::pink);
+        button(layout.danceSpring,
+               vrm.secondaryAvailable()
+                   ? (vrm.secondarySettings().enabled ? "SPRING ON" : "SPRING OFF")
+                   : "NO SPRING",
+               vrm.secondaryAvailable() && vrm.secondarySettings().enabled,
+               theme::accent);
+        label("1-4 STYLE · A AUTO · Y LAYER · J GEN · K SPRING · T TEST",
+              card.x + 18.0f, card.bottom() - 12.0f, 8, theme::dim, 0.6f);
     }
 
     // 2. Clip state ---------------------------------------------------------
@@ -4500,7 +4794,7 @@ void DesktopApp::Impl::drawDancePanels() {
         }
         const std::string reason = !dance.autoNote().empty() ? dance.autoNote()
                                                              : danceFrame.reason;
-        body(ellipsize(*text, reason.empty() ? std::string("—") : reason, card.w - 36.0f, 8,
+        body(ellipsize(*text, reason.empty() ? std::string("вЂ”") : reason, card.w - 36.0f, 8,
                        FontWeight::Regular),
              card.x + 18.0f, card.bottom() - 18.0f, 8, theme::dim);
     }
@@ -4514,8 +4808,14 @@ void DesktopApp::Impl::drawDancePanels() {
         button(layout.dbgFeetBtn, "FOOT CONTACT", dbgFeet, theme::accent);
         button(layout.dbgSkelBtn, "SKELETON", dbgSkeleton, theme::violet);
         button(layout.dbgRootBtn, "ROOT MOTION", dbgRoot, theme::pink);
+        button(layout.springMinusBtn, "S-", false, theme::muted);
+        button(layout.springPlusBtn, "S+", false, theme::muted);
+        button(layout.springDampBtn,
+               "DAMP " + formatNumber(vrm.secondarySettings().damping, 2), false,
+               theme::muted);
+        button(layout.springResetBtn, "RESET SPRING", false, theme::accent);
         const auto& stats = vrm.lastPose().stats;
-        float y = card.y + 68.0f;
+        float y = card.y + 84.0f;
         const char* names[2] = {"L", "R"};
         for (int f = 0; f < 2; ++f) {
             const auto& foot = danceFrame.pose.foot[static_cast<std::size_t>(f)];
@@ -4524,14 +4824,48 @@ void DesktopApp::Impl::drawDancePanels() {
             body(std::string(names[f]) + "  " + motion::footPhaseName(foot.phase),
                  card.x + 34.0f + f * 118.0f, y, 10, theme::muted);
         }
-        body("ROOT  yaw " + formatNumber(danceFrame.pose.rootYaw * 360.0f, 0) + "°  ·  x " +
+        body("ROOT  yaw " + formatNumber(danceFrame.pose.rootYaw * 360.0f, 0) + "В°  ·  x " +
                  formatNumber(danceFrame.pose.rootX * 160.0f, 0) + " z " +
-                 formatNumber(danceFrame.pose.rootZ * 160.0f, 0) + " cm",
-             card.x + 18.0f, y + 20.0f, 9, theme::muted);
-        body("HIPS  +" + formatNumber(stats.reachHipDrop * 100.0f, 1) + " cm reach  ·  IK err " +
-                 formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  " +
-                 formatNumber(vrm.lastRetargetMs(), 2) + " ms",
-             card.x + 18.0f, y + 36.0f, 9, theme::muted);
+                 formatNumber(danceFrame.pose.rootZ * 160.0f, 0) + " cm  ·  IK " +
+                 formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  LYR " +
+                 std::to_string(danceFrame.overlayActive) + "/" +
+                 std::to_string(danceFrame.overlayActive + danceFrame.overlayRejected),
+             card.x + 18.0f, y + 18.0f, 9, theme::muted);
+        if (musicDebug) {
+            body("MUSIC  bar " + std::to_string(danceFrame.barIndex + 1) + "  beat " +
+                     std::to_string(danceFrame.beatInBar + 1) + "/" +
+                     std::to_string(std::max(1, danceFrame.beatsPerBar)) + "  ·  down " +
+                     formatNumber(danceFrame.downbeatConfidence * 100.0f, 0) + "%",
+                 card.x + 18.0f, y + 34.0f, 9, theme::muted);
+            const double deviationMs =
+                danceFrame.warpDeviationBeats * 60000.0 /
+                std::max(1.0, danceFrame.bpm);
+            body("WARP  " + std::string(danceFrame.warpActive ? "on " : "off ") +
+                     formatNumber(deviationMs, 1) + " ms  ·  " +
+                     formatNumber(danceFrame.warpRate, 2) + "x  ·  acc " +
+                     formatNumber(danceFrame.musicAccent, 2) + "  ·  bass " +
+                     formatNumber(danceFrame.bassStrength, 2) + "  ·  align " +
+                     formatNumber(danceFrame.alignmentErrorMs, 1) + " ms",
+                 card.x + 18.0f, y + 50.0f, 9, theme::muted);
+        } else {
+            const auto& spring = vrm.secondaryStats();
+            body("HIPS  +" + formatNumber(stats.reachHipDrop * 100.0f, 1) +
+                     " cm reach  ·  IK err " +
+                     formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  " +
+                     formatNumber(vrm.lastRetargetMs(), 2) + " ms",
+                 card.x + 18.0f, y + 34.0f, 9, theme::muted);
+            body(std::string("SPRING ") +
+                     (vrm.secondaryAvailable()
+                          ? (vrm.secondarySettings().enabled ? "on " : "off ")
+                          : "none ") +
+                     std::to_string(spring.chains) + " chains  ·  " +
+                     formatNumber(spring.maxDisplacement * 100.0f, 1) + " cm  ·  " +
+                     formatNumber(vrm.secondarySettings().intensity, 1) + "x d" +
+                     formatNumber(vrm.secondarySettings().damping, 2) + "  ·  " +
+                     formatNumber(spring.simulateMilliseconds, 2) + " ms  ·  fingers " +
+                     std::to_string(stats.fingerBones),
+                 card.x + 18.0f, y + 50.0f, 9, theme::muted);
+        }
     }
 }
 
@@ -4607,6 +4941,24 @@ void DesktopApp::Impl::drawDanceDebug(const Rect& stage) {
                                       theme::alpha(theme::white, 0.85f), true);
                     }
                     ui::fillCircle(renderer, q.x, q.y, 2.0f, theme::alpha(theme::accent, 0.95f));
+                    prev = q;
+                    havePrev = true;
+                }
+            }
+        }
+        if (dbgSkeleton && v < 2 && loaded->hasSpringBones() &&
+            vrm.secondarySettings().enabled) {
+            for (const auto& chain : loaded->springChains) {
+                bool havePrev = false;
+                SDL_FPoint prev{};
+                for (int node : chain.nodes) {
+                    const math::Vec3 p =
+                        animation::HumanoidRetargeter::stagePosition(pose, node);
+                    const SDL_FPoint q = map(p);
+                    if (havePrev) {
+                        ui::thickLine(renderer, prev.x, prev.y, q.x, q.y, 1.2f,
+                                      theme::alpha(theme::amber, 0.65f), false);
+                    }
                     prev = q;
                     havePrev = true;
                 }

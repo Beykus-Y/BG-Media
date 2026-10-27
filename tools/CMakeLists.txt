@@ -41,3 +41,35 @@ add_executable(bgmedia_motion_qa
 )
 target_link_libraries(bgmedia_motion_qa PRIVATE bgmedia_rig)
 target_compile_options(bgmedia_motion_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+add_executable(bgmedia_procedural_dance
+    procedural_dance/main.cpp
+)
+target_link_libraries(bgmedia_procedural_dance PRIVATE bgmedia_rig)
+target_compile_options(bgmedia_procedural_dance PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+add_executable(bgmedia_sync_qa
+    sync_qa/main.cpp
+)
+target_link_libraries(bgmedia_sync_qa PRIVATE bgmedia_rig bgmedia_test_signals)
+target_include_directories(bgmedia_sync_qa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+target_compile_options(bgmedia_sync_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+add_executable(bgmedia_mesh_clip
+    mesh_clip/main.cpp
+)
+target_link_libraries(bgmedia_mesh_clip PRIVATE bgmedia_rig)
+target_compile_options(bgmedia_mesh_clip PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+if(BGMEDIA_BUILD_MINIAUDIO)
+    # Instrumented playback of a model + real track through the Desktop path (QA only).
+    add_executable(bgmedia_motion_diag
+        motion_diag/main.cpp
+    )
+    target_link_libraries(bgmedia_motion_diag PRIVATE bgmedia_rig bgmedia_miniaudio)
+    target_include_directories(bgmedia_motion_diag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(bgmedia_motion_diag PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_motion_diag PRIVATE shell32)
+    endif()
+endif()

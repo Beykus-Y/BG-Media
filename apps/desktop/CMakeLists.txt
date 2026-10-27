@@ -83,3 +83,20 @@ if(MSVC)
         _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
     )
 endif()
+
+# CPU-vs-GPU skinning agreement check (silhouette IoU). Development / QA tool.
+add_executable(bgmedia_skin_check
+    ${CMAKE_SOURCE_DIR}/tools/skin_check/main.cpp
+)
+target_link_libraries(bgmedia_skin_check PRIVATE
+    bgmedia_rig
+    bgmedia_sdlgpu
+    SDL3::SDL3
+)
+target_compile_features(bgmedia_skin_check PRIVATE cxx_std_20)
+target_compile_options(bgmedia_skin_check PRIVATE ${BGMEDIA_WARNING_FLAGS})
+if(MSVC)
+    target_compile_definitions(bgmedia_skin_check PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+endif()

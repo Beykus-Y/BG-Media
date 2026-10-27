@@ -338,10 +338,11 @@ SPIR-V/MSL-варианты (исходный HLSL уже отделён от AP
 - `retarget.is_deterministic_and_frame_rate_independent` — бит-в-бит
   воспроизведение после seek/rewind и 30-секундный sweep;
 - `retarget.model1_if_available` — реальный риг;
-- `dance.*` (26 кейсов) — формат `bgmotion.clip`, loop seam, скорость и
+- `dance.*` (28 кейсов) — формат `bgmotion.clip`, loop seam, скорость и
   ускорение, foot slide, повороты вокруг опорной стопы, 20 пар стилей на
   80/123/180 BPM (60 переходов), seek/pause/resume, one-shot, metric levels, Manual entry
-  beat, Auto-план и смена темпа. Подробнее: [BG_MOTION_3.md](BG_MOTION_3.md).
+  beat, Auto-план, смена темпа и accent confidence. Подробнее:
+  [BG_MOTION_3.md](BG_MOTION_3.md), [BG_MOTION_3_1.md](BG_MOTION_3_1.md).
 
 ASan (MSVC):
 
@@ -385,3 +386,8 @@ SDL_Renderer backend на этой машине не ограничивает с
 4. Vulkan/Metal shader variants (SPIR-V/MSL) и Linux/iOS проверка.
 5. Более точный порядок MToon renderQueue и per-material cull/ZWrite.
 6. Android-интеграция — отдельный этап, вне текущей задачи.
+
+
+## BG Motion 3.2: secondary animation and fingers
+
+The importer now also reads extensions.VRM.secondaryAnimation: 25 bone groups, 36 linear chains and 22 collider spheres on the local test model. SecondaryDynamics simulates those chains after humanoid retargeting and writes the node globals consumed by the existing skinning path. Finger bones (30 on the test model) are mapped into VrmModel::fingerNodes and driven by motion::HandPose; models without them report zero finger bones instead of receiving fake motion. VRM 1.0 VRMC_springBone is not parsed by this VRM 0.x importer.

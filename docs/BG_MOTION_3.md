@@ -1,5 +1,10 @@
 # BG Motion 3.0 — авторские танцевальные клипы
 
+> **Обновление:** поверх этого слоя реализован
+> [BG Motion 3.1](BG_MOTION_3_1.md) — `MusicalTimeline`, карта акцентов,
+> downbeat-выравнивание, safe time warp и расширенная QA. Формат клипов 3.0
+> остаётся совместимым; добавлено необязательное поле `accents[].confidence`.
+
 BG Motion 3.0 — следующий слой после BG Motion 2.0. Музыкальная цепочка не
 изменилась: **BG Beat** строит сетку, **BG Sync** отдаёт audible media time, а
 **BG Motion 3.0** сэмплирует по этой сетке заранее авторизованную хореографию.
@@ -32,7 +37,7 @@ BG Sync не менялись.
 | Смена стиля | движение | Manual: на следующий entry beat; Auto: по фразам |
 | Root motion | `CharacterPose.rotation` | yaw + перенос центра, с pivoting вокруг стоп |
 | Переносимость | CharacterPose | JSON, humanoid bone names, height units |
-| Проверка | motion-тесты | + 26 dance-тестов, QA-метрики и контактные листы |
+| Проверка | motion-тесты | + 28 dance-тестов, QA-метрики и контактные листы |
 
 Ключевое свойство осталось прежним: поза — **чистая функция**
 
@@ -480,7 +485,7 @@ python scripts\capture_dance_sequence.py --name transition ^
 
 ### 9.3 Тесты
 
-`bgmedia.dance` — 26 кейсов. Они проверяют не «нет исключения», а инварианты:
+`bgmedia.dance` — 28 кейсов. Они проверяют не «нет исключения», а инварианты:
 
 - формат, ошибки загрузчика, fuzz-коррупция, библиотека из пяти клипов;
 - loop seam, ограниченные скорость/ускорение, root motion, различимость
@@ -491,11 +496,12 @@ python scripts\capture_dance_sequence.py --name transition ^
 - все 20 пар стилей на каждом из 80/123/180 BPM (60 переходов) и 60 быстрых
   переключений подряд;
 - metric levels 0.5/1/2 в диапазоне 80–180 BPM;
-- Manual entry beat, Auto-план по энергии/тишине/confidence, смену темпа.
+- Manual entry beat, Auto-план по энергии/тишине/confidence, смену темпа;
+- необязательный `accents[].confidence` и его влияние на envelope.
 
-Всего в проекте: **82 теста**, 9 CTest-групп:
-`audio`, `analysis`, `cache`, `sync`, `choreography`, `motion`, `vrm`,
-`retarget`, `dance`.
+Всего в проекте: **115 тестов**, 12 CTest-групп:
+`audio`, `analysis`, `cache`, `sync`, `choreography`, `motion`, `timeline`,
+`warp`, `sync31`, `vrm`, `retarget`, `dance`.
 
 ### 9.4 Измерения
 
@@ -560,3 +566,6 @@ VRM-модель с разрешающей лицензией. Код загру
 - [VRM_INTEGRATION.md](VRM_INTEGRATION.md) — VRM 0.x, SDL_GPU, retargeting.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — место BG Motion 3.0 в движке.
 - [MEASUREMENTS.md](MEASUREMENTS.md) — измерения и условия экспериментов.
+
+
+> BG Motion 3.2 extends this format with optional clip v2 lanes: toe pitch, detailed hand pose and per-key finger/wrist channels. Version 1 files remain readable. See docs/BG_MOTION_3_2.md.

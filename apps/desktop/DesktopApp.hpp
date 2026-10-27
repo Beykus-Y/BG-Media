@@ -35,6 +35,7 @@ struct DesktopOptions {
     int danceBpm = 0;      // Motion Lab BPM when no music is loaded
     std::string dancePlan; // comma separated styles played in sequence (demo / captures)
     double danceSpan = 16.0;  // beats per style in --dance-plan
+    std::string danceExpression;  // off|soft|expressive; empty = profile/Soft
     bool presentation = false;
     bool debugFeet = false;
     bool debugSkeleton = false;

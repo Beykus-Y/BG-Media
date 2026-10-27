@@ -6,9 +6,16 @@ add_executable(bgmedia_tests
     test_sync.cpp
     test_choreography.cpp
     test_motion.cpp
+    test_timeline.cpp
+    test_warp.cpp
+    test_musical_sync.cpp
     test_vrm.cpp
     test_retarget.cpp
     test_dance.cpp
+    test_motion32.cpp
+    test_quality.cpp
+    test_spatial.cpp
+    test_spring.cpp
 )
 target_link_libraries(bgmedia_tests PRIVATE
     bgmedia_core
@@ -19,7 +26,7 @@ if(TARGET bgmedia_miniaudio)
     target_link_libraries(bgmedia_tests PRIVATE bgmedia_miniaudio)
     target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_MINIAUDIO=1)
 endif()
-target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3)
 target_compile_definitions(bgmedia_tests PRIVATE
     BGMEDIA_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
     BGMEDIA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -29,7 +36,7 @@ if(MSVC)
     target_compile_definitions(bgmedia_tests PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
-foreach(test_name audio analysis cache sync choreography motion vrm retarget dance)
+foreach(test_name audio analysis cache sync choreography motion timeline warp sync31 vrm retarget dance motion32 quality spatial spring)
     add_test(NAME bgmedia.${test_name} COMMAND bgmedia_tests ${test_name}.)
     set_tests_properties(bgmedia.${test_name} PROPERTIES
         TIMEOUT 120

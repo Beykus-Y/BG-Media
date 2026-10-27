@@ -597,6 +597,137 @@ SyntheticTrack makeDriftTrack(double bpm, double duration) {
     return track;
 }
 
+SyntheticTrack makeCompoundTrack(double pulseBpm, int pulsesPerBar, double duration,
+                                 int subdivision) {
+    SyntheticTrack track;
+    track.bpm = pulseBpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x6A7B8Cu);
+    const int pulses = std::max(1, pulsesPerBar);
+    const int div = std::max(2, subdivision);
+    const double period = 60.0 / std::max(20.0, pulseBpm);
+    int pulseIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++pulseIndex) {
+        const int inBar = pulseIndex % pulses;
+        track.beatTimes.push_back(time);
+        if (inBar == 0) {
+            track.downbeatTimes.push_back(time);
+        }
+        // A bass attack on every pulse gives the low-band pulse a clear
+        // periodicity; the downbeat note is stronger. Without it, 6/8 can be
+        // legitimately heard as a slower half-time pulse.
+        addBassNote(samples, kSampleRate, time, period * 0.9,
+                    inBar == 0 ? 0.30f : 0.18f);
+        addKick(samples, kSampleRate, time, inBar == 0 ? 0.86f : 0.58f, noise);
+        track.kickTimes.push_back(time);
+        for (int sub = 0; sub < div; ++sub) {
+            const double at = time + period * static_cast<double>(sub) / div;
+            if (at >= duration - 0.04) {
+                continue;
+            }
+            addHat(samples, kSampleRate, at, sub == 0 ? 0.15f : 0.11f, noise);
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeStrongHatWeakKickTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x7B8C9Du);
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addBassNote(samples, kSampleRate, time, period * 1.1, 0.16f);
+        }
+        // Weak low pulse, deliberately buried under the hat layer.
+        addKick(samples, kSampleRate, time, 0.20f, noise);
+        track.kickTimes.push_back(time);
+        addHat(samples, kSampleRate, time, 0.16f, noise);
+        const double offbeat = time + period * 0.5;
+        if (offbeat < duration - 0.04) {
+            addHat(samples, kSampleRate, offbeat, 0.88f, noise);
+            addSnare(samples, kSampleRate, offbeat, 0.12f, noise);
+        }
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeTempoRampTrack(double bpmA, double bpmB, double duration) {
+    SyntheticTrack track;
+    track.bpm = 0.5 * (bpmA + bpmB);
+    track.tempoChanges.push_back({0.0, bpmA});
+    track.tempoChanges.push_back({duration, bpmB});
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x8C9DAEu);
+    double time = 0.45;
+    int beatIndex = 0;
+    while (time < duration - 0.1) {
+        const double progress = std::clamp(time / std::max(0.1, duration), 0.0, 1.0);
+        const double bpm = bpmA + (bpmB - bpmA) * progress;
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+        }
+        addBeatCluster(samples, time, bpm, beatInBar, true, true, true, beatInBar == 0,
+                       noise, beatInBar == 0 ? 1.0f : 0.78f);
+        time += 60.0 / std::max(20.0, bpm);
+        ++beatIndex;
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
+SyntheticTrack makeShiftedAccentTrack(double bpm, double duration) {
+    SyntheticTrack track;
+    track.bpm = bpm;
+    const double period = 60.0 / bpm;
+    const int totalSamples = static_cast<int>(duration * kSampleRate);
+    std::vector<float> samples(static_cast<std::size_t>(totalSamples), 0.0f);
+    Noise noise(0x9DAEBFu);
+    int beatIndex = 0;
+    for (double time = 0.45; time < duration - 0.1; time += period, ++beatIndex) {
+        const int beatInBar = beatIndex % 4;
+        track.beatTimes.push_back(time);
+        if (beatInBar == 0) {
+            track.downbeatTimes.push_back(time);
+            addKick(samples, kSampleRate, time, 0.78f, noise);
+            addBassNote(samples, kSampleRate, time, period * 1.2, 0.22f);
+        } else {
+            // A quiet but real pulse on every beat: the grid is unambiguous,
+            // while the audible arrangement accents the shifted sixteenth.
+            addKick(samples, kSampleRate, time, 0.26f, noise);
+        }
+        // The audible accent sits a sixteenth after the pulse; the grid must
+        // not jump to it.
+        const double shifted = time + period * 0.25;
+        if (shifted < duration - 0.04) {
+            addSnare(samples, kSampleRate, shifted, 0.34f, noise);
+            addBassNote(samples, kSampleRate, shifted, period * 0.35, 0.20f);
+            addHat(samples, kSampleRate, shifted, 0.22f, noise);
+            track.swellTimes.push_back(shifted);
+        }
+        addHat(samples, kSampleRate, time, 0.10f, noise);
+    }
+    finish(samples, duration);
+    track.audio = monoAudio(std::move(samples));
+    return track;
+}
+
 bool writeWav16(const std::filesystem::path& path, const AudioData& audio,
                 std::string* error) {
     if (!audio.valid()) {

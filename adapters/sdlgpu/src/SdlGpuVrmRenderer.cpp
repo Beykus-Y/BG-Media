@@ -409,9 +409,12 @@ bool SdlGpuVrmRenderer::Impl::createPipelines(std::string* error) {
         info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
         info.rasterizer_state.enable_depth_clip = true;
         info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
-        info.depth_stencil_state.compare_op = blend
-                                                    ? SDL_GPU_COMPAREOP_ALWAYS
-                                                    : SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+        // Blended layers (eyes, brows, lashes, highlights) must still be depth *tested*
+        // against the opaque pass, otherwise they are drawn over everything, including
+        // through the back of the head and the hair. They do not write depth (the
+        // back-to-front sort handles their mutual order). A compare op of ALWAYS here
+        // made the "depth test" a no-op.
+        info.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
         info.depth_stencil_state.enable_depth_test = true;
         info.depth_stencil_state.enable_depth_write = depthWrite;
         info.target_info.color_target_descriptions = &colorTargetDescription;

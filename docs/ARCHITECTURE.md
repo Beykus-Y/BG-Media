@@ -44,7 +44,7 @@ apps/desktop (SDL3 window + SDL_Renderer UI + miniaudio playback)
          └── render     : ICharacterPresenter (no SDL types)
 
 bgmedia_rig
-   ├── motion3   : BG Motion 3.0 DanceClip / BeatClock / DancePlayer
+   ├── motion3   : BG Motion 3.1 DanceClip / MusicalTimeline / DancePlayer
    └── animation : HumanoidRetargeter (CharacterPose и ClipPose, foot IK)
 ```
 
@@ -74,6 +74,7 @@ bgmedia_rig
 | **BG Beat** | BPM, удары, onset, бас, тишина | `bgmedia_core/analysis` |
 | **BG Motion 2.0** | хореография, cues, CharacterPose | `bgmedia_core/choreography` |
 | **BG Motion 3.0** | авторские клипы, BeatClock, расписание, Auto | `bgmedia_rig/motion3` |
+| **BG Motion 3.1** | MusicalTimeline, accent map, downbeat alignment, safe time warp | `bgmedia_rig/motion3` |
 | **BG Sync** | общая модель времени, latency, seek, rate | `bgmedia_core/sync` |
 | **BG VRM** | GLB/VRM 0.x, humanoid rig, textures | `bgmedia_vrm` |
 | **BG Rig** | retargeting BG Motion в humanoid-кости, IK | `bgmedia_rig` |
@@ -91,7 +92,7 @@ bgmedia_rig
 ```text
 media PCM → Analyzer → BeatClock ─────────────────────┐
                            │                          │
-                     BG Motion 3.0 schedule           │
+                     BG Motion 3.1 schedule           │
                            ▼                          │
                      ClipPose (musical beats)         │
                            │                          │
@@ -345,6 +346,43 @@ BG Beat analysis ─► BeatClock ─► DanceDirector ─► DanceSchedule
 Подробный формат, хореография, QA и ограничения:
 [docs/BG_MOTION_3.md](BG_MOTION_3.md).
 
+### 7.3 BG Motion 3.1 — музыкальная синхронизация
+
+BG Motion 3.1 добавляет между BG Beat и планировщиком отдельный музыкальный
+слой, не меняя границу `bgmedia_core`:
+
+```text
+BG Beat (AnalysisResult)
+   │  beat times, meter, onsets, bass, silence
+   ▼
+MusicalTimeline        BeatClock + meter/downbeat confidence + AccentEvent[]
+   │                   subdivision, compound feel, silence weight
+   ▼
+DanceDirector          downbeat/entry alignment, phrase planning
+   │
+   ▼
+DanceSchedule          pure media-time segment sampling
+   │  MusicalTimeWarp (optional, C1, bounded)
+   ▼
+ClipPose → HumanoidRetargeter → foot IK → renderer
+```
+
+- `MusicalTimeline` не зависит от VRM/SDL и не меняет `AnalysisResult`.
+- `MusicalTimeWarp` не двигает root, hips и цели стоп; по умолчанию модулирует
+  только верхнюю часть тела. Контакты и IK остаются в том же retargeter-пути.
+- `DanceDirector` использует downbeat только при
+  `MusicalTimeline::downbeatTrusted()`; при низкой уверенности откатывается на
+  beat-level.
+- Смена BPM/сетки вызывает `rebase()`, seek — `reseed()`; оба сохраняют
+  музыкальную фазу и не создают скачка позы.
+- `DancePlayer` остаётся фасадом; host передаёт audible media time.
+- Desktop показывает beat/bar, downbeat confidence, accent/bass, warp
+  phase/rate и alignment error; профиль `off/soft/expressive` сохраняется в
+  `<cache>/motion-profile.cfg`.
+
+Подробности, формулы, baseline/3.1 и ограничения:
+[docs/BG_MOTION_3_1.md](BG_MOTION_3_1.md).
+
 ## 8. Точки расширения под BG Video / BG Effects
 
 Сейчас видео не реализовано. Чтобы добавить его без переписывания ядра:
@@ -405,7 +443,18 @@ BG Beat analysis ─► BeatClock ─► DanceDirector ─► DanceSchedule
   time-stretch.
 - Latency оценивается по периодам устройства; в UI есть sync trim ±150 мс.
 - Нет Android/iOS сборки, видео, эффектов и Telegram-интеграции.
-- BG Motion 3.0 поддерживает VRM 0.x humanoid; VRM 1.0, morph/blink, spring
+- BG Motion 3.1 поддерживает VRM 0.x humanoid; VRM 1.0, morph/blink, spring
   bones и floor collision не входят в текущий этап.
 - In-memory decoder ограничен 1 GiB; для очень длинных файлов нужен стриминговый
   анализ (следующий этап).
+
+
+## BG Motion 3.2 additions
+
+BG Motion 3.2 adds three stages after the 3.1 clip sampler and before skinning:
+
+1. composeMotion() applies independent motion primitives on masked body regions with priority, contact and support-foot checks.
+2. HumanoidRetargeter::applyClip() applies detailed per-finger hand poses and toe roll in addition to the core humanoid and foot IK solve.
+3. SecondaryDynamics simulates VRM 0.x spring chains (hair, coat/skirt, supported soft-tissue chains) on the final retargeted node globals, then the renderer builds skinning matrices.
+
+The musical chain (BG Beat -> BG Sync -> BG Motion) is unchanged. Procedural choreography bakes a model-independent gmotion.clip v2, so runtime sampling remains a pure function of musical time. See docs/BG_MOTION_3_2.md.

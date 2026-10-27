@@ -1,6 +1,7 @@
 #include "framework.hpp"
 
 #include "bgmedia/analysis/Analyzer.hpp"
+#include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "support/SyntheticSignals.hpp"
 
 #include <algorithm>
@@ -90,6 +91,8 @@ struct BeatAgreement {
     double fMeasure = 0.0;
     double meanSignedError = 0.0;
     double p95AbsoluteError = 0.0;
+    double medianAbsMs = 0.0;
+    double p95AbsMs = 0.0;
 };
 
 BeatAgreement scoreBeats(const std::vector<double>& truth,
@@ -154,6 +157,8 @@ BeatAgreement scoreBeats(const std::vector<double>& truth,
         const std::size_t index = static_cast<std::size_t>(
             std::ceil(0.95 * static_cast<double>(absolute.size())) - 1.0);
         score.p95AbsoluteError = absolute[std::min(index, absolute.size() - 1)];
+        score.medianAbsMs = absolute[absolute.size() / 2] * 1000.0;
+        score.p95AbsMs = absolute[std::min(index, absolute.size() - 1)] * 1000.0;
     }
     return score;
 }
@@ -479,4 +484,91 @@ TEST_CASE(analysis.cancellation_is_reported) {
         pcm, {}, [&calls]() { return ++calls > 2; });
     CHECK(report.status == AnalysisStatus::Cancelled);
     CHECK(report.message.find("cancel") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// BG Motion 3.1 corpus: fast pulses, compound meters and tempo ramps
+// ---------------------------------------------------------------------------
+
+TEST_CASE(analysis.fast_four_on_the_floor_is_not_subharmonic) {
+    using namespace bgmedia;
+    for (double bpm : {150.0, 180.0}) {
+        test::TrackOptions options;
+        options.bpm = bpm;
+        options.duration = 20.0;
+        const auto run = analyzeTrack(test::makeClickTrack(options));
+        CHECK_NEAR(run.result.bpm, bpm, 2.0);
+        const BeatAgreement agreement =
+            scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(agreement.fMeasure > 0.90);
+        CHECK(agreement.medianAbsMs < 20.0);
+        CHECK(agreement.p95AbsMs < 30.0);
+        CHECK(run.result.beatsPerBar == 4);
+    }
+}
+
+TEST_CASE(analysis.compound_meter_6_8_and_12_8) {
+    using namespace bgmedia;
+    {
+        const auto run = analyzeTrack(test::makeCompoundTrack(120.0, 2, 20.0, 3));
+        CHECK_NEAR(run.result.bpm, 120.0, 2.0);
+        CHECK(run.result.beatsPerBar == 2);
+        const BeatAgreement agreement =
+            scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(agreement.fMeasure > 0.90);
+        const BeatAgreement downbeats =
+            scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(downbeats.fMeasure > 0.80);
+        const motion::MusicalTimeline timeline =
+            motion::MusicalTimeline::fromAnalysis(run.result);
+        CHECK(timeline.subdivision() == 3);
+        CHECK(timeline.compound());
+        CHECK(timeline.meterLabel().find("6/8") != std::string::npos);
+    }
+    {
+        const auto run = analyzeTrack(test::makeCompoundTrack(90.0, 4, 20.0, 3));
+        CHECK_NEAR(run.result.bpm, 90.0, 2.0);
+        CHECK(run.result.beatsPerBar == 4);
+        const motion::MusicalTimeline timeline =
+            motion::MusicalTimeline::fromAnalysis(run.result);
+        CHECK(timeline.subdivision() == 3);
+        CHECK(timeline.compound());
+        CHECK(timeline.meterLabel().find("12/8") != std::string::npos);
+    }
+}
+
+TEST_CASE(analysis.tempo_ramp_reports_a_piecewise_map) {
+    using namespace bgmedia;
+    const auto run = analyzeTrack(test::makeTempoRampTrack(80.0, 120.0, 24.0));
+    CHECK(!run.result.tempoStable);
+    CHECK(run.result.tempoSegments.size() >= 3);
+    CHECK(!run.result.tempoTransitions.empty());
+    const BeatAgreement agreement =
+        scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 23.0);
+    CHECK(agreement.fMeasure > 0.90);
+    CHECK(agreement.medianAbsMs < 20.0);
+    CHECK(run.result.tempoSegments.front().bpm < 95.0);
+    CHECK(run.result.tempoSegments.back().bpm > 105.0);
+}
+
+TEST_CASE(analysis.strong_hats_and_shifted_accents_keep_the_pulse) {
+    using namespace bgmedia;
+    {
+        const auto run = analyzeTrack(test::makeStrongHatWeakKickTrack(128.0, 20.0));
+        CHECK_NEAR(run.result.bpm, 128.0, 2.0);
+        const BeatAgreement agreement =
+            scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(agreement.fMeasure > 0.90);
+        CHECK(agreement.medianAbsMs < 20.0);
+    }
+    {
+        const auto run = analyzeTrack(test::makeShiftedAccentTrack(100.0, 20.0));
+        CHECK_NEAR(run.result.bpm, 100.0, 2.0);
+        const BeatAgreement agreement =
+            scoreBeats(run.track.beatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(agreement.fMeasure > 0.90);
+        const BeatAgreement downbeats =
+            scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 19.0);
+        CHECK(downbeats.fMeasure > 0.80);
+    }
 }

@@ -3,17 +3,24 @@
 // writes one BMP frame, so renderer problems can be isolated from the UI.
 
 #include "bgmedia/animation/HumanoidRetargeter.hpp"
+#include "bgmedia/animation/SecondaryDynamics.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/DancePlayer.hpp"
+#include "bgmedia/motion3/MotionPrimitive.hpp"
+#include "bgmedia/motion3/ProceduralChoreography.hpp"
 #include "bgmedia/sdlgpu/SdlGpuVrmRenderer.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -70,6 +77,22 @@ int main(int argc, char** argv) {
     double focusY = 0.0;
     double yawDegrees = 180.0;
     double pitch = 0.10;
+    int generatedIndex = -1;
+    std::filesystem::path clipPath;
+    bool overlay = true;
+    bool footworkPrepass = true;  // BG Motion 3.2 stance-level pre-pass for authored clips
+    bool spring = false;
+    float springIntensity = 1.0f;
+    float springDamping = 0.5f;
+    int frames = 1;
+    double fps = 30.0;
+    std::filesystem::path frameDir;
+    std::string playerClip;
+    std::string switchClip;
+    double switchAt = 1.0e9;
+    std::filesystem::path dancesDir = "assets/dances";
+    bool opaqueOverride = false;  // QA: draw every material opaque (no blend, no alpha test)
+    std::vector<std::string> hideMaterials;  // QA: hide materials whose name contains any of these
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) {
@@ -88,6 +111,38 @@ int main(int argc, char** argv) {
             yawDegrees = std::stod(argv[++i]);
         } else if (arg == "--pitch" && i + 1 < argc) {
             pitch = std::stod(argv[++i]);
+        } else if (arg == "--generated" && i + 1 < argc) {
+            generatedIndex = std::atoi(argv[++i]);
+        } else if (arg == "--clip" && i + 1 < argc) {
+            clipPath = std::filesystem::path(argv[++i]);
+        } else if (arg == "--overlay" && i + 1 < argc) {
+            overlay = std::atoi(argv[++i]) != 0;
+        } else if (arg == "--spring" && i + 1 < argc) {
+            spring = std::atoi(argv[++i]) != 0;
+        } else if (arg == "--spring-intensity" && i + 1 < argc) {
+            springIntensity = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--spring-damping" && i + 1 < argc) {
+            springDamping = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--frames" && i + 1 < argc) {
+            frames = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--fps" && i + 1 < argc) {
+            fps = std::max(1.0, std::atof(argv[++i]));
+        } else if (arg == "--framedir" && i + 1 < argc) {
+            frameDir = std::filesystem::path(argv[++i]);
+        } else if (arg == "--footwork" && i + 1 < argc) {
+            footworkPrepass = std::string(argv[++i]) != "off";
+        } else if (arg == "--player" && i + 1 < argc) {
+            playerClip = argv[++i];
+        } else if (arg == "--switch-to" && i + 1 < argc) {
+            switchClip = argv[++i];
+        } else if (arg == "--switch-at" && i + 1 < argc) {
+            switchAt = std::atof(argv[++i]);
+        } else if (arg == "--opaque") {
+            opaqueOverride = true;
+        } else if (arg == "--hide-material" && i + 1 < argc) {
+            hideMaterials.push_back(argv[++i]);
+        } else if (arg == "--dances" && i + 1 < argc) {
+            dancesDir = std::filesystem::path(argv[++i]);
         }
     }
 
@@ -101,6 +156,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "VRM import failed: %s\n", loaded.error.c_str());
         SDL_Quit();
         return 1;
+    }
+    // QA aid for telling apart "the pose is wrong" from "a rigid material overlaps
+    // the body": a hidden material is fully transparent and alpha-tested away.
+    for (bgmedia::vrm::Material& material : loaded.model->materials) {
+        if (opaqueOverride) {
+            material.alphaMode = bgmedia::vrm::AlphaMode::Opaque;
+            material.baseColorFactor.w = 1.0f;
+        }
+        for (const std::string& needle : hideMaterials) {
+            if (material.name.find(needle) != std::string::npos) {
+                material.alphaMode = bgmedia::vrm::AlphaMode::Mask;
+                material.alphaCutoff = 0.5f;
+                material.baseColorFactor.w = 0.0f;
+                material.emissiveFactor.w = 0.0f;
+            }
+        }
     }
     const bgmedia::vrm::VrmModel& model = *loaded.model;
     std::printf("VRM %s: nodes=%d meshes=%d tris=%d materials=%d textures=%d "
@@ -135,6 +206,210 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    bgmedia::sdlgpu::Camera camera;
+    camera.distanceScale = static_cast<float>(zoom);
+    camera.targetYBias = static_cast<float>(focusY);
+    camera.yaw = static_cast<float>(yawDegrees * 3.14159265358979323846 / 180.0);
+    camera.pitch = static_cast<float>(pitch);
+    bgmedia::sdlgpu::RenderSettings settings;
+
+    if (!playerClip.empty() && frames >= 1) {
+        bgmedia::motion::DancePlayer player;
+        const std::size_t loadedCount = player.loadLibrary(dancesDir);
+        if (footworkPrepass) {
+            player.setLegGeometry(rig.legGeometry());
+        } else {
+            player.setFootworkPlanning(false);
+        }
+        if (loadedCount == 0) {
+            std::fprintf(stderr, "no dance clips in %s\n", dancesDir.string().c_str());
+            renderer.shutdown();
+            SDL_Quit();
+            return 1;
+        }
+        player.setOverlayMode(overlay ? bgmedia::motion::OverlayMode::Full
+                                      : bgmedia::motion::OverlayMode::Off);
+        if (!player.selectClip(playerClip, 0.0, true)) {
+            std::fprintf(stderr, "unknown clip %s\n", playerClip.c_str());
+            renderer.shutdown();
+            SDL_Quit();
+            return 1;
+        }
+        bgmedia::animation::SecondaryDynamics secondary(model);
+        bgmedia::animation::SecondarySettings springSettings;
+        springSettings.enabled = spring;
+        springSettings.intensity = springIntensity;
+        springSettings.damping = springDamping;
+        bool switched = false;
+        std::error_code ec;
+        if (frames > 1) {
+            std::filesystem::create_directories(frameDir, ec);
+        } else {
+            std::filesystem::create_directories(outputPath.parent_path(), ec);
+        }
+        std::printf("player %s -> %s @ %.2f, overlay %d, spring %d\n",
+                    playerClip.c_str(), switchClip.c_str(), switchAt, overlay ? 1 : 0,
+                    spring ? 1 : 0);
+        for (int frame = 0; frame < frames; ++frame) {
+            const double frameTime = time + static_cast<double>(frame) / fps;
+            if (!switched && !switchClip.empty() && frameTime >= switchAt) {
+                if (player.selectClip(switchClip, frameTime, false)) {
+                    std::printf("switched to %s at %.2f\n", switchClip.c_str(), frameTime);
+                }
+                switched = true;
+            }
+            const bgmedia::motion::DanceFrame danceFrame = player.update(frameTime);
+            bgmedia::animation::RetargetedPose retargeted =
+                rig.applyClip(danceFrame.pose, frameTime);
+            if (spring) {
+                if (frame == 0) {
+                    secondary.reset(retargeted);
+                }
+                secondary.update(retargeted, frame == 0 ? 0.0 : 1.0 / fps,
+                                 springSettings);
+            }
+            if (!renderer.render(retargeted, camera, settings, &error)) {
+                std::fprintf(stderr, "render failed at frame %d: %s\n", frame,
+                             error.c_str());
+                renderer.shutdown();
+                SDL_Quit();
+                return 1;
+            }
+            std::filesystem::path path = outputPath;
+            if (frames > 1) {
+                char name[64];
+                std::snprintf(name, sizeof name, "frame_%04d.bmp", frame);
+                path = frameDir / name;
+            }
+            SDL_Surface* surface = SDL_CreateSurfaceFrom(
+                renderer.width(), renderer.height(), SDL_PIXELFORMAT_RGBA32,
+                const_cast<std::uint8_t*>(renderer.pixels().data()),
+                renderer.width() * 4);
+            if (!surface || !SDL_SaveBMP(surface, toUtf8(path).c_str())) {
+                std::fprintf(stderr, "frame save failed: %s\n", SDL_GetError());
+                if (surface) SDL_DestroySurface(surface);
+                renderer.shutdown();
+                SDL_Quit();
+                return 1;
+            }
+            SDL_DestroySurface(surface);
+            if (frame == 0 || frame == frames - 1) {
+                const auto& ss = secondary.stats();
+                std::printf("frame %d t=%.2f clip=%s beat=%.2f layers=%d/%d "
+                            "springDisp=%.3fmm\n",
+                            frame, frameTime, danceFrame.clipId.c_str(),
+                            danceFrame.clipBeat, danceFrame.overlayActive,
+                            danceFrame.overlayActive + danceFrame.overlayRejected,
+                            ss.maxDisplacement * 1000.0f);
+            }
+        }
+        std::printf("wrote %d frame(s)\n", frames);
+        renderer.shutdown();
+        SDL_Quit();
+        return 0;
+    }
+
+    if ((generatedIndex >= 0 || !clipPath.empty()) && frames >= 1) {
+        bgmedia::motion::HumanoidClip clip;
+        std::vector<bgmedia::motion::PrimitiveCue> cues;
+        if (!clipPath.empty()) {
+            bgmedia::motion::ClipLoadResult clipLoaded =
+                bgmedia::motion::loadClipFile(clipPath);
+            if (!clipLoaded.ok) {
+                std::fprintf(stderr, "clip load failed: %s\n",
+                             clipLoaded.diagnostics.empty()
+                                 ? "unknown error"
+                                 : clipLoaded.diagnostics.front().message.c_str());
+                renderer.shutdown();
+                SDL_Quit();
+                return 1;
+            }
+            clip = std::move(clipLoaded.clip);
+            cues = bgmedia::motion::planPrimitiveOverlays(clip, 7u, 0.8f, true);
+        } else {
+            std::vector<bgmedia::motion::GeneratedDance> showcase =
+                bgmedia::motion::ProceduralChoreography::showcase();
+            if (generatedIndex < 0 ||
+                static_cast<std::size_t>(generatedIndex) >= showcase.size()) {
+                generatedIndex = 0;
+            }
+            clip = showcase[static_cast<std::size_t>(generatedIndex)].clip;
+            cues = showcase[static_cast<std::size_t>(generatedIndex)].overlays;
+        }
+        bgmedia::animation::SecondaryDynamics secondary(model);
+        bgmedia::animation::SecondarySettings springSettings;
+        springSettings.enabled = spring;
+        springSettings.intensity = springIntensity;
+        springSettings.damping = springDamping;
+        std::printf("clip %s: beats %.0f bpm %.0f cues %zu fingerBones %d "
+                    "springChains %d\n",
+                    clip.id.c_str(), clip.beats, clip.bpm, cues.size(),
+                    model.fingerBoneCount(), secondary.chainCount());
+        std::error_code ec;
+        if (frames > 1) {
+            std::filesystem::create_directories(frameDir, ec);
+        } else {
+            std::filesystem::create_directories(outputPath.parent_path(), ec);
+        }
+        for (int frame = 0; frame < frames; ++frame) {
+            const double frameTime = time + static_cast<double>(frame) / fps;
+            const double beat = frameTime * clip.bpm / 60.0;
+            bgmedia::motion::ClipPose pose = bgmedia::motion::sampleClip(clip, beat);
+            if (overlay && !cues.empty()) {
+                bgmedia::motion::CompositionOptions options;
+                bgmedia::motion::ComposedPose composed = bgmedia::motion::composeMotion(
+                    pose, cues, beat, clip.beats, clip.loop, options);
+                pose = composed.pose;
+            }
+            bgmedia::animation::RetargetedPose retargeted =
+                rig.applyClip(pose, frameTime);
+            if (spring) {
+                if (frame == 0) {
+                    secondary.reset(retargeted);
+                }
+                secondary.update(retargeted, frame == 0 ? 0.0 : 1.0 / fps,
+                                 springSettings);
+            }
+            if (!renderer.render(retargeted, camera, settings, &error)) {
+                std::fprintf(stderr, "render failed at frame %d: %s\n", frame,
+                             error.c_str());
+                renderer.shutdown();
+                SDL_Quit();
+                return 1;
+            }
+            std::filesystem::path path = outputPath;
+            if (frames > 1) {
+                char name[64];
+                std::snprintf(name, sizeof name, "frame_%04d.bmp", frame);
+                path = frameDir / name;
+            }
+            SDL_Surface* surface = SDL_CreateSurfaceFrom(
+                renderer.width(), renderer.height(), SDL_PIXELFORMAT_RGBA32,
+                const_cast<std::uint8_t*>(renderer.pixels().data()),
+                renderer.width() * 4);
+            if (!surface || !SDL_SaveBMP(surface, toUtf8(path).c_str())) {
+                std::fprintf(stderr, "frame save failed: %s\n", SDL_GetError());
+                if (surface) SDL_DestroySurface(surface);
+                renderer.shutdown();
+                SDL_Quit();
+                return 1;
+            }
+            SDL_DestroySurface(surface);
+            if (frame == 0 || frame == frames - 1) {
+                const auto& ss = secondary.stats();
+                std::printf("frame %d t=%.2f beat=%.2f wrist=%d footErr=%.4f "
+                            "springDisp=%.4f stretch=%.4f maxA=%.2fms\n",
+                            frame, frameTime, beat, pose.detailedHands ? 1 : 0,
+                            retargeted.stats.maxFootError, ss.maxDisplacement,
+                            ss.maxStretch, ss.simulateMilliseconds);
+            }
+        }
+        std::printf("wrote %d frame(s)\n", frames);
+        renderer.shutdown();
+        SDL_Quit();
+        return 0;
+    }
+
     const bgmedia::AnalysisResult analysis = makeSyntheticAnalysis(bpm, 120.0);
     const bgmedia::Choreography choreography =
         bgmedia::ChoreographyBuilder{}.build(analysis);
@@ -150,25 +425,17 @@ int main(int argc, char** argv) {
     const auto view = bgmedia::math::lookAtLH(eye, target, {0.0f, 1.0f, 0.0f});
     const auto proj = bgmedia::math::perspectiveFovLH(0.56f, 1.5f, 0.03f, 200.0f);
     const auto vp = proj * view;
-    const auto clip = [&](bgmedia::math::Vec3 p) {
+    const auto clipPoint = [&](bgmedia::math::Vec3 p) {
         const auto m = vp.m;
         return bgmedia::math::Vec4{m[0]*p.x + m[4]*p.y + m[8]*p.z + m[12],
                                    m[1]*p.x + m[5]*p.y + m[9]*p.z + m[13],
                                    m[2]*p.x + m[6]*p.y + m[10]*p.z + m[14],
                                    m[3]*p.x + m[7]*p.y + m[11]*p.z + m[15]};
     };
-    const auto c = clip(target);
+    const auto c = clipPoint(target);
     std::printf("camera eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) clip center=(%.3f,%.3f,%.3f,%.3f) ndc=(%.3f,%.3f)\n",
                 eye.x, eye.y, eye.z, target.x, target.y, target.z, c.x, c.y, c.z, c.w,
                 c.x / c.w, c.y / c.w);
-
-
-    bgmedia::sdlgpu::Camera camera;
-    camera.distanceScale = static_cast<float>(zoom);
-    camera.targetYBias = static_cast<float>(focusY);
-    camera.yaw = static_cast<float>(yawDegrees * 3.14159265358979323846 / 180.0);
-    camera.pitch = static_cast<float>(pitch);
-    bgmedia::sdlgpu::RenderSettings settings;
     if (!renderer.render(retargeted, camera, settings, &error)) {
         std::fprintf(stderr, "render failed: %s\n", error.c_str());
         renderer.shutdown();

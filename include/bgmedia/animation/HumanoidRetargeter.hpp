@@ -9,6 +9,7 @@
 // pose by HumanoidRetargeter's constructor.
 
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/ClipFootwork.hpp"
 #include "bgmedia/motion3/DanceClip.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
@@ -43,6 +44,47 @@ struct RetargetOptions {
 
     bool footIK = true;
     bool idleMotion = true;
+
+    // BG Motion 3.2 quality pass: keeps the forearms and hands out of the torso.
+    // Proxy based (an elliptical torso cylinder and arm spheres calibrated from
+    // the model's rest mesh), NOT an exact mesh intersection test.
+    bool armCollision = true;
+    float armClearanceMargin = 0.004f;  // extra gap, in character heights
+
+    // Keeps one leg out of the other (thigh/shin/foot capsules calibrated from the mesh).
+    // EXPERIMENTAL, OFF by default: it cannot separate legs that the clip itself planted
+    // crossed, and on authored clips it shows foot drag (see the quality pass doc).
+    bool legCollision = false;
+    float legClearanceMargin = 0.004f;  // extra gap, in character heights
+};
+
+// Torso cross-section samples along the spine (waist ... shoulders).
+inline constexpr int kProxyBands = 5;
+
+// Calibrated collision proxies of one model (metres, model space).
+struct CollisionProxyInfo {
+    bool valid = false;
+    bool fromMesh = false;   // false: proportions estimated from the skeleton
+    // Torso cross-section half extents at kProxyBands heights along the spine
+    // (band centres, waist ... shoulders); linearly interpolated.
+    float torsoHalfWidth = 0.0f;   // widest band
+    float torsoHalfFront = 0.0f;   // deepest band
+    float torsoHalfBack = 0.0f;
+    float bandWidth[kProxyBands] = {};
+    float bandFront[kProxyBands] = {};
+    float bandBack[kProxyBands] = {};
+    float fingerRadius = 0.0f;
+    float thighRadius = 0.0f;   // leg proxies (P90 of the skinned vertices to the bone segment)
+    float shinRadius = 0.0f;
+    float footRadius = 0.0f;
+    float footLength = 0.0f;    // ankle to toe tip
+    float legRadiusScale = 1.0f; // < 1: radii were reduced so the model's own stance is clear
+    // Cross-section shape |x/a|^p + |z/b|^p = 1: p = 2 is an ellipse, larger p is boxier
+    // (a vest). Fitted so that the proxy contains at least 94 % of the torso vertices.
+    float shapeExponent = 2.0f;
+    float upperArmRadius = 0.0f;
+    float foreArmRadius = 0.0f;
+    float handRadius = 0.0f;
 };
 
 struct RetargetStats {
@@ -51,16 +93,41 @@ struct RetargetStats {
     double retargetMilliseconds = 0.0;
     float height = 0.0f;
     float hipDrop = 0.0f;
+    // Largest distance, on the *evaluated* skeleton, between a foot joint and
+    // its requested target (reach deficit and solver error combined).
     float maxFootError = 0.0f;
+    // Largest distance between the evaluated foot joint and the closest point
+    // the leg chain can reach: error attributable to the solver/rig alone.
+    float footSolverError = 0.0f;
     float lowestFootY = 0.0f;
+
+    // Arm/torso proxy clearance (metres; positive = clear). `Raw` is before the
+    // refinement, `Min` after it. Proxy distances, not mesh distances.
+    bool armProxy = false;
+    float armClearanceRaw = 0.0f;
+    float armClearanceMin = 0.0f;
+    float armCorrection = 0.0f;       // largest wrist/elbow displacement applied
+    float armCorrectionElbow = 0.0f;  // ... of the elbow alone
+    float armCorrectionWrist = 0.0f;  // ... of the wrist alone
+    bool armCorrectionClamped = false;  // safe fallback limited the correction
+
+    // Leg-vs-leg proxy clearance (metres, positive = clear), before / after the correction.
+    bool legProxy = false;
+    float legClearanceRaw = 0.0f;
+    float legClearanceMin = 0.0f;
+    float legCorrection = 0.0f;         // largest foot-target displacement applied (m)
+    bool legConflictPlanted = false;    // both feet planted and overlapping: nothing may move
     int resolvedBones = 0;
     int missingBones = 0;
+    int fingerBones = 0;       // finger nodes present on the model
+    bool detailedHands = false;  // per-finger pose was applied
+    bool secondaryApplied = false;
 
     // BG Motion 3.0 (applyClip) diagnostics.
     bool clipDriven = false;
     float requestedHipDrop = 0.0f;  // authored, metres
     float reachHipDrop = 0.0f;      // extra drop added so planted feet are reachable
-    float footReachDeficit = 0.0f;  // metres a target stayed unreachable (0 = ok)
+    float footReachDeficit = 0.0f;  // metres a target lay beyond the legs' reach (0 = ok)
 };
 
 struct RetargetedPose {
@@ -92,6 +159,10 @@ public:
     HumanoidRetargeter& operator=(const HumanoidRetargeter&) = delete;
 
     [[nodiscard]] bool valid() const;
+    [[nodiscard]] CollisionProxyInfo collisionProxy() const;
+    // This model's lower body in the planner's reference units (cm at 160 cm height), for
+    // motion::planClipFootwork. Falls back to the reference body when the rig is incomplete.
+    [[nodiscard]] motion::LegGeometry legGeometry() const;
     [[nodiscard]] const std::string& error() const;
 
     // Deterministic: the output depends only on pose, mediaTime and options,

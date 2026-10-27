@@ -11,6 +11,8 @@ struct VrmScene::Impl {
     sdlgpu::SdlGpuVrmRenderer renderer;
     std::unique_ptr<vrm::VrmModel> model;
     std::unique_ptr<animation::HumanoidRetargeter> retargeter;
+    std::unique_ptr<animation::SecondaryDynamics> secondary;
+    animation::SecondarySettings secondarySettings;
     animation::RetargetedPose lastPose;
     sdlgpu::RenderSettings settings;
     SDL_Texture* texture = nullptr;
@@ -21,6 +23,8 @@ struct VrmScene::Impl {
     std::string warning;
     std::string renderError;
     double lastRetargetMs = 0.0;
+    double lastMediaTime = 0.0;
+    bool haveMediaTime = false;
 
     void destroyTexture() {
         if (texture) {
@@ -29,6 +33,25 @@ struct VrmScene::Impl {
         }
         textureWidth = 0;
         textureHeight = 0;
+    }
+
+    void applySecondary(double mediaTime) {
+        if (!secondary || !secondary->available()) {
+            return;
+        }
+        const bool seek = haveMediaTime &&
+                          (mediaTime < lastMediaTime - 0.05 ||
+                           mediaTime > lastMediaTime + 0.5);
+        if (!haveMediaTime || seek) {
+            secondary->reset(lastPose);
+            lastMediaTime = mediaTime;
+            haveMediaTime = true;
+            secondary->update(lastPose, 0.0, secondarySettings);
+            return;
+        }
+        const double dt = std::max(0.0, mediaTime - lastMediaTime);
+        lastMediaTime = mediaTime;
+        secondary->update(lastPose, dt, secondarySettings);
     }
 };
 
@@ -101,6 +124,10 @@ bool VrmScene::load(const std::filesystem::path& path, std::string* error) {
     }
     impl_->model = std::move(model);
     impl_->retargeter = std::move(retargeter);
+    impl_->secondary = std::make_unique<animation::SecondaryDynamics>(*impl_->model);
+    impl_->lastPose = {};
+    impl_->haveMediaTime = false;
+    impl_->lastMediaTime = 0.0;
     impl_->warning = std::move(warning);
     impl_->lastRetargetMs = 0.0;
     return true;
@@ -109,6 +136,7 @@ bool VrmScene::load(const std::filesystem::path& path, std::string* error) {
 void VrmScene::unload() {
     impl_->renderer.releaseModel();
     impl_->destroyTexture();
+    impl_->secondary.reset();
     impl_->model.reset();
     impl_->retargeter.reset();
     impl_->lastPose = {};
@@ -116,6 +144,8 @@ void VrmScene::unload() {
     impl_->warning.clear();
     impl_->renderError.clear();
     impl_->lastRetargetMs = 0.0;
+    impl_->haveMediaTime = false;
+    impl_->lastMediaTime = 0.0;
 }
 
 bool VrmScene::render(const CharacterPose& pose, double mediaTime,
@@ -138,6 +168,7 @@ bool VrmScene::render(const CharacterPose& pose, double mediaTime,
         }
         return false;
     }
+    impl_->applySecondary(mediaTime);
     if (!impl_->renderer.render(impl_->lastPose, camera, settings, error)) {
         return false;
     }
@@ -164,6 +195,7 @@ bool VrmScene::renderClip(const motion::ClipPose& pose, double mediaTime,
         }
         return false;
     }
+    impl_->applySecondary(mediaTime);
     if (!impl_->renderer.render(impl_->lastPose, camera, settings, error)) {
         return false;
     }
@@ -259,5 +291,33 @@ const std::string& VrmScene::warning() const { return impl_->warning; }
 const std::string& VrmScene::renderError() const { return impl_->renderError; }
 
 double VrmScene::lastRetargetMs() const { return impl_->lastRetargetMs; }
+
+motion::LegGeometry VrmScene::legGeometry() const {
+    return impl_->retargeter ? impl_->retargeter->legGeometry() : motion::LegGeometry{};
+}
+
+bool VrmScene::secondaryAvailable() const {
+    return impl_->secondary && impl_->secondary->available();
+}
+
+animation::SecondarySettings& VrmScene::secondarySettings() {
+    return impl_->secondarySettings;
+}
+
+const animation::SecondarySettings& VrmScene::secondarySettings() const {
+    return impl_->secondarySettings;
+}
+
+const animation::SecondaryStats& VrmScene::secondaryStats() const {
+    static const animation::SecondaryStats empty;
+    return impl_->secondary ? impl_->secondary->stats() : empty;
+}
+
+void VrmScene::resetSecondary() {
+    if (impl_->secondary) {
+        impl_->secondary->reset(impl_->lastPose);
+        impl_->haveMediaTime = true;
+    }
+}
 
 } // namespace bgmedia::desktop

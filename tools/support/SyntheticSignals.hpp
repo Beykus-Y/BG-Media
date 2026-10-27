@@ -70,6 +70,22 @@ struct TrackOptions {
 [[nodiscard]] SyntheticTrack makeDriftTrack(double bpm = 80.0,
                                             double duration = 18.0);
 
+// Compound-meter material: `pulsesPerBar` dotted-quarter pulses, each divided
+// into `subdivision` equal parts. 6/8 = 2 pulses, 12/8 = 4 pulses.
+[[nodiscard]] SyntheticTrack makeCompoundTrack(double pulseBpm, int pulsesPerBar,
+                                               double duration = 24.0,
+                                               int subdivision = 3);
+// Loud offbeat hats over a deliberately weak kick: the grid must stay on the
+// low pulse, not on the hi-hat layer.
+[[nodiscard]] SyntheticTrack makeStrongHatWeakKickTrack(double bpm = 128.0,
+                                                        double duration = 20.0);
+// Continuous tempo ramp (no sudden segment boundary).
+[[nodiscard]] SyntheticTrack makeTempoRampTrack(double bpmA, double bpmB,
+                                                double duration = 24.0);
+// Syncopated accents: kick only on downbeats, snares/bass shifted off the beat.
+[[nodiscard]] SyntheticTrack makeShiftedAccentTrack(double bpm = 100.0,
+                                                     double duration = 20.0);
+
 // 16-bit RIFF/WAVE writer used by tests and the fixture generator.
 bool writeWav16(const std::filesystem::path& path, const AudioData& audio,
                 std::string* error = nullptr);

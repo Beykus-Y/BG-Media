@@ -432,8 +432,27 @@ double numberField(const JsonValue* object, std::string_view key,
     return value && value->isNumber() ? value->number : fallback;
 }
 
-Vec4 vec4Field(const JsonValue* object, std::string_view key, Vec4 fallback) {
+Vec3 vec3Field(const JsonValue* object, std::string_view key, Vec3 fallback) {
     const JsonValue* value = objectField(object, key);
+    if (!value) {
+        return fallback;
+    }
+    if (value->isObject()) {
+        return {static_cast<float>(numberField(value, "x", fallback.x)),
+                static_cast<float>(numberField(value, "y", fallback.y)),
+                static_cast<float>(numberField(value, "z", fallback.z))};
+    }
+    if (value->isArray() && value->items.size() >= 3 &&
+        value->items[0].isNumber() && value->items[1].isNumber() &&
+        value->items[2].isNumber()) {
+        return {static_cast<float>(value->items[0].number),
+                static_cast<float>(value->items[1].number),
+                static_cast<float>(value->items[2].number)};
+    }
+    return fallback;
+}
+
+Vec4 vec4Field(const JsonValue* object, std::string_view key, Vec4 fallback) {    const JsonValue* value = objectField(object, key);
     if (!value || !value->isArray() || value->items.size() < 4) {
         return fallback;
     }
@@ -883,6 +902,13 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
                           ? model->sourcePath
                           : model->sourcePath.substr(slash + 1);
     }
+    if (const JsonValue* blendShapes = objectField(vrm, "blendShapeMaster")) {
+        if (const JsonValue* groups = objectField(blendShapes, "blendShapeGroups")) {
+            if (groups->isArray()) {
+                model->diagnostics.blendShapeCount = static_cast<int>(groups->items.size());
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Nodes, hierarchy and bind transforms
@@ -1094,6 +1120,255 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
     if (countMissingCoreBones(*model) > 0) {
         model->warnings.push_back("humanoid bindings missing: " +
                                   missingBoneList(*model));
+    }
+
+    // ------------------------------------------------------------------
+    // Optional finger mapping (VRM 0.x humanoid bone names)
+    // ------------------------------------------------------------------
+    {
+        static constexpr const char* kSides[2] = {"left", "right"};
+        static constexpr const char* kFingers[5] = {"Thumb", "Index", "Middle",
+                                                    "Ring", "Little"};
+        static constexpr const char* kJoints[3] = {"Proximal", "Intermediate",
+                                                   "Distal"};
+        for (const HumanoidEntry& entry : model->humanoidEntries) {
+            if (entry.node < 0 ||
+                static_cast<std::size_t>(entry.node) >= model->nodes.size()) {
+                continue;
+            }
+            bool matched = false;
+            for (int side = 0; side < 2 && !matched; ++side) {
+                for (int finger = 0; finger < kFingerCount && !matched; ++finger) {
+                    for (int joint = 0; joint < kFingerJointCount && !matched; ++joint) {
+                        const std::string name =
+                            std::string(kSides[side]) + kFingers[finger] + kJoints[joint];
+                        if (entry.name == name) {
+                            model->fingerNodes[static_cast<std::size_t>(side)]
+                                               [static_cast<std::size_t>(finger)]
+                                               [static_cast<std::size_t>(joint)] = entry.node;
+                            matched = true;
+                        }
+                    }
+                }
+            }
+        }
+        model->diagnostics.fingerBoneCount = model->fingerBoneCount();
+    }
+
+    // ------------------------------------------------------------------
+    // Secondary animation (VRM 0.x extensions.VRM.secondaryAnimation)
+    // ------------------------------------------------------------------
+    {
+        const JsonValue* secondary = objectField(vrm, "secondaryAnimation");
+        if (secondary && secondary->isObject()) {
+            model->springSource = "VRM.secondaryAnimation";
+            const auto validNode = [&](double raw) {
+                return raw >= 0.0 &&
+                       raw <= static_cast<double>(model->nodes.size() - 1) &&
+                       std::floor(raw) == raw;
+            };
+            if (const JsonValue* colliderGroups =
+                    objectField(secondary, "colliderGroups")) {
+                if (colliderGroups->isArray()) {
+                    for (const JsonValue& group : colliderGroups->items) {
+                        SpringColliderGroup parsed;
+                        const double rawNode = numberField(&group, "node", -1.0);
+                        if (!validNode(rawNode)) {
+                            model->warnings.push_back(
+                                "secondaryAnimation: ignored collider group with an invalid node");
+                            // Keep an empty placeholder: boneGroups reference collider
+                            // groups by their ORIGINAL index, so skipping the entry
+                            // would silently re-point every later reference.
+                            model->springColliderGroups.push_back(std::move(parsed));
+                            continue;
+                        }
+                        parsed.node = static_cast<int>(rawNode);
+                        if (const JsonValue* colliders =
+                                objectField(&group, "colliders")) {
+                            if (colliders->isArray()) {
+                                for (const JsonValue& collider : colliders->items) {
+                                    SpringCollider item;
+                                    item.offset = vec3Field(&collider, "offset", {});
+                                    item.radius = static_cast<float>(
+                                        std::max(0.0, numberField(&collider, "radius", 0.0)));
+                                    if (!math::finite(item.offset) ||
+                                        !std::isfinite(item.radius) ||
+                                        item.radius <= 0.0f) {
+                                        model->warnings.push_back(
+                                            "secondaryAnimation: ignored invalid collider sphere");
+                                        continue;
+                                    }
+                                    parsed.colliders.push_back(item);
+                                }
+                            }
+                        }
+                        model->springColliderGroups.push_back(std::move(parsed));
+                    }
+                }
+            }
+            const int colliderGroupCount =
+                static_cast<int>(model->springColliderGroups.size());
+            if (const JsonValue* groups = objectField(secondary, "boneGroups")) {
+                if (groups->isArray()) {
+                    for (const JsonValue& group : groups->items) {
+                        SpringBoneGroup parsed;
+                        parsed.comment = stringField(&group, "comment");
+                        const double center = numberField(&group, "center", -1.0);
+                        if (validNode(center)) {
+                            parsed.center = static_cast<int>(center);
+                        }
+                        double stiffness = numberField(&group, "stiffiness",
+                                                      numberField(&group, "stiffness", 0.5));
+                        parsed.stiffness = std::clamp(static_cast<float>(stiffness), 0.0f, 1.0f);
+                        parsed.gravityPower = std::clamp(
+                            static_cast<float>(numberField(&group, "gravityPower", 0.0)),
+                            0.0f, 10.0f);
+                        parsed.dragForce = std::clamp(
+                            static_cast<float>(numberField(&group, "dragForce", 0.1)),
+                            0.0f, 1.0f);
+                        parsed.hitRadius = std::max(
+                            0.0f, static_cast<float>(numberField(&group, "hitRadius", 0.01)));
+                        parsed.gravityDir = vec3Field(&group, "gravityDir",
+                                                      {0.0f, -1.0f, 0.0f});
+                        if (!math::finite(parsed.gravityDir) ||
+                            parsed.gravityDir.lengthSquared() < 1.0e-6f) {
+                            parsed.gravityDir = {0.0f, -1.0f, 0.0f};
+                        }
+                        if (const JsonValue* bones = objectField(&group, "bones")) {
+                            if (bones->isArray()) {
+                                for (const JsonValue& bone : bones->items) {
+                                    if (!bone.isNumber() || !validNode(bone.number)) {
+                                        model->warnings.push_back(
+                                            "secondaryAnimation: ignored invalid spring bone node");
+                                        continue;
+                                    }
+                                    parsed.roots.push_back(
+                                        static_cast<int>(bone.number));
+                                }
+                            }
+                        }
+                        if (const JsonValue* refs =
+                                objectField(&group, "colliderGroups")) {
+                            if (refs->isArray()) {
+                                for (const JsonValue& ref : refs->items) {
+                                    if (!ref.isNumber() ||
+                                        ref.number < 0.0 ||
+                                        ref.number >= static_cast<double>(colliderGroupCount) ||
+                                        std::floor(ref.number) != ref.number) {
+                                        model->warnings.push_back(
+                                            "secondaryAnimation: ignored invalid collider group reference");
+                                        continue;
+                                    }
+                                    parsed.colliderGroups.push_back(
+                                        static_cast<int>(ref.number));
+                                }
+                            }
+                        }
+                        if (parsed.roots.empty()) {
+                            continue;
+                        }
+                        model->springGroups.push_back(std::move(parsed));
+                    }
+                }
+            }
+
+            // Expand groups into linear chains. A node can be listed as a root
+            // in a later group (the coat skirt does this); such a node starts a
+            // new chain and ends the parent chain, which avoids simulating the
+            // same transform twice.
+            std::vector<char> isRoot(model->nodes.size(), 0);
+            for (const SpringBoneGroup& group : model->springGroups) {
+                for (int root : group.roots) {
+                    if (root >= 0 && static_cast<std::size_t>(root) < isRoot.size()) {
+                        isRoot[static_cast<std::size_t>(root)] = 1;
+                    }
+                }
+            }
+            const std::size_t groupCount = model->springGroups.size();
+            for (std::size_t g = 0; g < groupCount; ++g) {
+                const SpringBoneGroup& group = model->springGroups[g];
+                // A root's subtree is a tree, not a line: at a branching node the
+                // first child continues the chain and every other child starts a
+                // branch chain anchored at the branch point. Each node is written
+                // by exactly one chain; the anchor belongs to the parent chain.
+                const auto makeChain = [&](int root) {
+                    struct Pending {
+                        int parentChain;
+                        int parentIndex;
+                        int node;
+                    };
+                    std::vector<Pending> queue;
+                    queue.push_back({-1, 0, root});
+                    constexpr int kMaxChain = 24;
+                    constexpr std::size_t kMaxBranchChains = 512;
+                    for (std::size_t q = 0; q < queue.size(); ++q) {
+                        const Pending item = queue[q];
+                        SpringBoneChain chain;
+                        chain.group = static_cast<int>(g);
+                        chain.colliderGroups = group.colliderGroups;
+                        chain.stiffness = group.stiffness;
+                        chain.gravityPower = group.gravityPower;
+                        chain.dragForce = group.dragForce;
+                        chain.hitRadius = group.hitRadius;
+                        chain.gravityDir = group.gravityDir;
+                        chain.parentChain = item.parentChain;
+                        chain.parentIndex = item.parentIndex;
+                        if (item.parentChain >= 0) {
+                            const auto& parentNodes =
+                                model->springChains[static_cast<std::size_t>(item.parentChain)].nodes;
+                            chain.nodes.push_back(
+                                parentNodes[static_cast<std::size_t>(item.parentIndex)]);
+                        }
+                        const int myIndex = static_cast<int>(model->springChains.size());
+                        chain.nodes.push_back(item.node);
+                        int current = item.node;
+                        for (int depth = 0; depth < kMaxChain; ++depth) {
+                            const Node& node = model->nodes[static_cast<std::size_t>(current)];
+                            int next = -1;
+                            for (int child : node.children) {
+                                if (child < 0 ||
+                                    static_cast<std::size_t>(child) >= model->nodes.size()) {
+                                    continue;
+                                }
+                                if (isRoot[static_cast<std::size_t>(child)] && child != root) {
+                                    // A different group simulates this subtree.
+                                    continue;
+                                }
+                                if (next < 0) {
+                                    next = child;
+                                } else if (queue.size() < kMaxBranchChains) {
+                                    queue.push_back(
+                                        {myIndex, static_cast<int>(chain.nodes.size()) - 1, child});
+                                }
+                            }
+                            if (next < 0) {
+                                break;
+                            }
+                            chain.nodes.push_back(next);
+                            current = next;
+                        }
+                        model->springChains.push_back(std::move(chain));
+                    }
+                };
+                for (int root : group.roots) {
+                    if (root >= 0 && static_cast<std::size_t>(root) < model->nodes.size()) {
+                        makeChain(root);
+                    }
+                }
+            }
+            model->diagnostics.springGroupCount =
+                static_cast<int>(model->springGroups.size());
+            model->diagnostics.springChainCount =
+                static_cast<int>(model->springChains.size());
+            model->diagnostics.springBoneCount = model->springBoneCount();
+            model->diagnostics.springColliderGroupCount =
+                static_cast<int>(model->springColliderGroups.size());
+            int colliderCount = 0;
+            for (const SpringColliderGroup& group : model->springColliderGroups) {
+                colliderCount += static_cast<int>(group.colliders.size());
+            }
+            model->diagnostics.springColliderCount = colliderCount;
+        }
     }
 
     // ------------------------------------------------------------------
