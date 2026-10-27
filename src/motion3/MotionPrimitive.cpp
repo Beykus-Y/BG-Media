@@ -1,6 +1,7 @@
 #include "bgmedia/motion3/MotionPrimitive.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -87,9 +88,10 @@ struct Rng {
 // --- metadata --------------------------------------------------------------
 
 const std::vector<PrimitiveMetadata>& buildLibrary() {
-    static const std::vector<PrimitiveMetadata> library = {
+    static const std::vector<PrimitiveMetadata> library = [] {
+    std::vector<PrimitiveMetadata> v = {
         {PrimitiveKind::ArmWave, "armWave", "Arm wave", MotionCategory::Arm,
-         body::LeftArm | body::RightArm, BlendMode::Additive, 2.0f, 0.75f, 4.0f,
+         body::Arms | body::Hands, BlendMode::Additive, 2.0f, 0.75f, 4.0f,
          0.25f, 1.0f, 42, true, false, false, false, false,
          "A travelling wave from shoulder to wrist, one arm leading."},
         {PrimitiveKind::AlternatingArmSwing, "armSwing", "Alternating arm swing",
@@ -105,7 +107,7 @@ const std::vector<PrimitiveMetadata>& buildLibrary() {
          0.2f, 1.0f, 44, true, false, false, false, false,
          "A continuous roll around the forearm axis."},
         {PrimitiveKind::ArmReach, "armReach", "Arm reach", MotionCategory::Arm,
-         body::LeftArm | body::RightArm, BlendMode::Additive, 1.5f, 0.75f, 3.0f,
+         body::Arms | body::Hands, BlendMode::Additive, 1.5f, 0.75f, 3.0f,
          0.25f, 1.0f, 47, false, false, false, false, false,
          "A prepared diagonal reach with a controlled elbow and open hand."},
         {PrimitiveKind::ShoulderAccent, "shoulderAccent", "Shoulder accent",
@@ -136,14 +138,14 @@ const std::vector<PrimitiveMetadata>& buildLibrary() {
          BlendMode::Additive, 0.5f, 0.25f, 2.0f, 0.15f, 1.0f, 32, true, false, false,
          false, false, "A small, springy bounce that never moves a planted foot."},
         {PrimitiveKind::HipSway, "hipSway", "Hip sway", MotionCategory::FullBody,
-         body::Pelvis, BlendMode::Additive, 1.0f, 0.5f, 2.0f, 0.2f, 1.0f, 36, true,
+         body::Pelvis | body::Spine, BlendMode::Additive, 1.0f, 0.5f, 2.0f, 0.2f, 1.0f, 36, true,
          false, false, false, false, "Lateral pelvis shift with a soft roll."},
         {PrimitiveKind::WeightShift, "weightShift", "Weight shift",
-         MotionCategory::FullBody, body::Pelvis | body::Legs, BlendMode::Additive, 1.0f,
-         0.75f, 2.0f, 0.25f, 1.0f, 54, true, false, true, false, false,
+         MotionCategory::FullBody, body::Pelvis | body::Spine | body::Chest | body::Legs,
+         BlendMode::Additive, 1.0f, 0.75f, 2.0f, 0.25f, 1.0f, 54, true, false, true, false, false,
          "Transfers the body over the loaded leg; both feet stay planted."},
         {PrimitiveKind::SideStep, "sideStep", "Side step", MotionCategory::Footwork,
-         body::Pelvis | body::Legs | body::Feet, BlendMode::Additive, 1.0f, 0.75f, 2.0f,
+         body::Pelvis | body::Spine | body::Legs | body::Feet, BlendMode::Additive, 1.0f, 0.75f, 2.0f,
          0.3f, 1.0f, 66, true, false, true, true, false,
          "A lateral step with a knee lift and a hip-led landing."},
         {PrimitiveKind::StepTouch, "stepTouch", "Step touch", MotionCategory::Footwork,
@@ -193,6 +195,15 @@ const std::vector<PrimitiveMetadata>& buildLibrary() {
          BlendMode::Additive, 1.25f, 0.75f, 2.5f, 0.25f, 1.0f, 68, false, false, false,
          false, true, "Raises the arm and extends one finger while the rest relax."},
     };
+    // `side` only picks the lead/direction of these; they always involve both
+    // limbs, so the side must not narrow their mask.
+    for (PrimitiveMetadata& m : v) {
+        m.bilateral = m.kind == PrimitiveKind::WeightShift ||
+                      m.kind == PrimitiveKind::KneeBounce ||
+                      m.kind == PrimitiveKind::StepTouch;
+    }
+    return v;
+    }();
     return library;
 }
 
@@ -310,6 +321,46 @@ const char* blendModeName(BlendMode mode) {
     return "additive";
 }
 
+BodyMask maskBitForBone(HumanoidBone bone) {
+    switch (bone) {
+    case HumanoidBone::Hips: return body::Pelvis;
+    case HumanoidBone::Spine: return body::Spine;
+    case HumanoidBone::Chest:
+    case HumanoidBone::UpperChest: return body::Chest;
+    case HumanoidBone::Neck:
+    case HumanoidBone::Head: return body::Head;
+    case HumanoidBone::LeftShoulder:
+    case HumanoidBone::RightShoulder: return body::Shoulders;
+    case HumanoidBone::LeftUpperArm:
+    case HumanoidBone::LeftLowerArm: return body::LeftArm;
+    case HumanoidBone::RightUpperArm:
+    case HumanoidBone::RightLowerArm: return body::RightArm;
+    case HumanoidBone::LeftHand: return body::LeftHand;
+    case HumanoidBone::RightHand: return body::RightHand;
+    case HumanoidBone::LeftUpperLeg:
+    case HumanoidBone::LeftLowerLeg: return body::LeftLeg;
+    case HumanoidBone::RightUpperLeg:
+    case HumanoidBone::RightLowerLeg: return body::RightLeg;
+    case HumanoidBone::LeftFoot:
+    case HumanoidBone::LeftToes: return body::LeftFoot;
+    case HumanoidBone::RightFoot:
+    case HumanoidBone::RightToes: return body::RightFoot;
+    default: return body::None;
+    }
+}
+
+BodyMask narrowMaskToSide(BodyMask mask, int side) {
+    if (side == 0) {
+        return mask & ~(body::RightArm | body::RightHand | body::RightLeg |
+                        body::RightFoot);
+    }
+    if (side == 1) {
+        return mask & ~(body::LeftArm | body::LeftHand | body::LeftLeg |
+                        body::LeftFoot);
+    }
+    return mask;
+}
+
 bool masksConflict(BodyMask a, BodyMask b) {
     const BodyMask shared = a & b;
     // Hands/arms are separate layers by design. A torso cue and an arm cue can
@@ -370,7 +421,6 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
             swingArm(pose, arm, (28.0f * wave * sign) * amp);
             raiseArm(pose, arm, (10.0f + 8.0f * std::abs(wave)) * amp);
             bendElbow(pose, arm, (26.0f + 14.0f * std::max(0.0f, wave * sign)) * amp);
-            relaxHands(pose, 0.22f);
         }
         pose.mask = side >= 0 ? (side == 0 ? body::LeftArm : body::RightArm)
                               : body::LeftArm | body::RightArm;
@@ -434,9 +484,8 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
             setBone(pose,
                     sd == 0 ? HumanoidBone::LeftShoulder : HumanoidBone::RightShoulder,
                     axisAngle(kZ, -sign * 12.0f * up));
-            setBone(pose,
-                    sd == 0 ? HumanoidBone::LeftUpperArm : HumanoidBone::RightUpperArm,
-                    axisAngle(kZ, -sign * 5.0f * up));
+            // The arm hangs from the shoulder and inherits this lift; rotating
+            // the upper arm as well would write outside the Shoulders|Chest mask.
         }
         addBoneParent(pose, HumanoidBone::Chest, axisAngle(kY, 4.0f * up * (first == 0 ? 1.0f : -1.0f)));
         pose.mask = body::Shoulders;
@@ -567,8 +616,8 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         const int sd = side >= 0 ? side : first;
         pose.footLift[static_cast<std::size_t>(sd)] = 0.018f * lift * amp;
         pose.toePitch[static_cast<std::size_t>(sd)] = 0.75f * lift * amp;
-        addBoneParent(pose, HumanoidBone::LeftUpperLeg, axisAngle(kX, 2.0f * lift * amp));
-        addBoneParent(pose, HumanoidBone::RightUpperLeg, axisAngle(kX, 2.0f * lift * amp));
+        addBoneParent(pose, sd == 0 ? HumanoidBone::LeftUpperLeg : HumanoidBone::RightUpperLeg,
+                      axisAngle(kX, 2.0f * lift * amp));
         pose.touchesFeet = true;
         pose.mask = body::LeftLeg | body::RightLeg | body::LeftFoot | body::RightFoot;
         break;
@@ -624,8 +673,6 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
     case PrimitiveKind::FingerRipple: {
         for (int sd = 0; sd < 2; ++sd) {
             if (side >= 0 && sd != side) continue;
-            const ArmSet arm = armSet(sd);
-            bendElbow(pose, arm, 6.0f * env * amp);
             for (int fg = 1; fg < 5; ++fg) {
                 const float p = std::fmod(phase + static_cast<float>(fg) * 0.12f, 1.0f);
                 const float c = 0.15f + 0.42f * bell(p, 0.15f, 0.35f) * amp;
@@ -694,23 +741,25 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
 
 namespace {
 
+constexpr int kRegionCount = 13;  // one per body:: bit
+
 struct ActiveCue {
     const PrimitiveCue* cue = nullptr;
     PrimitivePose pose;
     float weight = 0.0f;
     BodyMask mask = body::None;
+    // Per-region share of the cue that survives stronger cues. 1 = untouched.
+    // Conflicts fade a weaker cue out by (1 - winner weight) instead of cutting
+    // it, so a stronger cue starting at weight ~0 cannot pop the weaker one.
+    std::array<float, kRegionCount> share{};
+    ActiveCue() { share.fill(1.0f); }
 };
 
-BodyMask narrowMask(BodyMask mask, int side) {
-    if (side == 0) {
-        return mask & ~(body::RightArm | body::RightHand | body::RightLeg |
-                        body::RightFoot);
+float regionShare(const ActiveCue& cue, BodyMask bit) {
+    if (bit == body::None) {
+        return 0.0f;
     }
-    if (side == 1) {
-        return mask & ~(body::LeftArm | body::LeftHand | body::LeftLeg |
-                        body::LeftFoot);
-    }
-    return mask;
+    return cue.share[static_cast<std::size_t>(std::countr_zero(bit))];
 }
 
 bool footPlanted(const ClipPose& pose, int foot) {
@@ -739,8 +788,11 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         beat = wrapPositive(beat, beats);
     }
 
-    std::vector<ActiveCue> active;
-    active.reserve(cues.size());
+    // --- 1. candidates -------------------------------------------------
+    // Every cue that is musically active and mechanically allowed, with its
+    // effective (side- and option-narrowed) mask.
+    std::vector<ActiveCue> candidates;
+    candidates.reserve(cues.size());
     for (const PrimitiveCue& cue : cues) {
         if (!(cue.durationBeats > 1.0e-4f) || !(cue.intensity > 1.0e-4f)) {
             continue;
@@ -755,25 +807,15 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
             continue;
         }
         const PrimitiveMetadata& metadata = cue.metadata();
-        BodyMask mask = cue.effectiveMask();
-        mask = narrowMask(mask, cue.side);
-        if (mask == body::None) {
-            ++out.diagnostics.rejectedByMask;
-            continue;
-        }
-        if (!options.allowFootwork && (mask & body::Legs)) {
-            ++out.diagnostics.rejectedByMask;
-            continue;
-        }
-        if (!options.allowHands && (mask & body::Hands)) {
-            ++out.diagnostics.rejectedByMask;
-            continue;
-        }
-        if (!options.allowTorso && (mask & (body::Torso))) {
-            ++out.diagnostics.rejectedByMask;
-            continue;
-        }
-        if (!options.allowHead && (mask & body::Head)) {
+        BodyMask mask = cue.sideMask();
+        // Options remove regions instead of discarding the whole gesture: an arm
+        // wave with hands disabled is still an arm wave.
+        if (!options.allowFootwork) mask &= ~body::Legs;
+        if (!options.allowHands) mask &= ~body::Hands;
+        if (!options.allowTorso) mask &= ~body::Torso;
+        if (!options.allowHead) mask &= ~body::Head;
+        if (mask == body::None || (metadata.category == MotionCategory::Footwork &&
+                                   (mask & body::Legs) == 0u)) {
             ++out.diagnostics.rejectedByMask;
             continue;
         }
@@ -783,11 +825,16 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         }
         if (metadata.altersFeet) {
             // A primitive may animate a swing foot, never a planted one. The
-            // base choreography owns contact.
+            // base choreography owns contact. Only the feet it actually lifts
+            // count; a touching foot is protected inside the application loop.
+            const PrimitivePose probe =
+                samplePrimitive(cue.kind, 0.5f, 1.0f, cue.side, 0.0f);
             bool blocked = false;
             for (int f = 0; f < 2; ++f) {
-                if (footPlanted(base, f) &&
-                    (mask & (f == 0 ? body::LeftFoot : body::RightFoot))) {
+                const bool lifts =
+                    std::abs(probe.footLift[static_cast<std::size_t>(f)]) > 1.0e-6f;
+                if (lifts && footPlanted(base, f) &&
+                    (mask & (f == 0 ? body::LeftFoot : body::RightFoot)) != 0u) {
                     blocked = true;
                 }
             }
@@ -804,47 +851,85 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         }
         ActiveCue entry;
         entry.cue = &cue;
-        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side,
-                                     0.0f);
+        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
         entry.weight = weight;
         entry.mask = mask;
         entry.pose.mask = mask;
-        // Conflict resolution: lower priority cues are dropped when a higher
-        // priority cue owns the same body region. Equal priority: the earlier
-        // scheduled cue keeps the region, which keeps the plan deterministic.
-        bool conflict = false;
+        candidates.push_back(std::move(entry));
+    }
+
+    // --- 2. deterministic selection ---------------------------------------
+    // Highest priority first; ties are broken by the cue's own data only, never
+    // by its position in the input array, so permuting the cues cannot change
+    // the outcome. A lower-priority cue never blocks a higher-priority one.
+    const auto cueOrder = [](const ActiveCue& a, const ActiveCue& b) {
+        const PrimitiveCue& ca = *a.cue;
+        const PrimitiveCue& cb = *b.cue;
+        if (ca.effectivePriority() != cb.effectivePriority()) {
+            return ca.effectivePriority() > cb.effectivePriority();
+        }
+        if (a.weight != b.weight) return a.weight > b.weight;
+        if (ca.kind != cb.kind) return ca.kind < cb.kind;
+        if (ca.side != cb.side) return ca.side < cb.side;
+        if (ca.beat != cb.beat) return ca.beat < cb.beat;
+        if (ca.durationBeats != cb.durationBeats) return ca.durationBeats < cb.durationBeats;
+        if (ca.intensity != cb.intensity) return ca.intensity > cb.intensity;
+        if (ca.blend != cb.blend) return ca.blend < cb.blend;
+        if (ca.phaseOffset != cb.phaseOffset) return ca.phaseOffset < cb.phaseOffset;
+        return a.mask < b.mask;
+    };
+    std::sort(candidates.begin(), candidates.end(), cueOrder);
+
+    // A weaker cue does not vanish when a stronger one claims a shared region:
+    // its contribution there fades by (1 - winner weight). The cue is dropped
+    // only when almost nothing of it would remain anywhere.
+    constexpr float kMinShare = 0.02f;
+    std::vector<ActiveCue> active;
+    active.reserve(candidates.size());
+    int upperLayers = 0;
+    for (ActiveCue& entry : candidates) {
+        bool conflicted = false;
         for (const ActiveCue& other : active) {
+            const BodyMask shared = entry.mask & other.mask;
             if (!masksConflict(entry.mask, other.mask)) {
                 continue;
             }
-            if (entry.cue->effectivePriority() <= other.cue->effectivePriority()) {
-                conflict = true;
-                break;
+            for (int r = 0; r < kRegionCount; ++r) {
+                const BodyMask bit = 1u << r;
+                if ((shared & bit) == 0u) {
+                    continue;
+                }
+                const float winner = std::clamp(other.weight * regionShare(other, bit), 0.0f, 1.0f);
+                entry.share[static_cast<std::size_t>(r)] *= 1.0f - winner;
+                conflicted = true;
             }
         }
-        if (conflict) {
-            ++out.diagnostics.rejectedByConflict;
-            continue;
-        }
-        active.push_back(std::move(entry));
-    }
-
-    std::sort(active.begin(), active.end(), [](const ActiveCue& a, const ActiveCue& b) {
-        const int pa = a.cue->effectivePriority();
-        const int pb = b.cue->effectivePriority();
-        if (pa != pb) return pa < pb;
-        return a.cue->beat < b.cue->beat;
-    });
-
-    int upperLayers = 0;
-    for (const ActiveCue& entry : active) {
-        if ((entry.mask & body::UpperBody) != 0u) {
-            ++upperLayers;
-            if (upperLayers > options.maxUpperBodyLayers) {
+        if (conflicted) {
+            float best = 0.0f;
+            for (int r = 0; r < kRegionCount; ++r) {
+                if ((entry.mask & (1u << r)) != 0u) {
+                    best = std::max(best, entry.share[static_cast<std::size_t>(r)]);
+                }
+            }
+            if (best < kMinShare) {
                 ++out.diagnostics.rejectedByConflict;
                 continue;
             }
+            ++out.diagnostics.narrowedByConflict;
         }
+        if ((entry.mask & body::UpperBody) != 0u) {
+            if (upperLayers >= options.maxUpperBodyLayers) {
+                ++out.diagnostics.rejectedByConflict;
+                continue;
+            }
+            ++upperLayers;
+        }
+        active.push_back(std::move(entry));
+    }
+    // Apply low priority first so a stronger override lands on top.
+    std::reverse(active.begin(), active.end());
+
+    for (const ActiveCue& entry : active) {
         const PrimitivePose& primitive = entry.pose;
         const float w = entry.weight;
         for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
@@ -853,52 +938,33 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                 continue;
             }
             const HumanoidBone bone = static_cast<HumanoidBone>(b);
-            BodyMask boneBit = body::None;
-            switch (bone) {
-            case HumanoidBone::Hips: boneBit = body::Pelvis; break;
-            case HumanoidBone::Spine: boneBit = body::Spine; break;
-            case HumanoidBone::Chest: boneBit = body::Chest; break;
-            case HumanoidBone::UpperChest: boneBit = body::Chest; break;
-            case HumanoidBone::Neck:
-            case HumanoidBone::Head: boneBit = body::Head; break;
-            case HumanoidBone::LeftShoulder:
-            case HumanoidBone::RightShoulder: boneBit = body::Shoulders; break;
-            case HumanoidBone::LeftUpperArm:
-            case HumanoidBone::LeftLowerArm: boneBit = body::LeftArm; break;
-            case HumanoidBone::RightUpperArm:
-            case HumanoidBone::RightLowerArm: boneBit = body::RightArm; break;
-            case HumanoidBone::LeftHand: boneBit = body::LeftHand; break;
-            case HumanoidBone::RightHand: boneBit = body::RightHand; break;
-            case HumanoidBone::LeftUpperLeg:
-            case HumanoidBone::LeftLowerLeg: boneBit = body::LeftLeg; break;
-            case HumanoidBone::RightUpperLeg:
-            case HumanoidBone::RightLowerLeg: boneBit = body::RightLeg; break;
-            case HumanoidBone::LeftFoot:
-            case HumanoidBone::LeftToes: boneBit = body::LeftFoot; break;
-            case HumanoidBone::RightFoot:
-            case HumanoidBone::RightToes: boneBit = body::RightFoot; break;
-            default: break;
-            }
+            const BodyMask boneBit = maskBitForBone(bone);
             if ((entry.mask & boneBit) == 0u) {
+                continue;
+            }
+            const float wb = w * regionShare(entry, boneBit);
+            if (wb <= 1.0e-5f) {
                 continue;
             }
             if (entry.cue->effectiveBlend() == BlendMode::Override) {
                 // Replace the masked bone: the cue's delta becomes the local
                 // rotation, blended from the current base by the cue weight.
-                out.pose.bone[b] = math::slerp(out.pose.bone[b], delta, w);
+                out.pose.bone[b] = math::slerp(out.pose.bone[b], delta, wb);
             } else {
-                out.pose.bone[b] = addDelta(out.pose.bone[b], delta, w);
+                out.pose.bone[b] = addDelta(out.pose.bone[b], delta, wb);
             }
             ++out.diagnostics.boneLayers[b];
         }
-        out.pose.hips = out.pose.hips + primitive.hips * w;
+        out.pose.hips = out.pose.hips + primitive.hips * (w * regionShare(entry, body::Pelvis));
         if (options.allowFootwork && primitive.touchesFeet) {
             for (int f = 0; f < 2; ++f) {
                 if (!footPlanted(base, f)) {
+                    const float wf =
+                        w * regionShare(entry, f == 0 ? body::LeftFoot : body::RightFoot);
                     out.pose.foot[static_cast<std::size_t>(f)].position.y +=
-                        primitive.footLift[static_cast<std::size_t>(f)] * w;
+                        primitive.footLift[static_cast<std::size_t>(f)] * wf;
                     out.pose.foot[static_cast<std::size_t>(f)].toePitch +=
-                        primitive.toePitch[static_cast<std::size_t>(f)] * w;
+                        primitive.toePitch[static_cast<std::size_t>(f)] * wf;
                 }
             }
         }
@@ -907,9 +973,10 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                 if ((entry.mask & (sd == 0 ? body::LeftHand : body::RightHand)) == 0u) {
                     continue;
                 }
-                out.pose.handPose[static_cast<std::size_t>(sd)] =
-                    blendHandPose(out.pose.handPose[static_cast<std::size_t>(sd)],
-                                  primitive.hand[static_cast<std::size_t>(sd)], w);
+                out.pose.handPose[static_cast<std::size_t>(sd)] = blendHandPose(
+                    out.pose.handPose[static_cast<std::size_t>(sd)],
+                    primitive.hand[static_cast<std::size_t>(sd)],
+                    w * regionShare(entry, sd == 0 ? body::LeftHand : body::RightHand));
                 out.pose.detailedHands = true;
             }
         }

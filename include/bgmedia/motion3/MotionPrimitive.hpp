@@ -120,6 +120,9 @@ struct PrimitiveMetadata {
     bool altersFeet = false;     // may move a swing foot, never a planted one
     bool needsFingers = false;
     const char* description = "";
+    // `side` picks the lead/direction only; the primitive always drives both
+    // limbs, so a side must not narrow its mask.
+    bool bilateral = false;
 };
 
 [[nodiscard]] const PrimitiveMetadata& primitiveMetadata(PrimitiveKind kind);
@@ -128,6 +131,9 @@ struct PrimitiveMetadata {
 [[nodiscard]] PrimitiveKind primitiveFromId(const std::string& id, bool* found = nullptr);
 [[nodiscard]] const char* categoryName(MotionCategory category);
 [[nodiscard]] const char* blendModeName(BlendMode mode);
+
+// Removes the opposite side's limbs from a mask (side: -1 both, 0 left, 1 right).
+[[nodiscard]] BodyMask narrowMaskToSide(BodyMask mask, int side);
 
 // A scheduled primitive on the clip's musical axis. `beat` is a clip beat;
 // a cue that crosses the loop point is wrapped by the scheduler.
@@ -151,6 +157,12 @@ struct PrimitiveCue {
     }
     [[nodiscard]] BodyMask effectiveMask() const {
         return maskOverride ? (maskOverride & metadata().mask) : metadata().mask;
+    }
+    // The mask the compositor actually grants: side-narrowed unless the
+    // primitive is bilateral.
+    [[nodiscard]] BodyMask sideMask() const {
+        return metadata().bilateral ? effectiveMask()
+                                    : narrowMaskToSide(effectiveMask(), side);
     }
     [[nodiscard]] BlendMode effectiveBlend() const { return blend; }
 };
@@ -183,6 +195,7 @@ struct CompositionDiagnostics {
     int rejectedByContact = 0;
     int rejectedBySupport = 0;
     int rejectedByMask = 0;
+    int narrowedByConflict = 0;  // kept with a smaller mask (hands/head/shoulders yielded)
     float maxWeight = 0.0f;
     std::array<int, vrm::kHumanoidBoneCount> boneLayers{};
     std::vector<std::string> notes;
@@ -213,6 +226,10 @@ struct ComposedPose {
 [[nodiscard]] std::vector<PrimitiveCue> planPrimitiveOverlays(
     const HumanoidClip& clip, std::uint32_t seed, float density,
     bool includeHands = true);
+
+// The body-mask bit that governs a humanoid bone (UpperChest -> Chest, Neck ->
+// Head, upper+lower arm -> arm). None for bones no mask can drive.
+[[nodiscard]] BodyMask maskBitForBone(vrm::HumanoidBone bone);
 
 // True when two body masks share a region that cannot be driven twice.
 [[nodiscard]] bool masksConflict(BodyMask a, BodyMask b);

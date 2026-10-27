@@ -271,17 +271,8 @@ DanceFrame DancePlayer::update(double mediaTime) {
         director_.reseed(mediaTime);
     }
     lastTime_ = mediaTime;
-    DanceFrame frame = director_.sample(mediaTime);
-    if (overlayMode_ == OverlayMode::Off || frame.clipId.empty()) {
-        return frame;
-    }
-    const HumanoidClip* clip = library_.find(frame.clipId);
-    if (!clip) {
-        return frame;
-    }
-    const std::vector<PrimitiveCue>& cues = overlaysFor(frame.clipId);
-    if (cues.empty()) {
-        return frame;
+    if (overlayMode_ == OverlayMode::Off) {
+        return director_.sample(mediaTime);
     }
     CompositionOptions options;
     options.allowFootwork = overlayMode_ == OverlayMode::Full;
@@ -289,16 +280,47 @@ DanceFrame DancePlayer::update(double mediaTime) {
     options.allowTorso = overlayMode_ != OverlayMode::HandsOnly;
     options.allowHead = overlayMode_ != OverlayMode::HandsOnly;
     options.maxUpperBodyLayers = overlayMode_ == OverlayMode::Light ? 2 : 3;
-    ComposedPose composed = composeMotion(frame.pose, cues, frame.clipBeat,
-                                          clip->beats, clip->loop, options);
-    frame.pose = composed.pose;
-    frame.overlayActive = composed.diagnostics.acceptedCues;
-    frame.overlayRejected = composed.diagnostics.rejectedByConflict +
-                            composed.diagnostics.rejectedByContact +
-                            composed.diagnostics.rejectedBySupport +
-                            composed.diagnostics.rejectedByMask;
-    frame.overlayWeight = composed.diagnostics.maxWeight;
-    frame.overlayHands = composed.pose.detailedHands;
+
+    // Overlays are composed per schedule segment, before the crossfade. The
+    // first call is the newest (incoming) segment; its diagnostics are the ones
+    // reported. The decorator only lives for this call, so it never outlives
+    // `this`.
+    struct Diag {
+        int calls = 0;
+        int accepted = 0;
+        int rejected = 0;
+        float weight = 0.0f;
+        bool hands = false;
+    } diag;
+    director_.schedule().setPoseDecorator(
+        [this, &options, &diag](ClipPose& pose, const ScheduleSegment& segment,
+                                double clipBeat) {
+            if (!segment.clip) {
+                return;
+            }
+            const std::vector<PrimitiveCue>& cues = overlaysFor(segment.clip->id);
+            if (cues.empty()) {
+                return;
+            }
+            const ComposedPose composed = composeMotion(
+                pose, cues, clipBeat, segment.clip->beats, segment.clip->loop, options);
+            pose = composed.pose;
+            if (diag.calls++ == 0) {
+                diag.accepted = composed.diagnostics.acceptedCues;
+                diag.rejected = composed.diagnostics.rejectedByConflict +
+                                composed.diagnostics.rejectedByContact +
+                                composed.diagnostics.rejectedBySupport +
+                                composed.diagnostics.rejectedByMask;
+                diag.weight = composed.diagnostics.maxWeight;
+                diag.hands = composed.pose.detailedHands;
+            }
+        });
+    DanceFrame frame = director_.sample(mediaTime);
+    director_.schedule().setPoseDecorator(nullptr);
+    frame.overlayActive = diag.accepted;
+    frame.overlayRejected = diag.rejected;
+    frame.overlayWeight = diag.weight;
+    frame.overlayHands = diag.hands;
     return frame;
 }
 

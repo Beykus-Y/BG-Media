@@ -197,6 +197,11 @@ ClipPose adaptPose(const ClipPose& stable, const ClipPose& warped, bool fullBody
     out.rootYaw = stable.rootYaw;
     out.foot = stable.foot;
     out.hand = warped.hand;
+    // The detailed hand layer (fingers + wrist) is a time-varying channel just
+    // like the scalar curl: it must come from the same warped sample, otherwise
+    // the hand and its fingers sit in different musical phases.
+    out.handPose = warped.handPose;
+    out.detailedHands = warped.detailedHands;
     out.energy = stable.energy;
     out.accent = std::max(stable.accent, warped.accent);
     return out;
@@ -283,6 +288,9 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
             const ClipPose warped = sampleClip(*segment.clip, mapped.beat);
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
+    }
+    if (decorator_) {
+        decorator_(own, segment, mapped.beat);
     }
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
