@@ -1176,6 +1176,10 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
                         if (!validNode(rawNode)) {
                             model->warnings.push_back(
                                 "secondaryAnimation: ignored collider group with an invalid node");
+                            // Keep an empty placeholder: boneGroups reference collider
+                            // groups by their ORIGINAL index, so skipping the entry
+                            // would silently re-point every later reference.
+                            model->springColliderGroups.push_back(std::move(parsed));
                             continue;
                         }
                         parsed.node = static_cast<int>(rawNode);
@@ -1283,42 +1287,66 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
             const std::size_t groupCount = model->springGroups.size();
             for (std::size_t g = 0; g < groupCount; ++g) {
                 const SpringBoneGroup& group = model->springGroups[g];
+                // A root's subtree is a tree, not a line: at a branching node the
+                // first child continues the chain and every other child starts a
+                // branch chain anchored at the branch point. Each node is written
+                // by exactly one chain; the anchor belongs to the parent chain.
                 const auto makeChain = [&](int root) {
-                    SpringBoneChain chain;
-                    chain.group = static_cast<int>(g);
-                    chain.colliderGroups = group.colliderGroups;
-                    chain.stiffness = group.stiffness;
-                    chain.gravityPower = group.gravityPower;
-                    chain.dragForce = group.dragForce;
-                    chain.hitRadius = group.hitRadius;
-                    chain.gravityDir = group.gravityDir;
-                    chain.nodes.push_back(root);
-                    int current = root;
+                    struct Pending {
+                        int parentChain;
+                        int parentIndex;
+                        int node;
+                    };
+                    std::vector<Pending> queue;
+                    queue.push_back({-1, 0, root});
                     constexpr int kMaxChain = 24;
-                    for (int depth = 0; depth < kMaxChain; ++depth) {
-                        const Node& node = model->nodes[static_cast<std::size_t>(current)];
-                        int next = -1;
-                        for (int child : node.children) {
-                            if (child < 0 ||
-                                static_cast<std::size_t>(child) >= model->nodes.size()) {
-                                continue;
-                            }
-                            if (isRoot[static_cast<std::size_t>(child)] &&
-                                child != root) {
-                                // A different group simulates this subtree.
-                                continue;
+                    constexpr std::size_t kMaxBranchChains = 512;
+                    for (std::size_t q = 0; q < queue.size(); ++q) {
+                        const Pending item = queue[q];
+                        SpringBoneChain chain;
+                        chain.group = static_cast<int>(g);
+                        chain.colliderGroups = group.colliderGroups;
+                        chain.stiffness = group.stiffness;
+                        chain.gravityPower = group.gravityPower;
+                        chain.dragForce = group.dragForce;
+                        chain.hitRadius = group.hitRadius;
+                        chain.gravityDir = group.gravityDir;
+                        chain.parentChain = item.parentChain;
+                        chain.parentIndex = item.parentIndex;
+                        if (item.parentChain >= 0) {
+                            const auto& parentNodes =
+                                model->springChains[static_cast<std::size_t>(item.parentChain)].nodes;
+                            chain.nodes.push_back(
+                                parentNodes[static_cast<std::size_t>(item.parentIndex)]);
+                        }
+                        const int myIndex = static_cast<int>(model->springChains.size());
+                        chain.nodes.push_back(item.node);
+                        int current = item.node;
+                        for (int depth = 0; depth < kMaxChain; ++depth) {
+                            const Node& node = model->nodes[static_cast<std::size_t>(current)];
+                            int next = -1;
+                            for (int child : node.children) {
+                                if (child < 0 ||
+                                    static_cast<std::size_t>(child) >= model->nodes.size()) {
+                                    continue;
+                                }
+                                if (isRoot[static_cast<std::size_t>(child)] && child != root) {
+                                    // A different group simulates this subtree.
+                                    continue;
+                                }
+                                if (next < 0) {
+                                    next = child;
+                                } else if (queue.size() < kMaxBranchChains) {
+                                    queue.push_back(
+                                        {myIndex, static_cast<int>(chain.nodes.size()) - 1, child});
+                                }
                             }
                             if (next < 0) {
-                                next = child;
+                                break;
                             }
+                            chain.nodes.push_back(next);
+                            current = next;
                         }
-                        if (next < 0) {
-                            break;
-                        }
-                        chain.nodes.push_back(next);
-                        current = next;
-                    }
-                    if (chain.nodes.size() >= 1) {
                         model->springChains.push_back(std::move(chain));
                     }
                 };

@@ -111,7 +111,12 @@ struct SpringBoneGroup {
 
 struct SpringBoneChain {
     int group = -1;
-    std::vector<int> nodes;             // root -> tip, parent/child order
+    // root -> tip, parent/child order. A branch chain (parentChain >= 0) starts
+    // with its *anchor*: the branch point, which belongs to - and is written by -
+    // the parent chain; it must not be simulated or written a second time.
+    std::vector<int> nodes;
+    int parentChain = -1;               // index into springChains, -1 = root chain
+    int parentIndex = 0;                // index of the anchor inside the parent chain
     std::vector<int> colliderGroups;
     float stiffness = 0.5f;
     float gravityPower = 0.0f;

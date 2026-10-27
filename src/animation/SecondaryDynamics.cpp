@@ -19,6 +19,14 @@ using math::Vec3;
 constexpr double kFixedStep = 1.0 / 120.0;
 constexpr double kMaxAccumulated = 0.10;
 constexpr float kTiny = 1.0e-6f;
+// VRM 0.x: a spring bone without a child simulates a virtual tail 7 cm along the
+// parent->bone direction.
+constexpr float kVirtualTailLength = 0.07f;
+// An animated chain root that moves further than this (in character heights)
+// between two updates is a teleport/seek, not motion: the state is snapped.
+constexpr float kTeleportHeights = 0.25f;
+// A frame gap longer than this is a pause/resume or a seek.
+constexpr double kHitchSeconds = 0.25;
 
 bool finiteVec(Vec3 value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -47,13 +55,24 @@ struct SecondaryDynamics::Impl {
         float hitRadius = 0.01f;
         Vec3 gravityDir{0.0f, -1.0f, 0.0f};
         std::string comment;
+        // Simulated points: one per node, plus one virtual tail point for a
+        // single-node chain. `animated` etc. are sized to the point count;
+        // `animatedRotations` / `scales` to the node count.
+        bool virtualTail = false;
+        int parentChain = -1;   // index into `chains` (not springChains), -1 = root chain
+        int parentIndex = 0;
         std::vector<Vec3> animated;
         std::vector<Vec3> current;
         std::vector<Vec3> previous;
         std::vector<Vec3> velocity;
         std::vector<Quat> animatedRotations;
         std::vector<Vec3> scales;
+        Vec3 lastAnimatedRoot{};
+        bool haveLastRoot = false;
         float totalRest = 0.0f;
+        [[nodiscard]] std::size_t pointCount() const {
+            return nodes.size() + (virtualTail ? 1u : 0u);
+        }
     };
 
     std::vector<Chain> chains;
@@ -71,7 +90,11 @@ struct SecondaryDynamics::Impl {
     void readTargets(const RetargetedPose& pose);
     void ensureState(const RetargetedPose& pose);
     void step(Chain& chain, const SecondarySettings& settings, float stepSeconds);
-    void solveConstraints(Chain& chain, float stepSeconds);
+    void solveConstraints(Chain& chain, Vec3 anchor);
+    void snapToAnimated();
+    // Where the first point of a chain is pinned: its own animated position, or
+    // (branch chain) the simulated position of the branch point in the parent.
+    [[nodiscard]] Vec3 anchorOf(const Chain& chain) const;
     void writePose(RetargetedPose& pose, const SecondarySettings& settings);
     [[nodiscard]] Vec3 toStage(Vec3 character) const {
         return rootOffset + rootPivot +
@@ -99,10 +122,10 @@ void SecondaryDynamics::Impl::build() {
             colliderRadii.push_back(collider.radius);
         }
     }
-    int groupIndex = 0;
-    for (const vrm::SpringBoneChain& source : model->springChains) {
-        if (source.nodes.size() < 2) {
-            ++groupIndex;
+    std::vector<int> sourceToChain(model->springChains.size(), -1);
+    for (std::size_t sourceIndex = 0; sourceIndex < model->springChains.size(); ++sourceIndex) {
+        const vrm::SpringBoneChain& source = model->springChains[sourceIndex];
+        if (source.nodes.empty()) {
             continue;
         }
         Chain chain;
@@ -119,19 +142,33 @@ void SecondaryDynamics::Impl::build() {
                                     model->springGroups.size()
                             ? model->springGroups[static_cast<std::size_t>(source.group)].comment
                             : std::string{};
-        chain.rest.resize(source.nodes.size() - 1);
+        // A branch chain is pinned to its parent's simulated branch point, but
+        // only if that parent chain is itself simulated.
+        if (source.parentChain >= 0 &&
+            static_cast<std::size_t>(source.parentChain) < sourceIndex &&
+            sourceToChain[static_cast<std::size_t>(source.parentChain)] >= 0) {
+            chain.parentChain = sourceToChain[static_cast<std::size_t>(source.parentChain)];
+            chain.parentIndex = source.parentIndex;
+        }
+        chain.virtualTail = chain.nodes.size() == 1;
         bool valid = true;
-        for (std::size_t i = 0; i + 1 < source.nodes.size(); ++i) {
-            const int a = source.nodes[i];
-            const int b = source.nodes[i + 1];
-            if (a < 0 || b < 0 ||
-                static_cast<std::size_t>(a) >= model->bindGlobals.size() ||
-                static_cast<std::size_t>(b) >= model->bindGlobals.size()) {
-                valid = false;
+        const auto nodeValid = [&](int n) {
+            return n >= 0 && static_cast<std::size_t>(n) < model->bindGlobals.size();
+        };
+        for (int n : chain.nodes) {
+            valid = valid && nodeValid(n);
+        }
+        if (!valid) {
+            continue;
+        }
+        chain.rest.resize(chain.pointCount() - 1);
+        for (std::size_t i = 0; i + 1 < chain.pointCount(); ++i) {
+            if (chain.virtualTail) {
+                chain.rest[i] = kVirtualTailLength;
                 break;
             }
-            const Vec3 pa = model->bindGlobals[static_cast<std::size_t>(a)].translationPart();
-            const Vec3 pb = model->bindGlobals[static_cast<std::size_t>(b)].translationPart();
+            const Vec3 pa = model->bindGlobals[static_cast<std::size_t>(chain.nodes[i])].translationPart();
+            const Vec3 pb = model->bindGlobals[static_cast<std::size_t>(chain.nodes[i + 1])].translationPart();
             const float rest = (pb - pa).length();
             if (!std::isfinite(rest) || rest < 1.0e-5f) {
                 valid = false;
@@ -140,21 +177,20 @@ void SecondaryDynamics::Impl::build() {
             chain.rest[i] = rest;
         }
         if (!valid) {
-            ++groupIndex;
             continue;
         }
         chain.totalRest = 0.0f;
         for (float rest : chain.rest) {
             chain.totalRest += rest;
         }
+        sourceToChain[sourceIndex] = static_cast<int>(chains.size());
         chains.push_back(std::move(chain));
-        ++groupIndex;
     }
     stats.available = !chains.empty();
     stats.chains = static_cast<int>(chains.size());
     stats.bones = 0;
     for (const Chain& chain : chains) {
-        stats.bones += static_cast<int>(chain.nodes.size());
+        stats.bones += static_cast<int>(chain.nodes.size()) - (chain.parentChain >= 0 ? 1 : 0);
     }
     stats.colliders = static_cast<int>(colliderCenters.size());
     stats.height = model->height;
@@ -188,7 +224,7 @@ void SecondaryDynamics::Impl::readTargets(const RetargetedPose& pose) {
     }
     for (Chain& chain : chains) {
         const std::size_t count = chain.nodes.size();
-        chain.animated.resize(count);
+        chain.animated.assign(chain.pointCount(), Vec3{});
         chain.animatedRotations.resize(count);
         chain.scales.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
@@ -205,27 +241,63 @@ void SecondaryDynamics::Impl::readTargets(const RetargetedPose& pose) {
             chain.scales[i] = {matrix.axisX().length(), matrix.axisY().length(),
                                matrix.axisZ().length()};
         }
+        if (chain.virtualTail) {
+            // Continue the parent -> bone direction by 7 cm (VRM 0.x).
+            Vec3 direction{0.0f, -1.0f, 0.0f};
+            const int node = chain.nodes[0];
+            const int parent = model->nodes[static_cast<std::size_t>(node)].parent;
+            if (parent >= 0 && static_cast<std::size_t>(parent) < pose.nodeGlobals.size() &&
+                static_cast<std::size_t>(node) < pose.nodeGlobals.size()) {
+                direction = safeNormalize(
+                    pose.nodeGlobals[static_cast<std::size_t>(node)].translationPart() -
+                        pose.nodeGlobals[static_cast<std::size_t>(parent)].translationPart(),
+                    direction);
+            }
+            const Vec3 tail = pose.nodeGlobals[static_cast<std::size_t>(node)].translationPart() +
+                              direction * kVirtualTailLength;
+            chain.animated[1] = toStage(tail);
+        }
     }
 }
 
 void SecondaryDynamics::Impl::ensureState(const RetargetedPose& pose) {
     if (!initialized) {
-        for (Chain& chain : chains) {
-            chain.current = chain.animated;
-            chain.previous = chain.animated;
-            chain.velocity.assign(chain.animated.size(), Vec3{});
-        }
+        snapToAnimated();
         initialized = true;
     }
     (void)pose;
 }
 
-void SecondaryDynamics::Impl::solveConstraints(Chain& chain, float stepSeconds) {
-    (void)stepSeconds;
+void SecondaryDynamics::Impl::snapToAnimated() {
+    for (Chain& chain : chains) {
+        chain.current = chain.animated;
+        chain.previous = chain.animated;
+        chain.velocity.assign(chain.animated.size(), Vec3{});
+        if (!chain.animated.empty()) {
+            chain.lastAnimatedRoot = chain.animated[0];
+            chain.haveLastRoot = true;
+        }
+    }
+    accumulator = 0.0;
+}
+
+Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain) const {
+    if (chain.parentChain >= 0 &&
+        static_cast<std::size_t>(chain.parentChain) < chains.size()) {
+        const Chain& parent = chains[static_cast<std::size_t>(chain.parentChain)];
+        const std::size_t index = static_cast<std::size_t>(std::max(0, chain.parentIndex));
+        if (index < parent.current.size()) {
+            return parent.current[index];
+        }
+    }
+    return chain.animated.empty() ? Vec3{} : chain.animated[0];
+}
+
+void SecondaryDynamics::Impl::solveConstraints(Chain& chain, Vec3 anchor) {
     if (chain.nodes.empty()) {
         return;
     }
-    chain.current[0] = chain.animated[0];
+    chain.current[0] = anchor;
     // Two alternating passes converge quickly for short VRM chains (4-6 nodes).
     for (int pass = 0; pass < 3; ++pass) {
         for (std::size_t i = 1; i < chain.current.size(); ++i) {
@@ -250,7 +322,7 @@ void SecondaryDynamics::Impl::solveConstraints(Chain& chain, float stepSeconds) 
             direction = direction / length;
             chain.current[i - 1] = chain.current[i] + direction * chain.rest[i - 1];
         }
-        chain.current[0] = chain.animated[0];
+        chain.current[0] = anchor;
         // Sphere collision after the length pass. Re-projecting may introduce a
         // small overlap, so the final pass below repeats it once more.
         for (int groupIndex : chain.colliderGroups) {
@@ -284,12 +356,24 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
     if (chain.nodes.empty()) {
         return;
     }
-    chain.current[0] = chain.animated[0];
-    chain.previous[0] = chain.animated[0];
-    const float stiffness = 10.0f + chain.stiffness * 26.0f;
-    const float drag = std::clamp(0.8f + chain.dragForce * 8.0f +
-                                      std::clamp(settings.damping, 0.0f, 1.0f) * 10.0f,
-                                  0.1f, 30.0f);
+    const Vec3 anchor = anchorOf(chain);
+    chain.current[0] = anchor;
+    chain.previous[0] = anchor;
+
+    // Position-based Verlet with a fixed step. Units are explicit:
+    //   displacement per step  d = current - previous           [m]
+    //   damping                d *= exp(-drag * dt)             [1/s]
+    //   spring toward the animated pose (angular frequency w)   a = w^2 (target - x)   [m/s^2]
+    //   gravity                a += g                           [m/s^2]
+    //   x' = x + d * damping + a * dt^2
+    // w^2 dt^2 stays below ~0.2 for every authored stiffness at the 120 Hz step, so
+    // the explicit scheme is stable; the length projection below keeps the chain
+    // inextensible regardless.
+    const float omega = 10.0f + chain.stiffness * 26.0f;
+    const float drag = std::clamp(
+        omega * (0.5f + 1.0f * chain.dragForce +
+                 0.8f * std::clamp(settings.damping, 0.0f, 1.0f)),
+        0.5f, 60.0f);
     const float decay = std::exp(-drag * stepSeconds);
     const Vec3 gravity = chain.gravityDir *
                          (9.81f * chain.gravityPower * 0.08f *
@@ -297,21 +381,23 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
     const float maxDisplacement =
         std::min(std::max(0.005f, settings.maxDisplacement),
                  std::max(0.006f, chain.totalRest * 0.45f));
+    const float dt2 = stepSeconds * stepSeconds;
+    const float maxSpeed = 12.0f;  // m/s
     for (std::size_t i = 1; i < chain.current.size(); ++i) {
-        Vec3 velocity = chain.current[i] - chain.previous[i];
-        if (!finiteVec(velocity)) {
-            velocity = {};
+        Vec3 displacement = chain.current[i] - chain.previous[i];  // metres per step
+        if (!finiteVec(displacement)) {
+            displacement = {};
         }
-        velocity += (chain.animated[i] - chain.current[i]) * (stiffness * stepSeconds);
-        velocity = velocity * decay;
-        velocity += gravity * stepSeconds;
-        const float speed = velocity.length();
-        const float maxSpeed = 12.0f;
+        displacement = displacement * decay;
+        const Vec3 acceleration =
+            (chain.animated[i] - chain.current[i]) * (omega * omega) + gravity;
+        displacement += acceleration * dt2;
+        const float speed = displacement.length() / stepSeconds;  // m/s
         if (speed > maxSpeed) {
-            velocity = velocity / speed * maxSpeed;
+            displacement = displacement * (maxSpeed / speed);
         }
         chain.previous[i] = chain.current[i];
-        chain.current[i] += velocity * stepSeconds;
+        chain.current[i] += displacement;
         // Keep values bounded even if a host feeds a pathological chain.
         Vec3 offset = chain.current[i] - chain.animated[i];
         const float distance = offset.length();
@@ -321,21 +407,26 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
         } else if (distance > maxDisplacement) {
             chain.current[i] = chain.animated[i] + offset / distance * maxDisplacement;
         }
-        chain.velocity[i] = velocity;
     }
-    solveConstraints(chain, stepSeconds);
+    solveConstraints(chain, anchor);
     for (std::size_t i = 1; i < chain.current.size(); ++i) {
-        chain.velocity[i] = (chain.current[i] - chain.previous[i]) / stepSeconds;
+        chain.velocity[i] = (chain.current[i] - chain.previous[i]) / stepSeconds;  // m/s
     }
 }
 
 void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
                                         const SecondarySettings& settings) {
     const float intensity = std::clamp(settings.intensity, 0.0f, 2.0f);
+    // Simulation points live in stage space (root yaw/translation applied) but
+    // node rotations in the pose are character space. A direction change measured
+    // in stage space must be re-expressed in the character frame before it is
+    // composed with an animated rotation: delta_char = R^-1 * delta_stage * R.
+    const Quat rootInverse = rootRotation.conjugate();
     for (Chain& chain : chains) {
         const std::size_t count = chain.nodes.size();
-        std::vector<Vec3> rendered(count);
-        for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t points = chain.pointCount();
+        std::vector<Vec3> rendered(points);
+        for (std::size_t i = 0; i < points; ++i) {
             Vec3 offset = chain.current[i] - chain.animated[i];
             if (!finiteVec(offset)) {
                 offset = {};
@@ -346,28 +437,34 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
             std::min(std::max(0.005f, settings.maxDisplacement),
                      std::max(0.006f, chain.totalRest * 0.45f)) *
             std::max(1.0f, intensity);
-        for (std::size_t i = 0; i < count; ++i) {
+        for (std::size_t i = 0; i < points; ++i) {
             Vec3 offset = rendered[i] - chain.animated[i];
             const float distance = offset.length();
             if (distance > maxDisplacement) {
                 rendered[i] = chain.animated[i] + offset / distance * maxDisplacement;
             }
         }
+        // A branch chain's anchor is written by its parent chain.
+        const std::size_t first = chain.parentChain >= 0 ? 1 : 0;
         // Rotate each segment so the skinned vertices follow the simulated
         // direction. The tip inherits its parent's delta.
         Quat inherited = Quat::identity();
         for (std::size_t i = 0; i < count; ++i) {
             Quat rotation = chain.animatedRotations[i];
-            if (i + 1 < count) {
+            if (i + 1 < points) {
                 const Vec3 from = safeNormalize(chain.animated[i + 1] - chain.animated[i]);
                 const Vec3 to = safeNormalize(rendered[i + 1] - rendered[i], from);
                 if (from.lengthSquared() > 0.5f && to.lengthSquared() > 0.5f) {
-                    const Quat delta = math::fromTo(from, to);
+                    const Quat stageDelta = math::fromTo(from, to);
+                    const Quat delta = (rootInverse * stageDelta * rootRotation).normalized();
                     rotation = (delta * rotation).normalized();
                     inherited = delta;
                 }
             } else {
                 rotation = (inherited * rotation).normalized();
+            }
+            if (i < first) {
+                continue;
             }
             const int node = chain.nodes[i];
             if (node < 0 || static_cast<std::size_t>(node) >= pose.nodeGlobals.size()) {
@@ -381,7 +478,7 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
                 Mat4::fromTRS(position, rotation, chain.scales[i]);
         }
         // Stats.
-        for (std::size_t i = 1; i < count; ++i) {
+        for (std::size_t i = 1; i < points; ++i) {
             const float displacement =
                 (rendered[i] - chain.animated[i]).length();
             stats.maxDisplacement = std::max(stats.maxDisplacement, displacement);
@@ -422,13 +519,8 @@ void SecondaryDynamics::reset(const RetargetedPose& pose) {
         return;
     }
     impl_->readTargets(pose);
-    impl_->ensureState(pose);
-    for (auto& chain : impl_->chains) {
-        chain.current = chain.animated;
-        chain.previous = chain.animated;
-        chain.velocity.assign(chain.animated.size(), Vec3{});
-    }
-    impl_->accumulator = 0.0;
+    impl_->snapToAnimated();
+    impl_->initialized = true;
     impl_->stats.valid = true;
 }
 
@@ -443,20 +535,45 @@ void SecondaryDynamics::update(RetargetedPose& pose, double deltaSeconds,
     impl_->stats.chains = static_cast<int>(impl_->chains.size());
     impl_->stats.bones = 0;
     for (const auto& chain : impl_->chains) {
-        impl_->stats.bones += static_cast<int>(chain.nodes.size());
+        impl_->stats.bones +=
+            static_cast<int>(chain.nodes.size()) - (chain.parentChain >= 0 ? 1 : 0);
     }
     impl_->stats.colliders = static_cast<int>(impl_->colliderCenters.size());
     impl_->stats.height = impl_->model ? impl_->model->height : 0.0f;
     impl_->readTargets(pose);
     impl_->ensureState(pose);
-    if (!settings.enabled) {
-        impl_->accumulator = 0.0;
+    // A seek, teleport or a long gap (pause/resume) makes the old velocities
+    // meaningless: snap to the animated pose instead of simulating a catch-up.
+    bool discontinuity = !(deltaSeconds >= 0.0) || deltaSeconds > kHitchSeconds ||
+                         !std::isfinite(deltaSeconds);
+    if (!discontinuity) {
+        const float teleport = kTeleportHeights * std::max(0.1f, impl_->stats.height);
+        for (const auto& chain : impl_->chains) {
+            if (chain.haveLastRoot && !chain.animated.empty() &&
+                (chain.animated[0] - chain.lastAnimatedRoot).length() > teleport) {
+                discontinuity = true;
+                break;
+            }
+        }
+    }
+    if (!settings.enabled || discontinuity) {
+        // While disabled (or after a discontinuity) the simulation shadows the
+        // animated pose, so enabling it later starts from the CURRENT pose with
+        // zero velocity instead of resuming from stale positions.
+        impl_->snapToAnimated();
         impl_->stats.valid = true;
         impl_->stats.simulateMilliseconds =
             std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        // Enabled but discontinuous: the pose is the animated pose this frame.
         return;
     }
-    if (!(deltaSeconds > 0.0) || !std::isfinite(deltaSeconds)) {
+    for (auto& chain : impl_->chains) {
+        if (!chain.animated.empty()) {
+            chain.lastAnimatedRoot = chain.animated[0];
+            chain.haveLastRoot = true;
+        }
+    }
+    if (!(deltaSeconds > 0.0)) {
         impl_->writePose(pose, settings);
         impl_->stats.valid = true;
         impl_->stats.simulateMilliseconds =
@@ -488,12 +605,7 @@ void SecondaryDynamics::update(RetargetedPose& pose, double deltaSeconds,
         }
     }
     if (impl_->stats.nonFinite) {
-        for (auto& chain : impl_->chains) {
-            chain.current = chain.animated;
-            chain.previous = chain.animated;
-            chain.velocity.assign(chain.animated.size(), Vec3{});
-        }
-        impl_->accumulator = 0.0;
+        impl_->snapToAnimated();
     }
     impl_->stats.valid = true;
     impl_->stats.simulateMilliseconds =

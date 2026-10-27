@@ -108,7 +108,8 @@ bool VrmModel::hasFingers() const {
 int VrmModel::springBoneCount() const {
     int count = 0;
     for (const SpringBoneChain& chain : springChains) {
-        count += static_cast<int>(chain.nodes.size());
+        // A branch chain's first node is its parent chain's node.
+        count += static_cast<int>(chain.nodes.size()) - (chain.parentChain >= 0 ? 1 : 0);
     }
     return count;
 }
