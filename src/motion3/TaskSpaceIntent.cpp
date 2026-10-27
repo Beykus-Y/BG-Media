@@ -39,6 +39,15 @@ Joint attach(const Joint& parent, Vec3 offset, const Quat& local) {
             (parent.rotation * local).normalized()};
 }
 
+// Detailed wrist layer. Same rotation and scales as HumanoidRetargeter::applyClip, which
+// applies it after the hand bone, so the orientation describes the whole pre-IK pose.
+Quat detailedWristRotation(const HandPose& pose) {
+    return (math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, pose.wrist[0] * 0.26f) *
+            math::fromAxisAngle({0.0f, 1.0f, 0.0f}, pose.wrist[1] * 0.30f) *
+            math::fromAxisAngle({0.0f, 0.0f, 1.0f}, pose.wrist[2] * 0.34f))
+        .normalized();
+}
+
 ArmIntent armIntent(const Joint& chest, const Quat& chestInverse, Vec3 shoulder,
                     Vec3 elbow, const Joint& hand) {
     ArmIntent intent;
@@ -114,8 +123,12 @@ TaskSpaceIntent extractTaskSpaceIntent(const ClipPose& pose) {
             attach(shoulder, {sign * kUpperArmX, 0.0f, 0.0f}, boneRotation(upperBone));
         const Joint lower = attach(upper, {sign * kUpperArmLength, 0.0f, 0.0f},
                                    boneRotation(lowerBone));
-        const Joint hand =
+        Joint hand =
             attach(lower, {sign * kForearmLength, 0.0f, 0.0f}, boneRotation(handBone));
+        if (pose.detailedHands) {
+            hand.rotation =
+                (hand.rotation * detailedWristRotation(pose.handPose[side])).normalized();
+        }
 
         out.arm[side] = armIntent(chest, chestInverse, upper.position, lower.position, hand);
     }

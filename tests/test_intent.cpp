@@ -89,6 +89,23 @@ TEST_CASE(intent.elbow_bend_defines_pole) {
     CHECK(left.elbowPole.y > 0.5f);
 }
 
+TEST_CASE(intent.detailed_wrist_is_part_of_orientation) {
+    ClipPose pose = motion::neutralClipPose();
+    pose.handPose[0].wrist = {1.0f, 0.0f, 0.0f};
+    // Without the detailed hand layer the wrist adds nothing.
+    CHECK(motion::extractTaskSpaceIntent(pose).arm[0].wristOrientation.w > 0.9999f);
+
+    pose.detailedHands = true;
+    const Quat expected = math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, 0.26f);
+    const Quat actual = motion::extractTaskSpaceIntent(pose).arm[0].wristOrientation;
+    CHECK_NEAR(actual.x, expected.x, 1e-5);
+    CHECK_NEAR(actual.y, expected.y, 1e-5);
+    CHECK_NEAR(actual.z, expected.z, 1e-5);
+    CHECK_NEAR(actual.w, expected.w, 1e-5);
+    // The right hand has its own (here neutral) wrist value.
+    CHECK(motion::extractTaskSpaceIntent(pose).arm[1].wristOrientation.w > 0.9999f);
+}
+
 TEST_CASE(intent.chest_relative_ignores_torso_and_stage) {
     const ArmIntent reference =
         motion::extractTaskSpaceIntent(motion::neutralClipPose()).arm[0];
