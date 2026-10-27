@@ -31,9 +31,11 @@ known beats:
   elbow direction change between neighbouring samples (`smoothWeight` per radian,
   `flipWeight` extra above pi/2). Ties break by candidate index, so the result is
   deterministic.
-- **Curve.** Stores the chosen elbow direction per sample (length = upper arm).
-  `sample(beat)` interpolates directions and keeps the bone length, so the arm never
-  stretches.
+- **Curve.** Stores only the chosen bend direction per sample (unit). `bendDirection(beat)`
+  interpolates it on the sphere; neighbours that point in opposite directions turn along a
+  fixed rotation path, so the direction never collapses. `elbow(beat, shoulder, wrist, ...)`
+  rebuilds the elbow on the two-bone locus for the wrist the consumer plans at that beat,
+  so both bones keep their length at every frame, not only at the stored samples.
 
 The solver never reads a previously rendered frame. Its output is a pure function of
 the samples, so it does not depend on the frame rate, seek position or call order.

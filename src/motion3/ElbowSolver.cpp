@@ -103,6 +103,27 @@ float armClearance(const CollisionProxyInfo& torso, Vec3 shoulder, Vec3 elbow, V
     return minimum;
 }
 
+// Interpolates unit directions on the sphere. Nearly antipodal endpoints have no unique
+// great circle, so the arc is taken around a fixed axis perpendicular to `a`.
+Vec3 slerpDirection(Vec3 a, Vec3 b, float t) {
+    const float cosine = std::clamp(math::dot(a, b), -1.0f, 1.0f);
+    if (cosine > 0.9999f) {
+        return safeNormalize(math::lerp(a, b, t), a);
+    }
+    if (cosine < -0.9999f) {
+        const Vec3 helper = std::abs(a.x) < 0.9f ? Vec3{1.0f, 0.0f, 0.0f}
+                                                 : Vec3{0.0f, 1.0f, 0.0f};
+        const Vec3 axis = math::normalize(math::cross(a, helper));
+        const float angle = math::kPi * t;
+        return a * std::cos(angle) + math::cross(axis, a) * std::sin(angle);
+    }
+    const float omega = std::acos(cosine);
+    const float sine = std::sin(omega);
+    return safeNormalize(a * (std::sin((1.0f - t) * omega) / sine) +
+                             b * (std::sin(t * omega) / sine),
+                         a);
+}
+
 float angleBetween(Vec3 a, Vec3 b) {
     const Vec3 na = safeNormalize(a, a);
     const Vec3 nb = safeNormalize(b, b);
@@ -120,30 +141,29 @@ math::Vec3 elbowPosition(Vec3 shoulder, Vec3 wrist, float swivel, Vec3 pole, flo
     return shoulder + offsetFor(locus, swivel);
 }
 
-math::Vec3 ElbowSwivelCurve::sample(double beat) const {
-    if (elbowOffset.empty()) {
+math::Vec3 ElbowSwivelCurve::bendDirection(double beat) const {
+    if (bend.empty()) {
         return {};
     }
     if (beat <= beats.front()) {
-        return elbowOffset.front();
+        return bend.front();
     }
     if (beat >= beats.back()) {
-        return elbowOffset.back();
+        return bend.back();
     }
     const auto next = std::upper_bound(beats.begin(), beats.end(), beat);
     const std::size_t index = static_cast<std::size_t>(next - beats.begin());
-    const Vec3& before = elbowOffset[index - 1];
-    const Vec3& after = elbowOffset[index];
     const double span = beats[index] - beats[index - 1];
     if (span <= 0.0) {
-        return after;
+        return bend[index];
     }
-    // Interpolate directions and keep the bone length: the arm never stretches.
     const float t = static_cast<float>((beat - beats[index - 1]) / span);
-    const float length = before.length();
-    const Vec3 direction =
-        math::lerp(safeNormalize(before, before), safeNormalize(after, after), t);
-    return safeNormalize(direction, before) * length;
+    return slerpDirection(bend[index - 1], bend[index], t);
+}
+
+math::Vec3 ElbowSwivelCurve::elbow(double beat, Vec3 shoulder, Vec3 wrist, float upperArm,
+                                   float forearm) const {
+    return elbowPosition(shoulder, wrist, 0.0f, bendDirection(beat), upperArm, forearm);
 }
 
 ElbowSwivelCurve solveElbowSwivel(const CollisionProxyInfo& torso,
@@ -240,14 +260,16 @@ ElbowSwivelCurve solveElbowSwivel(const CollisionProxyInfo& torso,
             std::min(stats.minClearanceAfter, clearance[index(k, chosen[k])]);
     }
     curve.beats.reserve(count);
-    curve.elbowOffset.reserve(count);
+    curve.bend.reserve(count);
     for (std::size_t k = 0; k < count; ++k) {
+        const Vec3& offset = offsets[index(k, chosen[k])];
         curve.beats.push_back(samples[k].beat);
-        curve.elbowOffset.push_back(offsets[index(k, chosen[k])]);
+        curve.bend.push_back(safeNormalize(offset, offset));
         if (k == 0) {
             continue;
         }
-        const float angle = angleBetween(curve.elbowOffset[k - 1], curve.elbowOffset[k]);
+        const Vec3& previous = offsets[index(k - 1, chosen[k - 1])];
+        const float angle = angleBetween(previous, offset);
         stats.maxSwivelStep = std::max(stats.maxSwivelStep, angle);
         if (angle > rightAngle) {
             ++stats.flips;

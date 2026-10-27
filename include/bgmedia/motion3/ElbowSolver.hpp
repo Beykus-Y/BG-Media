@@ -69,14 +69,22 @@ struct ElbowSolveReport {
                                        math::Vec3 pole, float upperArm, float forearm,
                                        bool* degenerate = nullptr);
 
-// Solved elbow curve. Stores the elbow direction (elbow - shoulder, length upperArm)
-// per sample; sample() interpolates the directions and keeps the bone length.
+// Solved elbow curve. Stores only the bend direction (unit, chest frame) per sample: the
+// side the elbow bends to. The elbow itself is rebuilt on the two-bone locus for the wrist
+// the consumer plans at that beat, so both bones keep their length at every frame.
 class ElbowSwivelCurve {
 public:
     std::vector<double> beats;
-    std::vector<math::Vec3> elbowOffset;
+    std::vector<math::Vec3> bend;
 
-    [[nodiscard]] math::Vec3 sample(double beat) const;
+    // Bend direction at a beat. Interpolated on the sphere; antipodal neighbours turn
+    // along a fixed rotation path, so the direction never collapses to zero.
+    [[nodiscard]] math::Vec3 bendDirection(double beat) const;
+
+    // Elbow position for the wrist at that beat. Both bone lengths are exact whenever the
+    // wrist is within reach (out-of-reach wrists are clamped, as in elbowPosition).
+    [[nodiscard]] math::Vec3 elbow(double beat, math::Vec3 shoulder, math::Vec3 wrist,
+                                   float upperArm, float forearm) const;
 };
 
 [[nodiscard]] ElbowSwivelCurve solveElbowSwivel(const animation::CollisionProxyInfo& torso,
