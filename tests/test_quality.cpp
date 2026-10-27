@@ -309,6 +309,7 @@ TEST_CASE(quality.crossfade_keeps_each_clips_overlays_until_the_blend_ends) {
     motion::ClipPose prevLegacy;
     motion::ClipPose prevPlain;
     float plainMax = 0.0f;
+    float steadyMax = 0.0f;
     bool havePrev = false;
     float prevProgress = -1.0f;
     const double dt = 1.0 / 240.0;
@@ -340,6 +341,9 @@ TEST_CASE(quality.crossfade_keeps_each_clips_overlays_until_the_blend_ends) {
             legacyMax = std::max(legacyMax, maxBoneAngle(legacy, prevLegacy));
             plainMax = std::max(plainMax, maxBoneAngle(plain.pose, prevPlain));
         }
+        if (havePrev && frame.transitionProgress < 0.0f && prevProgress < 0.0f) {
+            steadyMax = std::max(steadyMax, maxBoneAngle(frame.pose, prevNew));
+        }
         prevProgress = frame.transitionProgress;
         prevNew = frame.pose;
         prevLegacy = legacy;
@@ -348,9 +352,12 @@ TEST_CASE(quality.crossfade_keeps_each_clips_overlays_until_the_blend_ends) {
     }
     CHECK(sawTransition);
     std::cout << "\n            max per-step bone rotation over crossfade @240Hz: new="
-              << newMax << " legacy=" << legacyMax << " baseOnly=" << plainMax << " at t=" << worstAt
+              << newMax << " legacy=" << legacyMax << " baseOnly=" << plainMax << " steadyOverlay=" << steadyMax << " at t=" << worstAt
               << " progress=" << worstProgress << " bone=" << worstBone;
     CHECK(newMax <= 0.5f * legacyMax);
+    // KNOWN LIMITATION (docs/BG_MOTION_3_2_QUALITY_PASS.md): a residual hand pop
+    // remains around progress 0.8 (about 4x the steady-state overlay step); it
+    // is printed above, not hidden by a loosened threshold.
 }
 
 TEST_CASE(quality.time_warp_carries_the_detailed_hand_pose) {

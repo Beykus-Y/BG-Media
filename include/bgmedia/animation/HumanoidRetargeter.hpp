@@ -43,6 +43,29 @@ struct RetargetOptions {
 
     bool footIK = true;
     bool idleMotion = true;
+
+    // BG Motion 3.2 quality pass: keeps the forearms and hands out of the torso.
+    // Proxy based (an elliptical torso cylinder and arm spheres calibrated from
+    // the model's rest mesh), NOT an exact mesh intersection test.
+    bool armCollision = true;
+    float armClearanceMargin = 0.004f;  // extra gap, in character heights
+};
+
+// Calibrated collision proxies of one model (metres, model space).
+struct CollisionProxyInfo {
+    bool valid = false;
+    bool fromMesh = false;   // false: proportions estimated from the skeleton
+    // Torso cross-section half extents at three heights along the spine
+    // (0 = waist, 1 = waist/chest, 2 = shoulders); linearly interpolated.
+    float torsoHalfWidth = 0.0f;   // widest band
+    float torsoHalfFront = 0.0f;   // deepest band
+    float torsoHalfBack = 0.0f;
+    float bandWidth[3] = {0.0f, 0.0f, 0.0f};
+    float bandFront[3] = {0.0f, 0.0f, 0.0f};
+    float bandBack[3] = {0.0f, 0.0f, 0.0f};
+    float upperArmRadius = 0.0f;
+    float foreArmRadius = 0.0f;
+    float handRadius = 0.0f;
 };
 
 struct RetargetStats {
@@ -58,6 +81,14 @@ struct RetargetStats {
     // the leg chain can reach: error attributable to the solver/rig alone.
     float footSolverError = 0.0f;
     float lowestFootY = 0.0f;
+
+    // Arm/torso proxy clearance (metres; positive = clear). `Raw` is before the
+    // refinement, `Min` after it. Proxy distances, not mesh distances.
+    bool armProxy = false;
+    float armClearanceRaw = 0.0f;
+    float armClearanceMin = 0.0f;
+    float armCorrection = 0.0f;       // largest wrist/elbow displacement applied
+    bool armCorrectionClamped = false;  // safe fallback limited the correction
     int resolvedBones = 0;
     int missingBones = 0;
     int fingerBones = 0;       // finger nodes present on the model
@@ -100,6 +131,7 @@ public:
     HumanoidRetargeter& operator=(const HumanoidRetargeter&) = delete;
 
     [[nodiscard]] bool valid() const;
+    [[nodiscard]] CollisionProxyInfo collisionProxy() const;
     [[nodiscard]] const std::string& error() const;
 
     // Deterministic: the output depends only on pose, mediaTime and options,

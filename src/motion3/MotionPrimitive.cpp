@@ -860,7 +860,8 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
 
     // --- 2. deterministic selection ---------------------------------------
     // Highest priority first; ties are broken by the cue's own data only, never
-    // by its position in the input array, so permuting the cues cannot change
+    // by its position in the input array or by its current weight (weight order
+    // would flip mid-cue and pop the layers), so permuting the cues cannot change
     // the outcome. A lower-priority cue never blocks a higher-priority one.
     const auto cueOrder = [](const ActiveCue& a, const ActiveCue& b) {
         const PrimitiveCue& ca = *a.cue;
@@ -868,7 +869,6 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         if (ca.effectivePriority() != cb.effectivePriority()) {
             return ca.effectivePriority() > cb.effectivePriority();
         }
-        if (a.weight != b.weight) return a.weight > b.weight;
         if (ca.kind != cb.kind) return ca.kind < cb.kind;
         if (ca.side != cb.side) return ca.side < cb.side;
         if (ca.beat != cb.beat) return ca.beat < cb.beat;
@@ -886,7 +886,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
     constexpr float kMinShare = 0.02f;
     std::vector<ActiveCue> active;
     active.reserve(candidates.size());
-    int upperLayers = 0;
+    float upperLayerLoad = 0.0f;
     for (ActiveCue& entry : candidates) {
         bool conflicted = false;
         for (const ActiveCue& other : active) {
@@ -918,11 +918,29 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
             ++out.diagnostics.narrowedByConflict;
         }
         if ((entry.mask & body::UpperBody) != 0u) {
-            if (upperLayers >= options.maxUpperBodyLayers) {
+            // Layer cap as a *capacity*: every upper-body cue consumes its own
+            // weight, and a cue only gets what is left. A rising high-priority
+            // cue therefore squeezes weaker ones out gradually instead of
+            // evicting one of them in a single frame.
+            const float capacity = std::clamp(
+                static_cast<float>(options.maxUpperBodyLayers) - upperLayerLoad, 0.0f, 1.0f);
+            if (capacity < kMinShare) {
                 ++out.diagnostics.rejectedByConflict;
                 continue;
             }
-            ++upperLayers;
+            if (capacity < 1.0f) {
+                for (float& share : entry.share) {
+                    share *= capacity;
+                }
+                ++out.diagnostics.narrowedByConflict;
+            }
+            float best = 0.0f;
+            for (int r = 0; r < kRegionCount; ++r) {
+                if ((entry.mask & (1u << r)) != 0u) {
+                    best = std::max(best, entry.share[static_cast<std::size_t>(r)]);
+                }
+            }
+            upperLayerLoad += entry.weight * best;
         }
         active.push_back(std::move(entry));
     }

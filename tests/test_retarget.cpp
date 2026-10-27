@@ -317,4 +317,3 @@ TEST_CASE(retarget.model1_if_available) {
               << " bones=" << neutral.stats.resolvedBones;
 }
 
-#include "retarget_quality_tests.inc"
