@@ -364,6 +364,22 @@ ASan-прогон: `scripts/run_asan_windows.ps1` — dance-тесты вход�
 [tests/fixtures/README.md](tests/fixtures/README.md). Подробный
 до/после-разбор BG Beat: [docs/BG_BEAT_AUDIT.md](docs/BG_BEAT_AUDIT.md).
 
+## Непрерывная интеграция
+
+`.github/workflows/windows-ci.yml` собирает проект на `windows-latest` (MSVC,
+Ninja, CMake) в двух заданиях:
+
+- **Core, tools and tests** — `BGMEDIA_BUILD_DESKTOP=OFF`, затем полный
+  прогон `ctest`. Это основная проверка: она не требует SDL3 и не зависит от
+  приватных ресурсов.
+- **Desktop renderer build** — `BGMEDIA_BUILD_DESKTOP=ON` с закреплённым
+  SDL3 из `FetchContent`; проверяется, что `bgmedia_desktop` и SDL_GPU-
+  рендерер компилируются.
+
+Приватные `models/Model1.vrm` и музыка в CI отсутствуют. Тесты, которым нужна
+реальная модель, честно возвращаются с пометкой `skipped`, а не падают.
+ASan-прогон (`scripts/run_asan_windows.ps1`) в CI пока не включён.
+
 ## Структура репозитория
 
 ```text

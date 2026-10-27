@@ -1,0 +1,73 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "feat/**"
+      - "fix/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests:
+    name: Core, tools and tests (MSVC x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBGMEDIA_BUILD_DESKTOP=OFF
+          -DBGMEDIA_BUILD_TESTS=ON
+          -DBGMEDIA_BUILD_TOOLS=ON
+          -DBGMEDIA_BUILD_MINIAUDIO=ON
+
+      - name: Build
+        run: cmake --build build/ci --parallel
+
+      - name: Test
+        run: ctest --test-dir build/ci --output-on-failure --timeout 180
+
+  desktop:
+    name: Desktop renderer build (SDL3)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/desktop -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBGMEDIA_BUILD_DESKTOP=ON
+          -DBGMEDIA_BUILD_TESTS=OFF
+          -DBGMEDIA_BUILD_TOOLS=ON
+          -DBGMEDIA_BUILD_MINIAUDIO=ON
+          -DBGMEDIA_FETCH_SDL3=ON
+
+      - name: Build
+        run: cmake --build build/desktop --parallel
