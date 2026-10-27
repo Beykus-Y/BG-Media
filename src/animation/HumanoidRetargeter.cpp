@@ -304,7 +304,8 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     proxy.torsoHalfWidth = 0.46f * span;
     proxy.torsoHalfFront = 0.28f * span;
     proxy.torsoHalfBack = 0.26f * span;
-    for (int band = 0; band < 3; ++band) {
+    proxy.fingerRadius = 0.008f * height;
+    for (int band = 0; band < kProxyBands; ++band) {
         proxy.bandWidth[band] = proxy.torsoHalfWidth * (band == 0 ? 0.80f : 1.0f);
         proxy.bandFront[band] = proxy.torsoHalfFront;
         proxy.bandBack[band] = proxy.torsoHalfBack;
@@ -321,7 +322,7 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     }
 
     // Mesh calibration: classify skinned vertices by dominant joint.
-    enum : int { kNone = -1, kTorso = 0, kUpper = 1, kFore = 2, kHand = 3 };
+    enum : int { kNone = -1, kTorso = 0, kUpper = 1, kFore = 2, kHand = 3, kFinger = 4 };
     std::vector<int> cls(m.nodes.size(), kNone);
     const auto mark = [&](int node, int c) {
         if (node >= 0 && static_cast<std::size_t>(node) < cls.size()) {
@@ -337,8 +338,36 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     mark(rightLowerArm, kFore);
     mark(leftHand, kHand);
     mark(rightHand, kHand);
+    for (int sd = 0; sd < 2; ++sd)
+        for (int fg = 0; fg < 5; ++fg)
+            for (int jt = 0; jt < 3; ++jt) mark(fingers[sd][fg][jt], kFinger);
+    // Bone segment of a finger joint (joint -> next joint; the distal bone is extended
+    // by the length of the intermediate one).
+    const auto fingerSegment = [&](int node, Vec3& a, Vec3& b) {
+        for (int sd = 0; sd < 2; ++sd)
+            for (int fg = 0; fg < 5; ++fg)
+                for (int jt = 0; jt < 3; ++jt) {
+                    if (fingers[sd][fg][jt] != node) continue;
+                    a = bindPosition(node);
+                    if (jt < 2 && fingers[sd][fg][jt + 1] >= 0) {
+                        b = bindPosition(fingers[sd][fg][jt + 1]);
+                        return true;
+                    }
+                    if (jt > 0 && fingers[sd][fg][jt - 1] >= 0) {
+                        b = a + (a - bindPosition(fingers[sd][fg][jt - 1]));
+                        return true;
+                    }
+                    return false;
+                }
+        return false;
+    };
 
-    std::vector<float> lateral[3], front[3], back[3], rUpper, rFore, rHand;
+    struct TorsoSample {
+        float x, z;  // |lateral|, signed forward
+        int band;
+    };
+    std::vector<TorsoSample> torsoSamples;
+    std::vector<float> lateral[kProxyBands], front[kProxyBands], back[kProxyBands], rUpper, rFore, rHand, rFinger;
     const float torsoSpan = (neckPos - hipsPos).length();
     const Vec3 right = m.right;
     const Vec3 forward = m.forward;
@@ -382,9 +411,11 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
                     if (along < 0.0f || along > torsoSpan) {
                         continue;  // only the waist / rib cage / shoulder band
                     }
-                    const int band = std::min(2, static_cast<int>(3.0f * along / torsoSpan));
+                    const int band = std::min(kProxyBands - 1,
+                                              static_cast<int>(static_cast<float>(kProxyBands) * along / torsoSpan));
                     lateral[band].push_back(std::abs(math::dot(d, right)));
                     const float f = math::dot(d, forward);
+                    torsoSamples.push_back({std::abs(math::dot(d, right)), f, band});
                     (f >= 0.0f ? front[band] : back[band]).push_back(std::abs(f));
                 } else if (c == kUpper) {
                     const bool leftSide = node == leftUpperArm;
@@ -396,6 +427,11 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
                     rFore.push_back(distanceToSegment(
                         p, bindPosition(leftSide ? leftLowerArm : rightLowerArm),
                         bindPosition(leftSide ? leftHand : rightHand)));
+                } else if (c == kFinger) {
+                    Vec3 sa{}, sb{};
+                    if (fingerSegment(node, sa, sb)) {
+                        rFinger.push_back(distanceToSegment(p, sa, sb));
+                    }
                 } else {
                     const bool leftSide = node == leftHand;
                     const Vec3 wrist = bindPosition(leftSide ? leftHand : rightHand);
@@ -410,14 +446,16 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
     // the nearest band that has data; if there is none the skeleton fallback
     // stays in place.
     constexpr std::size_t kMinSamples = 8;
-    const auto fill = [&](std::vector<float> (&lists)[3], float* out, float lo, float hi) {
+    // The proxy follows the body including vest and pouches (P95), but not the few
+    // outlier vertices (a strap tail, a buckle); the clamps are in shoulder spans.
+    constexpr float kTorsoPercentile = 0.95f;
+    const auto fill = [&](std::vector<float> (&lists)[kProxyBands], float* out, float lo, float hi) {
         bool any = false;
-        float value[3] = {0.0f, 0.0f, 0.0f};
-        bool have[3] = {false, false, false};
-        for (int band = 0; band < 3; ++band) {
+        float value[kProxyBands] = {};
+        bool have[kProxyBands] = {};
+        for (int band = 0; band < kProxyBands; ++band) {
             if (lists[band].size() >= kMinSamples) {
-                // P85: the proxy follows the body, not the occasional strap or pouch.
-                value[band] = std::clamp(percentile(lists[band], 0.85f), lo, hi);
+                value[band] = std::clamp(percentile(lists[band], kTorsoPercentile), lo, hi);
                 have[band] = true;
                 any = true;
             }
@@ -425,11 +463,11 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
         if (!any) {
             return false;
         }
-        for (int band = 0; band < 3; ++band) {
+        for (int band = 0; band < kProxyBands; ++band) {
             int source = -1;
-            for (int d = 0; d < 3 && source < 0; ++d) {
+            for (int d = 0; d < kProxyBands && source < 0; ++d) {
                 for (int cand : {band - d, band + d}) {
-                    if (cand >= 0 && cand < 3 && have[cand]) {
+                    if (cand >= 0 && cand < kProxyBands && have[cand]) {
                         source = cand;
                         break;
                     }
@@ -439,25 +477,47 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
         }
         return true;
     };
-    float bw[3], bf[3], bb[3];
+    float bw[kProxyBands], bf[kProxyBands], bb[kProxyBands];
     if (fill(lateral, bw, 0.20f * span, 0.80f * span) &&
         fill(front, bf, 0.08f * span, 0.70f * span) &&
         fill(back, bb, 0.08f * span, 0.70f * span)) {
         proxy.fromMesh = true;
-        for (int band = 0; band < 3; ++band) {
+        for (int band = 0; band < kProxyBands; ++band) {
             proxy.bandWidth[band] = bw[band];
             proxy.bandFront[band] = bf[band];
             proxy.bandBack[band] = bb[band];
         }
-        proxy.torsoHalfWidth = *std::max_element(bw, bw + 3);
-        proxy.torsoHalfFront = *std::max_element(bf, bf + 3);
-        proxy.torsoHalfBack = *std::max_element(bb, bb + 3);
+        // Fit the cross-section exponent: the smallest p (2 = ellipse .. 4 = rounded box)
+        // for which at most 6 % of the torso vertices lie outside the proxy. A vest is
+        // boxier than an ellipse; an ellipse cuts its front corners, which is exactly
+        // where a forearm folded across the body ends up.
+        proxy.shapeExponent = 4.0f;
+        for (float pExp = 2.0f; pExp <= 4.0f; pExp += 0.25f) {
+            std::size_t outside = 0;
+            for (const TorsoSample& t : torsoSamples) {
+                const float a = std::max(1.0e-4f, bw[t.band]);
+                const float b = std::max(1.0e-4f, t.z >= 0.0f ? bf[t.band] : bb[t.band]);
+                const float v = std::pow(t.x / a, pExp) + std::pow(std::abs(t.z) / b, pExp);
+                outside += v > 1.0f;
+            }
+            if (!torsoSamples.empty() &&
+                static_cast<float>(outside) <= 0.06f * static_cast<float>(torsoSamples.size())) {
+                proxy.shapeExponent = pExp;
+                break;
+            }
+        }
+        proxy.torsoHalfWidth = *std::max_element(bw, bw + kProxyBands);
+        proxy.torsoHalfFront = *std::max_element(bf, bf + kProxyBands);
+        proxy.torsoHalfBack = *std::max_element(bb, bb + kProxyBands);
     }
     if (rUpper.size() >= 50) {
         proxy.upperArmRadius = std::clamp(percentile(rUpper, 0.85f), 0.010f * height, 0.060f * height);
     }
     if (rFore.size() >= 50) {
-        proxy.foreArmRadius = std::clamp(percentile(rFore, 0.85f), 0.010f * height, 0.060f * height);
+        proxy.foreArmRadius = std::clamp(percentile(rFore, 0.95f), 0.010f * height, 0.060f * height);
+    }
+    if (rFinger.size() >= 50) {
+        proxy.fingerRadius = std::clamp(percentile(rFinger, 0.90f), 0.004f * height, 0.030f * height);
     }
     if (rHand.size() >= 50) {
         proxy.handRadius = std::clamp(percentile(rHand, 0.80f), 0.015f * height, 0.080f * height);
@@ -511,8 +571,10 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         const float x = math::dot(d, rightAxis);
         const float z = math::dot(d, fwd);
         // Band-interpolated cross-section at this height along the spine.
-        const float t = std::clamp(y / torsoLength, 0.0f, 1.0f) * 2.0f;
-        const int b0 = std::min(1, static_cast<int>(t));
+        // Band centres sit at (i + 0.5) / kProxyBands of the spine length.
+        const float t = std::clamp(y / torsoLength * static_cast<float>(kProxyBands) - 0.5f, 0.0f,
+                                   static_cast<float>(kProxyBands - 1));
+        const int b0 = std::min(kProxyBands - 2, static_cast<int>(t));
         const float k = t - static_cast<float>(b0);
         const auto lerpBand = [&](const float* band) {
             return band[b0] * (1.0f - k) + band[b0 + 1] * k;
@@ -520,16 +582,22 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         const float b = std::max(0.02f, z >= 0.0f ? lerpBand(proxy.bandFront)
                                                   : lerpBand(proxy.bandBack));
         const float a = std::max(0.02f, lerpBand(proxy.bandWidth));
-        const float rr = std::sqrt((x * x) / (a * a) + (z * z) / (b * b));
+        // Super-ellipse radius rr = (|x/a|^p + |z/b|^p)^(1/p); rr = 1 on the surface.
+        const float pe = proxy.shapeExponent;
+        const float ux = std::abs(x) / a;
+        const float uz = std::abs(z) / b;
+        const float rr = std::pow(std::pow(ux, pe) + std::pow(uz, pe), 1.0f / pe);
         float surface;
         Vec3 n;
         if (rr < 1.0e-4f) {
             n = rightAxis;
             surface = -std::min(a, b);
         } else {
-            const float gx = x / (a * a * rr);
-            const float gz = z / (b * b * rr);
-            const float glen = std::sqrt(gx * gx + gz * gz);
+            // grad rr = rr^(1-p) * (sign(x) ux^(p-1) / a, sign(z) uz^(p-1) / b)
+            const float scale = std::pow(rr, 1.0f - pe);
+            const float gx = (x >= 0.0f ? 1.0f : -1.0f) * std::pow(ux, pe - 1.0f) / a * scale;
+            const float gz = (z >= 0.0f ? 1.0f : -1.0f) * std::pow(uz, pe - 1.0f) / b * scale;
+            const float glen = std::max(1.0e-6f, std::sqrt(gx * gx + gz * gz));
             surface = (rr - 1.0f) / glen;
             n = math::normalize(rightAxis * (gx / glen) + fwd * (gz / glen));
         }
@@ -563,45 +631,98 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         }
         const Vec3 E0 = E;
         const Vec3 W0 = W;
-        const Vec3 handDir = math::normalize(W - E);
 
-        const auto samples = [&](Vec3 e, Vec3 w, float out[5], Vec3 normals[5]) {
-            const Vec3 hd = math::normalize(w - e);
+        // Hand control points, as offsets from the wrist. The hand is carried rigidly
+        // (its world orientation is preserved below), so the offsets stay valid while
+        // the wrist moves. Points: palm centre, index and little knuckles, and for each
+        // finger its middle joint and tip (the distal bone extended by one more bone).
+        struct HandPoint {
+            Vec3 offset;
+            float radius;
+        };
+        std::vector<HandPoint> hand;
+        const int sd = arm.hand == rightHand ? 1 : 0;
+        hand.push_back({math::normalize(W0 - E0) * handCenterOffset, proxy.handRadius});
+        for (int fg : {1, 4}) {
+            if (fingers[sd][fg][0] >= 0) {
+                hand.push_back({actualPosition(globals, fingers[sd][fg][0]) - W0, proxy.handRadius * 0.7f});
+            }
+        }
+        for (int fg = 0; fg < 5; ++fg) {
+            const int j0 = fingers[sd][fg][0], j1 = fingers[sd][fg][1], j2 = fingers[sd][fg][2];
+            if (j1 >= 0) {
+                hand.push_back({actualPosition(globals, j1) - W0, proxy.fingerRadius});
+            }
+            if (j2 >= 0 && j1 >= 0) {
+                const Vec3 distal = actualPosition(globals, j2);
+                const Vec3 tip = distal + (distal - actualPosition(globals, j1));
+                hand.push_back({distal - W0, proxy.fingerRadius});
+                hand.push_back({tip - W0, proxy.fingerRadius});
+            } else if (j0 >= 0 && j1 < 0) {
+                hand.push_back({actualPosition(globals, j0) - W0, proxy.fingerRadius});
+            }
+        }
+        float handReach = 0.0f;  // how far any hand point (incl. its radius) can be from the wrist
+        for (const HandPoint& hp : hand) {
+            handReach = std::max(handReach, hp.offset.length() + hp.radius - proxy.handRadius);
+        }
+        handReach += 0.002f;
+        const std::size_t kFixed = 4;  // upper-mid (unused), elbow, forearm-mid, wrist
+        const std::size_t sampleCount = kFixed + hand.size();
+        std::vector<float> c(sampleCount);
+        std::vector<Vec3> n(sampleCount);
+        const auto samples = [&](Vec3 e, Vec3 w) {
             // Upper-arm mid is deliberately not sampled: a hanging arm lies
             // beside the torso by construction (the shoulder joint sits on its
             // edge), so only elbow, forearm and hand count.
-            const Vec3 pts[5] = {S + (e - S) * 0.5f, e, e + (w - e) * 0.5f, w,
-                                 w + hd * handCenterOffset};
-            const float rad[5] = {0.0f, proxy.foreArmRadius, proxy.foreArmRadius,
-                                  proxy.handRadius, proxy.handRadius};
-            for (int i = 0; i < 5; ++i) {
-                out[i] = i == 0 ? 1.0f : clearance(pts[i], rad[i] + gap, &normals[i]);
+            c[0] = 1.0f;
+            c[1] = clearance(e, proxy.foreArmRadius + gap, &n[1]);
+            c[2] = clearance(e + (w - e) * 0.5f, proxy.foreArmRadius + gap, &n[2]);
+            c[3] = clearance(w, proxy.handRadius + gap, &n[3]);
+            // Early out: when the wrist is farther from the torso than the whole hand can
+            // reach, no finger point can be inside it (the clearance field is 1-Lipschitz).
+            if (c[3] > handReach) {
+                for (std::size_t i = 0; i < hand.size(); ++i) {
+                    c[kFixed + i] = c[3] - handReach;
+                    n[kFixed + i] = n[3];
+                }
+                return;
+            }
+            for (std::size_t i = 0; i < hand.size(); ++i) {
+                c[kFixed + i] = clearance(w + hand[i].offset, hand[i].radius + gap, &n[kFixed + i]);
             }
         };
-        float c[5];
-        Vec3 n[5];
-        samples(E, W, c, n);
-        float armRaw = *std::min_element(c, c + 5);
+        samples(E, W);
+        float armRaw = *std::min_element(c.begin(), c.end());
         rawMin = std::min(rawMin, armRaw);
 
         // A few bounded iterations: moving the elbow changes the forearm sample.
-        Vec3 targetE = E;
-        Vec3 targetW = W;
         for (int it = 0; it < 6 && armRaw < 0.0f; ++it) {
-            const float pU = softPush(c[0], eps);
             const float pE = softPush(c[1], eps);
             const float pF = softPush(c[2], eps);
-            const float pW = softPush(c[3], eps);
-            const float pH = softPush(c[4], eps);
-            if (pU + pE + pF + pW + pH <= 1.0e-6f) {
+            // The wrist follows the deepest hand point along that point's own outward normal.
+            float handPush = softPush(c[3], eps);
+            Vec3 handNormal = n[3];
+            for (std::size_t i = kFixed; i < sampleCount; ++i) {
+                const float p = softPush(c[i], eps);
+                if (p > handPush) {
+                    handPush = p;
+                    handNormal = n[i];
+                }
+            }
+            if (pE + pF + handPush <= 1.0e-6f) {
                 break;
             }
-            // The elbow carries the upper arm (its midpoint moves half as far);
-            // the wrist carries the forearm/hand (midpoint moves with both).
-            const float moveE = std::max(pE, 2.0f * pU);
-            const float moveW = std::max({pW, pH, 2.0f * pF - moveE});
-            targetE = E + n[1] * moveE;
-            targetW = W + n[3] * std::max(0.0f, moveW);
+            // A forearm point is pushed by moving elbow and wrist together (the forearm
+            // translates), which needs the smallest swing: pivoting about a fixed elbow
+            // would need twice the wrist move for the same forearm clearance.
+            const float moveE = std::max(pE, pF);
+            Vec3 moveWVec = handNormal * handPush;
+            if (pF > handPush) {
+                moveWVec = n[2] * pF;
+            }
+            const Vec3 targetE = E + (pF > pE ? n[2] : n[1]) * moveE;
+            const Vec3 targetW = W + moveWVec;
             // Re-solve the two-bone chain: elbow on the circle closest to targetE.
             Vec3 reach = targetW - S;
             float dist = reach.length();
@@ -636,14 +757,16 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
             }
             E = newE;
             W = newW;
-            samples(E, W, c, n);
-            armRaw = *std::min_element(c, c + 5);
+            samples(E, W);
+            armRaw = *std::min_element(c.begin(), c.end());
         }
 
         if ((E - E0).length() > 1.0e-6f || (W - W0).length() > 1.0e-6f) {
-            // Swing-only update: keep the authored axial twist of both bones.
+            // Swing-only update: keep the authored axial twist of both bones, and the
+            // authored world orientation of the hand (its local rotation is re-derived).
             const Quat upperWorld0 = globals[static_cast<std::size_t>(arm.upper)].rotationQuat();
             const Quat lowerWorld0 = globals[static_cast<std::size_t>(arm.lower)].rotationQuat();
+            const Quat handWorld0 = globals[static_cast<std::size_t>(arm.hand)].rotationQuat();
             const Quat swingU = math::fromTo(E0 - S, E - S);
             const Quat upperWorld = (swingU * upperWorld0).normalized();
             const Vec3 foreDirAfterU = math::rotate(swingU, W0 - E0);
@@ -662,12 +785,14 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
             };
             writeLocal(arm.upper, (parentWorld.conjugate() * upperWorld).normalized());
             writeLocal(arm.lower, (upperWorld.conjugate() * lowerWorld).normalized());
+            writeLocal(arm.hand, (lowerWorld.conjugate() * handWorld0).normalized());
+            stats.armCorrectionElbow = std::max(stats.armCorrectionElbow, (E - E0).length());
+            stats.armCorrectionWrist = std::max(stats.armCorrectionWrist, (W - W0).length());
             stats.armCorrection = std::max(
                 stats.armCorrection, std::max((E - E0).length(), (W - W0).length()));
             changed = true;
         }
         finalMin = std::min(finalMin, armRaw);
-        (void)handDir;
     }
     if (changed) {
         evaluate(locals, globals);

@@ -417,6 +417,21 @@ int main(int argc, char** argv) {
                     t, pose.stats.armClearanceRaw, m.maxDepth * 1000.0f, along, nearest ? nearest->name : "-", nd * 100.0f,
                     nearest ? nearest->r * 100.0f : 0.0f,
                     nearest && nd <= nearest->r + 0.0065f ? "covered by a proxy sphere" : "NOT covered by any proxy sphere");
+        for (std::size_t h = 0; h < std::min<std::size_t>(2, hits.size()); ++h) {
+            Vec3 c{};
+            for (int k = 0; k < 3; ++k) c = c + skinned[static_cast<std::size_t>(tris[static_cast<std::size_t>(hits[h])][static_cast<std::size_t>(k)])];
+            c = c * (1.0f / 3.0f) - hips;
+            const float y = math::dot(c, up) / torsoLen;
+            const float bt = std::clamp(y * animation::kProxyBands - 0.5f, 0.0f, static_cast<float>(animation::kProxyBands - 1));
+            const int b0 = std::min(animation::kProxyBands - 2, static_cast<int>(bt));
+            const float k = bt - static_cast<float>(b0);
+            const float z = math::dot(c, model.forward);
+            const float pa = info.bandWidth[b0] * (1 - k) + info.bandWidth[b0 + 1] * k;
+            const float pb = z >= 0 ? info.bandFront[b0] * (1 - k) + info.bandFront[b0 + 1] * k
+                                    : info.bandBack[b0] * (1 - k) + info.bandBack[b0 + 1] * k;
+            std::printf("           crossing %zu: arm tri at lateral %.1f cm, forward %.1f cm, spine %.2f | proxy half-width %.1f cm, half-depth %.1f cm\n",
+                        h, math::dot(c, model.right) * 100.0f, z * 100.0f, y, pa * 100.0f, pb * 100.0f);
+        }
         if (hits.empty())
             std::printf("           triangle test: 0 arm triangles cross a torso triangle (vertices behind the surface without a crossing = "
                         "near contact / inside a fold)\n");
@@ -432,6 +447,11 @@ int main(int argc, char** argv) {
         double t;
         Measurement m;
         std::size_t index;
+        int crossings = 0;        // arm triangles crossing a torso triangle
+        float proxyRaw = 0.0f;    // proxy clearance before the refinement
+        float proxyFinal = 0.0f;  // after
+        float corrElbow = 0.0f, corrWrist = 0.0f;
+        float correction = 0.0f;  // largest elbow/wrist displacement applied (m)
     };
     for (const std::string& clip : clips) {
         motion::DancePlayer player;  // fresh per clip: a reused player keeps the first schedule
@@ -449,7 +469,90 @@ int main(int argc, char** argv) {
             const double t = f / hz;
             const auto frame = player.update(t);
             poses.push_back(rig.applyClip(frame.pose, t));
-            rows.push_back({t, measure(poses.back(), false), poses.size() - 1});
+            Row row{t, measure(poses.back(), false), poses.size() - 1};
+            row.crossings = static_cast<int>(crossingArmTris(false).size());  // uses the vertices just skinned
+            row.proxyRaw = poses.back().stats.armClearanceRaw;
+            row.proxyFinal = poses.back().stats.armClearanceMin;
+            row.correction = poses.back().stats.armCorrection;
+            row.corrElbow = poses.back().stats.armCorrectionElbow;
+            row.corrWrist = poses.back().stats.armCorrectionWrist;
+            rows.push_back(row);
+        }
+        {
+            int crossFrames = 0, maxCross = 0, proxyViolations = 0, corrected = 0, finalViolations = 0;
+            long totalCross = 0;
+            float maxCorr = 0.0f, rawMin = 9.0f, finalMin = 9.0f;
+            for (const Row& r : rows) {
+                crossFrames += r.crossings > 0;
+                maxCross = std::max(maxCross, r.crossings);
+                totalCross += r.crossings;
+                proxyViolations += r.proxyRaw < 0.0f;
+                finalViolations += r.proxyFinal < -0.002f;
+                corrected += r.correction > 1e-5f;
+                maxCorr = std::max(maxCorr, r.correction);
+                rawMin = std::min(rawMin, r.proxyRaw);
+                finalMin = std::min(finalMin, r.proxyFinal);
+            }
+            {
+                std::vector<float> cs;
+                for (const Row& r : rows) if (r.correction > 1e-5f) cs.push_back(r.correction);
+                std::sort(cs.begin(), cs.end());
+                const Row* big = nullptr;
+                for (const Row& r : rows) if (!big || r.correction > big->correction) big = &r;
+                if (big && big->correction > 1e-5f)
+                    std::printf("LARGEST %s: t=%.2f s, proxy raw clearance %+.1f mm, elbow moved %.1f mm, wrist moved %.1f mm\n",
+                                clip.c_str(), big->t, big->proxyRaw * 1000.0f, big->corrElbow * 1000.0f, big->corrWrist * 1000.0f);
+                if (!cs.empty())
+                    std::printf("CORRECTION %s: %zu frames, median %.1f mm, p90 %.1f mm, max %.1f mm; proxy deficit raw min %.1f mm\n",
+                                clip.c_str(), cs.size(), cs[cs.size() / 2] * 1000.0f, cs[cs.size() * 9 / 10] * 1000.0f,
+                                cs.back() * 1000.0f, -std::min(0.0f, rawMin) * 1000.0f);
+            }
+            std::printf("\nSUMMARY %s: frames with triangle crossings %d/%zu (max %d tris, sum %ld) | proxy violations raw %d, after %d "
+                        "(raw min %+.3f m, final min %+.3f m) | frames corrected %d, max correction %.1f mm\n",
+                        clip.c_str(), crossFrames, rows.size(), maxCross, totalCross, proxyViolations, finalViolations, rawMin,
+                        finalMin, corrected, maxCorr * 1000.0f);
+        }
+        {
+            // Smoothness: 60 Hz sequential playback, hands and elbows (stage-space speed/acceleration).
+            motion::DancePlayer smooth;
+            smooth.loadLibrary(dances);
+            smooth.setOverlayMode(overlay ? motion::OverlayMode::Full : motion::OverlayMode::Off);
+            (void)smooth.selectClip(clip, 0.0, true);
+            const double fps = 60.0;
+            std::vector<Vec3> prev(4), prev2(4);
+            double maxSpeed = 0.0, maxAccel = 0.0, maxRot = 0.0, maxCorr = 0.0, maxCorrStep = 0.0, prevCorr = 0.0;
+            math::Quat prevQ[2] = {math::Quat::identity(), math::Quat::identity()};
+            const vrm::HumanoidBone joints[4] = {vrm::HumanoidBone::LeftHand, vrm::HumanoidBone::RightHand,
+                                                 vrm::HumanoidBone::LeftLowerArm, vrm::HumanoidBone::RightLowerArm};
+            const int total = static_cast<int>(seconds * fps);
+            for (int f = 0; f < total; ++f) {
+                const double t = f / fps;
+                const auto pose = rig.applyClip(smooth.update(t).pose, t);
+                maxCorr = std::max(maxCorr, double(pose.stats.armCorrection));
+                if (f > 0) maxCorrStep = std::max(maxCorrStep, std::abs(double(pose.stats.armCorrection) - prevCorr));
+                prevCorr = pose.stats.armCorrection;
+                Vec3 cur[4];
+                for (int k = 0; k < 4; ++k) cur[k] = animation::HumanoidRetargeter::stagePosition(pose, model.nodeFor(joints[k]));
+                for (int k = 0; k < 2; ++k) {
+                    const math::Quat q = pose.nodeGlobals[static_cast<std::size_t>(model.nodeFor(joints[k]))].rotationQuat();
+                    if (f > 0) {
+                        const float d = std::abs(math::dot(q, prevQ[k]));
+                        maxRot = std::max(maxRot, 2.0 * std::acos(std::clamp(d, 0.0f, 1.0f)));
+                    }
+                    prevQ[k] = q;
+                }
+                if (f >= 2)
+                    for (int k = 0; k < 4; ++k) {
+                        maxSpeed = std::max(maxSpeed, double((cur[k] - prev[k]).length()) * fps);
+                        maxAccel = std::max(maxAccel, double((cur[k] - prev[k] * 2.0f + prev2[k]).length()) * fps * fps);
+                    }
+                for (int k = 0; k < 4; ++k) {
+                    prev2[k] = prev[k];
+                    prev[k] = cur[k];
+                }
+            }
+            std::printf("SMOOTH  %s: hand/elbow max speed %.2f m/s, max acceleration %.1f m/s^2, hand orientation max step %.3f rad/frame, correction max %.1f mm, max change between frames %.1f mm @60 Hz\n",
+                        clip.c_str(), maxSpeed, maxAccel, maxRot, maxCorr * 1000.0, maxCorrStep * 1000.0);
         }
         int torsoFrames = 0, hairFrames = 0;
         float worst = 0.0f;
@@ -471,8 +574,11 @@ int main(int argc, char** argv) {
                         r.m.maxDepth * 1000.0f,
                         r.m.worstNode >= 0 ? model.nodes[static_cast<std::size_t>(r.m.worstNode)].name.c_str() : "-");
         }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            return a.crossings != b.crossings ? a.crossings > b.crossings : a.m.penetrating > b.m.penetrating;
+        });
         for (std::size_t i = 0; i < std::min<std::size_t>(3, rows.size()); ++i) {
-            if (rows[i].m.penetrating < 5) break;
+            if (rows[i].m.penetrating < 5 && rows[i].crossings == 0) break;
             const double t = rows[i].t;
             // Use the pose from the sweep itself: a backwards update() would seek and
             // re-align the schedule, giving a different pose for the same time.

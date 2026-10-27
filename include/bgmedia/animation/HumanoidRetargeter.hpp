@@ -51,18 +51,25 @@ struct RetargetOptions {
     float armClearanceMargin = 0.004f;  // extra gap, in character heights
 };
 
+// Torso cross-section samples along the spine (waist ... shoulders).
+inline constexpr int kProxyBands = 5;
+
 // Calibrated collision proxies of one model (metres, model space).
 struct CollisionProxyInfo {
     bool valid = false;
     bool fromMesh = false;   // false: proportions estimated from the skeleton
-    // Torso cross-section half extents at three heights along the spine
-    // (0 = waist, 1 = waist/chest, 2 = shoulders); linearly interpolated.
+    // Torso cross-section half extents at kProxyBands heights along the spine
+    // (band centres, waist ... shoulders); linearly interpolated.
     float torsoHalfWidth = 0.0f;   // widest band
     float torsoHalfFront = 0.0f;   // deepest band
     float torsoHalfBack = 0.0f;
-    float bandWidth[3] = {0.0f, 0.0f, 0.0f};
-    float bandFront[3] = {0.0f, 0.0f, 0.0f};
-    float bandBack[3] = {0.0f, 0.0f, 0.0f};
+    float bandWidth[kProxyBands] = {};
+    float bandFront[kProxyBands] = {};
+    float bandBack[kProxyBands] = {};
+    float fingerRadius = 0.0f;
+    // Cross-section shape |x/a|^p + |z/b|^p = 1: p = 2 is an ellipse, larger p is boxier
+    // (a vest). Fitted so that the proxy contains at least 94 % of the torso vertices.
+    float shapeExponent = 2.0f;
     float upperArmRadius = 0.0f;
     float foreArmRadius = 0.0f;
     float handRadius = 0.0f;
@@ -88,6 +95,8 @@ struct RetargetStats {
     float armClearanceRaw = 0.0f;
     float armClearanceMin = 0.0f;
     float armCorrection = 0.0f;       // largest wrist/elbow displacement applied
+    float armCorrectionElbow = 0.0f;  // ... of the elbow alone
+    float armCorrectionWrist = 0.0f;  // ... of the wrist alone
     bool armCorrectionClamped = false;  // safe fallback limited the correction
     int resolvedBones = 0;
     int missingBones = 0;

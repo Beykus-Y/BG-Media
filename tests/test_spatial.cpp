@@ -547,3 +547,27 @@ TEST_CASE(spatial.thumb_opposition_follows_the_curl_axis_and_sign) {
     }
     CHECK(checkedThumbs == 6);
 }
+
+TEST_CASE(spatial.proxy_is_calibrated_from_the_mesh_including_fingers_and_shape) {
+    const auto path = realModelPath();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    vrm::LoadResult loaded = vrm::VrmLoader::load(path);
+    REQUIRE(loaded.ok());
+    animation::HumanoidRetargeter rig(*loaded.model);
+    const auto info = rig.collisionProxy();
+    CHECK(info.valid && info.fromMesh);
+    CHECK(info.fingerRadius > 0.004f * info.torsoHalfWidth);  // measured, not the 0.8 % of height default
+    CHECK(info.fingerRadius < info.handRadius);
+    CHECK(info.shapeExponent >= 2.0f && info.shapeExponent <= 4.0f);
+    for (int band = 0; band < animation::kProxyBands; ++band) {
+        CHECK(info.bandWidth[band] > 0.0f && info.bandFront[band] > 0.0f && info.bandBack[band] > 0.0f);
+    }
+    // The skeleton-only fallback (no mesh) must still produce a usable proxy.
+    auto minimal = loadMinimal(false);
+    REQUIRE(minimal != nullptr);
+    animation::HumanoidRetargeter small(*minimal);
+    CHECK(small.collisionProxy().valid);
+    CHECK(!small.collisionProxy().fromMesh);
+}
