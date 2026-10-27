@@ -218,9 +218,10 @@ bgmedia_desktop --file fixtures/beat_092.wav \
 - offbeat-бас с `nearestBeat=-1` не превращается в BassDip на быстром темпе;
 - freeze в тишине имеет нулевую энергию и impact.
 
-Полный набор сейчас: **82 теста**, 9 CTest-групп, 0 падений. Из них 26
-кейсов относятся к BG Motion 3.0 (`dance`), см.
-[BG_MOTION_3.md](BG_MOTION_3.md).
+Полный набор сейчас: **115 тестов**, 12 CTest-групп, 0 падений. Из них 28
+кейсов относятся к BG Motion 3.0/3.1 (`dance`), плюс группы `timeline`,
+`warp` и `sync31`; см. [BG_MOTION_3.md](BG_MOTION_3.md) и
+[BG_MOTION_3_1.md](BG_MOTION_3_1.md).
 
 ## 10. Границы и дальнейшее развитие
 

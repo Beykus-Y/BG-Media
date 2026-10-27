@@ -1,58 +1,29 @@
 #pragma once
 
-// BG Motion 3.0 playback: BeatClock -> DanceSchedule -> ClipPose.
+// BG Motion 3.1 playback: MusicalTimeline -> DanceSchedule -> ClipPose.
 //
 // The musical chain stays BG Beat -> BG Motion -> BG Sync -> Retargeter:
-//   * BeatClock turns a BG Beat analysis (or a user BPM / Motion Lab grid) into
-//     a smooth media-time <-> musical-beat mapping. Dancing is driven by that
-//     mapping, never by a free running animation timer, so it cannot drift.
+//   * BeatClock/MusicalTimeline turn the analysis (or a user BPM / Motion Lab
+//     grid) into a smooth media-time <-> musical-beat mapping and an accent
+//     map with real timestamps.
 //   * DanceSchedule is a list of clip segments. Sampling it is a PURE function
 //     of media time (seek, pause, any FPS and arbitrary jumps are therefore
 //     safe). Crossfades are part of the schedule, not hidden player state.
 //   * DanceDirector builds schedules: Manual (user picks a style, the change
-//     lands on the next beat) and Auto (phrase based plan from the analysis).
+//     lands on the next downbeat or entry beat) and Auto (phrase based plan).
+//   * The optional MusicalTimeWarp is a bounded phase modulation inside each
+//     beat. It never moves accent poses off the beat and never rotates root or
+//     foot targets: those keep the stable grid so contacts remain valid.
 
 #include "bgmedia/analysis/AnalysisResult.hpp"
 #include "bgmedia/motion3/DanceClip.hpp"
+#include "bgmedia/motion3/MusicalTimeline.hpp"
+#include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
 #include <string>
 #include <vector>
 
 namespace bgmedia::motion {
-
-class BeatClock {
-public:
-    BeatClock() = default;
-
-    [[nodiscard]] static BeatClock constant(double bpm, double firstBeatTime = 0.0,
-                                            int beatsPerBar = 4);
-    // Smoothed grid from BG Beat. Falls back to the analysed BPM when the beat
-    // list is too short.
-    [[nodiscard]] static BeatClock fromAnalysis(const AnalysisResult& analysis,
-                                                double fallbackBpm = 100.0);
-
-    [[nodiscard]] double beatAt(double mediaTime) const;
-    [[nodiscard]] double timeAtBeat(double beat) const;
-    [[nodiscard]] double bpmAt(double mediaTime) const;
-    // Beat index within the bar (0 = downbeat) of the beat containing `beat`.
-    [[nodiscard]] int beatInBar(double beat) const;
-    [[nodiscard]] int beatsPerBar() const { return beatsPerBar_; }
-    [[nodiscard]] bool valid() const { return valid_; }
-    [[nodiscard]] float confidence() const { return confidence_; }
-    [[nodiscard]] bool constantGrid() const { return times_.empty(); }
-    [[nodiscard]] double nominalBpm() const { return bpm_; }
-
-private:
-    bool valid_ = false;
-    double bpm_ = 100.0;
-    double first_ = 0.0;
-    int beatsPerBar_ = 4;
-    int barOffset_ = 0;
-    float confidence_ = 1.0f;
-    std::vector<double> times_;  // smoothed beat times; empty = constant grid
-    double headPeriod_ = 0.6;
-    double tailPeriod_ = 0.6;
-};
 
 struct ScheduleSegment {
     const HumanoidClip* clip = nullptr;
@@ -63,6 +34,10 @@ struct ScheduleSegment {
     double fadeSeconds = 0.6;      // blend length from the previous segment
     bool loop = true;
     std::string reason;            // why the planner chose this segment
+    bool alignedToDownbeat = false;  // the entry landed on a trusted bar start
+    bool barPhaseTrusted = true;   // the musical bar phase was trusted at entry
+    int meter = 4;                 // musical meter used for the entry
+    double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
 };
 
 struct DanceFrame {
@@ -71,14 +46,32 @@ struct DanceFrame {
     std::string clipName;
     std::string nextClipId;        // upcoming (or currently fading in) segment
     DanceStyle style = DanceStyle::Idle;
-    double clipBeat = 0.0;
+    double clipBeat = 0.0;         // warped clip beat used to sample the pose
+    double unwarpedClipBeat = 0.0; // stable-grid clip beat (diagnostics/A-B)
     float phase = 0.0f;            // 0..1 inside the current clip
     float playbackSpeed = 1.0f;    // musical tempo relative to the clip's authored tempo
+    float effectiveSpeed = 1.0f;   // playbackSpeed * warpRate
     bool speedLimited = false;     // tempo outside the clip's comfortable range
     float transitionProgress = -1.0f;  // 0..1 while crossfading, else -1
     double bpm = 0.0;
     bool oneShotFinished = false;
     std::string reason;
+
+    // --- BG Motion 3.1 musical diagnostics --------------------------------
+    double musicBeat = 0.0;        // absolute musical beat at this media time
+    double warpDeviationBeats = 0.0;
+    double warpRate = 1.0;         // d(warped beat)/d(music beat)
+    bool warpActive = false;
+    float musicAccent = 0.0f;
+    float bassStrength = 0.0f;
+    float downbeatConfidence = 0.0f;
+    float meterConfidence = 0.0f;
+    int beatsPerBar = 4;
+    int beatInBar = 0;
+    int barIndex = 0;
+    bool downbeat = false;
+    bool barPhaseTrusted = false;
+    double alignmentErrorMs = 0.0;
 };
 
 class DanceSchedule {
@@ -93,13 +86,26 @@ public:
     [[nodiscard]] bool empty() const { return segments_.empty(); }
 
     [[nodiscard]] DanceFrame sample(double mediaTime, const BeatClock& clock) const;
+    [[nodiscard]] DanceFrame sample(double mediaTime, const BeatClock& clock,
+                                    const MusicalTimeline& timeline,
+                                    const WarpProfile& warp) const;
     // Clip beat of a segment at a given media time (exposed for tests).
     [[nodiscard]] static double segmentClipBeat(const ScheduleSegment& segment,
                                                 double mediaTime, const BeatClock& clock);
+    // Full mapping, including the optional warp. `rate` is the instantaneous
+    // animation speed in clip beats per music beat.
+    [[nodiscard]] static double segmentClipBeat(const ScheduleSegment& segment,
+                                                double mediaTime,
+                                                const MusicalTimeline& timeline,
+                                                const WarpProfile& warp,
+                                                double* rate = nullptr,
+                                                bool* warpActive = nullptr,
+                                                double* deviation = nullptr);
 
 private:
     [[nodiscard]] ClipPose poseOf(std::size_t index, double mediaTime,
-                                  const BeatClock& clock, float* transition) const;
+                                  const MusicalTimeline& timeline,
+                                  const WarpProfile& warp, float* transition) const;
     std::vector<ScheduleSegment> segments_;
 };
 
@@ -112,6 +118,7 @@ struct AutoPlanOptions {
     float intenseThreshold = 0.68f;   // above: Energetic
     float minConfidence = 0.30f;      // below: stay on stable Groove
     int minPhrasesPerStyle = 1;
+    int phraseBars = 4;               // used when the meter is trusted
 };
 
 class DanceDirector {
@@ -119,11 +126,22 @@ public:
     explicit DanceDirector(const DanceLibrary* library = nullptr) : library_(library) {}
 
     void setLibrary(const DanceLibrary* library) { library_ = library; }
-    void setBeatClock(BeatClock clock) { clock_ = std::move(clock); }
+    // Replaces the grid and rebuilds a grid-only timeline. Kept for Motion Lab
+    // and for code that only needs a constant grid.
+    void setBeatClock(BeatClock clock);
+    // Installs a full musical timeline (grid + meter confidence + accents).
+    void setMusicalTimeline(MusicalTimeline timeline);
     [[nodiscard]] const BeatClock& beatClock() const { return clock_; }
+    [[nodiscard]] const MusicalTimeline& timeline() const { return timeline_; }
 
-    // Manual: the character moves to `style` on the next beat (or immediately
-    // when `immediate`). `oneShot` plays the clip once and returns to Idle.
+    void setWarpProfile(WarpProfile profile) { warp_ = profile; }
+    [[nodiscard]] const WarpProfile& warpProfile() const { return warp_; }
+    void setExpression(MotionExpression expression) { warp_.expression = expression; }
+    [[nodiscard]] MotionExpression expression() const { return warp_.expression; }
+
+    // Manual: the character moves to `style` on the next downbeat when the bar
+    // is trusted, otherwise on the next entry beat. `oneShot` plays the clip
+    // once and returns to Idle.
     void select(DanceStyle style, double now, bool oneShot = false, bool immediate = false);
     // Starts the all-styles showcase (Groove -> HipHop -> SideStep -> Energetic -> Idle).
     void startTestDance(double now, double beatsPerStyle = 16.0);
@@ -141,6 +159,7 @@ public:
     // Installs a new beat grid while keeping the current clip and its phase, so
     // a tempo change never makes the pose jump.
     void rebase(double now, BeatClock newClock);
+    void rebase(double now, MusicalTimeline newTimeline);
     // Drops everything that has not started yet (the dancer carries on with
     // the clip it is in).
     void dropFuture(double now) { schedule_.truncateAfter(now); }
@@ -154,6 +173,8 @@ public:
     void setSelectedStyle(DanceStyle style) { selected_ = style; }
     [[nodiscard]] const DanceLibrary* library() const { return library_; }
 
+    // Next point where a manual switch can start without breaking the bar.
+    [[nodiscard]] double nextAlignmentTime(double now) const;
     // Builds a segment for `clip` aligned to the musical grid at `alignTime`.
     [[nodiscard]] ScheduleSegment makeSegment(const HumanoidClip& clip, double startTime,
                                               double alignTime, double fadeSeconds) const;
@@ -164,9 +185,13 @@ public:
 private:
     [[nodiscard]] double fadeFor(double atTime) const;
     [[nodiscard]] const HumanoidClip* clipFor(DanceStyle style) const;
+    [[nodiscard]] double entryTimeFor(const HumanoidClip& clip, double now,
+                                      bool* alignedToDownbeat, double* alignmentError) const;
 
     const DanceLibrary* library_ = nullptr;
     BeatClock clock_ = BeatClock::constant(100.0);
+    MusicalTimeline timeline_ = MusicalTimeline::constant(100.0);
+    WarpProfile warp_;
     DanceSchedule schedule_;
     DanceStyle selected_ = DanceStyle::Idle;
 };

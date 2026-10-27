@@ -146,7 +146,9 @@ float accentEnvelope(const HumanoidClip& clip, double beat) {
         if (clip.loop) {
             d = std::min(d, static_cast<double>(clip.beats) - d);
         }
-        const float v = mark.strength * std::max(0.0f, 1.0f - static_cast<float>(d) / 0.35f);
+        const float v = mark.strength *
+                        std::clamp(mark.confidence, 0.0f, 1.0f) *
+                        std::max(0.0f, 1.0f - static_cast<float>(d) / 0.35f);
         best = std::max(best, v);
     }
     return best;
@@ -352,6 +354,10 @@ ClipPose sampleClip(const HumanoidClip& clip, double clipBeat) {
     return pose;
 }
 
+float clipAccentStrength(const HumanoidClip& clip, double clipBeat) {
+    return accentEnvelope(clip, clipBeat);
+}
+
 ClipPose blendPoses(const ClipPose& a, const ClipPose& b, float w) {
     w = std::clamp(w, 0.0f, 1.0f);
     if (w <= 0.0f) return a;
@@ -470,11 +476,14 @@ ClipLoadResult parseClipJson(const std::string& text, const std::string& sourceN
                 AccentMark mark;
                 double beat = 0;
                 double strength = 1;
+                double confidence = 1;
                 if (item.isObject() && reader.number(item, "beat", beat, true)) {
                     reader.number(item, "strength", strength);
+                    reader.number(item, "confidence", confidence);
                     reader.text(item, "kind", mark.kind);
                     mark.beat = static_cast<float>(beat);
                     mark.strength = static_cast<float>(strength);
+                    mark.confidence = static_cast<float>(confidence);
                     clip.accents.push_back(mark);
                 } else if (!item.isObject()) {
                     reader.error("each accent must be an object {beat, strength, kind}");
@@ -646,6 +655,9 @@ void validateClip(const HumanoidClip& clip, const std::string& sourceName,
     }
     for (const AccentMark& a : clip.accents) {
         if (a.beat < 0.0f || a.beat > clip.beats) warn("accent beat outside the clip");
+        if (!(a.confidence >= 0.0f && a.confidence <= 1.0f)) {
+            warn("accent confidence must be within 0..1");
+        }
     }
 
     // Contact segments.

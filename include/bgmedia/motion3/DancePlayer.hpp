@@ -29,11 +29,23 @@ public:
     // The musical grid driving the clips. Rebases the running clip so the pose
     // does not jump when the tempo changes.
     void setGrid(BeatClock clock, double now);
-    // BG Beat analysis used by Auto mode. nullptr = no music.
+    // Installs a full musical timeline (meter confidence, real accents, bass).
+    void setMusicalTimeline(MusicalTimeline timeline, double now);
+    // BG Beat analysis used by Auto mode and for the accent/timeline map.
+    // nullptr = no music. `now` keeps a Manual dance phase stable.
     void setAnalysis(const AnalysisResult* analysis);
+    void setAnalysis(const AnalysisResult* analysis, double now);
 
     void setMode(DanceMode mode, double now);
     [[nodiscard]] DanceMode mode() const { return mode_; }
+
+    // Expressive musical warp. Off / Soft / Expressive; the value is also
+    // persisted by the desktop host, not by the engine.
+    void setExpression(MotionExpression expression) { director_.setExpression(expression); }
+    [[nodiscard]] MotionExpression expression() const { return director_.expression(); }
+    void setWarpProfile(WarpProfile profile) { director_.setWarpProfile(profile); }
+    [[nodiscard]] const WarpProfile& warpProfile() const { return director_.warpProfile(); }
+    [[nodiscard]] const MusicalTimeline& timeline() const { return director_.timeline(); }
 
     // Manual selection (switches to Manual). The change lands on the next beat.
     void select(DanceStyle style, double now, bool immediate = false);

@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 
 project(BGMedia
-    VERSION 0.3.0
+    VERSION 0.3.1
     DESCRIPTION "BG Media - music analysis and choreography synchronization engine"
     LANGUAGES C CXX
 )
@@ -109,6 +109,9 @@ endif()
 
 add_library(bgmedia_rig STATIC
     src/animation/HumanoidRetargeter.cpp
+    src/motion3/BeatClock.cpp
+    src/motion3/MusicalTimeline.cpp
+    src/motion3/MusicalTimeWarp.cpp
     src/motion3/DanceClip.cpp
     src/motion3/DanceDirector.cpp
     src/motion3/DancePlayer.cpp

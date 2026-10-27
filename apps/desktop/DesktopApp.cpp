@@ -1,4 +1,4 @@
-#include "DesktopApp.hpp"
+﻿#include "DesktopApp.hpp"
 
 #include "MiniaudioPlayer.hpp"
 #include "TextRenderer.hpp"
@@ -259,7 +259,7 @@ struct Layout {
     Rect vrmEmptyLoad{};
     Rect vrmRightLoad{};
 
-    // BG Motion 3.0 controls (3D view).
+    // BG MOTION 3.1 controls (3D view).
     Rect danceManual{};
     Rect danceAuto{};
     Rect danceLoop{};
@@ -267,6 +267,7 @@ struct Layout {
     Rect danceStyle[5]{};
     Rect danceBpmMinus{};
     Rect danceBpmPlus{};
+    Rect danceExpr{};
     Rect dbgFeetBtn{};
     Rect dbgSkelBtn{};
     Rect dbgRootBtn{};
@@ -1260,7 +1261,7 @@ struct DesktopApp::Impl {
     }
 
     // ---------------------------------------------------------------------
-    // BG Motion 3.0: authored dance clips
+    // BG MOTION 3.1: authored dance clips
     // ---------------------------------------------------------------------
     motion::DancePlayer dance;
     motion::DanceFrame danceFrame;
@@ -1268,6 +1269,8 @@ struct DesktopApp::Impl {
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
     int danceLabBpm = 100;
+    bool musicDebug = false;
+    std::filesystem::path motionProfilePath;
     bool dbgFeet = false;
     bool dbgSkeleton = false;
     bool dbgRoot = false;
@@ -1299,8 +1302,13 @@ struct DesktopApp::Impl {
     void refreshDanceGrid() { dance.setGrid(danceGrid(), danceTime()); }
 
     void onTrackChangedForDance() {
-        dance.setAnalysis(track ? activeAnalysis() : nullptr);
-        dance.setGrid(danceGrid(), danceTime());
+        dance.setAnalysis(track ? activeAnalysis() : nullptr, danceTime());
+        // Only override the analysis timeline when the user explicitly asks for
+        // a Motion Lab tempo. Re-installing a grid-only clock here would throw
+        // away the downbeat confidence and the real accent map.
+        if (!track || motionLabBpm > 0) {
+            dance.setGrid(danceGrid(), danceTime());
+        }
         if (dance.mode() == motion::DanceMode::Auto && track) {
             std::fprintf(stderr, "BG Motion Auto plan:\n%s",
                          dance.director().describeSchedule().c_str());
@@ -1308,6 +1316,35 @@ struct DesktopApp::Impl {
         footTrail[0].clear();
         footTrail[1].clear();
         rootTrail.clear();
+    }
+
+    [[nodiscard]] static const char* expressionLabel(motion::MotionExpression expression) {
+        switch (expression) {
+        case motion::MotionExpression::Off: return "EXPR OFF";
+        case motion::MotionExpression::Soft: return "EXPR SOFT";
+        case motion::MotionExpression::Expressive: return "EXPR EXP";
+        }
+        return "EXPR SOFT";
+    }
+
+    void cycleExpression() {
+        if (!danceUi()) {
+            return;
+        }
+        motion::MotionExpression next = motion::MotionExpression::Soft;
+        switch (dance.expression()) {
+        case motion::MotionExpression::Off: next = motion::MotionExpression::Soft; break;
+        case motion::MotionExpression::Soft: next = motion::MotionExpression::Expressive; break;
+        case motion::MotionExpression::Expressive: next = motion::MotionExpression::Off; break;
+        }
+        dance.setExpression(next);
+        if (!motionProfilePath.empty()) {
+            std::string error;
+            if (!motion::saveWarpProfile(motionProfilePath, dance.warpProfile(), &error)) {
+                std::fprintf(stderr, "motion profile save failed: %s\n", error.c_str());
+            }
+        }
+        showToast(std::string("Expression: ") + expressionLabel(next));
     }
 
     void initDance() {
@@ -1322,7 +1359,7 @@ struct DesktopApp::Impl {
                                                                                : "warning",
                          d.file.c_str(), d.message.c_str());
         }
-        std::fprintf(stderr, "BG Motion 3.0: %zu dance clip(s) loaded from %s\n", count,
+        std::fprintf(stderr, "BG MOTION 3.1: %zu dance clip(s) loaded from %s\n", count,
                      toUtf8(directory).c_str());
         useClips = count > 0 && !options.legacyMotion;
         if (options.danceBpm > 0) {
@@ -1334,6 +1371,25 @@ struct DesktopApp::Impl {
         dbgSkeleton = options.debugSkeleton;
         dbgRoot = options.debugRoot;
         presentation = options.presentation;
+        musicDebug = options.motionDebug;
+        if (!cacheDirectory.empty()) {
+            motionProfilePath = cacheDirectory / "motion-profile.cfg";
+            motion::WarpProfile profile;
+            if (motion::loadWarpProfile(motionProfilePath, profile, nullptr)) {
+                dance.setWarpProfile(profile);
+            }
+        }
+        if (!options.danceExpression.empty()) {
+            motion::WarpProfile profile = dance.warpProfile();
+            profile.expression = motion::expressionFromName(options.danceExpression);
+            dance.setWarpProfile(profile);
+            if (!motionProfilePath.empty()) {
+                std::string error;
+                if (!motion::saveWarpProfile(motionProfilePath, profile, &error)) {
+                    std::fprintf(stderr, "motion profile save failed: %s\n", error.c_str());
+                }
+            }
+        }
         dance.setGrid(danceGrid(), 0.0);
         if (!useClips) {
             return;
@@ -2021,6 +2077,15 @@ struct DesktopApp::Impl {
                 showToast(dance.oneShot() ? "ONE SHOT: dance plays once, then Idle" : "LOOP");
             }
             break;
+        case SDLK_E:
+            if (danceUi()) {
+                cycleExpression();
+            }
+            break;
+        case SDLK_M:
+            musicDebug = !musicDebug;
+            showToast(musicDebug ? "Music debug on" : "Music debug off");
+            break;
         case SDLK_P:
             if (characterView == CharacterView::Vrm3D) {
                 togglePresentation();
@@ -2193,6 +2258,10 @@ struct DesktopApp::Impl {
                 changeDanceBpm(5);
                 return;
             }
+            if (layout.danceExpr.contains(x, y)) {
+                cycleExpression();
+                return;
+            }
             if (layout.dbgFeetBtn.contains(x, y)) {
                 dbgFeet = !dbgFeet;
                 return;
@@ -2352,8 +2421,9 @@ struct DesktopApp::Impl {
             layout.danceStyle[i] = {r1.x + 18.0f + static_cast<float>(i) * 68.0f, r1.y + 72.0f,
                                     64.0f, 28.0f};
         }
-        layout.danceBpmMinus = {r1.x + 120.0f, r1.y + 110.0f, 26.0f, 24.0f};
-        layout.danceBpmPlus = {r1.x + 150.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceBpmMinus = {r1.x + 110.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceBpmPlus = {r1.x + 140.0f, r1.y + 110.0f, 26.0f, 24.0f};
+        layout.danceExpr = {r1.x + 244.0f, r1.y + 110.0f, 108.0f, 24.0f};
         const Rect r3 = layout.right3;
         layout.dbgFeetBtn = {r3.x + 18.0f, r3.y + 34.0f, 106.0f, 24.0f};
         layout.dbgSkelBtn = {r3.x + 130.0f, r3.y + 34.0f, 104.0f, 24.0f};
@@ -2908,6 +2978,32 @@ void DesktopApp::Impl::drawEvents() {
         lastAccentX = x;
         ui::diamond(renderer, static_cast<float>(x), accentY, 3.2f,
                     theme::alpha(theme::amber, 0.85f));
+    }
+
+    // BG Motion 3.1 accent map: real onset timestamps that are not simply the
+    // beat or the bass row (syncopations and subdivisions). The debug panel
+    // exposes the same map numerically.
+    {
+        const auto& accents = dance.timeline().accents();
+        int lastAccentRowX = -100;
+        for (const motion::AccentEvent& accent : accents) {
+            if (accent.time < viewStart || accent.time > viewEnd ||
+                accent.strength < 0.10f || accent.downbeat || accent.bass ||
+                accent.kind == motion::AccentKind::Beat) {
+                continue;
+            }
+            const int x = static_cast<int>(timeToX(accent.time, layout.plot));
+            if (x == lastAccentRowX) {
+                continue;
+            }
+            lastAccentRowX = x;
+            const Uint8 alpha = static_cast<Uint8>(
+                std::clamp(90.0f + 150.0f * accent.strength, 0.0f, 245.0f));
+            ui::diamond(renderer, static_cast<float>(x), beatY + 19.0f, 2.2f,
+                        SDL_Color{166, 132, 255, alpha});
+        }
+        label("ACC", rect.x + 6.0f, beatY + 12.0f, 7,
+              theme::alpha(theme::violet, 0.8f), 0.8f);
     }
 
     label("BEAT", rect.x + 6.0f, rect.y + 5.0f, 7, theme::dim, 0.8f);
@@ -4112,7 +4208,7 @@ void DesktopApp::Impl::draw3DRightPanels() {
                    FontWeight::SemiBold,
                    pose.accented ? theme::amber : theme::text);
         y += 30.0f;
-        body("ACCENT " + std::string(pose.accented ? "ON" : "—") +
+        body("ACCENT " + std::string(pose.accented ? "ON" : "вЂ”") +
                  "   ·   ENERGY " + formatNumber(pose.energy, 2) +
                  "   ·   IMPACT " + formatNumber(pose.impact, 2),
              card.x + 18.0f, y, 9, theme::muted);
@@ -4245,7 +4341,7 @@ void DesktopApp::Impl::drawFooter() {
              190.0f, bar.y + 13.0f, 9, theme::dim);
     }
 
-    text->drawCentered("SPACE PLAY/PAUSE   ←/→ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
+    text->drawCentered("SPACE PLAY/PAUSE   в†ђ/в†’ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
                        "V A/B   B LAB   R RATE",
                        720.0f, bar.y + 13.0f, 8, FontWeight::SemiBold,
                        theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
@@ -4366,7 +4462,7 @@ void DesktopApp::Impl::renderFrame() {
 }
 
 // -------------------------------------------------------------------------
-// BG Motion 3.0 panels, debug views and presentation mode
+// BG MOTION 3.1 panels, debug views and presentation mode
 // -------------------------------------------------------------------------
 void DesktopApp::Impl::drawDancePanels() {
     const auto panelCard = [&](const Rect& rect) {
@@ -4389,7 +4485,7 @@ void DesktopApp::Impl::drawDancePanels() {
         panelCard(card);
         text->draw("DANCE", card.x + 18.0f, card.y + 12.0f, 11, FontWeight::SemiBold,
                    theme::text);
-        label("BG MOTION 3.0", card.right() - 112.0f, card.y + 15.0f, 8, theme::accent, 1.2f);
+        label("BG MOTION 3.1", card.right() - 112.0f, card.y + 15.0f, 8, theme::accent, 1.2f);
         const bool autoMode = dance.mode() == motion::DanceMode::Auto;
         button(layout.danceManual, "MANUAL", !autoMode, theme::accent);
         button(layout.danceAuto, "AUTO", autoMode, theme::violet);
@@ -4417,12 +4513,18 @@ void DesktopApp::Impl::drawDancePanels() {
         const int shownBpm =
             track ? static_cast<int>(std::lround(dance.director().beatClock().bpmAt(danceTime())))
                   : danceLabBpm;
-        body(std::to_string(shownBpm) + " BPM", card.x + 188.0f, card.y + 116.0f, 12,
+        body(std::to_string(shownBpm) + " BPM", card.x + 176.0f, card.y + 116.0f, 12,
              theme::text, FontWeight::SemiBold);
+        button(layout.danceExpr, expressionLabel(dance.expression()),
+               dance.expression() != motion::MotionExpression::Off,
+               dance.expression() == motion::MotionExpression::Expressive ? theme::pink
+                                                                          : theme::violet);
         label("1-4 STYLE · 0 IDLE · A AUTO", card.x + 18.0f, card.bottom() - 40.0f, 8,
               theme::dim, 0.6f);
         label("N ONE SHOT · T TEST · P PRESENT · UP/DN BPM", card.x + 18.0f,
               card.bottom() - 26.0f, 8, theme::dim, 0.6f);
+        label("E EXPRESSION · M MUSIC DEBUG · F5-F7 FOOT/SKELETON/ROOT", card.x + 18.0f,
+              card.bottom() - 12.0f, 8, theme::dim, 0.6f);
     }
 
     // 2. Clip state ---------------------------------------------------------
@@ -4500,7 +4602,7 @@ void DesktopApp::Impl::drawDancePanels() {
         }
         const std::string reason = !dance.autoNote().empty() ? dance.autoNote()
                                                              : danceFrame.reason;
-        body(ellipsize(*text, reason.empty() ? std::string("—") : reason, card.w - 36.0f, 8,
+        body(ellipsize(*text, reason.empty() ? std::string("вЂ”") : reason, card.w - 36.0f, 8,
                        FontWeight::Regular),
              card.x + 18.0f, card.bottom() - 18.0f, 8, theme::dim);
     }
@@ -4524,14 +4626,36 @@ void DesktopApp::Impl::drawDancePanels() {
             body(std::string(names[f]) + "  " + motion::footPhaseName(foot.phase),
                  card.x + 34.0f + f * 118.0f, y, 10, theme::muted);
         }
-        body("ROOT  yaw " + formatNumber(danceFrame.pose.rootYaw * 360.0f, 0) + "°  ·  x " +
+        body("ROOT  yaw " + formatNumber(danceFrame.pose.rootYaw * 360.0f, 0) + "В°  ·  x " +
                  formatNumber(danceFrame.pose.rootX * 160.0f, 0) + " z " +
-                 formatNumber(danceFrame.pose.rootZ * 160.0f, 0) + " cm",
-             card.x + 18.0f, y + 20.0f, 9, theme::muted);
-        body("HIPS  +" + formatNumber(stats.reachHipDrop * 100.0f, 1) + " cm reach  ·  IK err " +
-                 formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  " +
+                 formatNumber(danceFrame.pose.rootZ * 160.0f, 0) + " cm  ·  IK " +
+                 formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  +" +
+                 formatNumber(stats.reachHipDrop * 100.0f, 1) + " cm  ·  " +
                  formatNumber(vrm.lastRetargetMs(), 2) + " ms",
-             card.x + 18.0f, y + 36.0f, 9, theme::muted);
+             card.x + 18.0f, y + 20.0f, 9, theme::muted);
+        if (musicDebug) {
+            body("MUSIC  bar " + std::to_string(danceFrame.barIndex + 1) + "  beat " +
+                     std::to_string(danceFrame.beatInBar + 1) + "/" +
+                     std::to_string(std::max(1, danceFrame.beatsPerBar)) + "  ·  down " +
+                     formatNumber(danceFrame.downbeatConfidence * 100.0f, 0) + "%",
+                 card.x + 18.0f, y + 36.0f, 9, theme::muted);
+            const double deviationMs =
+                danceFrame.warpDeviationBeats * 60000.0 /
+                std::max(1.0, danceFrame.bpm);
+            body("WARP  " + std::string(danceFrame.warpActive ? "on " : "off ") +
+                     formatNumber(deviationMs, 1) + " ms  ·  " +
+                     formatNumber(danceFrame.warpRate, 2) + "x  ·  acc " +
+                     formatNumber(danceFrame.musicAccent, 2) + "  ·  bass " +
+                     formatNumber(danceFrame.bassStrength, 2) + "  ·  align " +
+                     formatNumber(danceFrame.alignmentErrorMs, 1) + " ms",
+                 card.x + 18.0f, y + 52.0f, 9, theme::muted);
+        } else {
+            body("HIPS  +" + formatNumber(stats.reachHipDrop * 100.0f, 1) +
+                     " cm reach  ·  IK err " +
+                     formatNumber(stats.maxFootError * 1000.0f, 1) + " mm  ·  " +
+                     formatNumber(vrm.lastRetargetMs(), 2) + " ms",
+                 card.x + 18.0f, y + 36.0f, 9, theme::muted);
+        }
     }
 }
 

@@ -14,18 +14,20 @@ BG Motion 2.0 в debug-режиме (Motion Lab 123 BPM, smooth sampling). Ря�
 
 ![BG Motion legacy stepped](docs/images/desktop-motion-stepped.png)
 
-BG Motion 3.0 играет авторские танцевальные клипы на VRM: Groove, Hip-Hop,
-Side Step и Energetic, с переходами по музыкальным beats. Скриншот сцены с
-`Model1.vrm` не добавлен в Git из-за лицензии модели; локальные кадры лежат в
-`artifacts/` (игнорируется). Формат клипов, хореография и QA описаны в
-[docs/BG_MOTION_3.md](docs/BG_MOTION_3.md).
+BG Motion 3.1 играет авторские танцевальные клипы на VRM: Groove, Hip-Hop,
+Side Step и Energetic, с переходами по музыкальным beats и downbeat-фразам.
+Скриншот сцены с `Model1.vrm` не добавлен в Git из-за лицензии модели;
+локальные кадры лежат в `artifacts/` (игнорируется). Формат клипов,
+хореография и QA описаны в [docs/BG_MOTION_3.md](docs/BG_MOTION_3.md), а
+музыкальная синхронизация 3.1 — в
+[docs/BG_MOTION_3_1.md](docs/BG_MOTION_3_1.md).
 
 Честная метрическая неоднозначность на 12/8-стимуле: выбран пульс 66.3 BPM,
 но UI показывает альтернативы 99.2/198.9 и `meter uncertain`:
 
 ![BG Beat metric ambiguity](docs/images/desktop-metric.png)
 
-Текущий этап — рабочий музыкальный анализатор, **BG Motion 3.0** и
+Текущий этап — рабочий музыкальный анализатор, **BG Motion 3.1** и
 **BG Media 3D**: настоящая VRM 0.x-модель в SDL_GPU-сцене, humanoid-скелет,
 retargeting авторских танцевальных клипов и синхронизация с плеером.
 Телеграм-интеграции, сервера и видео здесь по-прежнему нет.
@@ -60,6 +62,16 @@ Desktop во время воспроизведения музыки сохран
   Energetic — плюс Idle. Клипы хранятся как model-independent JSON, играют от
   музыкальных beats, а не от таймера, и переходят друг в друга на entry beat
   через двухбитовый crossfade.
+- **BG Motion 3.1:** `MusicalTimeline` с beat/bar/downbeat confidence,
+  реальной картой onset/bass акцентов, субдолями и 6/8–12/8 compound feel;
+  начало танца и Auto-фразы выравниваются по downbeat только при достаточной
+  уверенности. Добавлен ограниченный C1 time warp `Off/Soft/Expressive`
+  (верхняя часть тела по умолчанию), который не двигает root/hips/цели стоп и
+  не смещает акцентную позу с beat. Диагностика показывает beat/bar, local BPM,
+  downbeat confidence, accent/bass, warp phase/rate и alignment error; профиль
+  сохраняется в `motion-profile.cfg`.
+
+![BG Motion 3.1 timeline](docs/images/desktop-motion31-timeline.png)
 - Footwork хранится как stage-space цели стоп с контактами `stance`/`pivot`:
   опорная стопа не скользит, поворот идёт вокруг неё, IK сам опускает таз,
   если широкая стойка недостижима. Root motion ограничен и не уводит камеру.
@@ -89,11 +101,11 @@ Desktop во время воспроизведения музыки сохран
 
 Измерения на синтетическом корпусе и 5-минутном треке:
 **[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)**.
-300-секундный трек анализируется ~**1.53 с** (медиана, ~**196× realtime**) на
+300-секундный трек анализируется ~**1.52–1.75 с** (медиана 1.65 с, ~**171–196× realtime**) на
 Ryzen 7 5700X. Точность BPM на 92/123/163 BPM — в пределах долей BPM;
-beat recall 1.00 при допуске 60 мс, средняя ошибка времени 2–4 мс. Метрический
-уровень и downbeat проверяются отдельным regression-корпусом:
-[docs/BG_BEAT_AUDIT.md](docs/BG_BEAT_AUDIT.md).
+beat recall 1.00 при допуске 60 мс, средняя ошибка времени 2–4 мс. На
+21-сценарном корпусе 3.1 beat F1 **0.9837**, downbeat F1 **0.9406**,
+meter 21/21; см. [docs/BG_MOTION_3_1.md](docs/BG_MOTION_3_1.md).
 
 ## Быстрый старт: Windows
 
@@ -199,13 +211,15 @@ ctest --preset release
 | выбрать VRM | `F2`, кнопка **VRM**, drag-and-drop `.vrm`/`.glb` |
 | 3D-камера: орбита / zoom / reset | ЛКМ + drag / колесо / `C` |
 | масштаб / высота 3D-модели | `-`/`+` · `,`/`.` или кнопки в панели |
-| BG Motion 3.0: Groove / Hip-Hop / Side Step / Energetic | `1` / `2` / `3` / `4` (в 3D) |
-| BG Motion 3.0: Idle | `0` или `5` (в 3D) |
+| BG Motion 3.1: Groove / Hip-Hop / Side Step / Energetic | `1` / `2` / `3` / `4` (в 3D) |
+| BG Motion 3.1: Idle | `0` или `5` (в 3D) |
 | Manual / Auto | `A` или **MANUAL/AUTO** |
 | Loop / one-shot | `N` или **LOOP/ONE SHOT** |
 | TEST DANCE: все стили подряд | `T` или **TEST DANCE** |
 | Presentation mode | `P` или **PRESENT** |
 | foot contact / skeleton / root debug | `F5` / `F6` / `F7` |
+| музыкальная диагностика (beat/bar, warp, accent) | `M` |
+| Off / Soft / Expressive warp | `E` или кнопка **EXPR** |
 | BPM Motion Lab | `↑` / `↓` (с `Shift` — по 10) |
 | синтетический танец BG Motion 2.0 без музыки | `T` вне 3D-танцев |
 | sync trim ±5 мс | `[` / `]` |
@@ -330,14 +344,22 @@ ctest --test-dir build/windows --output-on-failure
 build/windows/bin/bgmedia_tests.exe
 ```
 
-82 теста, разбитые на 9 CTest-групп:
+115 тестов, разбитые на 12 CTest-групп:
 
 - `audio` — WAV PCM/float, 24-bit, truncated files, MP3/FLAC/WAV через
   miniaudio, downmix/hash;
 - `analysis` — straight 80/92/100/123/125/163 BPM, offbeat, 12/8 ternary
   66 BPM, half-time, shuffle, dense hats, syncopated bass, drift, tempo
   change, silence, bass vs broadband swell, ambiguous rhythm, cancellation,
-  onset timestamp bias;
+  onset timestamp bias, 150/180 BPM, 6/8/12/8 и tempo ramp;
+- `timeline` — beat phase invertibility, edge cases (empty/NaN/duplicate),
+  downbeat confidence gating, accent timestamps, subdivision/compound,
+  silence, tempo change;
+- `warp` — C1 invariants, bounded rate, monotonicity, contact scale, random
+  finiteness, profile round-trip, root/foot stability, retargeted slide,
+  exact accent pose;
+- `sync31` — downbeat alignment, low-confidence fallback, seek bar phase,
+  tempo rebase, exact accent pose, silence warp-off, Auto phrase downbeats;
 - `cache` — roundtrip, corruption, analyzer/format version mismatch, key
   mismatch, atomic store;
 - `sync` — latency compensation, pause/seek/rate, clamping, monotonic smoothing;
@@ -373,7 +395,7 @@ src/analysis/               STFT, onset, tempo, beat DP, bass, silence
 src/cache/                  версионированный бинарный кеш
 src/sync/                   TransportSnapshot + PlaybackClock
 src/choreography/           BG Motion 2.0 cues/poses/media-time sampling
-src/motion3/                BG Motion 3.0 clips, BeatClock, schedule, director
+src/motion3/                BG Motion 3.1 clips, BeatClock, timeline, warp, schedule
 src/vrm/                    GLB/glTF + VRM 0.x importer, PNG decode
 src/animation/              generic humanoid retargeter, clip IK, local transforms
 adapters/miniaudio/         MP3/FLAC/WAV decode adapter
@@ -382,7 +404,8 @@ apps/desktop/               SDL3 UI, 2D/3D compositor, miniaudio playback
 tools/analyze/              headless JSON CLI
 tools/fixturegen/           генератор синтетики
 tools/vrm_preview/          headless 3D preview/test render
-tools/motion_qa/            BG Motion 3.0 quality report
+tools/motion_qa/            BG Motion 3.0/3.1 quality report
+tools/sync_qa/              BG Motion 3.1 beat/meter/accent/warp QA corpus
 tools/motion_sheet/         contact sheets on the real renderer
 tools/dancegen/             Python DSL + deterministic dance baker
 tools/benchmark/            качество + скорость + кеш
@@ -392,6 +415,7 @@ docs/VRM_INTEGRATION.md     VRM 0.x, SDL_GPU, retargeting, UI, замеры
 docs/ANDROID_JNI.md         конкретный план Android/JNI
 docs/MOTION.md              BG Motion 2.0: keyframes, blending, accents, debug
 docs/BG_MOTION_3.md         BG Motion 3.0: clip format, footwork, transitions, QA
+docs/BG_MOTION_3_1.md       BG Motion 3.1: musical timeline, accent map, warp, QA
 docs/BG_BEAT_AUDIT.md       исправление метрического уровня, downbeat, UI, кеша
 docs/MEASUREMENTS.md        реальные замеры
 docs/images/                скриншоты 2D UI
@@ -414,7 +438,8 @@ bgmedia_core
    └── CharacterPose (нормализованный контракт для 2D/3D)
 
 bgmedia_vrm (cgltf/stb_image, без SDL) → VrmModel/humanoid/bind pose
-bgmedia_rig (без SDL) → BG Motion 3.0 DancePlayer → ClipPose
+bgmedia_rig (без SDL) → BG Motion 3.1 DancePlayer
+                       → MusicalTimeline + time warp → ClipPose
                        → local node transforms + foot IK
 adapters/sdlgpu (SDL_GPU) → offscreen RGBA8 + D32 → UI SDL_Texture
 ```
@@ -472,6 +497,12 @@ const auto& a = report.result;
   смешивает позиции стоп, поэтому на смене широкой и узкой стойки возможен
   короткий контролируемый slide; floor collision, лестниц и физических
   прыжков нет. Auto не угадывает стиль при низком confidence BG Beat.
+- BG Motion 3.1: time warp по умолчанию только верхняя часть тела; нет
+  отдельных фаз для рук/головы/secondary motion, floor collision и
+  нескольких опор. Offbeat-100 synthetic имеет ~28 мс phase bias, dense hats
+  160 остаётся half-time на уровне анализа (хореография использует rate 2×).
+  Predicted accent time — не измеренная задержка монитора. Подробно:
+  [docs/BG_MOTION_3_1.md](docs/BG_MOTION_3_1.md).
 - Meter/downbeat — эвристика. При низкой `meterConfidence` UI скрывает
   downbeat-акценты и пишет `meter uncertain`.
 - Реальные треки проверялись локально, но их эталонный BPM неизвестен; см.

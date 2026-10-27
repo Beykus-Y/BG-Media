@@ -180,6 +180,48 @@ AnalysisReport Analyzer::analyze(const PcmBuffer& pcm,
             result.beatPhaseConfidence = beatResult.beatPhaseConfidence;
             result.downbeatConfidence = beatResult.downbeatConfidence;
 
+            // The tracker may have proved that the reported tempo is a
+            // subharmonic of the actually audible pulse. Rescale the tempo
+            // metadata so the public result and the beat timestamps agree.
+            if (beatResult.metricMultiplier > 1) {
+                const double multiplier = static_cast<double>(beatResult.metricMultiplier);
+                structure.bpm *= multiplier;
+                structure.bpm = std::clamp(structure.bpm, config_.minBpm, config_.maxBpm);
+                for (TempoSegment& segment : structure.segments) {
+                    segment.bpm = std::clamp(segment.bpm * multiplier, config_.minBpm,
+                                             config_.maxBpm);
+                }
+                for (TempoTransition& transition : structure.transitions) {
+                    transition.fromBpm = std::clamp(transition.fromBpm * multiplier,
+                                                    config_.minBpm, config_.maxBpm);
+                    transition.toBpm = std::clamp(transition.toBpm * multiplier,
+                                                  config_.minBpm, config_.maxBpm);
+                }
+                result.bpm = structure.bpm;
+                result.tempoSegments = structure.segments;
+                result.tempoTransitions = structure.transitions;
+                result.octaveAmbiguous = true;
+                // The metric choice was evidence-based but it is still a
+                // metric choice, not a new certainty.
+                result.bpmLevelConfidence =
+                    std::min(1.0f, result.bpmLevelConfidence * 0.85f + 0.10f);
+                std::vector<double> scaledCandidates;
+                std::vector<float> scaledScores;
+                for (std::size_t i = 0; i < result.bpmCandidates.size(); ++i) {
+                    const double scaled = result.bpmCandidates[i] * multiplier;
+                    if (scaled < config_.minBpm - 0.5 || scaled > config_.maxBpm + 0.5) {
+                        continue;
+                    }
+                    scaledCandidates.push_back(scaled);
+                    scaledScores.push_back(
+                        i < result.bpmCandidateScores.size()
+                            ? result.bpmCandidateScores[i]
+                            : 0.0f);
+                }
+                result.bpmCandidates = std::move(scaledCandidates);
+                result.bpmCandidateScores = std::move(scaledScores);
+            }
+
             report(progress, 0.91f, "classifying bass accents");
             result.bassAccents = detectBassAccents(features, result.silences,
                                                    result.beats, pcm.duration(), config_);

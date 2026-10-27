@@ -28,13 +28,13 @@ build\windows\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 
 | Тест | Ожидаемый BPM | Определённый BPM | BPM conf. | Precision / Recall | Mean err | Анализ | Realtime |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 92 BPM | 92 | 92.06 | 0.84 | 0.93 / 1.00 | 2.4 мс | 70.2 мс | 285× |
-| 123 BPM | 123 | 123.00 | 0.69 | 0.93 / 1.00 | 3.4 мс | 126.2 мс | 159× |
-| 163 BPM | 163 | 162.75 | 0.73 | 0.91 / 1.00 | 2.6 мс | 102.9 мс | 194× |
-| 92 → 123 BPM | 92 / 123 | 104.72 weighted | 0.54 | 0.93 / 1.00 | 4.0 мс | 129.7 мс | 185× |
-| Тишина 4–9 с | 92 | 92.10 | 0.63 | 0.75 / 1.00 | 2.1 мс | 34.6 мс | 376× |
-| Басовые акценты | 92 | 92.04 | 0.73 | 0.93 / 1.00 | 3.7 мс | 66.0 мс | 303× |
-| Неоднозначный ритм | 92 + 138 | 91.90 | 0.62 | 0.93 / 1.00 | 7.2 мс | 161.8 мс | 124× |
+| 92 BPM | 92 | 92.06 | 0.84 | 0.93 / 1.00 | 2.4 мс | 68 мс | 294× |
+| 123 BPM | 123 | 123.00 | 0.69 | 0.93 / 1.00 | 3.4 мс | 125 мс | 160× |
+| 163 BPM | 163 | 162.75 | 0.73 | 0.91 / 1.00 | 2.6 мс | 104 мс | 193× |
+| 92 → 123 BPM | 92 / 123 | 104.72 weighted | 0.54 | 0.93 / 1.00 | 4.0 мс | 132 мс | 181× |
+| Тишина 4–9 с | 92 | 92.10 | 0.63 | 0.75 / 1.00 | 2.1 мс | 36 мс | 360× |
+| Басовые акценты | 92 | 92.04 | 0.73 | 0.93 / 1.00 | 3.7 мс | 67 мс | 300× |
+| Неоднозначный ритм | 92 + 138 | 91.90 | 0.62 | 0.93 / 1.00 | 7.2 мс | 162 мс | 124× |
 
 Метрический уровень и downbeat на regression-корпусе (детали и old/new:
 [docs/BG_BEAT_AUDIT.md](BG_BEAT_AUDIT.md)):
@@ -74,20 +74,21 @@ build\windows\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 
 | Метрика | Значение |
 |---|---:|
-| min | 1530 мс |
-| median | 1534 мс |
-| max | 1540 мс |
-| realtime factor (median) | **196×** |
+| min | 1523 мс |
+| median | 1651 мс |
+| max | 1686 мс |
+| realtime factor (median) | **182×** |
 | обнаружено | 118.00 BPM, confidence 1.00 |
 | удары | 589 |
 | spectrogram frames | 12 920 |
 | cache write | 4 мс |
 | cache read | 9 мс |
 
-То есть обычный 5-минутный трек анализируется примерно за **1.53 секунды** на
+То есть обычный 5-минутный трек анализируется примерно за **1.52–1.75 секунды** на
 этой машине. Запись кеша включается в измерение только при первом анализе;
-чтение кеша — единицы миллисекунд. Новый level-анализ добавил примерно 12%
-времени к прежним 1.37 с; это осознанная цена более устойчивой метрики.
+чтение кеша — единицы миллисекунд. Metric-level refinement и проверка ramp
+добавили около 3% к прежним 1.53 с; это осознанная цена более устойчивой
+метрики.
 Замеры времени шумят между запусками: в другом прогоне медиана была 1.69 с.
 
 ## GUI и синхронизация с аудиовыходом
@@ -114,16 +115,17 @@ build\windows\bin\bgmedia_benchmark.exe --json docs\benchmark.json
 ## Автотесты
 
 ```text
-1/9 ... 9/9
-100% tests passed, 0 tests failed out of 9
-Total Test time (real) ≈ 6.0 s
+1/12 ... 12/12
+100% tests passed, 0 tests failed out of 12
+Total Test time (real) ≈ 6.5 s
 ```
 
-82 unit/integration кейса, включая WAV (8/16/24/32-bit, float), MP3/FLAC
+115 unit/integration кейсов, включая WAV (8/16/24/32-bit, float), MP3/FLAC
 decode, straight/offbeat/ternary/half-time/shuffle/dense/drift BPM,
 downbeats, onset timestamp, tempo change, silence, bass semantics, cache
 corruption/versioning, sync latency/seek/rate, choreography, BG Motion 2.0,
-VRM/retargeting и BG Motion 3.0 (26 кейсов).
+VRM/retargeting, BG Motion 3.0 (28 dance-кейсов) и BG Motion 3.1
+(`timeline`, `warp`, `sync31`, 150/180 BPM, 6/8, 12/8, tempo ramp).
 
 ## BG Motion 2.0
 
@@ -187,6 +189,61 @@ Ryzen 7 5700X, 240 Hz. Для каждого клипа брались BPM `0.8�
 retargeter/SDL_GPU) для Groove → Hip-Hop и Energetic → Idle подтверждают
 отсутствие скачков на 24 кадрах вокруг каждого перехода. Артефакты лежат
 локально в `artifacts/dance-captures/` и не коммитятся из-за лицензии модели.
+
+## BG Motion 3.1 — музыкальная синхронизация
+
+Новый инструмент `bgmedia_sync_qa` прогоняет 21 детерминированный сценарий
+(60–180 BPM, 3/4, 6/8, 12/8, half-time, dense hats, offbeat, shifted accents,
+silence, tempo ramp, sudden change) и измеряет beat/meter/downbeat, predicted
+accent approach, качество анимации и стоимость. Машинный отчёт:
+[docs/sync_qa_3_1.json](sync_qa_3_1.json); baseline того же корпуса до
+analyzer-изменений: [docs/sync_qa_baseline_pre_refinement.json](sync_qa_baseline_pre_refinement.json).
+
+| Метрика | BG Beat 3.0 | BG Motion 3.1 | Изменение |
+|---|---:|---:|---:|
+| Beat F1 (среднее) | 0.8685 | **0.9837** | +0.1152 |
+| Median beat error (median по кейсам) | 1.73 мс | **1.71 мс** | −0.02 мс |
+| P95 beat error (median по кейсам) | 5.80 мс | **5.80 мс** | 0 |
+| Downbeat F1 (среднее) | 0.8129 | **0.9406** | +0.1277 |
+| Meter correct | 20/21 | **21/21** | +1 |
+| Downbeat trusted | 18/21 | 18/21 | 0 |
+| Worst retargeted slide | — | **1.95 мм** | — |
+| Non-finite | 0 | **0** | 0 |
+
+Ключевые случаи:
+
+| Сценарий | BPM 3.0 → 3.1 | Beat F1 3.0 → 3.1 | Median 3.0 → 3.1 |
+|---|---|---|---:|
+| 150 BPM | 75.0 → **149.9** | 0.674 → **1.000** | 37.3 → **6.2 мс** |
+| 180 BPM | 59.9 → **179.7** | 0.505 → **1.000** | 1.5 → 1.5 мс |
+| 6/8 | 59.9 → **119.8** | 0.676 → **1.000** | 1.7 → 5.1 мс |
+| 12/8 | 90.1 → 90.2 | 1.000 → 1.000 | 1.7 → 1.7 мс |
+| Tempo ramp 80→120 | 112.1 → 101.9 | 0.634 → **1.000** | 2.1 → 1.7 мс |
+| Dense hats 160 | 80.0 → 80.0 (half-time) | 0.658 → 0.658 | 7.1 → 7.1 мс |
+| Offbeat accents 100 | 100.0 → 100.0 | 1.000 → 1.000 | 27.6 → 27.6 мс |
+| Silence gap | 92.1 → 92.1 | 1.000 → 1.000 | 2.0 → 2.0 мс |
+| Half-time 80 | 80.3 → 80.3 | 1.000 → 1.000 | 2.4 → 2.4 мс |
+
+Dense hats 160 на уровне анализа остаётся half-time (80 BPM), но
+`DanceDirector::chooseRate` выбирает `rate=2.0`, effective **160.0 BPM**. Это
+честный metric-level выбор, а не ошибка BPM. 180 BPM hysteresis также
+предпочитает 1× (effective 179.7), а не half-time 90.
+
+Стоимость 3.1 на 24-секундных сценариях:
+
+| Метрика | Значение |
+|---|---:|
+| Analysis, среднее | 137.1 мс |
+| Timeline build, среднее | 0.03 мс |
+| Sample Off | 0.90 µs/frame |
+| Sample Expressive | 1.98 µs/frame |
+| Worst foot slide | 1.95 мм |
+| Non-finite | 0 |
+
+Точная акцентная поза на beat проверяется unit-тестом (`< 1e-4°`); QA
+accent approach — predicted, не измеренная задержка монитора. Offbeat-100
+имеет систематическое смещение ~27.6 мс — известное ограничение 3.1, см.
+[docs/BG_MOTION_3_1.md](BG_MOTION_3_1.md).
 
 ## Ограничения измерений
 

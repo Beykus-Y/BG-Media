@@ -786,6 +786,50 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
                   return a.score > b.score;
               });
 
+    // Metric-level tie-break. The autocorrelation/evidence score often puts a
+    // genuine fast pulse a few percent behind its slower subharmonic (180 BPM
+    // tracked as 60, 150 as 75, 160 as 80). If a faster metric relative is
+    // nearly as strong, still sits on the low pulse, and is closer to the
+    // configured comfortable tempo, prefer it. The low-pulse hit-rate gate
+    // prevents a hi-hat layer or an offbeat from being promoted.
+    bool metricUpgrade = false;
+    if (evaluated.size() > 1) {
+        const TempoCandidate& current = evaluated.front();
+        const double preferred = std::max(20.0, config.preferredBpm);
+        const double currentPrior = std::abs(std::log2(current.bpm / preferred));
+        int upgradeIndex = -1;
+        double upgradeScore = -1.0;
+        for (std::size_t i = 1; i < evaluated.size(); ++i) {
+            const TempoCandidate& candidate = evaluated[i];
+            const double ratio = candidate.bpm / std::max(1.0, current.bpm);
+            const bool metricRelative =
+                std::abs(ratio - 1.5) < 0.05 || std::abs(ratio - 2.0) < 0.06 ||
+                std::abs(ratio - 3.0) < 0.08 || std::abs(ratio - 4.0 / 3.0) < 0.05;
+            if (!metricRelative || candidate.bpm <= current.bpm) {
+                continue;
+            }
+            if (candidate.score < current.score * 0.92) {
+                continue;
+            }
+            if (candidate.lowHitRate < 0.85 || candidate.pulseScore + 0.10 < current.pulseScore ||
+                candidate.precisionAdjusted + 0.03 < current.precisionAdjusted ||
+                candidate.beatHitRate + 0.03 < current.beatHitRate) {
+                continue;
+            }
+            if (std::abs(std::log2(candidate.bpm / preferred)) + 0.01 >= currentPrior) {
+                continue;
+            }
+            if (candidate.score > upgradeScore) {
+                upgradeScore = candidate.score;
+                upgradeIndex = static_cast<int>(i);
+            }
+        }
+        if (upgradeIndex > 0) {
+            std::swap(evaluated[0], evaluated[static_cast<std::size_t>(upgradeIndex)]);
+            metricUpgrade = true;
+        }
+    }
+
     const TempoCandidate& best = evaluated.front();
     result.bpm = best.bpm;
 
@@ -812,6 +856,11 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
     }
     for (TempoCandidate& candidate : evaluated) {
         candidate.octaveRelatedToBest = metricRelated(candidate.bpm, best.bpm);
+    }
+    if (metricUpgrade) {
+        // The faster level was selected from a close metric alternative; this
+        // is a deliberate metrical choice, not a new certainty.
+        result.octaveAmbiguous = true;
     }
 
     const double separation =
@@ -978,6 +1027,105 @@ TempoStructure estimateTempoStructure(const std::vector<float>& env,
             }
         }
         windows.push_back(window);
+    }
+
+    // Smooth tempo ramp. The segment splitter only reacts to abrupt changes;
+    // a long accelerando/ritardando otherwise collapses into one average BPM
+    // and the beat tracker follows the wrong local period. Fit log2(BPM) over
+    // the valid windows and, when the drift is material and close to linear,
+    // emit a short piecewise-linear tempo map with explicit transitions.
+    {
+        std::vector<const TempoWindow*> valid;
+        for (const TempoWindow& window : windows) {
+            if (window.bpm > 0.0 && window.confidence >= 0.18f) {
+                valid.push_back(&window);
+            }
+        }
+        if (valid.size() >= 8) {
+            double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+            for (const TempoWindow* window : valid) {
+                const double x = window->centre;
+                const double y = std::log2(std::max(20.0, window->bpm));
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+            }
+            const double count = static_cast<double>(valid.size());
+            const double denom = count * sxx - sx * sx;
+            if (std::abs(denom) > 1e-9) {
+                const double slope = (count * sxy - sx * sy) / denom;
+                const double intercept = (sy - slope * sx) / count;
+                double residual = 0.0;
+                for (const TempoWindow* window : valid) {
+                    const double predicted = intercept + slope * window->centre;
+                    const double error =
+                        std::log2(std::max(20.0, window->bpm)) - predicted;
+                    residual += error * error;
+                }
+                residual = std::sqrt(residual / count);
+                const double span = valid.back()->centre - valid.front()->centre;
+                const double totalChange = std::abs(slope * span);
+                if (totalChange > 0.10 && residual < 0.035 && span > 4.0) {
+                    constexpr int kRampSegments = 4;
+                    std::vector<TempoSegment> ramp;
+                    ramp.reserve(kRampSegments);
+                    for (int i = 0; i < kRampSegments; ++i) {
+                        TempoSegment segment;
+                        segment.start = activeStartTime +
+                                        (activeEndTime - activeStartTime) * i / kRampSegments;
+                        segment.end = activeStartTime +
+                                      (activeEndTime - activeStartTime) * (i + 1) /
+                                          kRampSegments;
+                        const double mid = 0.5 * (segment.start + segment.end);
+                        segment.bpm = std::clamp(std::exp2(intercept + slope * mid),
+                                                 config.minBpm, config.maxBpm);
+                        double confidenceSum = 0.0;
+                        int confidenceCount = 0;
+                        for (const TempoWindow* window : valid) {
+                            if (window->centre >= segment.start &&
+                                window->centre <= segment.end) {
+                                confidenceSum += window->confidence;
+                                ++confidenceCount;
+                            }
+                        }
+                        segment.confidence =
+                            confidenceCount > 0
+                                ? static_cast<float>(confidenceSum / confidenceCount * 0.75)
+                                : 0.25f;
+                        ramp.push_back(segment);
+                    }
+                    std::vector<TempoTransition> transitions;
+                    for (std::size_t i = 1; i < ramp.size(); ++i) {
+                        TempoTransition transition;
+                        transition.start = ramp[i - 1].end - 0.4;
+                        transition.end = ramp[i].start + 0.4;
+                        transition.fromBpm = ramp[i - 1].bpm;
+                        transition.toBpm = ramp[i].bpm;
+                        transition.confidence = std::min(0.5f, 0.5f *
+                                                               (ramp[i - 1].confidence +
+                                                                ramp[i].confidence));
+                        transitions.push_back(transition);
+                    }
+                    structure.segments = std::move(ramp);
+                    structure.transitions = std::move(transitions);
+                    structure.stable = false;
+                    structure.bpm = weightedMedianBpm(windows, {0, windows.size() - 1});
+                    double confidenceSum = 0.0;
+                    int confidenceCount = 0;
+                    for (const TempoSegment& segment : structure.segments) {
+                        confidenceSum += segment.confidence;
+                        ++confidenceCount;
+                    }
+                    structure.confidence =
+                        confidenceCount > 0
+                            ? static_cast<float>(confidenceSum / confidenceCount * 0.65)
+                            : global.confidence * 0.5f;
+                    structure.octaveAmbiguous = global.octaveAmbiguous;
+                    return structure;
+                }
+            }
+        }
     }
 
     const auto ranges = segmentWindows(windows);

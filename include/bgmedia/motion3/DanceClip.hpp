@@ -68,6 +68,7 @@ struct ContactSegment {
 struct AccentMark {
     float beat = 0.0f;
     float strength = 1.0f;   // 0..1
+    float confidence = 1.0f; // 0..1; missing in version-1 clips
     std::string kind;        // free text: "downbeat", "hit", "pose" ...
 };
 
@@ -144,6 +145,10 @@ struct ClipPose {
 // Samples at a clip beat. Looping clips wrap; one-shot clips clamp.
 void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out);
 [[nodiscard]] ClipPose sampleClip(const HumanoidClip& clip, double clipBeat);
+
+// Authored accent envelope at a clip beat (0..1). Used by the musical time
+// warp when no external BG Beat accent map exists (Motion Lab clips).
+[[nodiscard]] float clipAccentStrength(const HumanoidClip& clip, double clipBeat);
 
 // Weighted blend (w = 0 -> a, w = 1 -> b). Rotations use slerp, root yaw and
 // foot yaw use the shortest arc, positions are linear.

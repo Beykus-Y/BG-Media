@@ -6,6 +6,9 @@ add_executable(bgmedia_tests
     test_sync.cpp
     test_choreography.cpp
     test_motion.cpp
+    test_timeline.cpp
+    test_warp.cpp
+    test_musical_sync.cpp
     test_vrm.cpp
     test_retarget.cpp
     test_dance.cpp
@@ -29,7 +32,7 @@ if(MSVC)
     target_compile_definitions(bgmedia_tests PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
-foreach(test_name audio analysis cache sync choreography motion vrm retarget dance)
+foreach(test_name audio analysis cache sync choreography motion timeline warp sync31 vrm retarget dance)
     add_test(NAME bgmedia.${test_name} COMMAND bgmedia_tests ${test_name}.)
     set_tests_properties(bgmedia.${test_name} PROPERTIES
         TIMEOUT 120

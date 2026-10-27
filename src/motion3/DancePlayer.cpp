@@ -15,13 +15,38 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
 
 void DancePlayer::setGrid(BeatClock clock, double now) {
     if (mode_ == DanceMode::Auto) {
-        director_.setBeatClock(std::move(clock));
+        // A constant clock is an explicit Motion Lab override; a grid derived
+        // from the analysis must keep the rich timeline (accents/downbeat
+        // confidence) instead of replacing it with a bare grid.
+        if (clock.constantGrid()) {
+            director_.setBeatClock(std::move(clock));
+        } else if (analysis_ && !analysis_->empty()) {
+            director_.setMusicalTimeline(MusicalTimeline::fromAnalysis(*analysis_));
+        } else {
+            director_.setBeatClock(std::move(clock));
+        }
+        return;
+    }
+    if (!clock.constantGrid() && analysis_ && !analysis_->empty()) {
+        director_.rebase(now, MusicalTimeline::fromAnalysis(*analysis_));
         return;
     }
     director_.rebase(now, std::move(clock));
 }
 
+void DancePlayer::setMusicalTimeline(MusicalTimeline timeline, double now) {
+    if (mode_ == DanceMode::Auto) {
+        director_.setMusicalTimeline(std::move(timeline));
+        return;
+    }
+    director_.rebase(now, std::move(timeline));
+}
+
 void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
+    setAnalysis(analysis, lastTime_ > -1.0e8 ? lastTime_ : 0.0);
+}
+
+void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
     if (mode_ == DanceMode::Auto) {
         if (analysis_ && !analysis_->empty()) {
@@ -31,6 +56,12 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
             director_.reset(0.0);
             autoNote_ = "Auto needs music: no track";
         }
+        return;
+    }
+    if (analysis_ && !analysis_->empty()) {
+        director_.rebase(now, MusicalTimeline::fromAnalysis(*analysis_));
+    } else {
+        director_.rebase(now, MusicalTimeline::fromClock(director_.beatClock(), true));
     }
 }
 

@@ -112,6 +112,281 @@ struct DpBeat {
     bool extrapolated = false;
 };
 
+struct GridEvidence {
+    double precision = 0.0;   // share of grid positions with an onset nearby
+    double recall = 0.0;      // share of onsets explained by the grid
+    double lowHit = 0.0;      // share of grid positions on a low-frequency pulse
+    double lowContrast = 0.0; // on-grid low pulse vs mid-beat low pulse
+};
+
+double envelopeAtTime(const std::vector<float>& curve, const SpectralFeatures& features,
+                      double time) {
+    if (curve.empty()) {
+        return 0.0;
+    }
+    const double frame = (time - features.onsetTimeOffset) * features.framesPerSecond;
+    return static_cast<double>(sampleCurve(curve, frame));
+}
+
+double percentile(std::vector<float> values, double fraction) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const std::size_t index = static_cast<std::size_t>(
+        std::clamp(fraction, 0.0, 1.0) * static_cast<double>(values.size() - 1));
+    return values[index];
+}
+
+GridEvidence evaluateGrid(const std::vector<double>& times,
+                          const std::vector<Onset>& onsets,
+                          const std::vector<float>& pulseEnv,
+                          const SpectralFeatures& features, double tolerance = 0.06) {
+    GridEvidence evidence;
+    if (times.size() < 2) {
+        return evidence;
+    }
+    int hits = 0;
+    for (double time : times) {
+        if (nearestOnset(onsets, time, tolerance) != nullptr) {
+            ++hits;
+        }
+    }
+    evidence.precision = static_cast<double>(hits) / static_cast<double>(times.size());
+
+    const double from = times.front() - tolerance;
+    const double to = times.back() + tolerance;
+    double weightSum = 0.0;
+    double hitWeight = 0.0;
+    int allOnsetCount = 0;
+    int allOnsetHits = 0;
+    for (const Onset& onset : onsets) {
+        if (onset.time < from || onset.time > to || onset.strength < 0.10f) {
+            continue;
+        }
+        ++allOnsetCount;
+        auto it = std::lower_bound(times.begin(), times.end(), onset.time);
+        double nearest = 1e9;
+        if (it != times.end()) {
+            nearest = std::abs(*it - onset.time);
+        }
+        if (it != times.begin()) {
+            nearest = std::min(nearest, std::abs(*(it - 1) - onset.time));
+        }
+        const bool hit = nearest <= tolerance;
+        if (hit) {
+            ++allOnsetHits;
+        }
+        const double weight = static_cast<double>(onset.strength);
+        weightSum += weight;
+        if (hit) {
+            hitWeight += weight;
+        }
+    }
+    evidence.recall =
+        weightSum > 1e-9
+            ? hitWeight / weightSum
+            : (allOnsetCount > 0 ? static_cast<double>(allOnsetHits) / allOnsetCount : 0.0);
+
+    std::vector<float> positive;
+    positive.reserve(pulseEnv.size());
+    for (float value : pulseEnv) {
+        if (std::isfinite(value) && value > 0.0f) {
+            positive.push_back(value);
+        }
+    }
+    const double threshold = std::max(0.04, 0.25 * percentile(positive, 0.90));
+    double onMean = 0.0;
+    double offMean = 0.0;
+    int lowHits = 0;
+    int pairs = 0;
+    for (std::size_t i = 0; i < times.size(); ++i) {
+        const double on = envelopeAtTime(pulseEnv, features, times[i]);
+        double interval = 0.0;
+        if (i + 1 < times.size()) {
+            interval = times[i + 1] - times[i];
+        } else if (i > 0) {
+            interval = times[i] - times[i - 1];
+        }
+        const double off =
+            envelopeAtTime(pulseEnv, features, times[i] + 0.5 * std::max(0.05, interval));
+        onMean += on;
+        offMean += off;
+        if (on >= threshold) {
+            ++lowHits;
+        }
+        ++pairs;
+    }
+    if (pairs > 0) {
+        onMean /= static_cast<double>(pairs);
+        offMean /= static_cast<double>(pairs);
+        evidence.lowHit = static_cast<double>(lowHits) / static_cast<double>(pairs);
+        evidence.lowContrast = onMean / (onMean + offMean + 0.02);
+    }
+    return evidence;
+}
+
+// If a stable track was tracked at a slower metric level, its beats still
+// cover only every second/third onset. This is deliberate: BG Beat should not
+// call a hi-hat layer a beat. But a genuine fast pulse (180 BPM four-on-the-
+// floor, or a 6/8 pulse at 120) should not be reported as 60 BPM either.
+//
+// The refinement is conservative and only runs on stable tempo maps:
+//   * the current grid must already sit on a low-frequency pulse;
+//   * the faster grid must explain materially more onsets;
+//   * it must still sit on the low pulse (not on hats or subdivisions);
+//   * it must be closer to the configured preferred tempo than the slower one.
+// This prevents the 100 BPM offbeat case (current grid off the pulse) and
+// 100 -> 200 (farther from the preferred tempo) from being "upgraded".
+int refineMetricLevel(std::vector<Beat>& beats, const std::vector<Onset>& onsets,
+                      const std::vector<float>& pulseEnv,
+                      const SpectralFeatures& features, const TempoStructure& tempo,
+                      const AnalysisConfig& config, double* refinedBpm) {
+    if (beats.size() < 8 || !tempo.stable || !tempo.transitions.empty()) {
+        return 1;
+    }
+    std::vector<double> current;
+    current.reserve(beats.size());
+    for (const Beat& beat : beats) {
+        current.push_back(beat.time);
+    }
+    if (current.size() < 8) {
+        return 1;
+    }
+    std::vector<double> gaps;
+    gaps.reserve(current.size() - 1);
+    for (std::size_t i = 1; i < current.size(); ++i) {
+        const double gap = current[i] - current[i - 1];
+        if (std::isfinite(gap) && gap > 0.05) {
+            gaps.push_back(gap);
+        }
+    }
+    if (gaps.size() < 6) {
+        return 1;
+    }
+    std::sort(gaps.begin(), gaps.end());
+    const double medianGap = gaps[gaps.size() / 2];
+    if (!std::isfinite(medianGap) || medianGap <= 0.05) {
+        return 1;
+    }
+    const double currentBpm = 60.0 / medianGap;
+    if (currentBpm < config.minBpm - 0.5 || currentBpm > config.maxBpm + 0.5) {
+        return 1;
+    }
+    const int baseSteps =
+        static_cast<int>(std::lround((current.back() - current.front()) / medianGap));
+    if (baseSteps < 7) {
+        return 1;
+    }
+    std::vector<double> regular;
+    regular.reserve(static_cast<std::size_t>(baseSteps) + 1);
+    double maxDeviation = 0.0;
+    for (int i = 0; i <= baseSteps; ++i) {
+        const double expected = current.front() + static_cast<double>(i) * medianGap;
+        regular.push_back(expected);
+        if (i < static_cast<int>(current.size())) {
+            maxDeviation = std::max(maxDeviation, std::abs(current[static_cast<std::size_t>(i)] - expected));
+        }
+    }
+    // Allow normal beat-snapping jitter, but do not regularise a genuine
+    // rubato/tempo-change grid.
+    if (maxDeviation > std::max(0.08, 0.20 * medianGap)) {
+        return 1;
+    }
+    const GridEvidence base = evaluateGrid(regular, onsets, pulseEnv, features);
+    if (base.lowHit < 0.50 || base.precision < 0.55) {
+        return 1;
+    }
+    const double preferred = std::max(20.0, config.preferredBpm);
+    const double currentPrior = std::abs(std::log2(currentBpm / preferred));
+
+    double bestScore = -1e9;
+    int bestMultiplier = 1;
+    double bestBpm = currentBpm;
+    std::vector<double> bestTimes;
+    for (int multiplier : {2, 3}) {
+        const double candidateBpm = currentBpm * static_cast<double>(multiplier);
+        if (candidateBpm > config.maxBpm + 0.5 || candidateBpm < config.minBpm - 0.5) {
+            continue;
+        }
+        if (std::abs(std::log2(candidateBpm / preferred)) + 0.01 >= currentPrior) {
+            continue;
+        }
+        std::vector<double> candidate;
+        candidate.reserve(static_cast<std::size_t>((baseSteps + 1) * multiplier));
+        for (int i = 0; i <= baseSteps; ++i) {
+            for (int k = 0; k < multiplier; ++k) {
+                const double time =
+                    current.front() +
+                    (static_cast<double>(i) +
+                     static_cast<double>(k) / static_cast<double>(multiplier)) *
+                        medianGap;
+                candidate.push_back(time);
+            }
+        }
+        candidate.push_back(current.back());
+        std::sort(candidate.begin(), candidate.end());
+        candidate.erase(std::unique(candidate.begin(), candidate.end()), candidate.end());
+        const GridEvidence evidence = evaluateGrid(candidate, onsets, pulseEnv, features);
+        const bool betterEvents = evidence.recall >= base.recall + 0.08;
+        const bool betterPulse = evidence.lowContrast >= base.lowContrast + 0.06;
+        if (evidence.precision < std::max(0.70, base.precision - 0.03) ||
+            evidence.lowHit < 0.85 || evidence.lowContrast < 0.55 ||
+            !(betterEvents || betterPulse)) {
+            continue;
+        }
+        const double score = 0.45 * evidence.recall + 0.35 * evidence.lowContrast +
+                             0.20 * evidence.precision -
+                             0.08 * std::abs(std::log2(candidateBpm / preferred));
+        if (score > bestScore) {
+            bestScore = score;
+            bestMultiplier = multiplier;
+            bestBpm = candidateBpm;
+            bestTimes = std::move(candidate);
+        }
+    }
+    if (bestMultiplier <= 1 || bestTimes.size() < 2) {
+        return 1;
+    }
+
+    std::vector<Beat> refined;
+    refined.reserve(bestTimes.size());
+    for (double time : bestTimes) {
+        if (time < 0.0) {
+            continue;
+        }
+        Beat beat;
+        beat.time = time;
+        const Onset* onset = nearestOnset(onsets, time, 0.030);
+        if (onset) {
+            beat.time = onset->time;
+            beat.strength = std::max(0.2f, onset->strength);
+            beat.confidence = 0.55f + 0.42f * std::min(1.0f, onset->strength);
+            beat.extrapolated = false;
+        } else {
+            beat.strength = dsp::clampf(
+                static_cast<float>(envelopeAtTime(features.env, features, time)), 0.0f, 1.5f);
+            beat.confidence = 0.30f;
+            beat.extrapolated = true;
+        }
+        if (!refined.empty() && beat.time - refined.back().time < 0.10) {
+            if (beat.confidence > refined.back().confidence) {
+                refined.back() = beat;
+            }
+            continue;
+        }
+        refined.push_back(beat);
+    }
+    if (refined.size() < 4) {
+        return 1;
+    }
+    beats = std::move(refined);
+    if (refinedBpm) {
+        *refinedBpm = bestBpm;
+    }
+    return bestMultiplier;
+}
+
 std::vector<DpBeat> trackRegion(const std::vector<float>& env,
                                 const std::vector<double>& periodFrames,
                                 int regionStart, int regionEnd) {
@@ -336,7 +611,7 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
             sampleCurve(features.env, static_cast<double>(item.frame)), 0.0f, 1.5f);
         beat.confidence = 0.25f + 0.35f * std::min(1.0f, beat.strength);
 
-        const Onset* onset = nearestOnset(result.onsets, beat.time, 0.055);
+        const Onset* onset = nearestOnset(result.onsets, beat.time, 0.030);
         if (onset) {
             beat.time = onset->time;
             beat.strength = std::max(beat.strength, onset->strength);
@@ -350,7 +625,7 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
     // already produced those, but after snapping a beat may sit between
     // transients (a weak beat), which is still a valid musical beat.
     for (Beat& beat : beats) {
-        const Onset* onset = nearestOnset(result.onsets, beat.time, 0.07);
+        const Onset* onset = nearestOnset(result.onsets, beat.time, 0.045);
         if (!onset) {
             beat.extrapolated = true;
             beat.confidence = std::min(beat.confidence, 0.33f);
@@ -493,6 +768,16 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         return result;
     }
 
+    // BG Motion 3.1: refine a slow metric level only when the event evidence
+    // proves that the current grid is a subharmonic. This is deliberately
+    // conservative; see refineMetricLevel().
+    double refinedBpm = tempo.bpm;
+    const int metricMultiplier =
+        refineMetricLevel(beats, result.onsets, pulseEnv, features, tempo, config,
+                          &refinedBpm);
+    result.metricMultiplier = metricMultiplier;
+    result.refinedBpm = metricMultiplier > 1 ? refinedBpm : tempo.bpm;
+
     // Meter and downbeat phase. Build a grid index from elapsed musical time,
     // not from the vector index: a missing beat at a silence seam must not
     // shift every following bar by one. Meter is evaluated over 2, 3, 4 and
@@ -500,7 +785,9 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
     std::vector<int> gridIndex(beats.size(), 0);
     for (std::size_t i = 1; i < beats.size(); ++i) {
         const double gap = beats[i].time - beats[i - 1].time;
-        const double bpm = bpmAtTime(tempo, beats[i].time, std::max(1.0, tempo.bpm));
+        const double bpm = (metricMultiplier > 1 && tempo.transitions.empty())
+                               ? refinedBpm
+                               : bpmAtTime(tempo, beats[i].time, std::max(1.0, tempo.bpm));
         const double period = 60.0 / std::max(1.0, bpm);
         int steps = static_cast<int>(std::llround(gap / std::max(1e-6, period)));
         steps = std::clamp(steps, 1, 16);
@@ -533,36 +820,71 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
     int bestPhase = 0;
     double bestScore = -1.0;
     double secondScore = -1.0;
+    int hintPhase = 0;
+    double hintScore = -1.0;
     const int firstGridPhase = gridIndex.empty() ? 0 : gridIndex.front();
     for (int meter : meters) {
+        std::vector<double> strengthMean(static_cast<std::size_t>(meter), 0.0);
+        std::vector<double> pulseMean(static_cast<std::size_t>(meter), 0.0);
+        std::vector<double> lowMean(static_cast<std::size_t>(meter), 0.0);
+        std::vector<int> counts(static_cast<std::size_t>(meter), 0);
+        for (std::size_t i = 0; i < beats.size(); ++i) {
+            const int phase = (gridIndex[i] % meter + meter) % meter;
+            const Beat& beat = beats[i];
+            strengthMean[static_cast<std::size_t>(phase)] +=
+                beat.strength * (0.5 + 0.5 * beat.confidence);
+            pulseMean[static_cast<std::size_t>(phase)] += pulseAt(beat.time);
+            lowMean[static_cast<std::size_t>(phase)] += lowEnergyAt(beat.time);
+            ++counts[static_cast<std::size_t>(phase)];
+        }
+        double strengthTotal = 0.0;
+        double pulseTotal = 0.0;
+        double lowTotal = 0.0;
+        int validPhases = 0;
         for (int phase = 0; phase < meter; ++phase) {
-            double strengthSum = 0.0;
-            double pulseSum = 0.0;
-            double lowEnergySum = 0.0;
-            int count = 0;
-            for (std::size_t i = 0; i < beats.size(); ++i) {
-                if ((gridIndex[i] % meter + meter) % meter != phase) {
-                    continue;
-                }
-                const Beat& beat = beats[i];
-                strengthSum += beat.strength * (0.5 + 0.5 * beat.confidence);
-                pulseSum += pulseAt(beat.time);
-                lowEnergySum += lowEnergyAt(beat.time);
-                ++count;
-            }
-            if (count == 0) {
+            const std::size_t p = static_cast<std::size_t>(phase);
+            if (counts[p] == 0) {
                 continue;
             }
-            const double strengthMean = strengthSum / static_cast<double>(count);
-            const double pulseMean = pulseSum / static_cast<double>(count);
-            const double lowEnergyMean = lowEnergySum / static_cast<double>(count);
-            const double lowEnergyNormalized =
-                lowEnergyReference > 1e-9 ? lowEnergyMean / lowEnergyReference : 0.0;
-            // Low-frequency pulse/energy are the primary downbeat cues.
-            // Broadband strength remains a fallback for bass-light material.
-            const double score = 0.24 * strengthMean + 0.38 * pulseMean +
-                                 0.38 * lowEnergyNormalized;
-            double adjusted = score * (meter == config.beatsPerBarHint ? 1.02 : 1.0);
+            strengthMean[p] /= static_cast<double>(counts[p]);
+            pulseMean[p] /= static_cast<double>(counts[p]);
+            lowMean[p] /= static_cast<double>(counts[p]);
+            strengthTotal += strengthMean[p];
+            pulseTotal += pulseMean[p];
+            lowTotal += lowMean[p];
+            ++validPhases;
+        }
+        if (validPhases == 0) {
+            continue;
+        }
+        for (int phase = 0; phase < meter; ++phase) {
+            const std::size_t p = static_cast<std::size_t>(phase);
+            if (counts[p] == 0) {
+                continue;
+            }
+            const double otherStrength =
+                validPhases > 1 ? (strengthTotal - strengthMean[p]) / (validPhases - 1) : 0.0;
+            const double otherPulse =
+                validPhases > 1 ? (pulseTotal - pulseMean[p]) / (validPhases - 1) : 0.0;
+            const double otherLow =
+                validPhases > 1 ? (lowTotal - lowMean[p]) / (validPhases - 1) : 0.0;
+            const double lowNormalized =
+                lowEnergyReference > 1e-9
+                    ? std::clamp(lowMean[p] / lowEnergyReference, 0.0, 2.0)
+                    : 0.0;
+            // Mean evidence alone favours a sparse meter: a 4-beat downbeat
+            // phase contains only the strongest event, while a 2-beat phase
+            // also contains the weaker one. Contrast against the other phases
+            // corrects that bias, so a genuine 6/8 (2 pulses) is not reported
+            // as 12/8 (4 pulses) merely because every fourth pulse is loudest.
+            const double strengthContrast = std::max(0.0, strengthMean[p] - otherStrength);
+            const double pulseContrast = std::max(0.0, pulseMean[p] - otherPulse);
+            const double lowContrast = std::max(0.0, lowMean[p] - otherLow);
+            const double score = 0.20 * strengthMean[p] + 0.32 * pulseMean[p] +
+                                 0.28 * lowNormalized +
+                                 0.10 * (strengthContrast + 1.0 * pulseContrast +
+                                         0.3 * lowContrast);
+            double adjusted = score * (meter == config.beatsPerBarHint ? 1.07 : 1.0);
             // Music normally establishes the meter on its first strong beat;
             // this weak prior resolves otherwise indistinguishable phase
             // candidates (e.g. a kick on 1 and 3 with no bass note). It is not
@@ -570,6 +892,10 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
             // close the alternatives were.
             if (phase == firstGridPhase % meter) {
                 adjusted *= 1.06;
+            }
+            if (meter == config.beatsPerBarHint && adjusted > hintScore) {
+                hintScore = adjusted;
+                hintPhase = phase;
             }
             if (adjusted > bestScore) {
                 secondScore = bestScore;
@@ -582,15 +908,64 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         }
     }
 
+    bool longGap = false;
+    bool tempoDrift = false;
+    {
+        const double gridBpm = metricMultiplier > 1 ? refinedBpm : tempo.bpm;
+        const double expected = gridBpm > 1.0 ? 60.0 / gridBpm : 0.5;
+        for (std::size_t i = 1; i < beats.size(); ++i) {
+            if (beats[i].time - beats[i - 1].time > 2.5 * expected) {
+                longGap = true;
+                break;
+            }
+        }
+        // A smooth tempo ramp may not create a TempoTransition, but the beat
+        // interval still drifts by more than a few percent. Treat the meter as
+        // uncertain in that case instead of reporting a sparse 2-beat bar.
+        std::vector<double> gaps;
+        gaps.reserve(beats.size());
+        for (std::size_t i = 1; i < beats.size(); ++i) {
+            const double gap = beats[i].time - beats[i - 1].time;
+            if (std::isfinite(gap) && gap > 0.05) {
+                gaps.push_back(gap);
+            }
+        }
+        if (gaps.size() >= 12) {
+            const std::size_t third = std::max<std::size_t>(4, gaps.size() / 4);
+            std::vector<double> head(gaps.begin(), gaps.begin() + static_cast<std::ptrdiff_t>(third));
+            std::vector<double> tail(gaps.end() - static_cast<std::ptrdiff_t>(third), gaps.end());
+            std::sort(head.begin(), head.end());
+            std::sort(tail.begin(), tail.end());
+            const double headGap = head[head.size() / 2];
+            const double tailGap = tail[tail.size() / 2];
+            if (headGap > 0.05 && tailGap > 0.05) {
+                tempoDrift = std::abs(std::log2(headGap / tailGap)) > 0.08;
+            }
+        }
+    }
+    const bool unstableTempo = !tempo.stable || tempoDrift;
+    const bool forceHintMeter = unstableTempo || longGap;
+    if (forceHintMeter) {
+        // A tempo change or a long silence breaks the observed bar continuity.
+        // Claiming a sparse 2-beat meter on the remaining fragments is worse
+        // than falling back to the configured meter with low confidence.
+        bestMeter = std::clamp(config.beatsPerBarHint, 2, 8);
+        bestPhase = hintScore > 0.0 ? hintPhase : 0;
+        bestScore = hintScore;
+    }
+
     result.beatsPerBar = bestMeter;
     if (bestScore > 0.0) {
         const double separation = secondScore > 0.0
                                       ? std::clamp((bestScore - secondScore) / bestScore,
                                                    0.0, 1.0)
                                       : 0.0;
-        result.meterConfidence = static_cast<float>(
-            std::clamp(0.10 + 0.55 * separation + 0.35 * std::min(1.0, bestScore),
-                       0.0, 1.0));
+        double confidence = 0.10 + 0.55 * separation + 0.35 * std::min(1.0, bestScore);
+        if (forceHintMeter) {
+            confidence = std::min(0.40, confidence * 0.60);
+        }
+        result.meterConfidence =
+            static_cast<float>(std::clamp(confidence, 0.0, 1.0));
         result.downbeatConfidence = result.meterConfidence;
     }
 

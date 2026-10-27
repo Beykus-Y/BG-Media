@@ -41,3 +41,10 @@ add_executable(bgmedia_motion_qa
 )
 target_link_libraries(bgmedia_motion_qa PRIVATE bgmedia_rig)
 target_compile_options(bgmedia_motion_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+add_executable(bgmedia_sync_qa
+    sync_qa/main.cpp
+)
+target_link_libraries(bgmedia_sync_qa PRIVATE bgmedia_rig bgmedia_test_signals)
+target_include_directories(bgmedia_sync_qa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+target_compile_options(bgmedia_sync_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})

@@ -215,6 +215,42 @@ TEST_CASE(dance.clips_are_normalized_and_model_independent) {
 // Motion quality
 // ---------------------------------------------------------------------------
 
+TEST_CASE(dance.accent_confidence_is_optional_and_affects_the_envelope) {
+    const std::string marker = "\"tracks\"";
+    std::string base = tinyClipJson();
+    {
+        const std::size_t at = base.find(marker);
+        REQUIRE(at != std::string::npos);
+        std::string text = base;
+        text.insert(at, "\"accents\":[{\"beat\":0,\"strength\":1}],");
+        const motion::ClipLoadResult loaded = motion::parseClipJson(text, "no-confidence.json");
+        CHECK(loaded.ok);
+        REQUIRE(loaded.clip.accents.size() == 1);
+        CHECK_NEAR(loaded.clip.accents[0].confidence, 1.0, 1e-6);
+        CHECK_NEAR(motion::clipAccentStrength(loaded.clip, 0.0), 1.0, 1e-6);
+    }
+    {
+        const std::size_t at = base.find(marker);
+        std::string text = base;
+        text.insert(at,
+                    "\"accents\":[{\"beat\":0,\"strength\":1,\"confidence\":0.4}],");
+        const motion::ClipLoadResult loaded = motion::parseClipJson(text, "confident.json");
+        CHECK(loaded.ok);
+        REQUIRE(loaded.clip.accents.size() == 1);
+        CHECK_NEAR(loaded.clip.accents[0].confidence, 0.4, 1e-6);
+        CHECK_NEAR(motion::clipAccentStrength(loaded.clip, 0.0), 0.4, 1e-5);
+    }
+    {
+        const std::size_t at = base.find(marker);
+        std::string text = base;
+        text.insert(at,
+                    "\"accents\":[{\"beat\":0,\"strength\":1,\"confidence\":3}],");
+        const motion::ClipLoadResult loaded = motion::parseClipJson(text, "bad-confidence.json");
+        CHECK(loaded.ok);   // a warning, not a rejected clip
+        CHECK(hasMessage(loaded, "confidence"));
+    }
+}
+
 TEST_CASE(dance.loops_have_no_seam_jump) {
     for (const motion::HumanoidClip& clip : library().clips()) {
         const qa::ClipReport r = qa::analyseClip(clip, nullptr, nullptr, clip.bpm);
@@ -617,6 +653,20 @@ TEST_CASE(dance.tempo_levels_cover_80_to_180_bpm) {
     const motion::DanceFrame f2 = director.sample(10.0 + 60.0 / 96.0);
     CHECK_NEAR(f2.clipBeat - f1.clipBeat, 1.0, 1e-6);
     CHECK_NEAR(f1.playbackSpeed, 1.0, 0.01);
+}
+
+TEST_CASE(dance.metric_level_has_hysteresis_near_the_range_edge) {
+    const motion::HumanoidClip& energetic =
+        *library().forStyle(motion::DanceStyle::Energetic);
+    bool limited = false;
+    // 180 BPM is only just outside Energetic's 92..176 range. A half-time
+    // reading at 90 is almost the same distance from the authored 126 BPM, so
+    // hysteresis keeps the natural 1x reading and reports the soft limit.
+    CHECK_NEAR(motion::DanceDirector::chooseRate(energetic, 180.0, &limited), 1.0, 1e-9);
+    CHECK(limited);
+    // 80 BPM is far below the range: double-time is the honest metric level.
+    CHECK_NEAR(motion::DanceDirector::chooseRate(energetic, 80.0, &limited), 2.0, 1e-9);
+    CHECK(!limited);
 }
 
 TEST_CASE(dance.manual_selection_lands_on_a_beat) {

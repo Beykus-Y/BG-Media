@@ -1,16 +1,16 @@
 {
   "longTrackSeconds": 300.000000,
-  "longMedianMs": 1533.936900,
-  "longRealtimeFactor": 195.575190,
-  "cacheWriteMs": 3.887900,
-  "cacheReadMs": 9.262800,
+  "longMedianMs": 1650.750900,
+  "longRealtimeFactor": 181.735476,
+  "cacheWriteMs": 3.934500,
+  "cacheReadMs": 8.170400,
   "cases": [
-    {"name": "92 BPM", "expectedBpm": 92.000000, "detectedBpm": 92.056044, "confidence": 0.835389, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 2.385992, "analysisMs": 70.223300, "realtimeFactor": 284.874313, "beats": 30, "tempoChange": false},
-    {"name": "123 BPM", "expectedBpm": 123.000000, "detectedBpm": 123.002308, "confidence": 0.692443, "precision": 0.925000, "recall": 1.000000, "meanBeatErrorMs": 3.395807, "analysisMs": 126.200500, "realtimeFactor": 158.495560, "beats": 40, "tempoChange": false},
-    {"name": "163 BPM", "expectedBpm": 163.000000, "detectedBpm": 162.746969, "confidence": 0.726797, "precision": 0.907407, "recall": 1.000000, "meanBeatErrorMs": 2.641704, "analysisMs": 102.885300, "realtimeFactor": 194.414472, "beats": 54, "tempoChange": false},
-    {"name": "tempo 92 -> 123", "expectedBpm": 0.000000, "detectedBpm": 104.720743, "confidence": 0.537081, "precision": 0.930233, "recall": 1.000000, "meanBeatErrorMs": 4.026490, "analysisMs": 129.646000, "realtimeFactor": 185.146327, "beats": 43, "tempoChange": true},
-    {"name": "silence gap", "expectedBpm": 92.000000, "detectedBpm": 92.101657, "confidence": 0.633725, "precision": 0.750000, "recall": 1.000000, "meanBeatErrorMs": 2.120829, "analysisMs": 34.555400, "realtimeFactor": 376.325099, "beats": 12, "tempoChange": false},
-    {"name": "bass accents", "expectedBpm": 92.000000, "detectedBpm": 92.039039, "confidence": 0.733390, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 3.715480, "analysisMs": 66.036300, "realtimeFactor": 302.998167, "beats": 30, "tempoChange": false},
-    {"name": "ambiguous rhythm", "expectedBpm": 0.000000, "detectedBpm": 91.899901, "confidence": 0.616829, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 7.238847, "analysisMs": 161.804100, "realtimeFactor": 123.618333, "beats": 30, "tempoChange": false}
+    {"name": "92 BPM", "expectedBpm": 92.000000, "detectedBpm": 92.056044, "confidence": 0.835389, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 2.385992, "analysisMs": 67.721500, "realtimeFactor": 295.403521, "beats": 30, "tempoChange": false},
+    {"name": "123 BPM", "expectedBpm": 123.000000, "detectedBpm": 123.002308, "confidence": 0.692443, "precision": 0.925000, "recall": 1.000000, "meanBeatErrorMs": 3.395807, "analysisMs": 124.248500, "realtimeFactor": 160.994301, "beats": 40, "tempoChange": false},
+    {"name": "163 BPM", "expectedBpm": 163.000000, "detectedBpm": 162.746969, "confidence": 0.726797, "precision": 0.907407, "recall": 1.000000, "meanBeatErrorMs": 2.641704, "analysisMs": 101.932400, "realtimeFactor": 196.242737, "beats": 54, "tempoChange": false},
+    {"name": "tempo 92 -> 123", "expectedBpm": 0.000000, "detectedBpm": 104.720743, "confidence": 0.537081, "precision": 0.930233, "recall": 1.000000, "meanBeatErrorMs": 4.026490, "analysisMs": 128.028900, "realtimeFactor": 187.484035, "beats": 43, "tempoChange": true},
+    {"name": "silence gap", "expectedBpm": 92.000000, "detectedBpm": 92.101657, "confidence": 0.633725, "precision": 0.750000, "recall": 1.000000, "meanBeatErrorMs": 2.120829, "analysisMs": 34.845600, "realtimeFactor": 373.210384, "beats": 12, "tempoChange": false},
+    {"name": "bass accents", "expectedBpm": 92.000000, "detectedBpm": 92.039039, "confidence": 0.733390, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 3.715480, "analysisMs": 66.243800, "realtimeFactor": 301.980235, "beats": 30, "tempoChange": false},
+    {"name": "ambiguous rhythm", "expectedBpm": 0.000000, "detectedBpm": 91.899901, "confidence": 0.616829, "precision": 0.933333, "recall": 1.000000, "meanBeatErrorMs": 7.238847, "analysisMs": 158.939300, "realtimeFactor": 125.846792, "beats": 30, "tempoChange": false}
   ]
 }

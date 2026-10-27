@@ -338,10 +338,11 @@ SPIR-V/MSL-варианты (исходный HLSL уже отделён от AP
 - `retarget.is_deterministic_and_frame_rate_independent` — бит-в-бит
   воспроизведение после seek/rewind и 30-секундный sweep;
 - `retarget.model1_if_available` — реальный риг;
-- `dance.*` (26 кейсов) — формат `bgmotion.clip`, loop seam, скорость и
+- `dance.*` (28 кейсов) — формат `bgmotion.clip`, loop seam, скорость и
   ускорение, foot slide, повороты вокруг опорной стопы, 20 пар стилей на
   80/123/180 BPM (60 переходов), seek/pause/resume, one-shot, metric levels, Manual entry
-  beat, Auto-план и смена темпа. Подробнее: [BG_MOTION_3.md](BG_MOTION_3.md).
+  beat, Auto-план, смена темпа и accent confidence. Подробнее:
+  [BG_MOTION_3.md](BG_MOTION_3.md), [BG_MOTION_3_1.md](BG_MOTION_3_1.md).
 
 ASan (MSVC):
 

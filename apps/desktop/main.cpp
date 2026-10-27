@@ -64,6 +64,7 @@ void printUsage() {
         << "                         energetic|idle|auto|test (works without music)\n"
         << "  --dance-plan <a,b,..>  play styles in sequence (--dance-span beats each, default 16)\n"
         << "  --dance-bpm <bpm>      Motion Lab tempo when no music is loaded (default 100)\n"
+        << "  --dance-expression <mode>  musical warp: off|soft|expressive (default soft)\n"
         << "  --dances <dir>         dance clip directory (default <assets>/dances)\n"
         << "  --presentation         clean presentation mode\n"
         << "  --debug-feet           foot contact debug views\n"
@@ -155,6 +156,8 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
             }
         } else if (arg == "--dances" && i + 1 < argc) {
             options.dancesDirectory = pathFromUtf8(argv[++i]);
+        } else if (arg == "--dance-expression" && i + 1 < argc) {
+            options.danceExpression = argv[++i];
         } else if (arg == "--presentation") {
             options.presentation = true;
             options.startIn3D = true;

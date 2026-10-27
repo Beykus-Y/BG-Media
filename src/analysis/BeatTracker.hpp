@@ -16,6 +16,12 @@ struct BeatTrackingResult {
     float meterConfidence = 0.0f;
     float beatPhaseConfidence = 0.0f;
     float downbeatConfidence = 0.0f;
+    // BG Motion 3.1: a stable track may be tracked at a slower metric level
+    // (for example a 180 BPM pulse locked to every third beat). When the
+    // evidence supports a faster level, the beats are refined and this
+    // multiplier tells the caller how to rescale the reported tempo.
+    int metricMultiplier = 1;
+    double refinedBpm = 0.0;
 };
 
 // Extracts onset peaks from the sharp onset envelope. Silence regions are

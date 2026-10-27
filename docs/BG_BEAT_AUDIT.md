@@ -128,8 +128,31 @@ confidence низкие, альтернативы видны. Это честн�
 
 `bgmedia_fixturegen` пишет соответствующие WAV в `fixtures/`. Проверяются BPM,
 one-to-one beat F1, downbeat F1, signed timing bias, `nearestBeat` для
-syncopated bass и cache invalidation. Всего в проекте **82 теста**, 9
-CTest-групп (включая 26 кейсов BG Motion 3.0).
+syncopated bass и cache invalidation. Всего в проекте **115 тестов**, 12
+CTest-групп (включая 28 кейсов BG Motion 3.0/3.1).
+
+### 5.1 Дополнения BG Motion 3.1 к BG Beat
+
+- **Metric-level tie-break** в tempo estimator: более быстрый кандидат (×1.5,
+  ×2, ×3, ×4/3) выбирается, если его score не ниже 92 %, `lowHitRate ≥ 0.85`,
+  precision не хуже и он ближе к `preferredBpm`. Это исправило 150→75,
+  180→60 и 160→80.
+- **Metric refinement в BeatTracker** как safety net: регулярная сетка,
+  low-pulse и onset evidence, жёсткие гейты; не применяется к offbeat/half-time.
+- **Meter contrast**: средняя сила фазы сравнивается с остальными фазами;
+  убран bias, из-за которого 6/8 (2 пульса) становился 12/8.
+- **Tempo ramp**: линейная регрессия `log2(BPM)` по локальным окнам; при
+  дрейфе >10 % строится 4-сегментная карта с переходами. Ramp 80→120:
+  beat F1 0.634 → 1.000.
+- **Snap tolerance 30 мс** вместо 55 мс: на 150 BPM ранние ложные onset-пики
+  больше не утягивают сетку.
+- **Fallback**: при `tempoStable=false`, дрейфе >8 % или gap >2.5 периода метр
+  понижается до hint с confidence ≤0.40; downbeat не считается фактом.
+
+Итог на 21 сценарии `bgmedia_sync_qa`: beat F1 **0.8685 → 0.9837**,
+downbeat F1 **0.8129 → 0.9406**, meter **20/21 → 21/21**. Детали:
+[docs/BG_MOTION_3_1.md](BG_MOTION_3_1.md), машинный отчёт:
+[docs/sync_qa_3_1.json](sync_qa_3_1.json).
 
 ## 6. Что осталось открытым
 
