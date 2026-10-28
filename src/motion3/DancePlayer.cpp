@@ -30,6 +30,21 @@ constexpr double kPlanBlendSeconds = 0.5;
 constexpr double kSwingCarrySeconds = 0.08;
 constexpr double kPlantedCarrySeconds = 3.0;
 
+// Overlay cue sets change from one loop to the next only inside this window around the seam
+// (half-width in beats); the composed poses are blended across it.
+constexpr double kOverlaySeamBeats = 0.5;
+// Upper bound of the per-(clip, loop) overlay memo. Plans are pure, so clearing is harmless.
+constexpr std::size_t kMaxOverlaySets = 256;
+
+// Seed of one clip's cue set for one loop: the host seed, the clip id and the loop index.
+std::uint32_t overlayLoopSeed(std::uint32_t hostSeed, const std::string& clipId,
+                              std::int64_t loop) {
+    const std::uint64_t key = variationMix(
+        variationHash(clipId) ^ variationMix(static_cast<std::uint64_t>(hostSeed) + 0x51ull) ^
+        variationMix(static_cast<std::uint64_t>(loop) + 0x7000ull));
+    return static_cast<std::uint32_t>(key ^ (key >> 32));
+}
+
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -133,8 +148,9 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     footworkReports_.clear();
     replanAuthored();
     generated_ = ProceduralChoreography::showcase();
+    generatedOverlays_.clear();
     for (GeneratedDance& dance : generated_) {
-        overlays_[dance.clip.id] = dance.overlays;
+        generatedOverlays_[dance.clip.id] = dance.overlays;
         if (!library_.find(dance.clip.id)) {
             library_.add(dance.clip);
         }
@@ -150,6 +166,7 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
 
 void DancePlayer::replanAuthored() {
     footworkReports_.clear();
+    overlays_.clear();  // the cue plans read the (re-planned) clips
     for (const HumanoidClip& raw : authored_) {
         if (!footworkPlan_) {
             library_.replace(raw);
@@ -198,18 +215,28 @@ void DancePlayer::setOverlayMode(OverlayMode mode) {
 }
 
 const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& clipId) {
-    auto it = overlays_.find(clipId);
-    if (it != overlays_.end()) {
+    return overlaysFor(clipId, 0);
+}
+
+const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& clipId,
+                                                          std::int64_t loop) {
+    if (const auto preset = generatedOverlays_.find(clipId); preset != generatedOverlays_.end()) {
+        return preset->second;
+    }
+    const std::pair<std::string, std::int64_t> key{clipId, loop};
+    if (const auto it = overlays_.find(key); it != overlays_.end()) {
         return it->second;
     }
     std::vector<PrimitiveCue> plan;
     if (const HumanoidClip* clip = library_.find(clipId)) {
-        const std::uint32_t seed =
-            overlaySeed_ ^ static_cast<std::uint32_t>(clipId.size() * 2654435761u);
+        const std::uint32_t seed = overlayLoopSeed(overlaySeed_, clipId, loop);
         const float density = std::clamp(0.25f + clip->energy * 0.8f, 0.25f, 1.0f);
         plan = planPrimitiveOverlays(*clip, seed, density, true);
     }
-    return overlays_.emplace(clipId, std::move(plan)).first->second;
+    if (overlays_.size() >= kMaxOverlaySets) {
+        overlays_.clear();
+    }
+    return overlays_.emplace(key, std::move(plan)).first->second;
 }
 
 bool DancePlayer::selectClip(const std::string& clipId, double now, bool immediate) {
@@ -502,21 +529,49 @@ DanceFrame DancePlayer::sampleFrame(double mediaTime) {
             if (!segment.clip) {
                 return;
             }
-            const std::vector<PrimitiveCue>& cues = overlaysFor(segment.clip->id);
-            if (cues.empty()) {
+            const HumanoidClip& clip = *segment.clip;
+            // Loop-seam blend of the cue sets: near a seam both loops' overlays are composed
+            // on the same base pose and blended, so the set changes without a step.
+            const LoopBlend loops = clip.loop
+                                        ? loopBlendAt(clipBeat, clip.beats, kOverlaySeamBeats)
+                                        : LoopBlend{};
+            const auto compose = [&](std::int64_t loop) {
+                // The reference returned by overlaysFor is used before the next call.
+                return composeMotion(pose, overlaysFor(clip.id, loop), clipBeat, clip.beats,
+                                     clip.loop, options);
+            };
+            if (loops.w <= 0.0f || loops.from == loops.to) {
+                if (overlaysFor(clip.id, loops.from).empty()) {
+                    return;
+                }
+                const ComposedPose composed = compose(loops.from);
+                pose = composed.pose;
+                if (diag.calls++ == 0) {
+                    diag.accepted = composed.diagnostics.acceptedCues;
+                    diag.rejected = composed.diagnostics.rejectedByConflict +
+                                    composed.diagnostics.rejectedByContact +
+                                    composed.diagnostics.rejectedBySupport +
+                                    composed.diagnostics.rejectedByMask;
+                    diag.weight = composed.diagnostics.maxWeight;
+                    diag.hands = composed.pose.detailedHands;
+                }
                 return;
             }
-            const ComposedPose composed = composeMotion(
-                pose, cues, clipBeat, segment.clip->beats, segment.clip->loop, options);
-            pose = composed.pose;
+            if (overlaysFor(clip.id, loops.from).empty() && overlaysFor(clip.id, loops.to).empty()) {
+                return;
+            }
+            const ComposedPose before = compose(loops.from);
+            const ComposedPose after = compose(loops.to);
+            pose = blendPoses(before.pose, after.pose, loops.w);
             if (diag.calls++ == 0) {
-                diag.accepted = composed.diagnostics.acceptedCues;
-                diag.rejected = composed.diagnostics.rejectedByConflict +
-                                composed.diagnostics.rejectedByContact +
-                                composed.diagnostics.rejectedBySupport +
-                                composed.diagnostics.rejectedByMask;
-                diag.weight = composed.diagnostics.maxWeight;
-                diag.hands = composed.pose.detailedHands;
+                const ComposedPose& shown = loops.w < 0.5f ? before : after;
+                diag.accepted = shown.diagnostics.acceptedCues;
+                diag.rejected = shown.diagnostics.rejectedByConflict +
+                                shown.diagnostics.rejectedByContact +
+                                shown.diagnostics.rejectedBySupport +
+                                shown.diagnostics.rejectedByMask;
+                diag.weight = shown.diagnostics.maxWeight;
+                diag.hands = shown.pose.detailedHands;
             }
         });
     DanceFrame frame = director_.sample(mediaTime);

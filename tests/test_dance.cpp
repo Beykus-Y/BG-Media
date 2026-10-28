@@ -4,13 +4,18 @@
 
 #include "bgmedia/motion3/DancePlayer.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -1271,4 +1276,366 @@ TEST_CASE(dance.rebased_one_shot_returns_after_its_remaining_beats) {
         CHECK(director.sample(back.startTime + back.fadeSeconds + 0.5).style ==
               motion::DanceStyle::Idle);
     }
+}
+
+// ---------------------------------------------------------------------------
+// BG Motion 3.4 variety: mirrors, per-loop amplitude and overlays, loop seams
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Largest per-bone rotation difference of two poses, in degrees.
+double maxBoneDeg(const motion::ClipPose& a, const motion::ClipPose& b) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
+        worst = std::max(worst, qa::angleBetween(a.bone[i], b.bone[i]));
+    }
+    return worst;
+}
+
+// Largest component difference of two poses (bones and hips). Exact comparison for purity:
+// angleBetween has a rounding floor of about 1e-6 degrees even for identical rotations.
+double maxComponentDiff(const motion::ClipPose& a, const motion::ClipPose& b) {
+    double worst = 0.0;
+    const auto take = [&](const math::Quat& p, const math::Quat& q) {
+        worst = std::max({worst, std::abs(double(p.x) - q.x), std::abs(double(p.y) - q.y),
+                          std::abs(double(p.z) - q.z), std::abs(double(p.w) - q.w)});
+    };
+    for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
+        take(a.bone[i], b.bone[i]);
+    }
+    worst = std::max({worst, std::abs(double(a.hips.x) - b.hips.x), std::abs(double(a.hips.y) - b.hips.y),
+                      std::abs(double(a.hips.z) - b.hips.z)});
+    return worst;
+}
+
+// Mirror image of a rotation, written out here independently of the implementation under test.
+math::Quat reflectQuat(const math::Quat& q) {
+    return {q.x, -q.y, -q.z, q.w};
+}
+
+math::Vec3 reflectAcross(const math::Vec3& v, const math::Vec3& normal) {
+    return v - normal * (2.0f * math::dot(v, normal));
+}
+
+bool sameCues(const std::vector<motion::PrimitiveCue>& a, const std::vector<motion::PrimitiveCue>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].kind != b[i].kind || a[i].side != b[i].side) return false;
+        if (std::abs(a[i].beat - b[i].beat) > 1e-6f || std::abs(a[i].intensity - b[i].intensity) > 1e-6f ||
+            std::abs(a[i].durationBeats - b[i].durationBeats) > 1e-6f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A 200 s, 120 BPM track with calm, active, intense, calm and silent phrases: the same plan
+// as dance.auto_mode_is_stable_and_explainable, where a style comes back after another one.
+AnalysisResult phrasedTrack() {
+    AnalysisResult a;
+    a.info.duration = 200.0;
+    a.bpm = 120.0;
+    a.bpmConfidence = 0.9f;
+    a.beatPhaseConfidence = 0.9f;
+    a.tempoStable = true;
+    a.beatsPerBar = 4;
+    for (int i = 0; i < 400; ++i) {
+        Beat b;
+        b.time = 0.5 + i * 0.5;
+        b.beatInBar = i % 4;
+        b.barIndex = i / 4;
+        b.downbeat = b.beatInBar == 0;
+        a.beats.push_back(b);
+    }
+    const auto section = [&](double s, double e, float energy) {
+        Section sec;
+        sec.start = s;
+        sec.end = e;
+        sec.energy = energy;
+        sec.confidence = 0.8f;
+        a.sections.push_back(sec);
+    };
+    section(0, 40, 0.15f);
+    section(40, 100, 0.5f);
+    section(100, 150, 0.9f);
+    section(150, 190, 0.2f);
+    SilenceRegion silence;
+    silence.start = 190.0;
+    silence.end = 200.0;
+    silence.confidence = 1.0f;
+    a.silences.push_back(silence);
+    for (double t = 0.5; t < 190.0; t += 0.25) {
+        Onset o;
+        o.time = t;
+        o.strength = t < 40 ? 0.2f : (t < 100 ? 0.5f : (t < 150 ? 0.95f : 0.25f));
+        a.onsets.push_back(o);
+    }
+    return a;
+}
+
+} // namespace
+
+TEST_CASE(dance.mirror_clip_is_an_involution_and_swaps_sides) {
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        const motion::HumanoidClip mirror = motion::mirrorClip(clip);
+        CHECK(mirror.id == clip.id + "~m");
+        const motion::HumanoidClip twice = motion::mirrorClip(mirror);
+        CHECK(twice.id == clip.id);
+        CHECK(twice.name == clip.name);
+
+        std::vector<motion::ClipDiagnostic> issues;
+        motion::validateClip(mirror, mirror.id, issues);
+        for (const motion::ClipDiagnostic& d : issues) {
+            CHECK(d.severity != motion::ClipDiagnostic::Severity::Error);
+        }
+
+        // Mirroring twice gives back every key of every track.
+        for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+            CHECK(twice.bones[b].size() == clip.bones[b].size());
+            for (std::size_t k = 0; k < std::min(twice.bones[b].size(), clip.bones[b].size()); ++k) {
+                CHECK(qa::angleBetween(twice.bones[b][k], clip.bones[b][k]) < 1e-3);
+            }
+        }
+        CHECK(twice.hips.size() == clip.hips.size());
+        for (std::size_t k = 0; k < std::min(twice.hips.size(), clip.hips.size()); ++k) {
+            CHECK_NEAR(twice.hips[k].x, clip.hips[k].x, 1e-6);
+            CHECK_NEAR(twice.root[k].z, clip.root[k].z, 1e-6);
+        }
+
+        // The mirror's left side is the reflected right side of the original, at any beat.
+        for (double fraction : {0.0, 0.13, 0.37, 0.5, 0.71, 0.94}) {
+            const double beat = fraction * clip.beats;
+            const motion::ClipPose orig = motion::sampleClip(clip, beat);
+            const motion::ClipPose mir = motion::sampleClip(mirror, beat);
+            for (vrm::HumanoidBone left : {vrm::HumanoidBone::LeftShoulder, vrm::HumanoidBone::LeftUpperArm,
+                                           vrm::HumanoidBone::LeftLowerArm, vrm::HumanoidBone::LeftHand,
+                                           vrm::HumanoidBone::LeftUpperLeg, vrm::HumanoidBone::LeftFoot}) {
+                const auto l = static_cast<std::size_t>(left);
+                const auto r = static_cast<std::size_t>(motion::mirroredBone(left));
+                CHECK(qa::angleBetween(mir.bone[l], reflectQuat(orig.bone[r])) < 0.01);
+                CHECK(qa::angleBetween(mir.bone[r], reflectQuat(orig.bone[l])) < 0.01);
+            }
+            for (std::size_t b : {static_cast<std::size_t>(vrm::HumanoidBone::Spine),
+                                  static_cast<std::size_t>(vrm::HumanoidBone::Head)}) {
+                CHECK(qa::angleBetween(mir.bone[b], reflectQuat(orig.bone[b])) < 0.01);
+            }
+            CHECK_NEAR(mir.rootX, -orig.rootX, 1e-5);
+            CHECK_NEAR(mir.rootZ, orig.rootZ, 1e-5);
+            CHECK_NEAR(mir.rootYaw, -orig.rootYaw, 1e-5);
+            CHECK_NEAR(mir.hips.x, -orig.hips.x, 1e-5);
+            CHECK_NEAR(mir.hips.y, orig.hips.y, 1e-5);
+            for (std::size_t f = 0; f < 2; ++f) {
+                const std::size_t other = 1 - f;
+                CHECK_NEAR(mir.foot[f].position.x, -orig.foot[other].position.x, 1e-5);
+                CHECK_NEAR(mir.foot[f].position.y, orig.foot[other].position.y, 1e-5);
+                CHECK_NEAR(mir.foot[f].position.z, orig.foot[other].position.z, 1e-5);
+                CHECK_NEAR(mir.foot[f].yaw, -orig.foot[other].yaw, 1e-5);
+                CHECK_NEAR(mir.foot[f].contact, orig.foot[other].contact, 1e-5);
+                CHECK_NEAR(mir.hand[f], orig.hand[1 - f], 1e-5);
+            }
+        }
+    }
+}
+
+TEST_CASE(dance.mirrored_clip_retargets_as_a_mirror_image) {
+    const motion::HumanoidClip& groove = *library().find("groove");
+    const motion::HumanoidClip mirror = motion::mirrorClip(groove);
+    for (const std::filesystem::path& path : {minimalVrm(), model1Path()}) {
+        if (!std::filesystem::exists(path)) continue;
+        Rig rig = makeRig(path);
+        CHECK(rig.ok());
+        const vrm::VrmModel& model = *rig.loaded.model;
+        const math::Vec3 normal = model.right * (1.0f / model.right.length());
+        for (double fraction : {0.1, 0.37, 0.6, 0.85}) {
+            const double beat = fraction * groove.beats;
+            const animation::RetargetedPose original =
+                rig.rig->applyClip(motion::sampleClip(groove, beat), 0.0);
+            const animation::RetargetedPose mirrored =
+                rig.rig->applyClip(motion::sampleClip(mirror, beat), 0.0);
+            for (auto [left, right] : {std::pair{vrm::HumanoidBone::LeftLowerArm, vrm::HumanoidBone::RightLowerArm},
+                                       std::pair{vrm::HumanoidBone::LeftHand, vrm::HumanoidBone::RightHand}}) {
+                if (!model.hasBone(left) || !model.hasBone(right)) continue;
+                const math::Vec3 leftMoved = mirrored.bonePosition(left, model) - model.boneBindPosition(left);
+                const math::Vec3 rightMoved = original.bonePosition(right, model) - model.boneBindPosition(right);
+                CHECK((leftMoved - reflectAcross(rightMoved, normal)).length() < 2e-3f * model.height);
+            }
+        }
+    }
+}
+
+TEST_CASE(dance.auto_mirrors_a_style_that_comes_back) {
+    AnalysisResult a = phrasedTrack();
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    player.setAnalysis(&a);
+    const auto& segments = player.director().schedule().segments();
+
+    // Every style alternates between its authored clip and the mirror, segment by segment.
+    std::map<int, bool> lastMirrored;
+    int mirrored = 0;
+    for (const motion::ScheduleSegment& seg : segments) {
+        const bool isMirror = seg.clip->id.size() > 2 && seg.clip->id.substr(seg.clip->id.size() - 2) == "~m";
+        CHECK(player.library().find(seg.clip->id) == seg.clip);  // lifetime-safe library pointer
+        CHECK(isMirror == (seg.reason.find("mirrored repeat") != std::string::npos));
+        if (seg.clip->style != motion::DanceStyle::Idle) {
+            const int style = static_cast<int>(seg.clip->style);
+            if (lastMirrored.count(style)) {
+                CHECK(lastMirrored[style] != isMirror);
+            } else {
+                CHECK(!isMirror);
+            }
+            lastMirrored[style] = isMirror;
+        } else {
+            CHECK(!isMirror);
+        }
+        mirrored += isMirror ? 1 : 0;
+    }
+    CHECK(mirrored >= 1);
+    CHECK(segments.size() <= 12);  // the phrase plan keeps its shape
+
+    // The plan is a pure function of the analysis.
+    motion::DancePlayer again;
+    again.loadLibrary(dancesDir());
+    again.setMode(motion::DanceMode::Auto, 0.0);
+    again.setAnalysis(&a);
+    const auto& other = again.director().schedule().segments();
+    CHECK(other.size() == segments.size());
+    for (std::size_t i = 0; i < std::min(other.size(), segments.size()); ++i) {
+        CHECK(other[i].clip->id == segments[i].clip->id);
+        CHECK_NEAR(other[i].startTime, segments[i].startTime, 1e-12);
+        CHECK(other[i].reason == segments[i].reason);
+    }
+}
+
+TEST_CASE(dance.loop_blend_is_periodic_and_continuous_across_seams) {
+    const double loopBeats = 16.0;
+    const double half = 0.5;
+    const double maxSlope = 1.875 / (2.0 * half);  // derivative of the quintic smootherstep
+    double previous = 0.0;
+    for (int i = -3200; i <= 3200; ++i) {
+        const double beat = i * 0.01;
+        const motion::LoopBlend lb = motion::loopBlendAt(beat, loopBeats, half);
+        CHECK(lb.w >= 0.0f && lb.w <= 1.0f);
+        const double seam = std::round(beat / loopBeats);
+        const double distance = beat - seam * loopBeats;
+        if (std::abs(distance) >= half) {
+            CHECK(lb.from == lb.to);
+            CHECK(lb.w == 0.0f);
+            CHECK(lb.from == static_cast<std::int64_t>(std::floor(beat / loopBeats)));
+        } else {
+            CHECK(lb.from == static_cast<std::int64_t>(seam) - 1);
+            CHECK(lb.to == static_cast<std::int64_t>(seam));
+        }
+        // The effective loop value (loop index, blended across the window) changes continuously.
+        const double effective = static_cast<double>(lb.from) + static_cast<double>(lb.to - lb.from) * lb.w;
+        if (i > -3200) {
+            CHECK(std::abs(effective - previous) <= 0.01 * maxSlope + 1e-6);
+        }
+        previous = effective;
+        // Periodic: one loop later, the same blend one loop further on.
+        const motion::LoopBlend next = motion::loopBlendAt(beat + loopBeats, loopBeats, half);
+        CHECK(next.from == lb.from + 1 && next.to == lb.to + 1);
+        CHECK_NEAR(next.w, lb.w, 1e-6);
+    }
+}
+
+TEST_CASE(dance.loop_variation_is_bounded_deterministic_and_seamless) {
+    const motion::HumanoidClip& groove = *library().find("groove");
+    const double bpm = groove.bpm;  // rate 1: the clip beat is the music beat
+    const auto makeDirector = [&] {
+        auto director = std::make_unique<motion::DanceDirector>(&library());
+        director->setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+        director->reset(0.0);
+        director->select(motion::DanceStyle::Groove, 0.0, false, true);
+        return director;
+    };
+    const auto d = makeDirector();
+    const auto poseAt = [&](const motion::DanceDirector& dir, double beat) {
+        return dir.sample(beat * 60.0 / bpm).pose;
+    };
+    CHECK_NEAR(d->sample(4.0 * 60.0 / bpm).clipBeat, 4.0, 1e-6);
+
+    // Two loops at the same phase differ, but only a little: the amplitude is within 8 %.
+    double worstDifference = 0.0;
+    for (double beat : {1.0, 2.5, 4.0, 6.0, 9.0, 11.5, 13.0}) {
+        for (int k = 0; k < 3; ++k) {
+            const double diff = maxBoneDeg(poseAt(*d, beat + 16.0 * k), poseAt(*d, beat + 16.0 * (k + 1)));
+            worstDifference = std::max(worstDifference, diff);
+            CHECK(diff < 12.0);
+        }
+    }
+    CHECK(worstDifference > 0.3);
+
+    // Pure: the same inputs give the same pose, from a fresh director as well.
+    const auto again = makeDirector();
+    for (double beat : {0.7, 4.2, 17.3, 33.9}) {
+        CHECK(maxComponentDiff(poseAt(*d, beat), poseAt(*again, beat)) == 0.0);
+        CHECK(maxComponentDiff(poseAt(*d, beat), poseAt(*d, beat)) == 0.0);
+    }
+
+    // Seam: the largest step across the loop boundary is no larger than the steps inside a
+    // loop, so the variation never pops.
+    const double step = 1.0 / 480.0;
+    double interior = 0.0;
+    for (double beat = 4.0; beat < 12.0; beat += step) {
+        interior = std::max(interior, maxBoneDeg(poseAt(*d, beat), poseAt(*d, beat + step)));
+    }
+    double seam = 0.0;
+    for (double beat = 15.0; beat < 17.0; beat += step) {
+        seam = std::max(seam, maxBoneDeg(poseAt(*d, beat), poseAt(*d, beat + step)));
+    }
+    CHECK(seam <= 1.3 * interior + 0.05);
+}
+
+TEST_CASE(dance.overlay_cues_change_per_loop_and_are_deterministic) {
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    for (const char* id : {"groove", "hiphop", "energetic"}) {
+        const std::vector<motion::PrimitiveCue> loop0 = player.overlaysFor(id, 0);
+        const std::vector<motion::PrimitiveCue> loop1 = player.overlaysFor(id, 1);
+        CHECK(!loop0.empty());
+        CHECK(sameCues(loop0, player.overlaysFor(id, 0)));
+        CHECK(!sameCues(loop0, loop1));
+
+        // A fresh player with the same seed plans the same cues for the same loop.
+        motion::DancePlayer other;
+        other.loadLibrary(dancesDir());
+        CHECK(sameCues(other.overlaysFor(id, 1), loop1));
+        // Another host seed plans other cues, also after the first plan was cached.
+        other.setOverlaySeed(77u);
+        CHECK(!sameCues(other.overlaysFor(id, 1), loop1));
+    }
+}
+
+TEST_CASE(dance.full_pipeline_is_seamless_across_loops) {
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    const motion::HumanoidClip& groove = *player.library().find("groove");
+    player.setGrid(motion::BeatClock::constant(groove.bpm, 0.0), 0.0);
+    player.select(motion::DanceStyle::Groove, 0.0, true);
+
+    // Frame by frame at 240 Hz, with overlays and the per-loop amplitude both active.
+    const double dt = 1.0 / 240.0;
+    const double beatSeconds = 60.0 / groove.bpm;
+    motion::ClipPose previous;
+    bool havePrevious = false;
+    double interior = 0.0;
+    double seam = 0.0;
+    for (int i = 0; i <= static_cast<int>(40.0 * beatSeconds / dt); ++i) {
+        const double t = i * dt;
+        const motion::DanceFrame frame = player.update(t);
+        const double beat = t / beatSeconds;
+        if (havePrevious) {
+            const double step = maxBoneDeg(previous, frame.pose);
+            if (beat >= 4.0 && beat < 12.0) interior = std::max(interior, step);
+            if (beat >= 15.0 && beat < 17.0) seam = std::max(seam, step);
+            if (beat >= 31.0 && beat < 33.0) seam = std::max(seam, step);
+        }
+        previous = frame.pose;
+        havePrevious = true;
+    }
+    CHECK(interior > 0.0);
+    CHECK(seam <= 1.5 * interior + 0.5);
 }

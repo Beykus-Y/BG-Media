@@ -1,7 +1,9 @@
 #include "bgmedia/motion3/DanceDirector.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <numeric>
 
@@ -241,6 +243,96 @@ ClipPose adaptPose(const ClipPose& stable, const ClipPose& warped, bool fullBody
     out.energy = stable.energy;
     out.accent = std::max(stable.accent, warped.accent);
     return out;
+}
+
+// BG Motion 3.4 variety. Every loop of a looping clip gets its own amplitude for the spine,
+// head and arm groups: a deterministic scale in [1 - span, 1 + span] that depends only on
+// (clip id, loop index, group). The swing is scaled about the clip's mean pose of each bone,
+// not about the bind pose, so the posture stays and only the swing grows or shrinks. The
+// scale changes between loops only inside a window around the seam, so the pose is continuous.
+constexpr float kAmplitudeSpan = 0.08f;
+constexpr double kAmplitudeSeamBeats = 0.5;
+constexpr std::size_t kAmplitudeGroups = 3;
+
+// -1: not scaled (hips, legs, feet, eyes: planted contacts and the root must not change).
+int amplitudeGroupOf(std::size_t bone) {
+    using B = vrm::HumanoidBone;
+    const auto at = [](B b) { return static_cast<std::size_t>(b); };
+    if (bone == at(B::Spine) || bone == at(B::Chest) || bone == at(B::UpperChest)) return 0;
+    if (bone == at(B::Neck) || bone == at(B::Head)) return 1;
+    if ((bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+        (bone >= at(B::RightShoulder) && bone <= at(B::RightHand))) {
+        return 2;
+    }
+    return -1;
+}
+
+float loopAmplitude(std::uint64_t clipHash, std::int64_t loop, std::size_t group) {
+    // The first pass of a clip is the authored choreography: its accents keep their exact pose.
+    // Variation starts with the second loop.
+    if (loop == 0) {
+        return 1.0f;
+    }
+    const std::uint64_t h = variationMix(clipHash ^ variationMix(static_cast<std::uint64_t>(loop)) ^
+                                         variationMix(0x100u + group));
+    const double unit = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);  // [0, 1)
+    return 1.0f + kAmplitudeSpan * static_cast<float>(2.0 * unit - 1.0);
+}
+
+// Mean rotation of one bone over the loop (a seamless track repeats its first key last, so
+// the last key is left out). Empty track = bind pose = identity.
+Quat trackMean(const std::vector<Quat>& track, int keyCount) {
+    if (keyCount < 3 || track.size() != static_cast<std::size_t>(keyCount)) {
+        return Quat::identity();
+    }
+    const int last = keyCount - 1;
+    const int samples = std::min(32, last);
+    const Quat reference = track[0];
+    float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
+    for (int s = 0; s < samples; ++s) {
+        const Quat& q = track[static_cast<std::size_t>(s * last / samples)];
+        const float sign = dot(q, reference) < 0.0f ? -1.0f : 1.0f;
+        x += sign * q.x;
+        y += sign * q.y;
+        z += sign * q.z;
+        w += sign * q.w;
+    }
+    return Quat{x, y, z, w}.normalized();
+}
+
+// mean * (mean^-1 q)^scale: the swing away from the mean posture, scaled by its angle.
+Quat scaleSwing(const Quat& q, const Quat& mean, float scale) {
+    Quat d = (mean.conjugate() * q).normalized();
+    if (d.w < 0.0f) {
+        d = {-d.x, -d.y, -d.z, -d.w};
+    }
+    const float vectorLength = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    const float halfAngle = std::atan2(vectorLength, d.w);
+    const float scaledHalf = halfAngle * scale;
+    const float k = vectorLength > 1e-7f ? std::sin(scaledHalf) / vectorLength : scale;
+    return (mean * Quat{k * d.x, k * d.y, k * d.z, std::cos(scaledHalf)}).normalized();
+}
+
+void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat) {
+    if (!clip.loop || !(clip.beats > 0.0f)) {
+        return;
+    }
+    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeSeamBeats);
+    const std::uint64_t hash = variationHash(clip.id);
+    std::array<float, kAmplitudeGroups> scale{};
+    for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
+        const float from = loopAmplitude(hash, blend.from, group);
+        const float to = loopAmplitude(hash, blend.to, group);
+        scale[group] = from + (to - from) * blend.w;
+    }
+    for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+        const int group = amplitudeGroupOf(bone);
+        if (group < 0 || scale[static_cast<std::size_t>(group)] == 1.0f) {
+            continue;  // unscaled groups keep the authored rotation bit for bit
+        }
+        const Quat mean = trackMean(clip.bones[bone], clip.keyCount);
+        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, scale[static_cast<std::size_t>(group)]);
+    }
 }
 
 } // namespace
@@ -510,6 +602,7 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
     }
+    applyLoopAmplitude(own, *segment.clip, mapped.beat);
     if (clipBeat) {
         *clipBeat = mapped.beat;
     }
@@ -1545,7 +1638,11 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         previous = style;
     }
 
-    // Emit one segment per style change; equal consecutive phrases continue.
+    // Emit one segment per style change; equal consecutive phrases continue. Each new segment
+    // of a style alternates between the authored clip and its mirror image, so a style that
+    // comes back does not repeat the same bit-identical swing. The mirror is a library-owned
+    // clip, so the segment's pointer stays valid.
+    std::array<bool, 6> mirrorNext{};  // per DanceStyle: the next segment of it is mirrored
     std::size_t index = 0;
     bool anySegment = false;
     for (int p = 0; p < phraseCount; ++p, ++index) {
@@ -1557,11 +1654,21 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         if (!clip) {
             continue;
         }
+        const std::size_t styleIndex = static_cast<std::size_t>(entry.style);
+        const bool mirrored = entry.style != DanceStyle::Idle && mirrorNext[styleIndex];
+        if (entry.style != DanceStyle::Idle) {
+            mirrorNext[styleIndex] = !mirrorNext[styleIndex];
+        }
+        if (mirrored && library_) {
+            if (const HumanoidClip* mirror = library_->mirrorOf(*clip)) {
+                clip = mirror;
+            }
+        }
         const double align = phrases[index].t0;
         const double fade = fadeFor(align);
         const double start = std::max(0.0, align - fade * 0.5);
         ScheduleSegment segment = makeSegment(*clip, start, align, fade);
-        segment.reason = entry.reason;
+        segment.reason = mirrored ? entry.reason + " -> mirrored repeat" : entry.reason;
         schedule_.append(segment, timeline_, warp_);
         anySegment = true;
     }
