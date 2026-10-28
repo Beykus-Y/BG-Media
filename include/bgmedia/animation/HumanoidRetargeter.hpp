@@ -56,6 +56,25 @@ struct RetargetOptions {
     // crossed, and on authored clips it shows foot drag (see the quality pass doc).
     bool legCollision = false;
     float legClearanceMargin = 0.004f;  // extra gap, in character heights
+
+    // BG Motion 3.3 soft IK. OFF by default: with the defaults the output is bit-identical
+    // to BG Motion 3.2. Each limb is solved by one two-bone solve (TwoBoneSolver.hpp).
+    // Reach fractions are of the limb's bind length (upper + lower bone).
+    bool softIK = false;
+    // Soft band before full extension. Arms take it freely. A free leg takes it scaled by
+    // (1 - 2 * contact): a planted leg (contact >= 0.5) keeps the exact hard reach, so a
+    // stance target is never shortened. The leg band is OFF by default: the C1 mapping
+    // (identity, then exponential) has a second-derivative step at the knee, which shows
+    // as an acceleration step on a free foot (see docs/BG_MOTION_3_3_SOFT_IK.md).
+    float armSoftReach = 0.10f;
+    float legSoftReach = 0.0f;
+    // Flexion range (radians, angle between the two bones, 0 = straight). Applied to free
+    // legs in the IK, and to the arm collision re-solve. A planted leg only reports a
+    // conflict, because a joint limit must not move a stance foot.
+    float elbowFlexMin = 0.0f;
+    float elbowFlexMax = 2.5f;
+    float kneeFlexMin = 0.0f;
+    float kneeFlexMax = 2.4f;
 };
 
 // Torso cross-section samples along the spine (waist ... shoulders).
@@ -128,6 +147,15 @@ struct RetargetStats {
     float requestedHipDrop = 0.0f;  // authored, metres
     float reachHipDrop = 0.0f;      // extra drop added so planted feet are reachable
     float footReachDeficit = 0.0f;  // metres a target lay beyond the legs' reach (0 = ok)
+
+    // BG Motion 3.3 soft IK diagnostics (all zero unless RetargetOptions::softIK).
+    bool softIK = false;
+    int softReachSolves = 0;             // two-bone solves whose distance the soft band moved
+    float softReachCompression = 0.0f;   // largest distance the soft band removed (m)
+    int bendBlends = 0;                  // solves whose bend side was blended to the rest bend
+    int flexLimits = 0;                  // free-limb solves held by a flexion limit
+    int plantedFlexConflicts = 0;        // planted legs a flexion limit would hold (not applied)
+    int plantedReachConflicts = 0;       // planted legs whose target lies beyond the hard reach
 };
 
 struct RetargetedPose {
