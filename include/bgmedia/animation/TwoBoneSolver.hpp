@@ -40,6 +40,10 @@ struct TwoBoneLimits {
     float flexMax = 3.14159265f;
     // false: the window is measured and reported (flexBound) but not applied.
     bool flexEnforced = true;
+    // Squared length of the pole's projection (perpendicular to the reach line) below
+    // which the pole is treated as absent and the fallback axes are used. Legs use 1e-8;
+    // the arm collision re-solve uses 1e-10, its BG Motion 3.2 threshold.
+    float poleEpsilon = 1.0e-8f;
 };
 
 struct TwoBoneSolution {

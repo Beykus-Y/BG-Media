@@ -32,7 +32,7 @@ float smoothstep01(float x) {
 // cancels and the rest bend is used: a point of the bend field that no blend can make
 // continuous (see docs/BG_MOTION_3_3_SOFT_IK.md, section 5).
 math::Vec3 bendSide(math::Vec3 direction, math::Vec3 pole, const TwoBoneChain& chain,
-                    bool stable, float straightWeight, bool& blended) {
+                    bool stable, float straightWeight, float poleEpsilon, bool& blended) {
     const auto perp = [&](math::Vec3 v) {
         return v - direction * math::dot(v, direction);
     };
@@ -61,10 +61,10 @@ math::Vec3 bendSide(math::Vec3 direction, math::Vec3 pole, const TwoBoneChain& c
     }
     // BG Motion 3.2 behaviour: the pole, then the right and forward axes.
     math::Vec3 bend = perp(pole);
-    if (bend.lengthSquared() < 1.0e-8f) {
+    if (bend.lengthSquared() < poleEpsilon) {
         bend = math::cross(chain.right, direction);
     }
-    if (bend.lengthSquared() < 1.0e-8f) {
+    if (bend.lengthSquared() < poleEpsilon) {
         bend = math::cross(chain.forward, direction);
     }
     return math::normalize(bend);
@@ -141,6 +141,7 @@ TwoBoneSolution solveTwoBone(math::Vec3 root, math::Vec3 target, math::Vec3 pole
     const float straightWeight = smoothstep01((lift / meanLength - kStraightFrom) /
                                               (kStraightTo - kStraightFrom));
     const math::Vec3 bend = bendSide(direction, pole, chain, limits.stableBend, straightWeight,
+                                     limits.poleEpsilon,
                                      out.bendBlended);
     out.knee = root + direction * along + bend * lift;
     return out;

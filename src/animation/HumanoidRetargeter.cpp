@@ -163,8 +163,8 @@ struct HumanoidRetargeter::Impl {
                     const RetargetOptions& options, RetargetStats& stats) const;
     // Pushes the FREE foot's IK target away from the other leg (see RetargetOptions::legCollision).
     void refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2], const Vec3 poles[2],
-                    const float contact[2], const TwoBoneLimits limits[2], float margin,
-                    RetargetStats& stats) const;
+                    const float contact[2], const TwoBoneLimits limits[2], bool solvedEndpoints,
+                    float margin, RetargetStats& stats) const;
     void evaluate(const std::vector<Mat4>& locals,
                   std::vector<Mat4>& globals) const;
     void applyLocalDelta(std::vector<Mat4>& locals, int node,
@@ -791,8 +791,11 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         if (l1 < 0.02f || l2 < 0.02f) {
             continue;
         }
-        const TwoBoneLimits armLimits = limbLimits(options.softIK, l1 + l2, options.armSoftReach,
-                                                   options.elbowFlexMin, options.elbowFlexMax, 1.0f);
+        TwoBoneLimits armLimits = limbLimits(options.softIK, l1 + l2, options.armSoftReach,
+                                             options.elbowFlexMin, options.elbowFlexMax, 1.0f);
+        // BG Motion 3.2's arm pole threshold (squared). With soft IK off, the arm solve must
+        // match 3.2 exactly, so a pole this small still sets the bend side.
+        armLimits.poleEpsilon = 1.0e-10f;
         const Vec3 E0 = E;
         const Vec3 W0 = W;
 
@@ -859,6 +862,14 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         samples(E, W);
         float armRaw = *std::min_element(c.begin(), c.end());
         rawMin = std::min(rawMin, armRaw);
+        // The soft band fades in with the collision depth: full at 1 cm of height inside
+        // the torso, zero at the surface. Without the fade, the band would switch on as the
+        // arm crosses the surface and jump the wrist (6.5 mm on the issue #26 reproduction).
+        // Soft off: softReach is already 0, so the weight changes nothing.
+        {
+            const float depthT = std::clamp(-armRaw / (0.01f * height), 0.0f, 1.0f);
+            armLimits.softReach *= depthT * depthT * (3.0f - 2.0f * depthT);
+        }
 
         // A few bounded iterations: moving the elbow changes the forearm sample.
         for (int it = 0; it < 6 && armRaw < 0.0f; ++it) {
@@ -970,7 +981,8 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
 
 void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2],
                                           const Vec3 poles[2], const float contact[2],
-                                          const TwoBoneLimits limits[2], float margin,
+                                          const TwoBoneLimits limits[2], bool solvedEndpoints,
+                                          float margin,
                                           RetargetStats& stats) const {
     if (!proxy.valid || proxy.thighRadius <= 0.0f || legs[0].upper < 0 || legs[1].upper < 0) {
         return;
@@ -983,9 +995,9 @@ void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3
     Vec3 hip[2] = {actualPosition(globals, legs[0].upper), actualPosition(globals, legs[1].upper)};
     const Vec3 original[2] = {targets[0], targets[1]};
 
-    // The knee the two-bone solver will choose: the same solve as solveLeg.
-    const auto kneeOf = [&](int f, Vec3 target) {
-        return solveTwoBone(hip[f], target, poles[f], legs[f].chain, limits[f]).knee;
+    // The chain the two-bone solver will build for a target: the same solve as solveLeg.
+    const auto solveOf = [&](int f, Vec3 target) {
+        return solveTwoBone(hip[f], target, poles[f], legs[f].chain, limits[f]);
     };
 
     struct Cap {
@@ -1002,12 +1014,14 @@ void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3
         Cap caps[2][3];
         float legParam[2][3][2];  // leg parameter range of each capsule
         for (int f = 0; f < 2; ++f) {
-            const Vec3 knee = kneeOf(f, targets[f]);
-            const float lenT = (knee - hip[f]).length(), lenS = (targets[f] - knee).length();
+            const TwoBoneSolution solution = solveOf(f, targets[f]);
+            const Vec3 knee = solution.knee;
+            const Vec3 ankle = solvedEndpoints ? solution.end : targets[f];
+            const float lenT = (knee - hip[f]).length(), lenS = (ankle - knee).length();
             const float total = std::max(1.0e-4f, lenT + lenS);
             caps[f][0] = {hip[f], knee, proxy.thighRadius, 0.45f};
-            caps[f][1] = {knee, targets[f], proxy.shinRadius, 0.0f};
-            caps[f][2] = {targets[f], targets[f] + forward * proxy.footLength, proxy.footRadius, 0.0f};
+            caps[f][1] = {knee, ankle, proxy.shinRadius, 0.0f};
+            caps[f][2] = {ankle, ankle + forward * proxy.footLength, proxy.footRadius, 0.0f};
             legParam[f][0][0] = 0.0f;
             legParam[f][0][1] = lenT / total;
             legParam[f][1][0] = lenT / total;
@@ -1742,7 +1756,9 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     }
 
     if (options.footIK && options.legCollision) {
-        impl_->refineLegs(globals, targets, poles, contacts, legLimits,
+        // With soft IK the shin and foot capsules end at the solved ankle, where the solve
+        // really places it. Without it they keep BG Motion 3.2's requested-target geometry.
+        impl_->refineLegs(globals, targets, poles, contacts, legLimits, options.softIK,
                           options.legClearanceMargin, out.stats);
     }
 

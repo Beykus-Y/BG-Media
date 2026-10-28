@@ -493,3 +493,119 @@ TEST_CASE(soft_ik.rotated_rig_gives_the_same_output) {
     CHECK(worst < 1.0e-4f);
     CHECK(b.stats.softReachSolves == a.stats.softReachSolves);
 }
+
+TEST_CASE(soft_ik.arm_pole_threshold_matches_the_legacy_formula) {
+    // A pole whose projection is about 5e-5 m off the reach line sets the bend side under the
+    // BG Motion 3.2 arm threshold (squared length 1e-10). The legs' 1e-8 threshold would
+    // discard it and use the fallback axis, moving the elbow about 4.9 cm.
+    const TwoBoneChain chain = chainOf(0.3f, 0.3f);
+    const Vec3 root{};
+    const Vec3 target{0.0f, -0.598f, 0.0f};
+    const Vec3 pole{0.0f, -0.3f, 0.00005f};
+
+    // The 3.2 arm formula, written out: elbow = S + dir * along + normalize(pole minus its
+    // reach-line component) * lift.
+    const float d = target.length();
+    const Vec3 dir = target / d;
+    const float along = (0.3f * 0.3f - 0.3f * 0.3f + d * d) / (2.0f * d);
+    const float lift = std::sqrt(std::max(0.0f, 0.3f * 0.3f - along * along));
+    const Vec3 side = math::normalize(pole - dir * math::dot(pole, dir));
+    const Vec3 legacyKnee = root + dir * along + side * lift;
+
+    TwoBoneLimits armLimits;
+    armLimits.poleEpsilon = 1.0e-10f;
+    const TwoBoneSolution arm = animation::solveTwoBone(root, target, pole, chain, armLimits);
+    CHECK(distance(arm.knee, legacyKnee) < 1.0e-5f);
+
+    // The default (leg) threshold takes the fallback axis instead, and the elbow moves.
+    const TwoBoneSolution leg = animation::solveTwoBone(root, target, pole, chain);
+    CHECK(distance(leg.knee, legacyKnee) > 0.04f);
+}
+
+TEST_CASE(soft_ik.leg_capsules_end_at_the_solved_ankle) {
+    // The free foot's requested target lies beyond the fold clamp, so the solve stops short
+    // of it. The leg collision capsules must follow the solved ankle, not the requested
+    // target: replaying the pose with the free foot placed exactly at the solved ankle must
+    // give the same leg clearance. (Before the fix the two differed by 0.146 m here.)
+    auto rig = makeRig();
+    CHECK(rig != nullptr);
+    if (!rig) {
+        return;
+    }
+    const vrm::VrmModel& m = *rig->loaded.model;
+    const auto& retargeter = *rig->retargeter;
+    RetargetOptions on;
+    on.softIK = true;
+    on.legCollision = true;
+    on.armCollision = false;
+
+    motion::ClipPose pose = motion::neutralClipPose();
+    pose.foot[0].contact = 1.0f;
+    pose.foot[0].position = {-0.3f, 0.0f, 0.0f};
+    pose.foot[1].contact = 0.0f;
+    pose.foot[1].position = {0.0f, 0.3f, 0.05f};
+    const RetargetedPose requested = retargeter.applyClip(pose, 0.0, on);
+    CHECK(requested.stats.footReachDeficit > 0.05f);
+
+    const Vec3 ankleBind = m.bindGlobals[static_cast<std::size_t>(m.nodeFor(vrm::HumanoidBone::RightFoot))]
+                               .translationPart();
+    const Vec3 solved = requested.bonePosition(vrm::HumanoidBone::RightFoot, m);
+    const Vec3 offset = solved - ankleBind;
+    const float h = m.height;
+    motion::ClipPose replay = pose;
+    replay.foot[1].position = {math::dot(offset, -m.right) / h, math::dot(offset, m.up) / h,
+                               math::dot(offset, m.forward) / h};
+    const RetargetedPose placed = retargeter.applyClip(replay, 0.0, on);
+    CHECK(distance(requested.bonePosition(vrm::HumanoidBone::RightFoot, m),
+                   placed.bonePosition(vrm::HumanoidBone::RightFoot, m)) < 1.0e-4f);
+    CHECK(std::fabs(requested.stats.legClearanceRaw - placed.stats.legClearanceRaw) < 1.0e-4f);
+}
+
+TEST_CASE(soft_ik.arm_soft_band_fades_in_with_collision_depth) {
+    // Issue #26 reproduction: on minimal.vrm with the left elbow rotated 0.6 rad about clip Y,
+    // the arm crosses the torso's collision surface near left upper arm clip-Z -2.60696 rad.
+    // The soft band must not switch on at that surface: a 1e-4 rad step across it moved the
+    // wrist 6.5 mm and the elbow 10.3 mm before the depth fade, and moves it 0.08 mm now.
+    auto rig = makeRig();
+    CHECK(rig != nullptr);
+    if (!rig) {
+        return;
+    }
+    const vrm::VrmModel& m = *rig->loaded.model;
+    const auto& retargeter = *rig->retargeter;
+    RetargetOptions on;
+    on.softIK = true;
+
+    struct ArmAt {
+        Vec3 elbow, wrist;
+        float raw;  // stats.armClearanceRaw: positive outside the torso, negative inside
+    };
+    const auto armAt = [&](double shoulderZ) {
+        motion::ClipPose pose = motion::neutralClipPose();
+        pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm)] =
+            math::fromAxisAngle({0.0f, 0.0f, 1.0f}, static_cast<float>(shoulderZ));
+        pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::LeftLowerArm)] =
+            math::fromAxisAngle({0.0f, 1.0f, 0.0f}, 0.6f);
+        const RetargetedPose p = retargeter.applyClip(pose, 0.0, on);
+        return ArmAt{p.bonePosition(vrm::HumanoidBone::LeftLowerArm, m),
+                     p.bonePosition(vrm::HumanoidBone::LeftHand, m), p.stats.armClearanceRaw};
+    };
+
+    // Bisect the surface crossing inside the bracket.
+    double lo = -2.6075, hi = -2.6068;
+    const bool loOutside = armAt(lo).raw > 0.0f;
+    CHECK(loOutside != (armAt(hi).raw > 0.0f));
+    for (int i = 0; i < 60; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if ((armAt(mid).raw > 0.0f) == loOutside) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const double crossing = 0.5 * (lo + hi);
+    const ArmAt before = armAt(crossing - 1.0e-4);
+    const ArmAt after = armAt(crossing + 1.0e-4);
+    CHECK(distance(before.wrist, after.wrist) < 5.0e-4f);
+    CHECK(distance(before.elbow, after.elbow) < 5.0e-4f);
+}

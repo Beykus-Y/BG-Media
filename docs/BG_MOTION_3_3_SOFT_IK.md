@@ -99,10 +99,39 @@ Where the limit is applied:
 - A planted leg whose target lies beyond the hard reach is counted in
   `plantedReachConflicts`. Its target is still not moved (the hip drop, as before,
   handles reachability).
+- The leg collision capsules (shin and foot) end at the solved ankle when `softIK`
+  is on, so the clearance is measured where the leg really is. A free target beyond
+  the fold clamp is not where the solve puts the foot. With `softIK` off, the capsules
+  keep the BG Motion 3.2 geometry, which uses the requested target. Test:
+  `leg_capsules_end_at_the_solved_ankle`.
 
 The threshold at contact 0.5 is a hard switch for the flexion window, while the
 soft band fades in continuously. This is the one place where a contact change can
 still step (see section 5).
+
+### Arms: soft band, collision depth and the pole
+
+The arm soft band applies only in the collision re-solve (section 2). It fades in
+with the arm's initial collision depth, computed once per arm from the clearance
+before any push:
+
+    w = smoothstep(clamp(-raw / (0.01 * height), 0, 1))
+
+The band is zero at the surface and full at 1 cm of depth. Before this fade, the
+band switched on as the arm crossed the surface, so a tiny change of the shoulder
+moved the wrist. On the issue #26 reproduction (`minimal.vrm`, left elbow 0.6 rad
+about clip Y, left upper arm clip Z near -2.60696 rad), a 1e-4 rad step across the
+surface moved the wrist 6.5 mm and the elbow 10.3 mm. With the fade the same step
+moves them 0.08 mm and 0.04 mm, the same as with soft IK off. With
+`softIK` off the band is zero, so nothing changes. Test:
+`arm_soft_band_fades_in_with_collision_depth`.
+
+The arm re-solve keeps BG Motion 3.2's pole threshold (squared length 1e-10, set by
+`TwoBoneLimits::poleEpsilon`). The legs use 1e-8. A pole 5e-5 m off the reach line
+still sets the arm's bend side at the 3.2 threshold. At 1e-8 it would fall back to
+the fallback axis, and the elbow would move 4.9 cm on the reproduction chain
+(`0.3 / 0.3 m`, target `(0, -0.598, 0)`, pole `(0, -0.3, 0.00005)`). Test:
+`arm_pole_threshold_matches_the_legacy_formula`.
 
 ### Options and diagnostics
 
@@ -120,7 +149,7 @@ still step (see section 5).
 and `footSolverError` are measured against the solved (soft) end point, so with
 soft IK on a deficit includes any soft shortfall.
 
-## 3. Tests (`tests/test_soft_ik.cpp`, suite `soft_ik`, 14 cases)
+## 3. Tests (`tests/test_soft_ik.cpp`, suite `soft_ik`, 17 cases)
 
 - Soft-reach math: identity between the knees; monotone and never reaching the
   limits; C1 at both knees (numerical slopes); zero band equals the hard clamp;
@@ -140,6 +169,12 @@ soft IK on a deficit includes any soft shortfall.
   band, while a free foot is; the same output on repeated calls, independent of
   calls in between and of the media time; the whole rig rotated about its up
   axis yields the rotated output (arm collision off, see section 5).
+- Review fixes: the arm pole threshold matches the 3.2 formula
+  (`arm_pole_threshold_matches_the_legacy_formula`); the leg capsules follow the solved
+  ankle (`leg_capsules_end_at_the_solved_ankle`, a free foot beyond the fold clamp:
+  the old geometry differed by 0.146 m of clearance); the arm soft band has no
+  discontinuity across the collision surface (`arm_soft_band_fades_in_with_collision_depth`,
+  which fails without the depth fade).
 
 ## 4. Measurements
 
@@ -147,6 +182,11 @@ Golden check (not committed, a local bit-hash over 1149 retargeter outputs:
 `apply` pose path with and without collisions, every bundled dance clip, far-foot
 variants): the hashes before and after this change are identical
 (`apply=24e6b0210a5727db clip=c1ec35c1617d1ad4 collide=116c99bf02af93af`).
+
+Default-off CSV check against origin/dev's `bgmedia_motion_diag`: `--model
+tests/fixtures/minimal.vrm --clip X --to 12 --csv`, for fluidSignal, streetCurrent,
+neonPulse, hiphop and sidestep, with and without `--leg-proxy`. All ten CSVs are
+byte-identical.
 
 Fixture `tests/fixtures/minimal.vrm`, `bgmedia_motion_diag --clip fluidSignal
 --from 0 --to 30 --fps 60`:
@@ -182,6 +222,9 @@ knee window did not engage on this clip.
 - **Contact switch.** The flexion window switches on at contact 0.5 (the soft band
   does not). A target that sits in the folded part of the window can step when a
   foot becomes planted. This is the price of a stance foot that must never move.
+- **Arm fade scale.** The 1 cm depth over which the arm band fades in is a tuning
+  choice, not derived from the rig. It only sets how far inside the surface the band
+  reaches full strength. Shallower or deeper fades keep the continuity property.
 - **Rig-level rotation test.** It turns the rest pose and the model axes, but the
   arm collision proxy is calibrated on the unrotated mesh (pre-existing). The test
   therefore runs with arm collision off.
