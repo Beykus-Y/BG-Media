@@ -1,7 +1,9 @@
 #include "bgmedia/motion3/DanceDirector.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <numeric>
 
@@ -243,6 +245,97 @@ ClipPose adaptPose(const ClipPose& stable, const ClipPose& warped, bool fullBody
     return out;
 }
 
+// BG Motion 3.4 variety. Every loop of a looping clip gets its own amplitude for the spine,
+// head and arm groups: a deterministic scale in [1 - span, 1 + span] that depends only on
+// (clip id, loop index, group). The swing is scaled about the clip's mean pose of each bone,
+// not about the bind pose, so the posture stays and only the swing grows or shrinks. The
+// scale changes between loops only over the last beat before each seam, and reaches the next
+// loop's value exactly at the seam, so the pose is continuous.
+constexpr float kAmplitudeSpan = 0.08f;
+constexpr double kAmplitudeWindowBeats = 1.0;
+constexpr std::size_t kAmplitudeGroups = 3;
+
+// -1: not scaled (hips, legs, feet, eyes: planted contacts and the root must not change).
+int amplitudeGroupOf(std::size_t bone) {
+    using B = vrm::HumanoidBone;
+    const auto at = [](B b) { return static_cast<std::size_t>(b); };
+    if (bone == at(B::Spine) || bone == at(B::Chest) || bone == at(B::UpperChest)) return 0;
+    if (bone == at(B::Neck) || bone == at(B::Head)) return 1;
+    if ((bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+        (bone >= at(B::RightShoulder) && bone <= at(B::RightHand))) {
+        return 2;
+    }
+    return -1;
+}
+
+float loopAmplitude(std::uint64_t clipHash, std::int64_t loop, std::size_t group) {
+    // The first pass of a clip is the authored choreography: its accents keep their exact pose.
+    // Variation starts with the second loop.
+    if (loop == 0) {
+        return 1.0f;
+    }
+    const std::uint64_t h = variationMix(clipHash ^ variationMix(static_cast<std::uint64_t>(loop)) ^
+                                         variationMix(0x100u + group));
+    const double unit = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);  // [0, 1)
+    return 1.0f + kAmplitudeSpan * static_cast<float>(2.0 * unit - 1.0);
+}
+
+// Mean rotation of one bone over the loop (a seamless track repeats its first key last, so
+// the last key is left out). Empty track = bind pose = identity.
+Quat trackMean(const std::vector<Quat>& track, int keyCount) {
+    if (keyCount < 3 || track.size() != static_cast<std::size_t>(keyCount)) {
+        return Quat::identity();
+    }
+    const int last = keyCount - 1;
+    const int samples = std::min(32, last);
+    const Quat reference = track[0];
+    float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
+    for (int s = 0; s < samples; ++s) {
+        const Quat& q = track[static_cast<std::size_t>(s * last / samples)];
+        const float sign = dot(q, reference) < 0.0f ? -1.0f : 1.0f;
+        x += sign * q.x;
+        y += sign * q.y;
+        z += sign * q.z;
+        w += sign * q.w;
+    }
+    return Quat{x, y, z, w}.normalized();
+}
+
+// mean * (mean^-1 q)^scale: the swing away from the mean posture, scaled by its angle.
+Quat scaleSwing(const Quat& q, const Quat& mean, float scale) {
+    Quat d = (mean.conjugate() * q).normalized();
+    if (d.w < 0.0f) {
+        d = {-d.x, -d.y, -d.z, -d.w};
+    }
+    const float vectorLength = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    const float halfAngle = std::atan2(vectorLength, d.w);
+    const float scaledHalf = halfAngle * scale;
+    const float k = vectorLength > 1e-7f ? std::sin(scaledHalf) / vectorLength : scale;
+    return (mean * Quat{k * d.x, k * d.y, k * d.z, std::cos(scaledHalf)}).normalized();
+}
+
+void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat) {
+    if (!clip.loop || !(clip.beats > 0.0f)) {
+        return;
+    }
+    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
+    const std::uint64_t hash = variationHash(clip.id);
+    std::array<float, kAmplitudeGroups> scale{};
+    for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
+        const float from = loopAmplitude(hash, blend.from, group);
+        const float to = loopAmplitude(hash, blend.to, group);
+        scale[group] = from + (to - from) * blend.w;
+    }
+    for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+        const int group = amplitudeGroupOf(bone);
+        if (group < 0 || scale[static_cast<std::size_t>(group)] == 1.0f) {
+            continue;  // unscaled groups keep the authored rotation bit for bit
+        }
+        const Quat mean = trackMean(clip.bones[bone], clip.keyCount);
+        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, scale[static_cast<std::size_t>(group)]);
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -417,76 +510,149 @@ Quat inertialOffset(const RotationVector& o0, const RotationVector& velocity, do
 
 namespace {
 
-// BG Motion 3.3 (#9) follow-through. A spring x'' + c x' + k x = -g w(t), driven by the
-// bone's angular velocity w, is evaluated as a finite convolution with its impulse
-// response over a fixed window of history. The window is clamped to the segment start.
-constexpr double kFollowPi = 3.14159265358979323846;
-constexpr double kFollowHz = 2.5;        // natural frequency of the lag
-constexpr double kFollowDamping = 0.45;  // damping ratio
-constexpr double kFollowGain = 6.0;      // drive, 1/s
-constexpr double kFollowStep = 1.0 / 120.0;
-constexpr double kFollowWindow = 0.6;    // seconds of history
-constexpr float kFollowMaxRad = 0.2f;    // cap on the lag per bone
+// BG Motion 3.3 (#9) follow-through, per-bone table (WP-E). A chain bone is displayed at its
+// chain rotation delayed by its lag share: weight * kFollowLagSeconds. The chain rotation is the
+// product of the bone deltas from the hips down; the retargeter composes deltas the same way, so
+// a hand with a still track follows its arm and lags it. Each bone's offset from its own
+// base motion is soft-capped at its angle limit, which keeps the lag bounded and continuous.
+// Everything reads basePose at earlier media times: the result is a pure function of media time,
+// so seeks, pauses and every frame rate agree.
+constexpr double kFollowLagSeconds = 0.12;
+constexpr double kFollowDegToRad = 3.14159265358979323846 / 180.0;
 
-bool isFollowBone(std::size_t bone) {
+// Parent first: a bone's offset is taken against its displayed parent.
+constexpr std::array<DanceSchedule::FollowThroughBone, 12> kFollowTable{{
+    {vrm::HumanoidBone::Chest, 0.3f, 3.0f},
+    {vrm::HumanoidBone::UpperChest, 0.5f, 4.0f},
+    {vrm::HumanoidBone::Neck, 0.6f, 6.0f},
+    {vrm::HumanoidBone::Head, 1.0f, 10.0f},
+    {vrm::HumanoidBone::LeftShoulder, 0.2f, 3.0f},
+    {vrm::HumanoidBone::LeftUpperArm, 0.3f, 8.0f},
+    {vrm::HumanoidBone::LeftLowerArm, 0.6f, 12.0f},
+    {vrm::HumanoidBone::LeftHand, 1.0f, 20.0f},
+    {vrm::HumanoidBone::RightShoulder, 0.2f, 3.0f},
+    {vrm::HumanoidBone::RightUpperArm, 0.3f, 8.0f},
+    {vrm::HumanoidBone::RightLowerArm, 0.6f, 12.0f},
+    {vrm::HumanoidBone::RightHand, 1.0f, 20.0f},
+}};
+
+// Parent in the humanoid chain. Hips is the root and returns Count.
+vrm::HumanoidBone parentOf(vrm::HumanoidBone bone) {
     using B = vrm::HumanoidBone;
-    return bone == static_cast<std::size_t>(B::Head) ||
-           bone == static_cast<std::size_t>(B::LeftHand) ||
-           bone == static_cast<std::size_t>(B::RightHand);
-}
-
-// Impulse response of x'' + c x' + k x = u, for tau >= 0.
-double followImpulse(double tau) {
-    const double w0 = 2.0 * kFollowPi * kFollowHz;
-    const double k = w0 * w0;
-    const double c = 2.0 * kFollowDamping * w0;
-    const double wd = std::sqrt(k - c * c / 4.0);
-    return std::exp(-c * tau / 2.0) * std::sin(wd * tau) / wd;
-}
-
-// Angular velocity (rad/s, local frame) between two orientations one step apart.
-Vec3 angularVelocity(const Quat& earlier, const Quat& later) {
-    Quat rel = (later * conjugate(earlier)).normalized();
-    if (rel.w < 0.0f) {
-        rel = {-rel.x, -rel.y, -rel.z, -rel.w};
+    switch (bone) {
+    case B::Spine: return B::Hips;
+    case B::Chest: return B::Spine;
+    case B::UpperChest: return B::Chest;
+    case B::Neck:
+    case B::LeftShoulder:
+    case B::RightShoulder: return B::UpperChest;
+    case B::Head: return B::Neck;
+    case B::LeftUpperArm: return B::LeftShoulder;
+    case B::RightUpperArm: return B::RightShoulder;
+    case B::LeftLowerArm: return B::LeftUpperArm;
+    case B::RightLowerArm: return B::RightUpperArm;
+    case B::LeftHand: return B::LeftLowerArm;
+    case B::RightHand: return B::RightLowerArm;
+    default: return B::Count;
     }
-    const float scale = static_cast<float>(2.0 / kFollowStep);
-    return {rel.x * scale, rel.y * scale, rel.z * scale};
+}
+
+// Chain rotation of `bone`: the deltas from the hips down to the bone, parent first.
+// Count yields the identity, so a root's parent is handled without a special case.
+Quat chainRotation(const ClipPose& pose, vrm::HumanoidBone bone) {
+    using B = vrm::HumanoidBone;
+    std::array<B, 8> chain{};
+    std::size_t depth = 0;
+    for (B at = bone; at != B::Count && depth < chain.size(); at = parentOf(at)) {
+        chain[depth++] = at;
+    }
+    Quat rotation = Quat::identity();
+    while (depth > 0) {
+        rotation = rotation * pose.bone[static_cast<std::size_t>(chain[--depth])];
+    }
+    return rotation;
+}
+
+// Bounds the rotation angle of `q` by `capRadians` smoothly: angle -> cap * tanh(angle / cap).
+// Small offsets pass almost unchanged, large ones saturate, and nothing is discontinuous.
+// A non-finite input gives the identity.
+Quat softCapAngle(const Quat& q, double capRadians) {
+    double w = q.w;
+    double x = q.x;
+    double y = q.y;
+    double z = q.z;
+    if (w < 0.0) {
+        w = -w;
+        x = -x;
+        y = -y;
+        z = -z;
+    }
+    const double s = std::sqrt(x * x + y * y + z * z);
+    if (!(s > 1.0e-12)) {
+        return Quat::identity();
+    }
+    const double angle = 2.0 * std::atan2(s, w);
+    const double capped = capRadians * std::tanh(angle / capRadians);
+    const double k = std::sin(0.5 * capped) / s;
+    return Quat{static_cast<float>(k * x), static_cast<float>(k * y), static_cast<float>(k * z),
+                static_cast<float>(std::cos(0.5 * capped))}
+        .normalized();
 }
 
 } // namespace
 
+const std::array<DanceSchedule::FollowThroughBone, 12>& DanceSchedule::followThroughBones() {
+    return kFollowTable;
+}
+
 void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
                                        const MusicalTimeline& timeline,
                                        const WarpProfile& warp) const {
+    using B = vrm::HumanoidBone;
+    constexpr std::size_t kCount = kFollowTable.size();
     const double startTime = segments_[index].startTime;
-    const int samples = static_cast<int>(std::lround(kFollowWindow / kFollowStep));
-    // Base poses at the window times, newest first: entry j is at mediaTime - j * step.
-    std::vector<ClipPose> history;
-    history.reserve(static_cast<std::size_t>(samples + 2));
-    for (int j = 0; j <= samples + 1; ++j) {
-        const double t = std::max(startTime, mediaTime - static_cast<double>(j) * kFollowStep);
-        history.push_back(basePose(index, t, timeline, warp, nullptr));
-    }
-    for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
-        if (!isFollowBone(bone)) {
+    const ClipPose base = pose;
+
+    // Lagged chain rotation of each table bone. Bones with the same weight share one sample.
+    std::array<Quat, kCount> lagged{};
+    std::array<bool, kCount> sampled{};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        if (sampled[i]) {
             continue;
         }
-        Vec3 lag{};
-        for (int j = 0; j <= samples; ++j) {
-            const auto at = static_cast<std::size_t>(j);
-            const Vec3 w = angularVelocity(history[at + 1].bone[bone], history[at].bone[bone]);
-            const auto weight = static_cast<float>(
-                -kFollowGain * followImpulse(static_cast<double>(j) * kFollowStep) * kFollowStep);
-            lag = lag + w * weight;
+        const float weight = kFollowTable[i].weight;
+        const double at = std::max(startTime, mediaTime - weight * kFollowLagSeconds);
+        const ClipPose past = basePose(index, at, timeline, warp, nullptr);
+        for (std::size_t j = i; j < kCount; ++j) {
+            if (!sampled[j] && kFollowTable[j].weight == weight) {
+                lagged[j] = chainRotation(past, kFollowTable[j].bone);
+                sampled[j] = true;
+            }
         }
-        const float length = std::sqrt(dot(lag, lag));
-        if (length > kFollowMaxRad) {
-            lag = lag * (kFollowMaxRad / length);
+    }
+
+    // Parent-first pass: each local offset is relative to the parent as it is displayed, so the
+    // lag accumulates down the chain. Bones outside the table keep their base rotation.
+    std::array<Quat, kCount> shown{};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const B bone = kFollowTable[i].bone;
+        const B parent = parentOf(bone);
+        Quat parentChain = chainRotation(base, parent);
+        for (std::size_t j = 0; j < i; ++j) {
+            if (kFollowTable[j].bone == parent) {
+                parentChain = shown[j];
+                break;
+            }
         }
-        // Small-angle rotation vector as a quaternion, applied in the parent frame.
-        const Quat offset = Quat{lag.x * 0.5f, lag.y * 0.5f, lag.z * 0.5f, 1.0f}.normalized();
-        pose.bone[bone] = (offset * pose.bone[bone]).normalized();
+        const Quat& own = base.bone[static_cast<std::size_t>(bone)];
+        // Local delta that puts the chain on its lagged rotation, then the bounded offset of the
+        // bone's own motion (parent frame, same convention as the retargeter's deltas).
+        const Quat wanted = conjugate(parentChain) * lagged[i];
+        const Quat offset = softCapAngle((wanted * conjugate(own)).normalized(),
+                                         kFollowTable[i].capDegrees * kFollowDegToRad);
+        const Quat local = (offset * own).normalized();
+        pose.bone[static_cast<std::size_t>(bone)] = local;
+        shown[i] = (parentChain * local).normalized();
     }
 }
 
@@ -510,6 +676,7 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
     }
+    applyLoopAmplitude(own, *segment.clip, mapped.beat);
     if (clipBeat) {
         *clipBeat = mapped.beat;
     }
@@ -1064,20 +1231,19 @@ void DanceDirector::reseed(double now) {
     }
     ScheduleSegment segment = makeSegment(*clip, now - 1.0e6, now, 0.0);
     if (clip->tempoSync) {
+        // The clip beat is the unwrapped musical beat, counted from the grid origin, exactly as
+        // continuous play advances it. A wrapped (in-bar) phase would reset the loop index to 0,
+        // and with it the per-loop variation, at every seek. Continuous play from the grid origin
+        // has the same clip beat at every time, so a seek lands on its pose and its loop.
+        // With a trusted bar the count includes the grid's bar offset (an analysis whose first
+        // beat is not a downbeat), so musical downbeats stay on clip bar starts.
         const double beatPos = clock_.beatAt(now);
         const int inBar = clock_.beatInBar(beatPos);
         const double fraction = beatPos - std::floor(beatPos + 1e-6);
-        const double barLength = std::max(1, clip->beatsPerBar);
-        if (timeline_.downbeatTrusted()) {
-            segment.entryClipBeat =
-                wrapPositive((inBar + std::max(0.0, fraction)) * segment.rate, barLength);
-            segment.alignedToDownbeat = inBar == 0 && fraction < 1e-4;
-        } else {
-            // No trusted bar: preserve the fractional beat phase only.
-            segment.entryClipBeat =
-                wrapPositive(std::max(0.0, fraction) * segment.rate, barLength);
-            segment.alignedToDownbeat = false;
-        }
+        const double barOffset = timeline_.downbeatTrusted() ? clock_.barOffset() : 0.0;
+        segment.entryClipBeat = (beatPos + barOffset) * segment.rate;
+        segment.alignedToDownbeat =
+            timeline_.downbeatTrusted() && inBar == 0 && fraction < 1e-4;
         segment.barPhaseTrusted = timeline_.downbeatTrusted();
     } else {
         segment.entryClipBeat = 0.0;
@@ -1545,7 +1711,12 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         previous = style;
     }
 
-    // Emit one segment per style change; equal consecutive phrases continue.
+    // Emit one segment per style change; equal consecutive phrases continue. Each new segment
+    // of a style alternates between the authored clip and its mirror image, so a style that
+    // comes back does not repeat the same bit-identical swing. The mirror is a library-owned
+    // clip, so the segment's pointer stays valid.
+    // Per DanceStyle: the next segment of that style is mirrored.
+    std::array<bool, kDanceStyleCount> mirrorNext{};
     std::size_t index = 0;
     bool anySegment = false;
     for (int p = 0; p < phraseCount; ++p, ++index) {
@@ -1557,11 +1728,21 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         if (!clip) {
             continue;
         }
+        const std::size_t styleIndex = static_cast<std::size_t>(entry.style);
+        const bool mirrored = entry.style != DanceStyle::Idle && mirrorNext[styleIndex];
+        if (entry.style != DanceStyle::Idle) {
+            mirrorNext[styleIndex] = !mirrorNext[styleIndex];
+        }
+        if (mirrored && library_) {
+            if (const HumanoidClip* mirror = library_->mirrorOf(*clip)) {
+                clip = mirror;
+            }
+        }
         const double align = phrases[index].t0;
         const double fade = fadeFor(align);
         const double start = std::max(0.0, align - fade * 0.5);
         ScheduleSegment segment = makeSegment(*clip, start, align, fade);
-        segment.reason = entry.reason;
+        segment.reason = mirrored ? entry.reason + " -> mirrored repeat" : entry.reason;
         schedule_.append(segment, timeline_, warp_);
         anySegment = true;
     }

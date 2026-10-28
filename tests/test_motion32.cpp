@@ -8,6 +8,7 @@
 #include "bgmedia/motion3/ProceduralChoreography.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1037,10 +1038,23 @@ TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) 
     CHECK(atEnd.step < 0.05);
 }
 
-// BG Motion 3.3 (#9): the opt-in follow-through lags only head and hands, stays bounded,
-// is deterministic in media time (fresh schedule equals a schedule sampled in order), and
-// is off by default.
-TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_head_and_hands) {
+// Angle (radians) between two bone rotations: the rotation angle of conj(p) * q, taken from the
+// vector part so that it stays accurate near identity.
+namespace {
+
+float rotationAngle(const math::Quat& p, const math::Quat& q) {
+    const math::Quat r = p.conjugate() * q;
+    const float vector = std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    return 2.0f * std::atan2(vector, std::abs(r.w));
+}
+
+} // namespace
+
+// BG Motion 3.3 (#9) follow-through, WP-E. The table lags the upper body along the chain. Every
+// listed bone stays inside its own angle cap, nothing else changes (hips, spine, legs, feet,
+// toes and eyes are bit-identical), the result is deterministic in media time (fresh schedule
+// and reverse order agree with a sequential pass), and it is off by default on the schedule.
+TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_upper_body_chain) {
     const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
     const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
     const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
@@ -1058,39 +1072,179 @@ TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_head_a
     };
     CHECK(!motion::DanceSchedule{}.followThrough());
 
+    // The table is the intended set: upper body only, each bone once, parents before children.
+    using B = vrm::HumanoidBone;
+    const auto& table = motion::DanceSchedule::followThroughBones();
+    std::array<float, vrm::kHumanoidBoneCount> capRadians{};
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        const std::size_t bone = static_cast<std::size_t>(table[i].bone);
+        CHECK(capRadians[bone] == 0.0f);
+        capRadians[bone] = table[i].capDegrees * 3.14159265f / 180.0f;
+        CHECK(table[i].weight > 0.0f && table[i].weight <= 1.0f);
+        CHECK(table[i].capDegrees > 0.0f && table[i].capDegrees <= 30.0f);
+    }
+    for (const B listed : {B::Chest, B::UpperChest, B::Neck, B::Head, B::LeftShoulder,
+                           B::LeftUpperArm, B::LeftLowerArm, B::LeftHand, B::RightShoulder,
+                           B::RightUpperArm, B::RightLowerArm, B::RightHand}) {
+        CHECK(capRadians[static_cast<std::size_t>(listed)] > 0.0f);
+    }
+    for (const B unlisted : {B::Hips, B::Spine, B::LeftUpperLeg, B::LeftLowerLeg, B::LeftFoot,
+                             B::LeftToes, B::RightUpperLeg, B::RightLowerLeg, B::RightFoot,
+                             B::RightToes, B::LeftEye, B::RightEye}) {
+        CHECK(capRadians[static_cast<std::size_t>(unlisted)] == 0.0f);
+    }
+
     const motion::DanceSchedule plain = makeSchedule(false);
     const motion::DanceSchedule lagged = makeSchedule(true);
-    const motion::DanceSchedule sequential = makeSchedule(true);
-    for (const double t : {1.0, 2.25, 3.5, 4.75}) {
+    const motion::DanceSchedule reverse = makeSchedule(true);
+    const std::vector<double> times{1.0, 2.25, 3.5, 4.75};
+    std::vector<motion::ClipPose> sequentialPoses;
+    float largestLag = 0.0f;  // the test must see the follow-through move something
+    for (const double t : times) {
         const motion::ClipPose p0 = plain.sample(t, clock, timeline, off).pose;
         const motion::ClipPose p1 = lagged.sample(t, clock, timeline, off).pose;
-        // Head and hands carry the lag; every other bone is identical to the plain pose.
+        sequentialPoses.push_back(p1);
         for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
-            const math::Quat& a0 = p0.bone[bone];
-            const math::Quat& a1 = p1.bone[bone];
-            // Component differences: an angle from acos is too noisy near identity.
-            const float diff = std::max({std::abs(a0.x - a1.x), std::abs(a0.y - a1.y),
-                                         std::abs(a0.z - a1.z), std::abs(a0.w - a1.w)});
-            const bool follows = bone == static_cast<std::size_t>(vrm::HumanoidBone::Head) ||
-                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::LeftHand) ||
-                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::RightHand);
-            if (!follows) {
-                CHECK_NEAR(diff, 0.0f, 1e-6f);
+            CHECK(finiteQuat(p1.bone[bone]));
+            if (capRadians[bone] > 0.0f) {
+                // Bounded: the offset from the bone's own motion is inside its cap.
+                CHECK(rotationAngle(p0.bone[bone], p1.bone[bone]) <= capRadians[bone] + 1e-5f);
+                largestLag = std::max(largestLag, rotationAngle(p0.bone[bone], p1.bone[bone]));
             } else {
-                // Lag is capped at 0.2 rad; a quaternion component is at most sin(angle/2).
-                CHECK(diff <= 0.11f);
+                // Untouched: identical to the plain pose, not merely close.
+                CHECK_NEAR(rotationAngle(p0.bone[bone], p1.bone[bone]), 0.0f, 1e-7f);
             }
         }
-        // Same media time from a fresh schedule gives the same pose (seek equals playback).
-        const motion::ClipPose again = sequential.sample(t, clock, timeline, off).pose;
-        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
-            CHECK_NEAR(std::abs(p1.bone[bone].x - again.bone[bone].x) +
-                           std::abs(p1.bone[bone].y - again.bone[bone].y) +
-                           std::abs(p1.bone[bone].z - again.bone[bone].z) +
-                           std::abs(p1.bone[bone].w - again.bone[bone].w),
-                       0.0f, 1e-6f);
+        CHECK(p0.hips.x == p1.hips.x && p0.hips.y == p1.hips.y && p0.hips.z == p1.hips.z);
+        for (std::size_t f = 0; f < 2; ++f) {
+            CHECK(p0.foot[f].position.x == p1.foot[f].position.x);
+            CHECK(p0.foot[f].position.y == p1.foot[f].position.y);
+            CHECK(p0.foot[f].position.z == p1.foot[f].position.z);
+            CHECK(p0.foot[f].yaw == p1.foot[f].yaw);
         }
     }
+    CHECK(largestLag > 0.5f * 3.14159265f / 180.0f);
+    // Deterministic: the same media times from a fresh schedule, in reverse order, match.
+    for (std::size_t i = times.size(); i-- > 0;) {
+        const motion::ClipPose again = reverse.sample(times[i], clock, timeline, off).pose;
+        CHECK_NEAR(poseDistance(again, sequentialPoses[i]), 0.0f, 1e-6f);
+    }
+}
+
+// BG Motion 3.3 (#9): follow-through is a measurable phase lag. A sudden 60 degree swing of the
+// left upper arm with every other track in bind pose: the hand has no motion of its own, so its
+// swing can only come from the chain. The displayed hand must reach half of the swing later
+// than the displayed upper arm, and the plain schedule must show no lag at all.
+TEST_CASE(motion32.follow_through_shows_hand_lagging_a_sudden_arm_move) {
+    motion::HumanoidClip clip;
+    clip.id = "suddenArm";
+    clip.bpm = 120.0;
+    clip.beats = 8.0f;
+    clip.keysPerBeat = 16;
+    clip.keyCount = 8 * 16 + 1;
+    clip.loop = false;
+    clip.seamless = false;
+    std::vector<math::Quat>& arm = clip.bones[static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm)];
+    arm.resize(static_cast<std::size_t>(clip.keyCount));
+    for (int k = 0; k < clip.keyCount; ++k) {
+        // Smootherstep from beat 2 to beat 2.25 (0.125 s at 120 BPM): fast, but continuous.
+        const float u = std::clamp((static_cast<float>(k) / 16.0f - 2.0f) / 0.25f, 0.0f, 1.0f);
+        const float s = u * u * u * (u * (u * 6.0f - 15.0f) + 10.0f);
+        arm[static_cast<std::size_t>(k)] =
+            math::fromAxisAngle(math::Vec3{0.0f, 0.0f, 1.0f}, s * 60.0f * 3.14159265f / 180.0f);
+    }
+    const motion::BeatClock clock = motion::BeatClock::constant(120.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+
+    const auto makeSchedule = [&](bool follow) {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(follow);
+        motion::ScheduleSegment seg;
+        seg.clip = &clip;
+        seg.fadeSeconds = 0.0;
+        schedule.append(seg);
+        return schedule;
+    };
+    const auto identity = math::Quat::identity();
+    // World rotation of the chain shoulder (bind) -> upper arm -> lower arm -> hand, as the
+    // retargeter composes it, and of the upper arm alone.
+    const auto chainAt = [&](const motion::DanceSchedule& schedule, double t, bool hand) {
+        const motion::ClipPose pose = schedule.sample(t, clock, timeline, off).pose;
+        const std::size_t ua = static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm);
+        const std::size_t la = static_cast<std::size_t>(vrm::HumanoidBone::LeftLowerArm);
+        const std::size_t h = static_cast<std::size_t>(vrm::HumanoidBone::LeftHand);
+        const math::Quat upper = pose.bone[ua];
+        return hand ? upper * pose.bone[la] * pose.bone[h] : upper;
+    };
+    // First time the swing reaches half of its final angle.
+    const auto halfTime = [&](const motion::DanceSchedule& schedule, bool hand) {
+        const double dt = 1.0 / 480.0;
+        const float final = rotationAngle(identity, chainAt(schedule, 1.6, hand));
+        double half = -1.0;
+        for (double t = 0.9; t <= 1.6; t += dt) {
+            if (rotationAngle(identity, chainAt(schedule, t, hand)) >= 0.5f * final) {
+                half = t;
+                break;
+            }
+        }
+        return half;
+    };
+
+    const motion::DanceSchedule plain = makeSchedule(false);
+    const motion::DanceSchedule lagged = makeSchedule(true);
+    const double plainUpper = halfTime(plain, false);
+    const double plainHand = halfTime(plain, true);
+    const double laggedUpper = halfTime(lagged, false);
+    const double laggedHand = halfTime(lagged, true);
+    CHECK(plainUpper > 0.9 && plainHand > 0.9);
+    CHECK(laggedUpper > 0.9 && laggedHand > 0.9);
+    // Without follow-through the hand is the upper arm: no lag at all.
+    CHECK_NEAR(plainHand - plainUpper, 0.0, 1e-9);
+    // With it, the hand trails the upper arm by a clear margin (lag share of the chain).
+    CHECK(laggedHand - laggedUpper > 0.03);
+    // The upper arm itself also trails its own motion, but only by its small share.
+    CHECK(laggedUpper >= plainUpper - 1e-9);
+}
+
+// BG Motion 3.3 (#9): the follow-through is continuous across a crossfade, the fade end and a loop
+// seam, and a seek lands on the same pose as playback.
+TEST_CASE(motion32.follow_through_is_continuous_across_fades_and_loop_seams) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+    const double seam = static_cast<double>(a.clip.beats) * 60.0 / 104.0;
+
+    const auto makeSchedule = [&] {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(true);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const motion::DanceSchedule schedule = makeSchedule();
+    const auto poseAt = [&](double t) { return schedule.sample(t, clock, timeline, off).pose; };
+    const double edge = 1.0e-4;
+    for (const double t : {t0, t0 + fade, seam}) {
+        CHECK_NEAR(poseDistance(poseAt(t - edge), poseAt(t + edge)), 0.0f, 1e-2f);
+    }
+    // Seek equals playback at a time inside the fade.
+    CHECK_NEAR(poseDistance(poseAt(t0 + 0.3), makeSchedule().sample(t0 + 0.3, clock, timeline, off).pose),
+               0.0f, 1e-6f);
 }
 
 // BG Motion 3.3 (#10): the phrase head look is an opt-in choice. With it off the head

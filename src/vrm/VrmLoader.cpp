@@ -37,6 +37,9 @@ constexpr std::size_t kMaxSkinJoints = 2'048;
 constexpr std::size_t kMaxTextures = 4'096;
 constexpr std::size_t kMaxDecodedBytes = 512ull * 1024ull * 1024ull;
 constexpr int kMaxImageDimension = 8'192;
+// Eye-to-head offset (model units, metres for VRM) below which the eyes do not
+// define a usable forward direction; the loader then falls back to +Z.
+constexpr float kMinEyeForwardLength = 0.005f;
 
 std::string toUtf8(const std::filesystem::path& path) {
     const std::u8string value = path.u8string();
@@ -1970,9 +1973,12 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
             model->bindGlobals[static_cast<std::size_t>(rightEyeNode)].translationPart();
         Vec3 front = (left + right) * 0.5f - head;
         front.y = 0.0f;
-        front = math::normalize(front);
-        if (front.lengthSquared() > 0.1f) {
-            model->forward = front;
+        // Check the raw eye-to-head offset before normalizing: a unit vector
+        // always passes a length test, so the degenerate case must be caught
+        // on the un-normalized value.
+        if (math::finite(front) &&
+            front.lengthSquared() > kMinEyeForwardLength * kMinEyeForwardLength) {
+            model->forward = math::normalize(front);
         } else {
             model->forward = {0.0f, 0.0f, 1.0f};
         }

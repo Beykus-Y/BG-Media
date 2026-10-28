@@ -54,6 +54,13 @@ constexpr std::uint32_t kAliveSeed = 0x6d61736cU;
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Render-to-display latency compensation for the dance pose (about 15 to 30 ms
+// between sampling a frame and it reaching the screen). The dancer is sampled
+// this far ahead of the media clock so it lands on the beat the viewer hears.
+// Applies to the 3D character only: audio, the transport and UI cursors keep
+// the media time.
+constexpr double kDanceVisualLeadSeconds = 0.020;
+
 std::string toUtf8(const std::filesystem::path& path) {
     const std::u8string value = path.u8string();
     return std::string(reinterpret_cast<const char*>(value.data()), value.size());
@@ -1252,7 +1259,7 @@ struct DesktopApp::Impl {
         vrm.renderSettings().modelOffset.y =
             std::clamp(vrm.renderSettings().modelOffset.y, -0.5f, 0.5f);
         if (danceUi()) {
-            const double danceNow = danceTime();
+            const double danceNow = danceVisualTime();
             updateDance();
             // The foot order of the pause hand-over is chosen once, from the pose the
             // dancer stopped in, and kept until the blend is fully back to the dance.
@@ -1299,6 +1306,10 @@ struct DesktopApp::Impl {
     motion::ClipPose danceIdleAnchor;  // latched pose whose root places the Idle stance
     bool useClips = true;
     double danceLabTime = 0.0;
+    // Set once the user picks a dance mode or a style this session. Until then a
+    // loaded track starts in Auto (the out-of-box default), and the choice is not
+    // persisted, so every launch begins that way.
+    bool danceModeChosen = false;
     bool danceLabRunning = true;
     int danceLabBpm = 100;
     bool musicDebug = false;
@@ -1321,6 +1332,12 @@ struct DesktopApp::Impl {
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
     [[nodiscard]] double danceTime() const {
         return track ? currentPosition() : danceLabTime;
+    }
+    // Dance time for the character's pose on this frame: the media clock plus the
+    // render latency lead. Scheduling and the transport keep using danceTime(). A capture
+    // (still or offline render) shows the exact media time, so it takes no lead.
+    [[nodiscard]] double danceVisualTime() const {
+        return track && !captureMode ? danceTime() + kDanceVisualLeadSeconds : danceTime();
     }
 
     // Whether the dance transport is moving. Scrubbing and capture drive the dance
@@ -1386,6 +1403,11 @@ struct DesktopApp::Impl {
         // away the downbeat confidence and the real accent map.
         if (!track || motionLabBpm > 0) {
             dance.setGrid(danceGrid(), danceTime());
+        }
+        // Default to Auto for a track the user has not steered in this session.
+        // setMode(Auto) builds the plan from the analysis set above.
+        if (track && !danceModeChosen && danceUi() && dance.mode() != motion::DanceMode::Auto) {
+            dance.setMode(motion::DanceMode::Auto, danceTime());
         }
         if (dance.mode() == motion::DanceMode::Auto && track) {
             std::fprintf(stderr, "BG Motion Auto plan:\n%s",
@@ -1501,6 +1523,10 @@ struct DesktopApp::Impl {
         if (!useClips) {
             return;
         }
+        if (!options.dancePlan.empty() || !options.dance.empty()) {
+            // A dance named on the command line is an explicit choice.
+            danceModeChosen = true;
+        }
         if (!options.dancePlan.empty()) {
             std::vector<motion::DanceStyle> styles;
             std::stringstream list(options.dancePlan);
@@ -1532,6 +1558,7 @@ struct DesktopApp::Impl {
             return;
         }
         generatedDanceIndex = -1;
+        danceModeChosen = true;
         dance.select(style, danceTime());
         const motion::HumanoidClip* clip = dance.library().forStyle(style);
         showToast(std::string("Dance: ") + (clip ? clip->name : motion::styleName(style)) +
@@ -1563,6 +1590,7 @@ struct DesktopApp::Impl {
             showToast("No procedural dances generated");
             return;
         }
+        danceModeChosen = true;
         generatedDanceIndex =
             (generatedDanceIndex + 1) % static_cast<int>(generated.size() + 1);
         if (generatedDanceIndex == static_cast<int>(generated.size())) {
@@ -1625,6 +1653,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.setMode(mode, danceTime());
         if (mode == motion::DanceMode::Auto) {
             showToast(dance.autoNote().empty() ? "Auto dance" : dance.autoNote());
@@ -1652,6 +1681,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.startTestDance(danceTime());
         showToast("TEST DANCE: Groove > Hip-Hop > Side Step > Energetic");
     }
@@ -1668,7 +1698,7 @@ struct DesktopApp::Impl {
     }
 
     void updateDance() {
-        danceFrame = dance.update(danceTime());
+        danceFrame = dance.update(danceVisualTime());
     }
 
     void recordDanceTrails() {

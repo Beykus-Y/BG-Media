@@ -30,6 +30,18 @@ constexpr double kPlanBlendSeconds = 0.5;
 constexpr double kSwingCarrySeconds = 0.08;
 constexpr double kPlantedCarrySeconds = 3.0;
 
+// Upper bound of the per-(clip, loop) overlay memo. Plans are pure, so clearing is harmless.
+constexpr std::size_t kMaxOverlaySets = 256;
+
+// Seed of one clip's cue set for one loop: the host seed, the clip id and the loop index.
+std::uint32_t overlayLoopSeed(std::uint32_t hostSeed, const std::string& clipId,
+                              std::int64_t loop) {
+    const std::uint64_t key = variationMix(
+        variationHash(clipId) ^ variationMix(static_cast<std::uint64_t>(hostSeed) + 0x51ull) ^
+        variationMix(static_cast<std::uint64_t>(loop) + 0x7000ull));
+    return static_cast<std::uint32_t>(key ^ (key >> 32));
+}
+
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -133,8 +145,9 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     footworkReports_.clear();
     replanAuthored();
     generated_ = ProceduralChoreography::showcase();
+    generatedOverlays_.clear();
     for (GeneratedDance& dance : generated_) {
-        overlays_[dance.clip.id] = dance.overlays;
+        generatedOverlays_[dance.clip.id] = dance.overlays;
         if (!library_.find(dance.clip.id)) {
             library_.add(dance.clip);
         }
@@ -150,6 +163,7 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
 
 void DancePlayer::replanAuthored() {
     footworkReports_.clear();
+    overlays_.clear();  // the cue plans read the (re-planned) clips
     for (const HumanoidClip& raw : authored_) {
         if (!footworkPlan_) {
             library_.replace(raw);
@@ -198,18 +212,28 @@ void DancePlayer::setOverlayMode(OverlayMode mode) {
 }
 
 const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& clipId) {
-    auto it = overlays_.find(clipId);
-    if (it != overlays_.end()) {
+    return overlaysFor(clipId, 0);
+}
+
+const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& clipId,
+                                                          std::int64_t loop) {
+    if (const auto preset = generatedOverlays_.find(clipId); preset != generatedOverlays_.end()) {
+        return preset->second;
+    }
+    const std::pair<std::string, std::int64_t> key{clipId, loop};
+    if (const auto it = overlays_.find(key); it != overlays_.end()) {
         return it->second;
     }
     std::vector<PrimitiveCue> plan;
     if (const HumanoidClip* clip = library_.find(clipId)) {
-        const std::uint32_t seed =
-            overlaySeed_ ^ static_cast<std::uint32_t>(clipId.size() * 2654435761u);
+        const std::uint32_t seed = overlayLoopSeed(overlaySeed_, clipId, loop);
         const float density = std::clamp(0.25f + clip->energy * 0.8f, 0.25f, 1.0f);
         plan = planPrimitiveOverlays(*clip, seed, density, true);
     }
-    return overlays_.emplace(clipId, std::move(plan)).first->second;
+    if (overlays_.size() >= kMaxOverlaySets) {
+        overlays_.clear();
+    }
+    return overlays_.emplace(key, std::move(plan)).first->second;
 }
 
 bool DancePlayer::selectClip(const std::string& clipId, double now, bool immediate) {
@@ -502,12 +526,28 @@ DanceFrame DancePlayer::sampleFrame(double mediaTime) {
             if (!segment.clip) {
                 return;
             }
-            const std::vector<PrimitiveCue>& cues = overlaysFor(segment.clip->id);
-            if (cues.empty()) {
+            const HumanoidClip& clip = *segment.clip;
+            // Cues are planned per loop. A looping clip composes loop L at its beat inside the
+            // loop, plus the tails of loop L-1 that spill past the seam (composeLoopCues). The
+            // fade-in before beat 0 is loop 0. There is no crossfade between two loops' sets:
+            // every cue envelope starts and ends at zero, so a change of set at the seam is
+            // continuous, and a cue planned on the downbeat ramps in at full weight.
+            std::int64_t loop = 0;
+            double local = clipBeat;
+            if (clip.loop && clip.beats > 0.0f) {
+                loop = std::max<std::int64_t>(
+                    0, static_cast<std::int64_t>(std::floor(clipBeat / clip.beats)));
+                local = clipBeat - static_cast<double>(loop) * clip.beats;
+            }
+            // Copied: the lookup of loop L may evict the memo that a reference would point into.
+            const std::vector<PrimitiveCue> previous =
+                loop > 0 ? overlaysFor(clip.id, loop - 1) : std::vector<PrimitiveCue>{};
+            const std::vector<PrimitiveCue>& current = overlaysFor(clip.id, loop);
+            if (current.empty() && previous.empty()) {
                 return;
             }
-            const ComposedPose composed = composeMotion(
-                pose, cues, clipBeat, segment.clip->beats, segment.clip->loop, options);
+            const ComposedPose composed =
+                composeLoopCues(pose, current, previous, local, clip.beats, options);
             pose = composed.pose;
             if (diag.calls++ == 0) {
                 diag.accepted = composed.diagnostics.acceptedCues;
