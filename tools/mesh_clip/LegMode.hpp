@@ -212,6 +212,11 @@ inline Box triangleBox(const Vec3* p) {
         b.lo = {std::min(b.lo.x, p[k].x), std::min(b.lo.y, p[k].y), std::min(b.lo.z, p[k].z)};
         b.hi = {std::max(b.hi.x, p[k].x), std::max(b.hi.y, p[k].y), std::max(b.hi.z, p[k].z)};
     }
+    // Pad by the contact tolerance, so pairs that touch within it across a cell
+    // boundary still reach the narrow phase.
+    const Vec3 pad{probe::kTriangleEpsilon, probe::kTriangleEpsilon, probe::kTriangleEpsilon};
+    b.lo = b.lo - pad;
+    b.hi = b.hi + pad;
     return b;
 }
 

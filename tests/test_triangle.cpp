@@ -74,6 +74,18 @@ TEST_CASE(triangle.vertex_touch_is_contact_without_depth) {
     CHECK_NEAR(contact.depth, 0.0, 1e-9);
 }
 
+TEST_CASE(triangle.crossing_planes_meeting_at_one_vertex_have_no_depth) {
+    // Both triangles straddle the other's plane but share only the origin.
+    const Vec3 a[3] = {P(0, 0, 0), P(0.01f, 0.01f, 0), P(0.01f, -0.01f, 0)};
+    const Vec3 b[3] = {P(0, 0, 0), P(-0.01f, 0, 0.01f), P(-0.01f, 0, -0.01f)};
+    const auto ab = triangleContact(a, b);
+    CHECK(ab.intersects);
+    CHECK_NEAR(ab.depth, 0.0, 1e-9);
+    const auto ba = triangleContact(b, a);
+    CHECK(ba.intersects);
+    CHECK_NEAR(ba.depth, 0.0, 1e-9);
+}
+
 TEST_CASE(triangle.near_miss_within_epsilon_counts_as_touching) {
     const float epsilon = 1.0e-4f;
     const Vec3 near[3] = {P(0.1f, 0.1f, 0.5e-4f), P(0.5f, 0.1f, 0.5e-4f), P(0.1f, 0.5f, 0.5e-4f)};

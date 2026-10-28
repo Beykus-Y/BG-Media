@@ -204,6 +204,8 @@ inline bool coplanarOverlap(const math::Vec3* a, const math::Vec3* b, math::Vec3
     if (a1 < b0 || b1 < a0) return out;  // the two intervals on the line are disjoint
 
     out.intersects = true;
+    // Intervals that only meet at an endpoint are a touch, not a penetration.
+    if (std::min(a1, b1) - std::max(a0, b0) <= epsilon) return out;
     out.depth = std::min(detail::axisOvershoot(da), detail::axisOvershoot(db));
     return out;
 }
