@@ -62,6 +62,20 @@ Quat qFromTo(Vec3 from, Vec3 to) {
 
 Quat qNorm(Quat q) { return q.normalized(); }
 
+// Wrist roll (degrees) as a continuous function of the arm plane.
+// magnitude: 9 deg for a low arm, 22 deg for a raised arm, ramped through the
+// 62..96 deg elevation band; direction: signed azimuth, zero at 45 deg.
+// Continuous in both arguments, so neighbouring keys cannot step the hand.
+float wristRollDeg(float elevDeg, float azimDeg) {
+    const auto smooth = [](float x) {
+        x = std::clamp(x, 0.0f, 1.0f);
+        return x * x * (3.0f - 2.0f * x);
+    };
+    const float magnitude = 9.0f + 13.0f * smooth((elevDeg - 62.0f) / 34.0f);
+    const float direction = std::tanh((azimDeg - 45.0f) / 7.0f);
+    return magnitude * direction;
+}
+
 std::uint32_t hashSeed(std::uint32_t seed) {
     seed ^= seed >> 16;
     seed *= 0x7feb352du;
@@ -407,6 +421,8 @@ private:
     void authorBody();
     void authorArms();
     void authorAccents();
+    // Strength of the nearest authored accent (0..1); a plain beat gets 0.55.
+    [[nodiscard]] float accentStrengthAt(float beat) const;
     void armKey(float beat, int side, float elev, float azim, float twist,
                 float elbow, float wrist = 0.0f, bool hit = false);
     void bothArms(float beat, std::array<float, 4> leftArm,
@@ -429,8 +445,7 @@ private:
 };
 
 void Choreographer::armKey(float beat, int side, float elev, float azim, float twist,
-                           float elbow, float wrist, bool hit) {
-    if (side == 0) {
+                           float elbow, float wrist, bool hit) {    if (side == 0) {
         pose(beat, hit, 1.0f, {{Ctrl::ArmLElev, elev}, {Ctrl::ArmLAzim, azim},
                               {Ctrl::ArmLTwist, twist}, {Ctrl::ArmLElbow, elbow},
                               {Ctrl::ArmLWrist, wrist}});
@@ -446,10 +461,15 @@ void Choreographer::bothArms(float beat, std::array<float, 4> leftArm,
     // Wrist orientation follows the arm plane: a high arm turns the palm
     // slightly down/in, a low arm keeps it neutral. This is authored, not
     // random, and gives the hand layer a real base to build gestures on.
-    const float wristL = (leftArm[0] > 80.0f ? 22.0f : 9.0f) *
-                         (leftArm[1] > 45.0f ? 1.0f : -1.0f);
-    const float wristR = (rightArm[0] > 80.0f ? 22.0f : 9.0f) *
-                         (rightArm[1] > 45.0f ? 1.0f : -1.0f);
+    //
+    // Both dependencies are continuous on purpose. The old form
+    // `elev > 80 ? 22 : 9` and `azim > 45 ? 1 : -1` was a branch on the pose
+    // values, so a key that crossed either threshold baked a 13 deg step into
+    // the hand track; played back that is a 600 deg/s wrist snap (the
+    // `neonPulse` anomaly: 14.1 rad/s at 60 FPS on Model1). A ramp plus a
+    // signed azimuth keeps the same neutral/palm-down intent without a jump.
+    const float wristL = wristRollDeg(leftArm[0], leftArm[1]);
+    const float wristR = wristRollDeg(rightArm[0], rightArm[1]);
     armKey(beat, 0, leftArm[0], leftArm[1], leftArm[2], leftArm[3], wristL, hit);
     armKey(beat, 1, rightArm[0], rightArm[1], rightArm[2], rightArm[3], wristR, hit);
 }
@@ -543,12 +563,24 @@ void Choreographer::authorBody() {
         const float b = static_cast<float>(beat);
         const int section = static_cast<int>(b / (bar * 2.0f));
         const float sectionEnergy = (section == 0) ? 0.7f : (section == 3 ? 1.0f : 0.9f);
+        // Every beat used to drop by exactly the same amount at exactly the same
+        // time, which is what makes a loop read as a metronome. The accent map
+        // decides how deep this beat is and how long it takes to come back up:
+        // a strong beat lands lower and releases later, a weak beat is shallow
+        // and recovers sooner. The down key never moves off the beat, so the
+        // music stays in time; only the depth and the release change.
+        const float hit = accentStrengthAt(b);
+        const float depth = dip * sectionEnergy * (0.74f + 0.34f * hit);
+        const float release = 0.52f + 0.16f * hit;
         pose(b, false, 1.0f,
-             {{Ctrl::HipsY, -dip * sectionEnergy},
-              {Ctrl::SpineBend, (street ? 9.0f : 5.0f) * sectionEnergy}});
-        pose(b + 0.5f, false, 1.0f,
-             {{Ctrl::HipsY, -dip * 0.42f * sectionEnergy},
-              {Ctrl::SpineBend, (street ? 4.0f : 2.0f) * sectionEnergy}});
+             {{Ctrl::HipsY, -depth},
+              {Ctrl::SpineBend, (street ? 9.0f : 5.0f) * sectionEnergy * (0.85f + 0.2f * hit)}});
+        // The spine answers after the pelvis instead of stopping with it.
+        pose(b + 0.09f, false, 1.0f,
+             {{Ctrl::SpineBend, (street ? 8.4f : 4.6f) * sectionEnergy * (0.85f + 0.2f * hit)}});
+        pose(b + release, false, 1.0f,
+             {{Ctrl::HipsY, -depth * 0.40f},
+              {Ctrl::SpineBend, (street ? 3.6f : 1.8f) * sectionEnergy}});
         // Body wave: each vertebra group lags the previous one.
         pose(b, false, 1.0f, {{Ctrl::WaveLower, -4.5f * intensity}});
         pose(b + 0.5f, false, 1.0f, {{Ctrl::WaveLower, 6.0f * intensity}});
@@ -618,7 +650,12 @@ void Choreographer::authorArms() {
     // one diagonal, one low/back. A phrase selects a pair and swaps sides on
     // the next beat, so the arms travel instead of holding a T-pose.
     const std::array<std::array<float, 4>, 7> presets = {{
-        {baseElev + 34.0f + jitterL, 16.0f, 12.0f, 28.0f},   // open / horizontal
+        // Neutral is a relaxed arm: low, elbows bent, hands in front of the
+        // hips. It used to be `baseElev + 34` (about 16 deg below horizontal),
+        // which is where the "arms held out like a scarecrow" look of the
+        // procedural clips came from: every return pose and most motif blocks
+        // used it, so the arms spent the dance in one horizontal plane.
+        {24.0f + jitterL * 0.5f, 30.0f, 10.0f, 46.0f},        // neutral / low
         {124.0f + jitterR, 22.0f, 5.0f, 22.0f},               // overhead
         {36.0f + jitterL, 72.0f, 4.0f, 102.0f},               // folded across chest
         {26.0f + jitterR, -12.0f, 12.0f, 54.0f},              // low and back
@@ -703,8 +740,21 @@ void Choreographer::authorAccents() {
     accent(bar * 7.0f, 0.9f, "toe");
 }
 
-void Choreographer::authorStructure() {
-    structure_.clear();
+float Choreographer::accentStrengthAt(float beat) const {
+    float strength = 0.55f;
+    float nearest = 1.0f;
+    for (const AccentMark& mark : accents_) {
+        const float raw = std::abs(mark.beat - beat);
+        const float distance = std::min(raw, std::max(0.0f, period_ - raw));
+        if (distance < nearest) {
+            nearest = distance;
+            strength = mark.strength;
+        }
+    }
+    return nearest <= 0.5f ? std::clamp(strength, 0.0f, 1.0f) : 0.55f;
+}
+
+void Choreographer::authorStructure() {    structure_.clear();
     structure_.push_back("Section: intro groove");
     structure_.push_back("Section: development (side-touch, cross-step)");
     structure_.push_back("Section: build (pivot, arms)");
@@ -715,9 +765,10 @@ GeneratedDance Choreographer::build() {
     const auto started = Clock::now();
     authorStructure();
     authorFootwork();
+    // Accents first: the body shaping reads their strength per beat.
+    authorAccents();
     authorBody();
     authorArms();
-    authorAccents();
 
     const int keyCount = static_cast<int>(std::lround(period_ * request_.keysPerBeat)) + 1;
     const int cycles = keyCount - 1;
