@@ -430,7 +430,9 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         for (int sd = 0; sd < 2; ++sd) {
             if (side >= 0 && sd != side) continue;
             const ArmSet arm = armSet(sd);
-            const float s = bell(phase, 0.10f, 0.30f);
+            // Attack widened from 0.10 to 0.35 of the cue (about 0.15-0.2 beat for the
+            // usual 0.5-beat accents): the wrist snap no longer peaks at 25+ rad/s.
+            const float s = bell(phase, 0.35f, 0.30f);
             rollWrist(pose, arm, (40.0f * s) * amp);
             setBone(pose, arm.hand, axisAngle(kY, -18.0f * s * amp));
             for (int fg = 1; fg < 5; ++fg) {
