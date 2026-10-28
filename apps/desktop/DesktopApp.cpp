@@ -1334,7 +1334,9 @@ struct DesktopApp::Impl {
                 // Idle has a wall-clock time axis (tempoSync false): one beat per 60 / bpm s.
                 idlePose = motion::sampleClip(*idle, wallNow * idle->bpm / 60.0);
             }
-            pose = motion::blendPoses(dancePose, idlePose, idleMix);
+            // The dancer keeps the dance root and the feet are handed over one at a
+            // time, so a travelled dancer does not glide back to the Idle origin.
+            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix);
         }
         motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f);
         return pose;

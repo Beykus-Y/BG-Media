@@ -29,6 +29,11 @@ constexpr double kWeightShiftCm = 1.0;
 constexpr double kWeightShiftMinSeconds = 7.0;
 constexpr double kWeightShiftSpanSeconds = 4.0;
 
+// Foot handover of the dance -> Idle blend. Foot positions are in model heights.
+constexpr double kFootLiftCapHeights = 0.03;                      // about 4.8 cm at 1.6 m
+constexpr double kFootLiftMinTravel = 1.0 / kReferenceHeightCm;   // 1 cm
+constexpr double kFootLiftFraction = 0.5;                         // lift = 0.5 * travel, capped
+
 // Head look-around: total yaw +-4 deg and pitch +-2 deg, split neck 40 % / head 60 %.
 constexpr double kLookYawDeg = 4.0;
 constexpr double kLookPitchDeg = 2.0;
@@ -86,6 +91,24 @@ double wave(double cycles, double phase) {
 float smoothstep01(float edge0, float edge1, float x) {
     const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
+}
+
+// Ease over [0, 1] with zero first and second derivatives at both ends. Exactly 0 at 0
+// and exactly 1 at 1, so an endpoint test can use ==.
+float smootherstep01(float x) {
+    const float t = std::clamp(x, 0.0f, 1.0f);
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+// a * (1 - t) + b * t: exact at both ends (a at t = 0, b at t = 1). The usual
+// a + (b - a) * t is not exact at t = 1 in floating point.
+float exactLerp(float a, float b, float t) { return a * (1.0f - t) + b * t; }
+
+// Shortest-arc lerp of a turn value. Exact at t = 0.
+float turnLerp(float from, float to, float t) {
+    float d = to - from;
+    d -= std::round(d);
+    return from + d * t;
 }
 
 math::Quat pitchQuat(double degrees) {
@@ -182,6 +205,52 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
                             pitchQuat((1.0 - kNeckShare) * pitch);
     composeBone(pose, HumanoidBone::Neck, neck);
     composeBone(pose, HumanoidBone::Head, head);
+}
+
+ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix) {
+    const float m = std::isfinite(mix) ? std::clamp(mix, 0.0f, 1.0f) : 0.0f;
+    if (m <= 0.0f) {
+        return dance;
+    }
+    // Body: plain crossfade. The root is the dance root on both sides, so blendPoses
+    // leaves it unchanged at every mix and the Idle origin never pulls a travelled
+    // dancer back.
+    ClipPose idleBody = idle;
+    idleBody.rootX = dance.rootX;
+    idleBody.rootZ = dance.rootZ;
+    idleBody.rootYaw = dance.rootYaw;
+    ClipPose out = blendPoses(dance, idleBody, m);
+
+    // Feet: one at a time. Foot 0 (left) moves over mix 0..0.5, foot 1 (right) over 0.5..1.
+    // At every mix one of the two feet has p = 0 or p = 1, so it sits exactly on an endpoint.
+    for (std::size_t f = 0; f < 2; ++f) {
+        const float start = f == 0 ? 0.0f : 0.5f;
+        const float p = smootherstep01((m - start) / 0.5f);
+        // Guarded: sin(pi) is not exactly 0 in floating point, and the endpoints must stay exact.
+        const float arch = (p > 0.0f && p < 1.0f)
+                               ? static_cast<float>(std::sin(kTwoPi * 0.5 * p))
+                               : 0.0f;
+        const ClipPose::Foot& from = dance.foot[f];
+        const ClipPose::Foot& to = idle.foot[f];
+        ClipPose::Foot& foot = out.foot[f];
+
+        Vec3 position{exactLerp(from.position.x, to.position.x, p),
+                      exactLerp(from.position.y, to.position.y, p),
+                      exactLerp(from.position.z, to.position.z, p)};
+        const double dx = static_cast<double>(to.position.x) - from.position.x;
+        const double dz = static_cast<double>(to.position.z) - from.position.z;
+        const double travel = std::sqrt(dx * dx + dz * dz);
+        if (travel >= kFootLiftMinTravel && arch > 0.0f) {
+            const double lift = std::min(kFootLiftCapHeights, kFootLiftFraction * travel);
+            position.y += static_cast<float>(lift) * arch;
+        }
+        foot.position = position;
+        foot.yaw = turnLerp(from.yaw, to.yaw, p);
+        foot.toePitch = exactLerp(from.toePitch, to.toePitch, p);
+        foot.contact = std::min(exactLerp(from.contact, to.contact, p), 1.0f - arch);
+        foot.phase = p < 0.5f ? from.phase : to.phase;
+    }
+    return out;
 }
 
 void IdleCrossfade::update(bool running, double wallNow) {
