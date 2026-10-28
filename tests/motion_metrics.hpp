@@ -19,8 +19,11 @@ using motion::HumanoidClip;
 using vrm::HumanoidBone;
 
 inline double angleBetween(const math::Quat& a, const math::Quat& b) {
-    const float d = std::abs(math::dot(a.normalized(), b.normalized()));
-    return 2.0 * std::acos(std::clamp(d, 0.0f, 1.0f)) * 180.0 / 3.14159265358979;
+    // atan2 of the relative rotation: acos(|dot|) turns float rounding of two identical
+    // rotations into ~0.04 deg, which drowns sub-millidegree checks.
+    const math::Quat r = b.normalized() * a.normalized().conjugate();
+    const double s = std::sqrt(double(r.x) * r.x + double(r.y) * r.y + double(r.z) * r.z);
+    return 2.0 * std::atan2(s, std::abs(double(r.w))) * 180.0 / 3.14159265358979;
 }
 
 // Angular velocity vector (deg/s) taking a to b over dt, world axes.

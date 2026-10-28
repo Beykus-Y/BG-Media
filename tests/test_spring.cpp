@@ -892,3 +892,78 @@ TEST_CASE(spring.thigh_colliders_push_a_skirt_out_of_the_thigh) {
               << without << " m, with thigh colliders=" << with << " m";
     CHECK(with > without + 0.03f);  // the colliders push it out to about radius + hitRadius
 }
+
+// --------------------------------------------------------------------------
+// Render interpolation: a steadily moving chain must not trail
+// --------------------------------------------------------------------------
+TEST_CASE(spring.render_interpolation_adds_no_trailing_for_a_steady_glide) {
+    // A stiff, gravity-free chain (neck -> head -> eye). The body glides at a steady
+    // speed by a root shift only, so the spring settles into a constant offset from
+    // its animated target. That offset must not depend on the frame rate: at 50 and
+    // 90 FPS the frames fall between the 120 Hz steps, and an interpolation that mixes
+    // absolute positions and then subtracts this frame's target adds a step of lag
+    // (0.5 m/s * 1/120 s = 4 mm here) on top of the spring's own offset.
+    auto model = loadSynthetic(
+        R"("boneGroups":[{"comment":"glide","stiffiness":1.0,"gravityPower":0,"dragForce":0.4,)"
+        R"("center":-1,"hitRadius":0.02,"bones":[3],"colliderGroups":[]}])");
+    REQUIRE(model != nullptr);
+    animation::HumanoidRetargeter rig(*model);
+    REQUIRE(rig.valid());
+    constexpr int kHeadNode = 4;           // chain 0 is 3 -> 4 -> 19; point 1 is node 4
+    constexpr float kSpeed = 0.5f;         // metres per second
+    const float height = model->height;
+    // The animated stage position of the head at a given time (rigid glide).
+    const auto animatedAt = [&](double time) {
+        motion::ClipPose base = motion::neutralClipPose();
+        base.rootX = static_cast<float>(kSpeed * time / height);
+        const auto pose = rig.applyClip(base, time);
+        return animation::HumanoidRetargeter::stagePosition(pose, kHeadNode);
+    };
+    // Worst deviation, from t = 2 s on, of the rendered head from the expected one:
+    //   expected = (simulated point after the last fixed step) + (animated(now) - animated(step)).
+    // The fixed step count is replayed with the same arithmetic as the solver, so the
+    // "last step" time is exact, not estimated.
+    const auto worstError = [&](double fps) {
+        constexpr double kStep = 1.0 / 120.0;  // the solver's fixed step
+        animation::SecondaryDynamics dynamics(*model);
+        animation::SecondarySettings settings;
+        const int frames = static_cast<int>(std::lround(3.0 * fps));
+        double accumulator = 0.0;
+        long long stepsDone = 0;
+        float worst = 0.0f;
+        for (int i = 0; i <= frames; ++i) {
+            const double t = i / fps;
+            const double dt = i == 0 ? 0.0 : 1.0 / fps;
+            if (dt > 0.0) {
+                accumulator += dt;
+                while (accumulator >= kStep) {
+                    accumulator -= kStep;
+                    ++stepsDone;
+                }
+            }
+            motion::ClipPose base = motion::neutralClipPose();
+            base.rootX = static_cast<float>(kSpeed * t / height);
+            auto pose = rig.applyClip(base, t);
+            dynamics.update(pose, dt, settings);
+            if (t >= 2.0) {
+                const double lastStep = static_cast<double>(stepsDone) * kStep;
+                const math::Vec3 expected =
+                    dynamics.chainPoint(0, 1) + (animatedAt(t) - animatedAt(lastStep));
+                const math::Vec3 rendered =
+                    animation::HumanoidRetargeter::stagePosition(pose, kHeadNode);
+                worst = std::max(worst, (rendered - expected).length());
+            }
+        }
+        return worst;
+    };
+    const float err120 = worstError(120.0);
+    const float err90 = worstError(90.0);
+    const float err50 = worstError(50.0);
+    std::cout << std::fixed << std::setprecision(6)
+              << "\n            steady glide at 0.5 m/s, rendered vs expected: 120 FPS=" << err120
+              << " m, 90 FPS=" << err90 << " m, 50 FPS=" << err50 << " m";
+    // A one-step lag at this speed is 4.2 mm; the bound is far below it.
+    CHECK(err120 < 2.0e-4f);
+    CHECK(err90 < 2.0e-4f);
+    CHECK(err50 < 2.0e-4f);
+}

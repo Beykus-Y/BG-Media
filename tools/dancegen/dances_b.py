@@ -59,7 +59,8 @@ def build_hiphop():
         d.pose(k, wave_lower=-4.0, wave_mid=-4.0, wave_upper=-2.0)
         d.pose(k + 0.5, wave_lower=3.0, wave_mid=5.0, wave_upper=8.0 if k % 2 else 3.0)
     for k in (3, 7, 11, 15):
-        d.pose(k + 0.05, hit=True, wave_upper=-9.0, wave_mid=-7.0)
+        # the pop starts 0.15 beat after its base key: a 0.05 beat snap is a 17 ms flick at 180 BPM
+        d.pose(k + 0.15, hit=True, wave_upper=-9.0, wave_mid=-7.0)
         d.pose(k + 0.5, hit=True, wave_upper=-9.0, wave_mid=-7.0)
     # shoulder hits on alternating off-beats
     for k in range(16):
@@ -313,14 +314,17 @@ def build_energetic():
     d.poses(2.0, arms(up_wide, up_wide), hit=True)
     d.poses(3.0, arms((70, 25, 5, 90), (70, 25, 5, 90)))
     d.poses(4.0, arms((30, 40, 10, 60), (30, 40, 10, 60)))
-    d.poses(5.0, arms((168, 20, 0, 10), (40, -35, 10, 15)), hit=True)
-    d.poses(6.0, arms((40, -35, 10, 15), (168, 20, 0, 10)), hit=True)
+    # the lunges are freezes (explicit holds, no velocity carried through): as accents they
+    # would sweep the arms through the key at full speed and break the 900 deg/s gate at 180 BPM
+    d.poses(5.0, arms((168, 20, 0, 10), (40, -35, 10, 15)), hold=True)
+    d.poses(6.0, arms((40, -35, 10, 15), (168, 20, 0, 10)), hold=True)
     d.poses(7.0, arms((50, 50, 0, 100), (50, 50, 0, 100)))
     d.poses(8.0, arms(sweep_l, (60, 10, 5, 30)))
     d.poses(9.4, arms((130, 30, 0, 30), (100, 60, 0, 90)), hit=True)
     d.poses(10.6, arms((130, 30, 0, 30), (100, 60, 0, 90)))
     d.poses(11.6, arms((60, 40, 10, 70), (60, 40, 10, 70)))
-    d.poses(12.0, arms((90, 0, 10, 20), (90, 0, 10, 20)))
+    # the spin pose lands at 12.15: the elbow move from 11.6 is 0.55 beat, not a 0.4 beat snap
+    d.poses(12.15, arms((90, 0, 10, 20), (90, 0, 10, 20)))
     d.poses(13.0, arms((150, 10, 0, 20), (150, 10, 0, 20)))
     d.poses(14.0, arms((172, 5, 0, 5), (62, -25, 10, 20)), hit=True)
     d.poses(15.0, arms((70, 30, 10, 60), (60, 30, 10, 60)))

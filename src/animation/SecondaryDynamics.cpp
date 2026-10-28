@@ -62,8 +62,17 @@ struct SecondaryDynamics::Impl {
         int parentChain = -1;   // index into `chains` (not springChains), -1 = root chain
         int parentIndex = 0;
         std::vector<Vec3> animated;
+        // Animated target of the previous frame. Each fixed step samples the target at
+        // its own time between the two frames (stepTarget), so the spring never sees a
+        // frame-start staircase.
+        std::vector<Vec3> animatedPrevFrame;
+        std::vector<Vec3> stepTarget;
         std::vector<Vec3> current;
         std::vector<Vec3> previous;
+        // Target each stored state was produced against: animPrev pairs with previous,
+        // animCur with current. Render interpolation works on the offsets from these.
+        std::vector<Vec3> animPrev;
+        std::vector<Vec3> animCur;
         std::vector<Vec3> velocity;
         std::vector<Quat> animatedRotations;
         std::vector<Vec3> scales;
@@ -80,6 +89,7 @@ struct SecondaryDynamics::Impl {
     std::vector<float> colliderRadii;
     std::vector<std::vector<int>> colliderLookup;  // group index -> flat collider indices
     double accumulator = 0.0;
+    float renderAlpha = 0.0f;  // accumulator / kFixedStep, set by writePose
     SecondaryStats stats;
     bool initialized = false;
     Vec3 rootOffset{};
@@ -89,12 +99,15 @@ struct SecondaryDynamics::Impl {
     void build();
     void readTargets(const RetargetedPose& pose);
     void ensureState(const RetargetedPose& pose);
-    void step(Chain& chain, const SecondarySettings& settings, float stepSeconds);
-    void solveConstraints(Chain& chain, Vec3 anchor);
+    // Fills chain.stepTarget with the animated target at `fraction` of the frame.
+    void interpolateStepTarget(Chain& chain, double fraction);
+    void step(Chain& chain, const SecondarySettings& settings, float stepSeconds,
+              const std::vector<Vec3>& target);
+    void solveConstraints(Chain& chain, Vec3 anchor, const std::vector<Vec3>& target);
     void snapToAnimated();
-    // Where the first point of a chain is pinned: its own animated position, or
-    // (branch chain) the simulated position of the branch point in the parent.
-    [[nodiscard]] Vec3 anchorOf(const Chain& chain) const;
+    // Where the first point of a chain is pinned: the target's root, or (branch
+    // chain) the simulated position of the branch point in the parent.
+    [[nodiscard]] Vec3 anchorOf(const Chain& chain, const std::vector<Vec3>& target) const;
     void writePose(RetargetedPose& pose, const SecondarySettings& settings);
     [[nodiscard]] Vec3 toStage(Vec3 character) const {
         return rootOffset + rootPivot +
@@ -224,6 +237,8 @@ void SecondaryDynamics::Impl::readTargets(const RetargetedPose& pose) {
     }
     for (Chain& chain : chains) {
         const std::size_t count = chain.nodes.size();
+        // The previous frame's target stays available for the step-time interpolation.
+        chain.animatedPrevFrame = chain.animated;
         chain.animated.assign(chain.pointCount(), Vec3{});
         chain.animatedRotations.resize(count);
         chain.scales.resize(count);
@@ -272,6 +287,10 @@ void SecondaryDynamics::Impl::snapToAnimated() {
     for (Chain& chain : chains) {
         chain.current = chain.animated;
         chain.previous = chain.animated;
+        chain.animPrev = chain.animated;
+        chain.animCur = chain.animated;
+        chain.animatedPrevFrame = chain.animated;
+        chain.stepTarget = chain.animated;
         chain.velocity.assign(chain.animated.size(), Vec3{});
         if (!chain.animated.empty()) {
             chain.lastAnimatedRoot = chain.animated[0];
@@ -279,9 +298,24 @@ void SecondaryDynamics::Impl::snapToAnimated() {
         }
     }
     accumulator = 0.0;
+    renderAlpha = 0.0f;
 }
 
-Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain) const {
+void SecondaryDynamics::Impl::interpolateStepTarget(Chain& chain, double fraction) {
+    const std::size_t count = chain.animated.size();
+    chain.stepTarget.resize(count);
+    const bool haveHistory = chain.animatedPrevFrame.size() == count;
+    const float t = static_cast<float>(std::clamp(fraction, 0.0, 1.0));
+    for (std::size_t i = 0; i < count; ++i) {
+        // Exactly the current frame's target at the frame's end, so a step that lands on
+        // the frame boundary matches the rendered animation bit for bit.
+        chain.stepTarget[i] = (!haveHistory || t >= 1.0f)
+                                  ? chain.animated[i]
+                                  : math::lerp(chain.animatedPrevFrame[i], chain.animated[i], t);
+    }
+}
+
+Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain, const std::vector<Vec3>& target) const {
     if (chain.parentChain >= 0 &&
         static_cast<std::size_t>(chain.parentChain) < chains.size()) {
         const Chain& parent = chains[static_cast<std::size_t>(chain.parentChain)];
@@ -290,10 +324,11 @@ Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain) const {
             return parent.current[index];
         }
     }
-    return chain.animated.empty() ? Vec3{} : chain.animated[0];
+    return target.empty() ? Vec3{} : target[0];
 }
 
-void SecondaryDynamics::Impl::solveConstraints(Chain& chain, Vec3 anchor) {
+void SecondaryDynamics::Impl::solveConstraints(Chain& chain, Vec3 anchor,
+                                               const std::vector<Vec3>& target) {
     if (chain.nodes.empty()) {
         return;
     }
@@ -304,7 +339,7 @@ void SecondaryDynamics::Impl::solveConstraints(Chain& chain, Vec3 anchor) {
             Vec3 direction = chain.current[i] - chain.current[i - 1];
             const float length = direction.length();
             if (!std::isfinite(length) || length < kTiny) {
-                direction = safeNormalize(chain.animated[i] - chain.animated[i - 1]);
+                direction = safeNormalize(target[i] - target[i - 1]);
                 if (direction.lengthSquared() < 0.5f) {
                     direction = {0.0f, -1.0f, 0.0f};
                 }
@@ -352,13 +387,20 @@ void SecondaryDynamics::Impl::solveConstraints(Chain& chain, Vec3 anchor) {
 }
 
 void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settings,
-                                   float stepSeconds) {
+                                   float stepSeconds, const std::vector<Vec3>& target) {
     if (chain.nodes.empty()) {
         return;
     }
-    const Vec3 anchor = anchorOf(chain);
+    const Vec3 anchor = anchorOf(chain, target);
     chain.current[0] = anchor;
     chain.previous[0] = anchor;
+    // The state before this step pairs with the target it was produced against. The
+    // root of a chain is pinned to its own target, so its entry is that target.
+    chain.animPrev = chain.animCur;
+    if (chain.animPrev.size() != target.size()) {
+        chain.animPrev = target;
+    }
+    chain.animPrev[0] = target[0];
 
     // Position-based Verlet with a fixed step. Units are explicit:
     //   displacement per step  d = current - previous           [m]
@@ -390,7 +432,7 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
         }
         displacement = displacement * decay;
         const Vec3 acceleration =
-            (chain.animated[i] - chain.current[i]) * (omega * omega) + gravity;
+            (target[i] - chain.current[i]) * (omega * omega) + gravity;
         displacement += acceleration * dt2;
         const float speed = displacement.length() / stepSeconds;  // m/s
         if (speed > maxSpeed) {
@@ -399,24 +441,26 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
         chain.previous[i] = chain.current[i];
         chain.current[i] += displacement;
         // Keep values bounded even if a host feeds a pathological chain.
-        Vec3 offset = chain.current[i] - chain.animated[i];
+        Vec3 offset = chain.current[i] - target[i];
         const float distance = offset.length();
         if (!std::isfinite(distance)) {
-            chain.current[i] = chain.animated[i];
-            chain.previous[i] = chain.animated[i];
+            chain.current[i] = target[i];
+            chain.previous[i] = target[i];
         } else if (distance > maxDisplacement) {
-            chain.current[i] = chain.animated[i] + offset / distance * maxDisplacement;
+            chain.current[i] = target[i] + offset / distance * maxDisplacement;
         }
     }
-    solveConstraints(chain, anchor);
+    solveConstraints(chain, anchor, target);
     for (std::size_t i = 1; i < chain.current.size(); ++i) {
         chain.velocity[i] = (chain.current[i] - chain.previous[i]) / stepSeconds;  // m/s
     }
+    chain.animCur = target;
 }
 
 void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
                                         const SecondarySettings& settings) {
     const float intensity = std::clamp(settings.intensity, 0.0f, 2.0f);
+    renderAlpha = static_cast<float>(std::clamp(accumulator / kFixedStep, 0.0, 1.0));
     // Simulation points live in stage space (root yaw/translation applied) but
     // node rotations in the pose are character space. A direction change measured
     // in stage space must be re-expressed in the character frame before it is
@@ -427,16 +471,34 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
         const std::size_t points = chain.pointCount();
         std::vector<Vec3> rendered(points);
         for (std::size_t i = 0; i < points; ++i) {
-            Vec3 offset = chain.current[i] - chain.animated[i];
+            // Render interpolation on the OFFSET from the animated target. Interpolating
+            // absolute positions and then subtracting this frame's animated pose lags by
+            // up to one fixed step: a body moving at 2 m/s would show about 1.7 cm of
+            // false trailing. Each offset here is taken against the target of its own
+            // step, so a steadily moving chain has a constant offset and no lag. The
+            // render time lies after the last step, so the offset is one step behind
+            // during fast transients only. The simulation state is never changed here.
+            const Vec3 previousTarget =
+                i < chain.animPrev.size() ? chain.animPrev[i] : chain.animated[i];
+            const Vec3 currentTarget =
+                i < chain.animCur.size() ? chain.animCur[i] : chain.animated[i];
+            const Vec3 previousState =
+                i < chain.previous.size() ? chain.previous[i] : chain.current[i];
+            const Vec3 previousOffset = previousState - previousTarget;
+            const Vec3 currentOffset = chain.current[i] - currentTarget;
+            Vec3 offset = math::lerp(previousOffset, currentOffset, renderAlpha);
             if (!finiteVec(offset)) {
                 offset = {};
             }
             rendered[i] = chain.animated[i] + offset * intensity;
         }
+        // The written limit sits a micron-scale margin inside the authored one: the
+        // round trip through the stage and character frames carries float error of
+        // the same order, and a point must never be reported beyond the limit.
         const float maxDisplacement =
             std::min(std::max(0.005f, settings.maxDisplacement),
                      std::max(0.006f, chain.totalRest * 0.45f)) *
-            std::max(1.0f, intensity);
+            std::max(1.0f, intensity) * (1.0f - 1.0e-4f);
         for (std::size_t i = 0; i < points; ++i) {
             Vec3 offset = rendered[i] - chain.animated[i];
             const float distance = offset.length();
@@ -580,12 +642,22 @@ void SecondaryDynamics::update(RetargetedPose& pose, double deltaSeconds,
             std::chrono::duration<double, std::milli>(Clock::now() - started).count();
         return;
     }
+    const double accumulatedBefore = impl_->accumulator;
     impl_->accumulator = std::min(impl_->accumulator + deltaSeconds, kMaxAccumulated);
     int steps = 0;
     const int maxSteps = std::clamp(settings.maxSubsteps, 1, 32);
     while (impl_->accumulator >= kFixedStep && steps < maxSteps) {
+        // Step number `steps + 1` happens this far into the frame. Its animated target is
+        // taken at that moment, not at the frame start, so the spring is driven by the
+        // animation at the time it simulates.
+        const double stepEnd = static_cast<double>(steps + 1) * kFixedStep - accumulatedBefore;
+        const double fraction = stepEnd / deltaSeconds;
         for (auto& chain : impl_->chains) {
-            impl_->step(chain, settings, static_cast<float>(kFixedStep));
+            if (chain.nodes.empty()) {
+                continue;
+            }
+            impl_->interpolateStepTarget(chain, fraction);
+            impl_->step(chain, settings, static_cast<float>(kFixedStep), chain.stepTarget);
         }
         impl_->accumulator -= kFixedStep;
         ++steps;

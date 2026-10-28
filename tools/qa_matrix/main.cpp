@@ -12,8 +12,9 @@
 // formula earlier reports used.
 //
 // Seek error replays the clip from a fresh player that jumps straight to a few of the
-// sampled times and compares every node with the sequential replay (spring off only:
-// the spring carries history by design).
+// sampled times, lets the 0.18 s seek hand-over settle (0.25 s), and compares every node
+// with the sequential replay at that time (spring off only: the spring carries history
+// by design).
 //
 // Not measured here: skinned-mesh triangle intersections. They need the real mesh, so
 // run bgmedia_motion_diag with the private model for those.
@@ -207,11 +208,19 @@ Scenario runScenario(const std::string& modelName, const vrm::VrmModel& model,
     s.samples = std::max(2, static_cast<int>(std::lround(o.seconds * fps))) + 1;
 
     // Seek points are spread evenly over the replay. The spring carries history by
-    // design, so the seek comparison runs with it off.
-    std::vector<int> seekAt;
+    // design, so the seek comparison runs with it off. A jump is judged at a settle point
+    // 0.25 s later: DancePlayer hands the pose over for 0.18 s after a jump, and the
+    // schedule itself is what the seek must reproduce.
+    const int settleSteps = static_cast<int>(std::lround(0.25 * fps));
+    std::vector<int> jumpAt;
     if (!spring) {
-        for (int j = 1; j <= o.seekPoints; ++j) seekAt.push_back(j * (s.samples - 1) / (o.seekPoints + 1));
+        for (int j = 1; j <= o.seekPoints; ++j) {
+            const int at = j * (s.samples - 1) / (o.seekPoints + 1);
+            if (at + settleSteps < s.samples) jumpAt.push_back(at);
+        }
     }
+    std::vector<int> seekAt = jumpAt;
+    for (int at : jumpAt) seekAt.push_back(at + settleSteps);
     const Replay reference = replay(model, rig, o, clip, overlay, spring, kReferenceHz, {});
     const Replay sampled = replay(model, rig, o, clip, overlay, spring, fps, seekAt);
     s.ikErrorMm = sampled.worstIk * 1000.0;
@@ -225,22 +234,24 @@ Scenario runScenario(const std::string& modelName, const vrm::VrmModel& model,
         s.slideMm = std::max(s.slideMm, maxPlantedSlide(sampled.track[ft], slideT) * 1000.0);
     }
 
-    if (!seekAt.empty()) {
+    if (!jumpAt.empty()) {
         s.seekMm = 0.0;
-        for (std::size_t j = 0; j < seekAt.size(); ++j) {
+        for (std::size_t j = 0; j < jumpAt.size(); ++j) {
             motion::DancePlayer jumper;
             configurePlayer(jumper, rig, o.dances, overlay);
             if (!jumper.selectClip(clip, o.from, true)) {
                 throw std::runtime_error("clip not found in the library: " + clip);
             }
-            // Start from the replay's first time so the jump goes through the seek path
-            // (DancePlayer only reseeds when it has an earlier update to compare with).
-            jumper.update(o.from);
-            const double t = o.from + seekAt[j] / fps;
+            // Start from the replay's first time so the jump goes through the seek path.
+            (void)jumper.update(o.from);
+            const double t = o.from + jumpAt[j] / fps;
+            (void)jumper.update(t);
+            const double settle = o.from + (jumpAt[j] + settleSteps) / fps;
             const std::vector<Vec3> nodes = nodePositions(
-                rig.applyClip(jumper.update(t).pose, t), model.nodes.size());
+                rig.applyClip(jumper.update(settle).pose, settle), model.nodes.size());
+            const std::vector<Vec3>& expected = sampled.seekNodes[jumpAt.size() + j];
             for (std::size_t n = 0; n < nodes.size(); ++n) {
-                s.seekMm = std::max(s.seekMm, (nodes[n] - sampled.seekNodes[j][n]).length() * 1000.0);
+                s.seekMm = std::max(s.seekMm, (nodes[n] - expected[n]).length() * 1000.0);
             }
         }
     }

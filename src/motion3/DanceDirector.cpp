@@ -13,6 +13,28 @@ float smootherstep(float t) {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
+// Search window of the planted-foot hand-over (A1): the next swing of the foot is looked for
+// over at most this many seconds after the fade starts.
+constexpr double kHandOverWindow = 4.0;
+constexpr double kHandOverStep = 1.0 / 60.0;
+constexpr double kHandOverMinSwing = 0.25;  // seconds a hand-over swing must last
+constexpr int kHandOverSamples = static_cast<int>(kHandOverWindow / kHandOverStep);
+
+// A segment's hand-over can hold its feet until this media time. Every place that keeps or
+// drops segments uses this one lifetime, so a predecessor is never dropped while it still
+// anchors a planted foot.
+// A swing found in the window ends inside it, but a rebase to a slower tempo can move it
+// later; its own end then extends the lifetime.
+double handOverEnd(const ScheduleSegment& segment) {
+    double end = segment.startTime + segment.fadeSeconds + kHandOverWindow;
+    for (const auto& window : segment.footSwing) {
+        if (window.resolved && !window.slide) {
+            end = std::max(end, window.end);
+        }
+    }
+    return end;
+}
+
 double circularDistance(double a, double b, double period) {
     double d = std::fmod(std::abs(a - b), period);
     return std::min(d, period - d);
@@ -89,6 +111,20 @@ float accentAtNextBoundary(const ScheduleSegment& segment, double musicBeat,
                           : std::clamp(std::max(0.35f, beatConfidence), 0.0f, 1.0f);
     }
     return std::clamp(accent, 0.0f, 1.0f);
+}
+
+// Inverse of the linear (unwarped) clip-beat mapping: the media time at which `segment`
+// reaches linear clip beat `beat` on `clock`.
+double timeAtLinearClipBeat(const ScheduleSegment& segment, double beat, const BeatClock& clock) {
+    if (!segment.clip) {
+        return segment.alignTime;
+    }
+    if (!segment.clip->tempoSync) {
+        return segment.alignTime + (beat - segment.entryClipBeat) * 60.0 / segment.clip->bpm;
+    }
+    const double rate = std::max(segment.rate, 1e-6);
+    return clock.timeAtBeat(clock.beatAt(segment.alignTime) +
+                            (beat - segment.entryClipBeat) / rate);
 }
 
 Mapping mapSegment(const ScheduleSegment& segment, double mediaTime,
@@ -223,6 +259,28 @@ void DanceSchedule::append(ScheduleSegment segment) {
     segments_.push_back(std::move(segment));
 }
 
+void DanceSchedule::append(ScheduleSegment segment, const MusicalTimeline& timeline,
+                           const WarpProfile& warp) {
+    const std::size_t before = segments_.size();
+    append(std::move(segment));
+    if (segments_.size() > before && segments_.size() > 1) {
+        const std::size_t index = segments_.size() - 1;
+        for (int foot = 0; foot < 2; ++foot) {
+            segments_[index].footSwing[static_cast<std::size_t>(foot)] =
+                findFootSwing(index, foot, timeline, warp);
+        }
+    }
+}
+
+void DanceSchedule::refreshFootSwings(const MusicalTimeline& timeline, const WarpProfile& warp) {
+    for (std::size_t index = 1; index < segments_.size(); ++index) {
+        for (int foot = 0; foot < 2; ++foot) {
+            segments_[index].footSwing[static_cast<std::size_t>(foot)] =
+                findFootSwing(index, foot, timeline, warp);
+        }
+    }
+}
+
 void DanceSchedule::truncateAfter(double time) {
     while (segments_.size() > 1 && segments_.back().startTime > time) {
         segments_.pop_back();
@@ -232,8 +290,7 @@ void DanceSchedule::truncateAfter(double time) {
 void DanceSchedule::pruneBefore(double time, std::size_t keepAtLeast) {
     // Drop segments whose blend finished long before `time`; the newest
     // surviving one is the new base and no longer needs a predecessor.
-    while (segments_.size() > keepAtLeast &&
-           segments_[1].startTime + segments_[1].fadeSeconds < time - 5.0) {
+    while (segments_.size() > keepAtLeast && handOverEnd(segments_[1]) < time - 5.0) {
         segments_.erase(segments_.begin());
     }
 }
@@ -281,16 +338,79 @@ bool isInertialBone(std::size_t bone) {
            (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
 }
 
-// Critically damped decay of an offset, rescaled so it is exactly 1 at the transition
-// start and exactly 0 at the fade's end (no jump when the blend hands over to the
-// incoming clip). The slope at the start is non-zero, so the outgoing motion is carried
-// forward rather than eased to rest.
-float inertialDecay(double elapsed, double fadeSeconds) {
-    constexpr double kLambdaFades = 5.0;
-    const auto raw = [](double x) { return (1.0 + x) * std::exp(-x); };
-    const double atEnd = raw(kLambdaFades);
-    const double x = std::max(elapsed, 0.0) / fadeSeconds * kLambdaFades;
-    return static_cast<float>(std::max(0.0, (raw(x) - atEnd) / (1.0 - atEnd)));
+// Inertialization of a bone offset (BG Motion 3.3, A8). The offset is a rotation vector o
+// (axis times angle). In decay time x = elapsed * 5 / fade it follows
+//   o(x) = o0 p(x) + v q(x) - g(x) (o0 p(5) + v q(5)) - h(x) S,
+// with p(x) = (1 + x) e^-x and q(x) = x e^-x, so o(0) = o0 and the slope at 0 is the offset's
+// own velocity v (in decay time). g(x) = u^2 (3 - 2u), u = min(x / 5, 1), brings the offset to
+// exactly 0 at the fade's end; h(x) = u^2 (u - 1) times S, the slope (per u) of the first
+// two terms at x = 5, makes the slope 0 there too, so the hand-over to the incoming clip has
+// no step in value or velocity.
+// The offset's velocity is carried through the fade start: the outgoing motion goes on, and
+// the incoming clip's own motion is added to it.
+using RotationVector = std::array<double, 3>;
+
+// The rotation vector of q as given: the caller picks the quaternion sign. Flipping it here
+// instead would move the vector to the opposite side at a half turn (w changing sign between
+// two samples), which reads as a velocity spike.
+RotationVector rotationVectorOf(const Quat& q) {
+    const double x = q.x;
+    const double y = q.y;
+    const double z = q.z;
+    const double w = q.w;
+    const double s = std::sqrt(x * x + y * y + z * z);
+    const double angle = 2.0 * std::atan2(s, w);
+    const double k = s > 1.0e-12 ? angle / s : 2.0;
+    return {k * x, k * y, k * z};
+}
+
+Quat quaternionOf(const RotationVector& v) {
+    const double angle = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (angle < 1.0e-12) {
+        return Quat{static_cast<float>(v[0] * 0.5), static_cast<float>(v[1] * 0.5),
+                    static_cast<float>(v[2] * 0.5), 1.0f}
+            .normalized();
+    }
+    const double k = std::sin(angle * 0.5) / angle;
+    return Quat{static_cast<float>(k * v[0]), static_cast<float>(k * v[1]),
+                static_cast<float>(k * v[2]), static_cast<float>(std::cos(angle * 0.5))}
+        .normalized();
+}
+
+// `o0` is the offset at the transition start, `velocity` its rate of change (rad/s).
+Quat inertialOffset(const RotationVector& o0, const RotationVector& velocity, double elapsed,
+                    double fadeSeconds) {
+    constexpr double kLambda = 5.0;
+    // Velocity in decay time: d/dx = (fade / lambda) d/dt.
+    const double scale = fadeSeconds / kLambda;
+    const double x = std::min(std::max(elapsed, 0.0) / fadeSeconds, 1.0) * kLambda;
+    const auto raw = [&](double at) {
+        const double p = (1.0 + at) * std::exp(-at);
+        const double q = at * std::exp(-at);
+        RotationVector r{};
+        for (std::size_t i = 0; i < 3; ++i) {
+            r[i] = o0[i] * p + velocity[i] * scale * q;
+        }
+        return r;
+    };
+    const RotationVector atX = raw(x);
+    const RotationVector atEnd = raw(kLambda);
+    // Slope of raw at the end, per unit u = x / lambda: p'(x) = -x e^-x, q'(x) = (1 - x) e^-x.
+    const double e = std::exp(-kLambda);
+    RotationVector slopeEnd{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        slopeEnd[i] = kLambda * (o0[i] * (-kLambda * e) + velocity[i] * scale * (1.0 - kLambda) * e);
+    }
+    // Cubic Hermite correction: g takes the end value away (g(1) = 1, g'(1) = 0) and h the end
+    // slope (h(1) = 0, h'(1) = 1); both are flat at u = 0, so the start keeps o0 and its slope.
+    const double u = x / kLambda;
+    const double g = u * u * (3.0 - 2.0 * u);
+    const double hEnd = u * u * (u - 1.0);
+    RotationVector o{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        o[i] = atX[i] - g * atEnd[i] - hEnd * slopeEnd[i];
+    }
+    return quaternionOf(o);
 }
 
 } // namespace
@@ -396,6 +516,126 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
     return own;
 }
 
+namespace {
+
+// Grid samples of one segment's foot contact, from the start of the fade.
+struct SwingSamples {
+    int begin = -1;  // sample index where the foot leaves the ground
+    int end = -1;    // sample index where it lands again
+};
+
+SwingSamples findSwingSamples(const ScheduleSegment& segment, int foot, double start,
+                              const MusicalTimeline& timeline, const WarpProfile& warp) {
+    // The feet of a pose always come from the linear (unwarped) clip beat: the warp moves
+    // the upper body only. The search reads the same beat, so it agrees with the pose.
+    const auto contactAt = [&](int k) {
+        if (!segment.clip) return 0.0f;
+        const Mapping mapping = mapSegment(segment, start + k * kHandOverStep, timeline.grid(),
+                                           &timeline, warp, false);
+        return footContactAt(*segment.clip, foot, mapping.linearBeat);
+    };
+    SwingSamples swing;
+    float previous = contactAt(0);
+    const float next = contactAt(1);
+    for (int k = 0; k <= kHandOverSamples; ++k) {
+        const float c = k == 0 ? previous : contactAt(k);
+        // A swing starts where the contact falls below one half (a lift); a foot that is
+        // already low and not rising at the fade start counts as swinging from the start.
+        // A planting ramp (rising contact) is not a swing.
+        const bool lifts = k == 0 ? (c < 0.5f && next <= c + 1e-6f)
+                                  : (previous >= 0.5f && c < 0.5f);
+        if (swing.begin < 0 && lifts) {
+            swing.begin = k;
+        } else if (swing.begin >= 0 && c >= 0.5f) {
+            // A remainder of a swing that lands within a few frames cannot carry the
+            // offset without a jump: look for the next lift instead.
+            if ((k - swing.begin) * kHandOverStep >= kHandOverMinSwing) {
+                swing.end = k;
+                break;
+            }
+            swing.begin = -1;
+        }
+        previous = c;
+    }
+    return swing;
+}
+
+} // namespace
+
+ScheduleSegment::FootSwingWindow DanceSchedule::findFootSwing(std::size_t index, int foot,
+                                                              const MusicalTimeline& timeline,
+                                                              const WarpProfile& warp) const {
+    const ScheduleSegment& incoming = segments_[index];
+    const ScheduleSegment& outgoing = segments_[index - 1];
+    const double start = incoming.startTime;
+    // The hand-over follows whichever swing of this foot comes first: the incoming clip's own
+    // swing, or the outgoing clip's next lift when the incoming clip keeps the foot planted.
+    // Only complete swings (lift and landing both inside the window) can carry the foot; an
+    // outgoing lift without a landing must not hide a complete incoming swing.
+    const SwingSamples in = findSwingSamples(incoming, foot, start, timeline, warp);
+    const SwingSamples out = findSwingSamples(outgoing, foot, start, timeline, warp);
+    const bool inComplete = in.begin >= 0 && in.end >= 0;
+    const bool outComplete = out.begin >= 0 && out.end >= 0;
+    const bool useIncoming = inComplete && (!outComplete || in.begin <= out.begin);
+    const bool useOutgoing = !useIncoming && outComplete;
+
+    ScheduleSegment::FootSwingWindow window;
+    window.resolved = true;
+    if (!useIncoming && !useOutgoing) {
+        // Neither clip swings this foot in the window: time-based hand-over inside the fade.
+        // The foot slides here; the entry choice keeps this rare.
+        window.slide = true;
+        return window;
+    }
+    const SwingSamples& swing = useIncoming ? in : out;
+    const ScheduleSegment& source = useIncoming ? incoming : outgoing;
+    window.begin = start + swing.begin * kHandOverStep;
+    window.end = start + swing.end * kHandOverStep;
+    window.beginBeat = segmentClipBeat(source, window.begin, timeline.grid());
+    window.endBeat = segmentClipBeat(source, window.end, timeline.grid());
+    window.fromOutgoing = !useIncoming;
+    return window;
+}
+
+std::array<DanceSchedule::FootHandOver, 2> DanceSchedule::footHandOver(
+    std::size_t index, double mediaTime, const MusicalTimeline& timeline,
+    const WarpProfile& warp) const {
+    const ScheduleSegment& incoming = segments_[index];
+    const double start = incoming.startTime;
+    const double fade = incoming.fadeSeconds;
+    const double linear = (mediaTime - start) / fade;
+
+    std::array<FootHandOver, 2> out;
+    for (int f = 0; f < 2; ++f) {
+        FootHandOver& hand = out[static_cast<std::size_t>(f)];
+        const auto& stored = incoming.footSwing[static_cast<std::size_t>(f)];
+        const ScheduleSegment::FootSwingWindow window =
+            stored.resolved ? stored : findFootSwing(index, f, timeline, warp);
+        if (window.slide) {
+            hand.progress = smootherstep(static_cast<float>(linear));
+            hand.active = linear < 1.0;
+            continue;
+        }
+        // Progress runs in the swing's own clip beats (the pose's feet read the same linear
+        // beat), so it stays on the swing when a rebase changes the tempo.
+        const ScheduleSegment& source = window.fromOutgoing ? segments_[index - 1] : incoming;
+        const double bA = window.beginBeat;
+        const double bB = window.endBeat;
+        const double beat = segmentClipBeat(source, mediaTime, timeline.grid());
+        if (bB <= bA || beat <= bA) {
+            hand.progress = bB <= bA && mediaTime >= window.end ? 1.0f : 0.0f;
+            hand.active = hand.progress < 1.0f;
+        } else if (beat >= bB) {
+            hand.progress = 1.0f;
+            hand.active = false;
+        } else {
+            hand.progress = smootherstep(static_cast<float>((beat - bA) / (bB - bA)));
+            hand.active = true;
+        }
+    }
+    return out;
+}
+
 ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
                                 const MusicalTimeline& timeline,
                                 const WarpProfile& warp) const {
@@ -422,8 +662,10 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
     ClipPose result;
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
-        if (u < 1.0) {
-            if (transition) {
+        // A planted foot can outlast the fade: its hand-over ends at the incoming swing.
+        const bool mayHoldFeet = mediaTime < handOverEnd(segment);
+        if (u < 1.0 || mayHoldFeet) {
+            if (transition && u < 1.0) {
                 *transition = static_cast<float>(std::clamp(u, 0.0, 1.0));
             }
             // The incoming pose is evaluated first, as before: decorator consumers rely on
@@ -435,25 +677,75 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
                 return result;
             }
             const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
-            result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
-            if (inertialTransitions_) {
+            const auto hand = footHandOver(index, mediaTime, timeline, warp);
+            const bool feetHeld = hand[0].active || hand[1].active;
+            if (u >= 1.0 && !feetHeld) {
+                memo.emplace(key, own);
+                return own;
+            }
+            if (u < 1.0) {
+                result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            } else {
+                result = own;
+            }
+            // A1: each planted foot is handed over by its own swing, not by the time blend.
+            for (std::size_t f = 0; f < 2; ++f) {
+                ClipPose::Foot& foot = result.foot[f];
+                const ClipPose::Foot& from = previous.foot[f];
+                const ClipPose::Foot& to = own.foot[f];
+                // Contact and phase follow the same progress as the position, so a foot
+                // that is moving is never reported as planted.
+                const float progress = hand[f].progress;
+                foot.position = from.position + (to.position - from.position) * progress;
+                float yawDelta = to.yaw - from.yaw;
+                yawDelta -= std::round(yawDelta);
+                foot.yaw = from.yaw + yawDelta * progress;
+                foot.contact = from.contact + (to.contact - from.contact) * progress;
+                foot.phase = progress < 0.5f ? from.phase : to.phase;
+            }
+            if (u < 1.0 && inertialTransitions_) {
                 // Inertialization: the offset between the outgoing and incoming upper body
                 // is fixed at the transition start, so it depends only on the segment and
                 // not on how the time was reached (seek and playback stay identical).
+                // The offset's velocity at the start is sampled one step later, so the
+                // outgoing motion is carried through the fade start, not frozen there.
                 const double startTime = segment.startTime;
+                constexpr double kVelocityStep = 1.0 / 240.0;
                 const ClipPose outgoingAtStart =
                     poseOf(index - 1, startTime, timeline, warp, nullptr, memo);
                 const ClipPose incomingAtStart = ownPose(index, startTime, timeline, warp);
-                const float decay = inertialDecay(mediaTime - startTime, segment.fadeSeconds);
+                const ClipPose outgoingNext =
+                    poseOf(index - 1, startTime + kVelocityStep, timeline, warp, nullptr, memo);
+                const ClipPose incomingNext =
+                    ownPose(index, startTime + kVelocityStep, timeline, warp);
                 for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
                     if (!isInertialBone(bone)) {
                         continue;
                     }
-                    const Quat offset =
+                    Quat offset =
                         (outgoingAtStart.bone[bone] * conjugate(incomingAtStart.bone[bone]))
                             .normalized();
-                    result.bone[bone] =
-                        (math::slerp(Quat::identity(), offset, decay) * own.bone[bone]).normalized();
+                    Quat offsetNext =
+                        (outgoingNext.bone[bone] * conjugate(incomingNext.bone[bone])).normalized();
+                    // q and -q are the same rotation. The start takes the minimal (w >= 0)
+                    // representation, and the next sample is put in the same hemisphere, so the
+                    // velocity is the change of one continuous rotation vector.
+                    if (offset.w < 0.0f) {
+                        offset = Quat{-offset.x, -offset.y, -offset.z, -offset.w};
+                    }
+                    if (dot(offset, offsetNext) < 0.0f) {
+                        offsetNext = Quat{-offsetNext.x, -offsetNext.y, -offsetNext.z,
+                                          -offsetNext.w};
+                    }
+                    const RotationVector before = rotationVectorOf(offset);
+                    const RotationVector after = rotationVectorOf(offsetNext);
+                    RotationVector velocity{};
+                    for (std::size_t i = 0; i < 3; ++i) {
+                        velocity[i] = (after[i] - before[i]) / kVelocityStep;
+                    }
+                    const Quat carried = inertialOffset(before, velocity, mediaTime - startTime,
+                                                        segment.fadeSeconds);
+                    result.bone[bone] = (carried * own.bone[bone]).normalized();
                 }
             }
             memo.emplace(key, result);
@@ -501,6 +793,16 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
     frame.transitionProgress = transition;
 
     const ScheduleSegment& current = segments_[k];
+    {
+        const auto isIdle = [](const ScheduleSegment& s) {
+            return s.clip && s.clip->style == DanceStyle::Idle ? 1.0f : 0.0f;
+        };
+        const float incoming = isIdle(current);
+        frame.idleWeight = transition >= 0.0f && k > 0
+                               ? isIdle(segments_[k - 1]) +
+                                     (incoming - isIdle(segments_[k - 1])) * transition
+                               : incoming;
+    }
     const ScheduleSegment* shown = &current;
     const ScheduleSegment* next = k + 1 < segments_.size() ? &segments_[k + 1] : nullptr;
     if (transition >= 0.0f && transition < 0.5f && k > 0) {
@@ -559,11 +861,13 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
 void DanceDirector::setBeatClock(BeatClock clock) {
     clock_ = std::move(clock);
     timeline_ = MusicalTimeline::fromClock(clock_, true);
+    schedule_.refreshFootSwings(timeline_, warp_);
 }
 
 void DanceDirector::setMusicalTimeline(MusicalTimeline timeline) {
     timeline_ = std::move(timeline);
     clock_ = timeline_.grid();
+    schedule_.refreshFootSwings(timeline_, warp_);
 }
 
 const HumanoidClip* DanceDirector::clipFor(DanceStyle style) const {
@@ -731,7 +1035,9 @@ ScheduleSegment DanceDirector::makeSegment(const HumanoidClip& clip, double star
 void DanceDirector::reset(double now) {
     schedule_.clear();
     selected_ = DanceStyle::Idle;
+    selectedClip_.clear();
     if (const HumanoidClip* idle = clipFor(DanceStyle::Idle)) {
+        selectedClip_ = idle->id;
         ScheduleSegment segment;
         segment.clip = idle;
         segment.startTime = now - 1.0e6;
@@ -740,12 +1046,15 @@ void DanceDirector::reset(double now) {
         segment.reason = "idle";
         segment.meter = timeline_.beatsPerBar();
         segment.barPhaseTrusted = timeline_.downbeatTrusted();
-        schedule_.append(segment);
+        schedule_.append(segment, timeline_, warp_);
     }
 }
 
 void DanceDirector::reseed(double now) {
-    const HumanoidClip* clip = clipFor(selected_);
+    const HumanoidClip* clip = library_ ? library_->find(selectedClip_) : nullptr;
+    if (!clip) {
+        clip = clipFor(selected_);
+    }
     if (!clip) {
         clip = clipFor(DanceStyle::Idle);
     }
@@ -774,7 +1083,7 @@ void DanceDirector::reseed(double now) {
         segment.entryClipBeat = 0.0;
     }
     segment.reason = "re-aligned after seek";
-    schedule_.append(segment);
+    schedule_.append(segment, timeline_, warp_);
 }
 
 void DanceDirector::rebase(double now, BeatClock newClock) {
@@ -782,26 +1091,10 @@ void DanceDirector::rebase(double now, BeatClock newClock) {
         setBeatClock(std::move(newClock));
         return;
     }
-    const auto& segments = schedule_.segments();
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < segments.size(); ++i) {
-        if (segments[i].startTime <= now) {
-            k = i;
-        }
-    }
-    ScheduleSegment segment = segments[k];
-    segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
-    setBeatClock(std::move(newClock));
-    segment.alignTime = now;
-    segment.startTime = now - 1.0e6;
-    segment.fadeSeconds = 0.0;
-    if (segment.clip->tempoSync) {
-        segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
-    }
-    segment.meter = timeline_.beatsPerBar();
-    segment.barPhaseTrusted = timeline_.downbeatTrusted();
-    schedule_.clear();
-    schedule_.append(segment);
+    const BeatClock before = clock_;
+    clock_ = std::move(newClock);
+    timeline_ = MusicalTimeline::fromClock(clock_, true);
+    reanchorSchedule(now, before);
 }
 
 void DanceDirector::rebase(double now, MusicalTimeline newTimeline) {
@@ -809,28 +1102,106 @@ void DanceDirector::rebase(double now, MusicalTimeline newTimeline) {
         setMusicalTimeline(std::move(newTimeline));
         return;
     }
-    const auto& segments = schedule_.segments();
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < segments.size(); ++i) {
-        if (segments[i].startTime <= now) {
-            k = i;
+    const BeatClock before = clock_;
+    timeline_ = std::move(newTimeline);
+    clock_ = timeline_.grid();
+    reanchorSchedule(now, before);
+}
+
+void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
+    // Segments are kept, not collapsed: the schedule holds the outgoing and incoming
+    // clips of a crossfade in progress and any queued one-shot return.
+    const std::vector<ScheduleSegment> old = schedule_.segments();
+    std::size_t first = old.size();
+    for (std::size_t i = 0; i < old.size(); ++i) {
+        if (handOverEnd(old[i]) > now) {
+            first = i;
+            break;
         }
     }
-    ScheduleSegment segment = segments[k];
-    segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
-    const double previousBeat = segment.entryClipBeat;
-    setMusicalTimeline(std::move(newTimeline));
-    segment.alignTime = now;
-    segment.startTime = now - 1.0e6;
-    segment.fadeSeconds = 0.0;
-    if (segment.clip->tempoSync) {
-        segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
+    // The segment before `first` is the base at `now`, or the outgoing side of the fade in
+    // progress. Segments before it have finished blending and no longer affect the pose.
+    const std::size_t keepFrom = first == 0 ? 0 : first - 1;
+    std::vector<ScheduleSegment> kept;
+    std::vector<bool> pending(old.size(), false);  // by index in `kept`
+    for (std::size_t i = keepFrom; i < old.size(); ++i) {
+        ScheduleSegment segment = old[i];
+        if (!segment.clip) {
+            continue;
+        }
+        if (segment.startTime <= now) {
+            // Active or blending: the clip beat at `now` is preserved, and the mapping
+            // restarts from `now` on the new grid. startTime and fadeSeconds are kept, so an
+            // in-progress crossfade keeps its progress.
+            segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, before);
+            segment.alignTime = now;
+            if (segment.clip->tempoSync) {
+                segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
+            }
+            segment.meter = timeline_.beatsPerBar();
+            segment.barPhaseTrusted = timeline_.downbeatTrusted();
+        } else {
+            // Pending: keep the musical beat it was aligned to, placed on the new grid.
+            const double oldAlign = segment.alignTime;
+            double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
+            double fade = segment.fadeSeconds;
+            const bool oneShotReturn = segment.reason == "one-shot finished" && !kept.empty() &&
+                                       !kept.back().loop && kept.back().clip->tempoSync;
+            if (oneShotReturn) {
+                // A one-shot's return follows the one-shot's own end: the rebased clip keeps
+                // its beat at `now` and plays its remaining beats at the new rate.
+                const ScheduleSegment& shot = kept.back();
+                alignTime = timeAtLinearClipBeat(shot, shot.clip->beats, clock_);
+                fade = fadeFor(alignTime);
+            } else if (alignTime < now) {
+                // A faster grid moved the entry into the past: enter again as a fresh
+                // selection at `now` would, so the clip does not start mid-way past its
+                // entry (and past the swing that carries its planted feet over).
+                double error = 0.0;
+                bool aligned = false;
+                alignTime = segment.clip->tempoSync
+                                ? entryTimeFor(*segment.clip, now, &aligned, &error)
+                                : now;
+            }
+            const bool loop = segment.loop;
+            const std::string reason = segment.reason;
+            const double alignmentError = segment.alignmentErrorSeconds;
+            segment = makeSegment(*segment.clip, std::max(now, alignTime - fade * 0.5),
+                                  alignTime, fade);
+            segment.loop = loop;
+            segment.reason = reason;
+            segment.alignmentErrorSeconds = alignmentError;
+            // Nothing of a pending segment has been shown yet, so its planted-foot swings
+            // are searched again from its new start on the new grid (append below). Kept
+            // windows could land before that start when a faster grid moves the entry into
+            // the past, and the hand-over would then be complete on its first frame.
+            pending[kept.size()] = true;
+        }
+        kept.push_back(std::move(segment));
     }
-    segment.entryClipBeat = previousBeat;
-    segment.meter = timeline_.beatsPerBar();
-    segment.barPhaseTrusted = timeline_.downbeatTrusted();
+    // The swing windows' media seconds follow their clip beats on the new grid, so the
+    // hand-over lifetime (handOverEnd) lasts until the rebased swing has landed.
+    for (std::size_t k = 1; k < kept.size(); ++k) {
+        if (pending[k]) {
+            continue;
+        }
+        for (auto& window : kept[k].footSwing) {
+            if (!window.resolved || window.slide) {
+                continue;
+            }
+            const ScheduleSegment& source = window.fromOutgoing ? kept[k - 1] : kept[k];
+            window.begin = timeAtLinearClipBeat(source, window.beginBeat, clock_);
+            window.end = timeAtLinearClipBeat(source, window.endBeat, clock_);
+        }
+    }
     schedule_.clear();
-    schedule_.append(segment);
+    for (std::size_t k = 0; k < kept.size(); ++k) {
+        if (pending[k]) {
+            schedule_.append(std::move(kept[k]), timeline_, warp_);
+        } else {
+            schedule_.append(std::move(kept[k]));
+        }
+    }
 }
 
 void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool immediate) {
@@ -842,6 +1213,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
         reset(now - 0.01);
     }
     selected_ = style;
+    selectedClip_ = clip->id;
     schedule_.truncateAfter(now);
 
     double align = now;
@@ -857,7 +1229,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
     segment.alignedToDownbeat = aligned || segment.alignedToDownbeat;
     segment.alignmentErrorSeconds = alignmentError;
     segment.reason = oneShot ? "manual one-shot" : "manual";
-    schedule_.append(segment);
+    schedule_.append(segment, timeline_, warp_);
 
     if (oneShot && clip->tempoSync) {
         const ScheduleSegment& placed = schedule_.segments().back();
@@ -869,7 +1241,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
-            schedule_.append(back);
+            schedule_.append(back, timeline_, warp_);
         }
     }
     schedule_.pruneBefore(now);
@@ -885,6 +1257,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
         reset(now - 0.01);
     }
     selected_ = clip->style;
+    selectedClip_ = clip->id;
     schedule_.truncateAfter(now);
 
     double align = now;
@@ -900,7 +1273,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
     segment.alignedToDownbeat = aligned || segment.alignedToDownbeat;
     segment.alignmentErrorSeconds = alignmentError;
     segment.reason = "manual clip";
-    schedule_.append(segment);
+    schedule_.append(segment, timeline_, warp_);
     if (oneShot && clip->tempoSync) {
         const ScheduleSegment& placed = schedule_.segments().back();
         const double endBeat =
@@ -911,7 +1284,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
-            schedule_.append(back);
+            schedule_.append(back, timeline_, warp_);
         }
     }
     schedule_.pruneBefore(now);
@@ -967,9 +1340,10 @@ void DanceDirector::startSequence(const std::vector<DanceStyle>& styles, double 
         segment.alignedToDownbeat = first ? (firstAligned || segment.alignedToDownbeat)
                                           : segment.alignedToDownbeat;
         segment.reason = "sequence";
-        schedule_.append(segment);
+        schedule_.append(segment, timeline_, warp_);
         first = false;
         selected_ = style;
+        selectedClip_ = clip->id;
         beat += step;
     }
 }
@@ -1188,7 +1562,7 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         const double start = std::max(0.0, align - fade * 0.5);
         ScheduleSegment segment = makeSegment(*clip, start, align, fade);
         segment.reason = entry.reason;
-        schedule_.append(segment);
+        schedule_.append(segment, timeline_, warp_);
         anySegment = true;
     }
     selected_ = DanceStyle::Groove;

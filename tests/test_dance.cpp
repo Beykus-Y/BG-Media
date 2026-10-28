@@ -588,9 +588,21 @@ TEST_CASE(dance.transitions_are_continuous_between_all_styles) {
                                          motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
                                          motion::DanceStyle::Energetic};
     for (double bpm : {80.0, 123.0, 180.0}) {
-        for (motion::DanceStyle from : styles) {
-            for (motion::DanceStyle to : styles) {
-                if (from == to) continue;
+        // Foot speed of each style on its own (authored motion, no transition). A transition
+        // may not move a foot faster than the authored motion of the styles it joins.
+        double steadyFoot[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+        for (std::size_t s = 0; s < 5; ++s) {
+            motion::DanceDirector steady(&library());
+            steady.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+            steady.reset(0.0);
+            steady.select(styles[s], 0.0, false, true);
+            steadyFoot[s] = qa::measureWindow(steady, 2.0, 12.0, 240.0).maxFootStep;
+        }
+        for (std::size_t fromIndex = 0; fromIndex < 5; ++fromIndex) {
+            for (std::size_t toIndex = 0; toIndex < 5; ++toIndex) {
+                if (fromIndex == toIndex) continue;
+                const motion::DanceStyle from = styles[fromIndex];
+                const motion::DanceStyle to = styles[toIndex];
                 motion::DanceDirector director(&library());
                 director.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
                 director.reset(0.0);
@@ -603,7 +615,13 @@ TEST_CASE(dance.transitions_are_continuous_between_all_styles) {
                 CHECK(j.maxAngularAcceleration < 4.0e4);
                 CHECK(j.maxHipsStep < 0.006);
                 CHECK(j.maxRootStep < 0.006);
-                CHECK(j.maxFootStep < 0.02);             // no teleporting feet
+                // No teleporting feet. The largest step of a foot per 240 Hz frame must stay
+                // within the authored foot speed of the two styles (the crossfade adds no
+                // foot motion of its own), or within 3 m/s on a 1.7 m model, whichever is
+                // larger: a 25 cm stance change has to fit inside one swing.
+                const double authored = std::max(steadyFoot[fromIndex], steadyFoot[toIndex]);
+                const double physical = 3.0 / (1.7 * 240.0);
+                CHECK(j.maxFootStep < std::max(1.25 * authored, physical));
             }
         }
     }
@@ -626,7 +644,7 @@ TEST_CASE(dance.repeated_switching_stays_stable) {
     CHECK(j.finite);
     CHECK(j.maxAngularSpeed < 1100.0);
     CHECK(j.maxHipsStep < 0.008);
-    CHECK(j.maxFootStep < 0.025);
+    CHECK(j.maxFootStep < 0.025);   // switching every 0.2-0.5 s is faster than any real dance; loose on purpose
     CHECK(director.schedule().segments().size() < 80);
 }
 
@@ -773,4 +791,484 @@ TEST_CASE(dance.tempo_change_does_not_jump_the_pose) {
     }
     CHECK(worst < 0.1);
     CHECK_NEAR(before.clipBeat, after.clipBeat, 1e-6);
+}
+
+// Largest travel of a foot the viewer sees as planted (blended contact >= 0.999) while the
+// crossfade runs, including the window in which a planted foot waits for the incoming
+// swing. Each planted run is anchored at its first sample. Returns metres.
+namespace {
+struct PlantedTravel {
+    double worstM = 0.0;
+    double worstT = 0.0;
+    int worstFoot = 0;
+};
+
+PlantedTravel plantedTravelAcrossFade(motion::DanceDirector& director, double heightMetres) {
+    PlantedTravel out;
+    const auto& segs = director.schedule().segments();
+    if (segs.size() < 2) return out;
+    const motion::ScheduleSegment& incoming = segs.back();
+    const double t0 = incoming.startTime;
+    const double t1 = incoming.startTime + incoming.fadeSeconds + 2.0;
+    const double dt = 1.0 / 240.0;
+    for (int f = 0; f < 2; ++f) {
+        bool inRun = false;
+        math::Vec3 anchor{};
+        for (double t = t0; t <= t1 + 1e-9; t += dt) {
+            const motion::ClipPose::Foot foot = director.sample(t).pose.foot[static_cast<std::size_t>(f)];
+            if (foot.contact < 0.999f) {
+                inRun = false;
+                continue;
+            }
+            if (!inRun) {
+                inRun = true;
+                anchor = foot.position;
+                continue;
+            }
+            const double travel = (foot.position - anchor).length() * heightMetres;
+            if (travel > out.worstM) {
+                out.worstM = travel;
+                out.worstT = t;
+                out.worstFoot = f;
+            }
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE(dance.planted_feet_hold_during_fades) {
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kHeight = 1.7;
+    double worst = 0.0;
+    for (double bpm : {80.0, 123.0, 180.0}) {
+        for (motion::DanceStyle from : styles) {
+            for (motion::DanceStyle to : styles) {
+                if (from == to) continue;
+                motion::DanceDirector director(&library());
+                director.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+                director.reset(0.0);
+                director.select(from, 0.0, false, true);
+                const double switchAt = 60.0 / bpm * 9.37;
+                director.select(to, switchAt);
+                const PlantedTravel travel = plantedTravelAcrossFade(director, kHeight);
+                CHECK(travel.worstM < 0.005);   // under 5 mm of slide per planted run
+                worst = std::max(worst, travel.worstM);
+            }
+        }
+    }
+    CHECK(worst < 0.005);
+}
+
+namespace {
+
+double worstBoneAngle(const motion::ClipPose& a, const motion::ClipPose& b) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
+        worst = std::max(worst, qa::angleBetween(a.bone[i], b.bone[i]));
+    }
+    return worst;
+}
+
+// A player that plays `clipId` from time zero without any jump: the reference for
+// "where the dance should be" at a given media time.
+void steadyPlayer(motion::DancePlayer& player, const std::string& clipId) {
+    player.loadLibrary(dancesDir());
+    player.setGrid(motion::BeatClock::constant(100.0, 0.0), 0.0);
+    if (!player.selectClip(clipId, 0.0, true)) {
+        throw std::runtime_error("clip not found in the library: " + clipId);
+    }
+}
+
+} // namespace
+
+TEST_CASE(dance.seek_keeps_a_generated_clip) {
+    // Generated Custom clips share one style with the other showcase clips. A seek must
+    // keep playing the selected clip, not the first clip of that style.
+    motion::DancePlayer player;
+    steadyPlayer(player, "streetCurrent");
+    for (double t : {50.0, 3.0, 120.0, 7.5, 0.25}) {
+        CHECK(player.update(t).clipId == "streetCurrent");
+    }
+    CHECK(player.selectedStyle() == motion::DanceStyle::Custom);
+}
+
+TEST_CASE(dance.hitch_does_not_move_the_pose) {
+    // A stall of more than half a second is a jump of the host clock, not a new pose.
+    motion::DancePlayer player;
+    steadyPlayer(player, "groove");
+    const motion::DanceFrame before = player.update(10.0);
+    const motion::DanceFrame after = player.update(10.6);
+    CHECK(worstBoneAngle(before.pose, after.pose) < 1e-3);
+    // ...and playback picks the schedule up again: after the blend it is the pure pose.
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "groove");
+    const motion::DanceFrame settled = player.update(10.6 + 0.25);
+    CHECK(worstBoneAngle(settled.pose, reference.update(10.85).pose) < 1e-3);
+    CHECK(std::abs(settled.pose.hips.y - reference.update(10.85).pose.hips.y) < 1e-4);
+}
+
+TEST_CASE(dance.seek_never_pops) {
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    motion::DancePlayer referenceAt60;
+    steadyPlayer(referenceAt60, "hiphop");
+    const motion::DanceFrame before = player.update(10.0);
+    // seek far away: the first frame after the seek is still the pose the viewer had
+    const motion::DanceFrame jumped = player.update(60.0);
+    CHECK(worstBoneAngle(before.pose, jumped.pose) < 1e-3);
+    // the blend moves on with media time and lands on the schedule
+    const motion::DanceFrame mid = player.update(60.09);
+    CHECK(worstBoneAngle(mid.pose, jumped.pose) > 1e-4);
+    CHECK(worstBoneAngle(mid.pose, referenceAt60.update(60.09).pose) > 1e-4);
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "hiphop");
+    const motion::DanceFrame settled = player.update(60.3);
+    CHECK(worstBoneAngle(settled.pose, reference.update(60.3).pose) < 1e-3);
+}
+
+TEST_CASE(dance.seek_is_deterministic_and_pure_after_the_blend) {
+    // Two players reach the same media time by different paths: once the blend is over,
+    // the pose depends on the time only.
+    motion::DancePlayer direct;
+    steadyPlayer(direct, "sidestep");
+    motion::DancePlayer wandering;
+    steadyPlayer(wandering, "sidestep");
+    (void)wandering.update(40.0);
+    (void)wandering.update(3.0);
+    (void)wandering.update(90.0);
+    (void)direct.update(90.0);
+    const motion::DanceFrame a = direct.update(90.5);
+    const motion::DanceFrame b = wandering.update(90.5);
+    CHECK(worstBoneAngle(a.pose, b.pose) < 1e-3);
+}
+
+TEST_CASE(dance.plan_and_grid_changes_fade_from_the_current_pose) {
+    // Manual -> Auto with no music keeps the Manual dance; a tempo change in Auto must
+    // still start from the pose the viewer had, not jump to the new grid.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setGrid(motion::BeatClock::constant(100.0, 0.0), 0.0);
+    player.select(motion::DanceStyle::SideStep, 0.0, true);
+    const motion::DanceFrame before = player.update(9.0);
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    const motion::DanceFrame after = player.update(9.0);
+    CHECK(worstBoneAngle(before.pose, after.pose) < 1e-3);
+    const motion::DanceFrame next = player.update(9.02);
+    CHECK(worstBoneAngle(after.pose, next.pose) < 15.0);   // only natural motion in 20 ms
+}
+
+TEST_CASE(dance.rebase_keeps_crossfade_and_pending_one_shot_return) {
+    // A grid change in the middle of a crossfade must keep the fade running from the same
+    // pose, not collapse it to the incoming clip. A one-shot's return to idle is queued
+    // after the clip, so a grid change must not drop it.
+    motion::DanceDirector director(&library());
+    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    director.select(motion::DanceStyle::Groove, 0.0, false, true);
+    director.select(motion::DanceStyle::HipHop, 2.0);
+    double mid = 2.0;
+    for (double t = 2.0; t < 4.0; t += 1.0 / 240.0) {
+        if (director.sample(t).transitionProgress >= 0.5f) {
+            mid = t;
+            break;
+        }
+    }
+    const motion::DanceFrame before = director.sample(mid);
+    CHECK(before.transitionProgress > 0.0f && before.transitionProgress < 1.0f);
+    director.rebase(mid, motion::BeatClock::constant(140.0, 0.0));
+    const motion::DanceFrame after = director.sample(mid);
+    CHECK(after.transitionProgress > 0.0f && after.transitionProgress < 1.0f);
+    // Re-anchoring the clip beat at the new tempo rounds in float: ~0.01 deg on the
+    // fastest clips, far below a visible pop.
+    CHECK(worstBoneAngle(before.pose, after.pose) < 0.05);
+
+    motion::DanceDirector oneShot(&library());
+    oneShot.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    oneShot.select(motion::DanceStyle::Energetic, 0.0, true, true);
+    oneShot.rebase(1.0, motion::BeatClock::constant(120.0, 0.0));
+    CHECK(oneShot.sample(60.0).style == motion::DanceStyle::Idle);
+}
+
+TEST_CASE(dance.paused_seek_reaches_the_correct_pose) {
+    // The host is paused: media time stands still after the seek. The seek hand-over must
+    // still finish on the schedule's pose instead of holding the pose from before the seek.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    const motion::DanceFrame before = player.update(10.0);
+    motion::DanceFrame settled;
+    for (int i = 0; i < 100; ++i) {
+        settled = player.update(60.0);
+    }
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "hiphop");
+    CHECK(worstBoneAngle(settled.pose, reference.update(60.0).pose) < 1e-3);
+    CHECK(std::abs(settled.pose.hips.y - reference.update(60.0).pose.hips.y) < 1e-4);
+    // ...and the seek itself did not pop: the first frame after it still shows the old pose.
+    motion::DancePlayer again;
+    steadyPlayer(again, "hiphop");
+    (void)again.update(10.0);
+    CHECK(worstBoneAngle(again.update(60.0).pose, before.pose) < 1e-3);
+}
+
+TEST_CASE(dance.continuous_backward_scrub_follows_the_scrub_position) {
+    // A scrub moves the media time backwards a little every frame. Each frame is a jump of the
+    // host clock, but the pose must follow the scrub position, not stay at the pose where the
+    // scrub started. Overlays are off so the schedule can be compared with a pure reference.
+    motion::DancePlayer player;
+    player.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(player, "hiphop");
+    for (double t = 0.0; t <= 60.0 + 1e-9; t += 1.0 / 60.0) {
+        (void)player.update(t);
+    }
+    const motion::DanceFrame atStart = player.update(60.0);
+    motion::DancePlayer reference;
+    reference.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(reference, "hiphop");
+
+    double t = 60.0;
+    double worstAfterWindow = 0.0;
+    double farthestFromStart = 0.0;
+    for (int frame = 1; frame <= 60; ++frame) {   // one second of scrubbing at 60 fps
+        t -= 0.05;
+        const motion::DanceFrame scrubbed = player.update(t);
+        const motion::ClipPose target = reference.director().sample(t).pose;
+        if (frame * 0.05 > 0.5) {   // the hand-over itself lasts a fraction of a second
+            worstAfterWindow = std::max(worstAfterWindow, worstBoneAngle(scrubbed.pose, target));
+        }
+        farthestFromStart = std::max(farthestFromStart, worstBoneAngle(scrubbed.pose, atStart.pose));
+    }
+    CHECK(worstAfterWindow < 1e-3);
+    CHECK(farthestFromStart > 5.0);   // it moved: the pose is not frozen at the scrub's start
+}
+
+TEST_CASE(dance.paused_tempo_change_does_not_stick) {
+    // Auto without music keeps the Manual schedule, but a constant grid change moves the clip
+    // beat at the same media time. While the host is paused the first frame holds the pose the
+    // viewer had, and the next frame is the schedule on the new grid, not a blend stuck on the
+    // old pose.
+    motion::DancePlayer player;
+    player.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(player, "sidestep");
+    const motion::DanceFrame before = player.update(9.0);
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    const motion::DanceFrame held = player.update(9.0);
+    CHECK(worstBoneAngle(held.pose, before.pose) < 1e-3);
+    const motion::DanceFrame settled = player.update(9.0);
+    CHECK(worstBoneAngle(settled.pose, player.director().sample(9.0).pose) < 1e-3);
+    CHECK(worstBoneAngle(settled.pose, before.pose) > 1e-3);   // the tempo change is visible
+}
+
+TEST_CASE(dance.rebase_keeps_foot_targets_across_handover) {
+    // A grid change while a foot is in its hand-over, or in the window the hand-over still
+    // needs after the fade, must not move the feet. The swing is kept in media time, so a
+    // tempo change moves nothing at the moment of the change.
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kMetresPerHeight = 1.7;
+    double worstSame = 0.0;
+    double worstChanged = 0.0;
+    for (motion::DanceStyle from : styles) {
+        for (motion::DanceStyle to : styles) {
+            if (from == to) continue;
+            for (double u : {0.3, 0.7, 1.2}) {
+                for (double bpmAfter : {100.0, 112.0}) {
+                    motion::DanceDirector director(&library());
+                    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+                    director.select(from, 0.0, false, true);
+                    director.select(to, 5.37);
+                    const motion::ScheduleSegment& incoming = director.schedule().segments().back();
+                    const double now = incoming.startTime + u * incoming.fadeSeconds;
+                    const motion::ClipPose before = director.sample(now).pose;
+                    director.rebase(now, motion::BeatClock::constant(bpmAfter, 0.0));
+                    const motion::ClipPose after = director.sample(now).pose;
+                    double jump = 0.0;
+                    for (std::size_t f = 0; f < 2; ++f) {
+                        const double metres =
+                            (before.foot[f].position - after.foot[f].position).length() *
+                            kMetresPerHeight;
+                        jump = std::max(jump, metres);
+                    }
+                    if (bpmAfter == 100.0) {
+                        worstSame = std::max(worstSame, jump);
+                    } else {
+                        worstChanged = std::max(worstChanged, jump);
+                    }
+                }
+            }
+        }
+    }
+    CHECK(worstSame < 0.001);      // unchanged tempo: under 1 mm
+    CHECK(worstChanged < 0.01);    // 100 -> 112 BPM: under 1 cm
+}
+
+TEST_CASE(dance.frame_reports_the_idle_share_through_a_crossfade) {
+    // The desktop alive layer uses it to keep breathing from stacking on Idle's own.
+    motion::DanceDirector director(&library());
+    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    director.select(motion::DanceStyle::Idle, 0.0, false, true);
+    CHECK(director.sample(1.0).idleWeight == 1.0f);
+    director.select(motion::DanceStyle::Groove, 2.0);
+    float previous = 1.0f;
+    bool sawFade = false;
+    for (double t = 2.0; t < 12.0; t += 1.0 / 120.0) {
+        const motion::DanceFrame frame = director.sample(t);
+        CHECK(frame.idleWeight >= 0.0f && frame.idleWeight <= 1.0f);
+        CHECK(frame.idleWeight <= previous + 1.0e-6f);
+        if (frame.transitionProgress >= 0.0f) {
+            sawFade = true;
+            CHECK_NEAR(frame.idleWeight, 1.0 - frame.transitionProgress, 1.0e-6);
+        }
+        previous = frame.idleWeight;
+    }
+    CHECK(sawFade);
+    CHECK(director.sample(12.0).idleWeight == 0.0f);
+}
+
+TEST_CASE(dance.plan_blend_keeps_planted_feet_in_place) {
+    // A tempo change re-maps the schedule: the body blends over to the new grid, but a
+    // foot that stays planted must not slide there with it.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    player.setOverlayMode(motion::OverlayMode::Off);
+    for (double t = 0.0; t <= 9.0; t += 1.0 / 120.0) {
+        (void)player.update(t);
+    }
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    motion::DanceFrame previous = player.update(9.0);
+    double worstSlide = 0.0;
+    for (double t = 9.0 + 1.0 / 240.0; t <= 10.0; t += 1.0 / 240.0) {
+        const motion::DanceFrame frame = player.update(t);
+        for (std::size_t f = 0; f < 2; ++f) {
+            if (previous.pose.foot[f].contact >= 0.999f && frame.pose.foot[f].contact >= 0.999f) {
+                const motion::Vec3 d = frame.pose.foot[f].position - previous.pose.foot[f].position;
+                worstSlide = std::max(worstSlide,
+                                      static_cast<double>(std::sqrt(d.x * d.x + d.z * d.z)));
+            }
+        }
+        previous = frame;
+    }
+    // Per 240 Hz frame, a planted foot creeps by at most the slow fallback, never the
+    // 0.5 s body blend (which moved it ~33 cm, ~1 cm per frame).
+    CHECK(worstSlide < 0.0015);
+}
+
+TEST_CASE(dance.plan_blend_never_pushes_a_landed_foot_below_the_floor) {
+    // The carried anchor is horizontal: a foot planted before the change but airborne in
+    // the new schedule must land on the floor, not keep a negative height offset.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    player.setOverlayMode(motion::OverlayMode::Off);
+    for (double t = 0.0; t <= 2.0; t += 1.0 / 120.0) {
+        (void)player.update(t);
+    }
+    player.setMode(motion::DanceMode::Auto, 2.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 2.0);
+    double lowest = 0.0;
+    for (double t = 2.0; t <= 4.0; t += 1.0 / 240.0) {
+        const motion::DanceFrame frame = player.update(t);
+        for (std::size_t f = 0; f < 2; ++f) {
+            lowest = std::min(lowest, static_cast<double>(frame.pose.foot[f].position.y));
+        }
+    }
+    // HipHop itself dips to about -0.0025 (heel roll); the old carry reached -0.061.
+    CHECK(lowest > -0.005);
+}
+
+TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
+    // A tempo rebase during a hand-over changes when the clip's swing happens. The hand-over
+    // follows the swing's clip beats, so a planted foot is not dragged to its new place while
+    // the clip still holds it down (HipHop 100 BPM -> Energetic, then 80 BPM mid-fade), and the
+    // hand-over lasts until the rebased swing has landed (Idle 180 -> Energetic, then 100). The
+    // planted slide after the rebase is compared with the same transition without a tempo
+    // change, so slides a pair has anyway (no swing in the window) do not count.
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kMetresPerHeight = 1.7;
+    constexpr double kStep = 1.0 / 120.0;
+    const auto plantedSlide = [&](motion::DanceStyle from, motion::DanceStyle to, double u,
+                                  double bpmBefore, double bpmAfter) {
+        motion::DanceDirector director(&library());
+        director.setBeatClock(motion::BeatClock::constant(bpmBefore, 0.0));
+        director.select(from, 0.0, false, true);
+        director.select(to, 5.37);
+        const motion::ScheduleSegment& incoming = director.schedule().segments().back();
+        const double now = incoming.startTime + u * incoming.fadeSeconds;
+        director.rebase(now, motion::BeatClock::constant(bpmAfter, 0.0));
+        // Horizontal travel of a foot over a run of frames where it is planted.
+        motion::ClipPose previous = director.sample(now).pose;
+        std::array<double, 2> run{0.0, 0.0};
+        double worst = 0.0;
+        // Long enough for a swing a slower tempo pushed past the original search window.
+        for (double t = now + kStep; t < now + 10.0; t += kStep) {
+            const motion::ClipPose pose = director.sample(t).pose;
+            for (std::size_t f = 0; f < 2; ++f) {
+                if (previous.foot[f].contact <= 0.95f || pose.foot[f].contact <= 0.95f) {
+                    run[f] = 0.0;
+                    continue;
+                }
+                const motion::Vec3 d = pose.foot[f].position - previous.foot[f].position;
+                run[f] += std::sqrt(d.x * d.x + d.z * d.z) * kMetresPerHeight;
+                worst = std::max(worst, run[f]);
+            }
+            previous = pose;
+        }
+        return worst;
+    };
+    double worstExcess = 0.0;
+    for (motion::DanceStyle from : styles) {
+        for (motion::DanceStyle to : styles) {
+            if (from == to) continue;
+            // u < 0 rebases before the queued transition starts; 140 BPM moves its entry
+            // into the past.
+            for (double u : {-1.0, 0.01, 0.2, 0.5, 0.8}) {
+                const double steady = plantedSlide(from, to, u, 100.0, 100.0);
+                for (double bpmAfter : {80.0, 125.0, 140.0}) {
+                    worstExcess =
+                        std::max(worstExcess, plantedSlide(from, to, u, 100.0, bpmAfter) - steady);
+                }
+                // 180 -> 100 BPM moves a swing past the window the transition was planned
+                // with: the hand-over must last until that swing lands.
+                const double fast = plantedSlide(from, to, u, 180.0, 180.0);
+                worstExcess =
+                    std::max(worstExcess, plantedSlide(from, to, u, 180.0, 100.0) - fast);
+            }
+        }
+    }
+    // A rebase adds under 3 cm of planted slide. What remains is the settling tail of a
+    // landing (shown contact 0.95..1 while the hand-over finishes); the bugs this guards
+    // against slid a planted foot by 38 to 48 cm.
+    CHECK(worstExcess < 0.03);
+}
+
+TEST_CASE(dance.rebased_one_shot_returns_after_its_remaining_beats) {
+    // The rebased one-shot keeps its clip beat and plays the rest at the new rate; its Idle
+    // return must follow that end, not the old absolute beat (Energetic 100 -> 180 BPM at 5 s
+    // cut the clip off at beat 8.3 of 16).
+    for (double bpmAfter : {80.0, 140.0, 180.0}) {
+        motion::DanceDirector director(&library());
+        director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+        director.select(motion::DanceStyle::Energetic, 0.0, true, true);
+        director.rebase(5.0, motion::BeatClock::constant(bpmAfter, 0.0));
+        const auto& segments = director.schedule().segments();
+        CHECK(segments.size() == 2);
+        if (segments.size() != 2) continue;
+        const motion::ScheduleSegment& shot = segments[0];
+        const motion::ScheduleSegment& back = segments[1];
+        const motion::BeatClock grid = motion::BeatClock::constant(bpmAfter, 0.0);
+        // The clip's last beat is reached at the return's alignment, within a sample.
+        const double endBeat =
+            motion::DanceSchedule::segmentClipBeat(shot, back.alignTime, grid);
+        CHECK_NEAR(endBeat, shot.clip->beats, 1e-6);
+        // Until the return's fade starts, the one-shot is what plays.
+        CHECK(director.sample(back.startTime - 0.01).style == motion::DanceStyle::Energetic);
+        CHECK(director.sample(back.startTime + back.fadeSeconds + 0.5).style ==
+              motion::DanceStyle::Idle);
+    }
 }

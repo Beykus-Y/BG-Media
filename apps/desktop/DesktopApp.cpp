@@ -9,6 +9,7 @@
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/version.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
@@ -47,6 +48,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using ui::Rect;
+
+// Personality of the idle life layer (breathing phase, look-around rhythm).
+constexpr std::uint32_t kAliveSeed = 0x6d61736cU;
 
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -1250,8 +1254,22 @@ struct DesktopApp::Impl {
         if (danceUi()) {
             const double danceNow = danceTime();
             updateDance();
+            // The foot order of the pause hand-over is chosen once, from the pose the
+            // dancer stopped in, and kept until the blend is fully back to the dance.
+            const float idleMix = danceIdle.mix(animationTime);
+            // The Idle stance is anchored at the same pose's root, so on resume the
+            // advancing dance root does not drag the planted Idle feet along.
+            if (idleMix <= 0.0f) {
+                danceIdleFirstFoot = -1;
+            } else if (danceIdleFirstFoot < 0) {
+                danceIdleFirstFoot = motion::airborneFootFirst(danceFrame.pose);
+                danceIdleAnchor = danceFrame.pose;
+            }
+            const motion::ClipPose pose =
+                composeDancePose(danceFrame.pose, animationTime, idleMix,
+                                 danceFrame.idleWeight, danceIdleFirstFoot);
             std::string danceError;
-            if (!vrm.renderClip(danceFrame.pose, danceNow, vrmCamera, vrm.renderSettings(),
+            if (!vrm.renderClip(pose, danceNow, vrmCamera, vrm.renderSettings(),
                                 &danceError)) {
                 vrmFrameError = danceError;
             } else {
@@ -1275,6 +1293,10 @@ struct DesktopApp::Impl {
     // ---------------------------------------------------------------------
     motion::DancePlayer dance;
     motion::DanceFrame danceFrame;
+    // Dance <-> Idle crossfade for a stopped transport (wall-clock driven).
+    motion::IdleCrossfade danceIdle;
+    int danceIdleFirstFoot = -1;  // latched foot order of the pause hand-over
+    motion::ClipPose danceIdleAnchor;  // latched pose whose root places the Idle stance
     bool useClips = true;
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
@@ -1299,6 +1321,50 @@ struct DesktopApp::Impl {
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
     [[nodiscard]] double danceTime() const {
         return track ? currentPosition() : danceLabTime;
+    }
+
+    // Whether the dance transport is moving. Scrubbing and capture drive the dance
+    // from the position, so they never count as stopped.
+    [[nodiscard]] bool danceTransportRunning() const {
+        if (!track) {
+            // Without a track the dance clock is danceLabTime, which only advances while
+            // Motion Lab runs (the synthetic demo's own play state does not move it).
+            return captureMode || danceLabRunning;
+        }
+        return captureMode || scrubbing || playing();
+    }
+
+    // The pose the 3D character shows this frame. The dance is frozen while the
+    // transport is stopped; once it has been stopped for a moment the pose eases
+    // to the Idle clip, sampled on wall time. The alive layer (breathing, weight
+    // shift, head look-around) comes last, with its energy taken from the blended
+    // pose: full strength at idle, reduced while dancing.
+    // `scheduledIdle` is the Idle clip's share in the dance pose itself (Idle selected,
+    // a one-shot's return, an Auto silence segment): that pose already breathes too.
+    [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
+                                                    double wallNow, float idleMix,
+                                                    float scheduledIdle,
+                                                    int firstFoot) const {
+        motion::ClipPose pose = dancePose;
+        float bodyWeight = 1.0f - std::clamp(scheduledIdle, 0.0f, 1.0f);
+        if (idleMix > 0.0f) {
+            const motion::HumanoidClip* idle =
+                dance.library().forStyle(motion::DanceStyle::Idle);
+            motion::ClipPose idlePose = motion::neutralClipPose();
+            if (idle && idle->bpm > 0.0) {
+                // Idle has a wall-clock time axis (tempoSync false): one beat per 60 / bpm s.
+                idlePose = motion::sampleClip(*idle, wallNow * idle->bpm / 60.0);
+            }
+            // The dancer keeps the dance root and the feet are handed over one at a
+            // time, so a travelled dancer does not glide back to the Idle origin.
+            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix, firstFoot,
+                                                  firstFoot >= 0 ? &danceIdleAnchor : nullptr);
+            // Idle already breathes and shifts its weight, so the alive layer's
+            // breathing and weight shift fade out as it takes over. The head look stays.
+            bodyWeight *= 1.0f - std::clamp(idleMix, 0.0f, 1.0f);
+        }
+        motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f, bodyWeight, 1.0f);
+        return pose;
     }
 
     [[nodiscard]] motion::BeatClock danceGrid() const {
@@ -5208,6 +5274,7 @@ int DesktopApp::Impl::run() {
             updateDemo(deltaSeconds);
             updatePlayback();
             animationTime = static_cast<double>(frameStart) / 1e9;
+            danceIdle.update(danceTransportRunning(), animationTime);
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {

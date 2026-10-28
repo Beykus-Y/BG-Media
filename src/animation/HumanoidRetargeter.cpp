@@ -1586,19 +1586,20 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         impl_->applyLocalDelta(locals, impl_->boneNode[b], quatToModel(q));
     }
 
-    // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade.
-    // BG Motion 3.2 uses the detailed per-finger pose when the clip, an overlay
-    // or the hand layer provides one; otherwise the v1 scalar is preserved
-    // exactly so old clips keep their authored look.
+    // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade. Every hand
+    // takes the detailed per-finger path (BG Motion 3.3, A7). A clip without detailed hands
+    // is posed with the relaxed pose of its scalar curl, so turning detailedHands on no
+    // longer pops the fingers from the v1 look.
     {
         static constexpr float kFlex[5][3] = {{22.0f, 30.0f, 20.0f}, {38.0f, 52.0f, 34.0f},
                                               {40.0f, 56.0f, 36.0f}, {38.0f, 54.0f, 34.0f},
                                               {36.0f, 50.0f, 32.0f}};
         for (int sd = 0; sd < 2; ++sd) {
-            const bool detailed = pose.detailedHands;
-            const motion::HandPose& handPose =
-                pose.handPose[static_cast<std::size_t>(sd)];
-            if (detailed) {
+            const motion::HandPose handPose =
+                pose.detailedHands ? pose.handPose[static_cast<std::size_t>(sd)]
+                                   : motion::relaxedHandPose(
+                                         pose.hand[static_cast<std::size_t>(sd)]);
+            if (pose.detailedHands) {
                 const int handNode = sd == 0 ? impl_->leftHand : impl_->rightHand;
                 const Quat wrist =
                     // Pitch keeps the established convention (positive = about
@@ -1609,24 +1610,16 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                         .normalized();
                 impl_->applyLocalDelta(locals, handNode, quatToModel(wrist));
             }
-            const float curl =
-                std::clamp(pose.hand[static_cast<std::size_t>(sd)], 0.0f, 1.0f);
             for (int fg = 0; fg < 5; ++fg) {
                 for (int jt = 0; jt < 3; ++jt) {
                     const int node = impl_->fingers[sd][fg][jt];
                     if (node < 0) {
                         continue;
                     }
-                    float amount = 0.0f;
-                    if (detailed) {
-                        amount = handPose.curl[static_cast<std::size_t>(fg)]
-                                             [static_cast<std::size_t>(jt)];
-                        if (fg == 0) {
-                            amount = std::min(1.0f, amount +
-                                                        0.22f * handPose.thumbOpposition);
-                        }
-                    } else {
-                        amount = curl;
+                    float amount = handPose.curl[static_cast<std::size_t>(fg)]
+                                                [static_cast<std::size_t>(jt)];
+                    if (fg == 0) {
+                        amount = std::min(1.0f, amount + 0.22f * handPose.thumbOpposition);
                     }
                     const float angle =
                         kFlex[fg][jt] * amount * (kPi / 180.0f) *
@@ -1638,7 +1631,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                 }
                 // Spread fans the fingers in the palm plane. It is deliberately
                 // small: a large value reads as a broken hand, not a gesture.
-                if (detailed && fg > 0) {
+                if (fg > 0) {
                     const float fan = handPose.spread[static_cast<std::size_t>(fg)] *
                                       (static_cast<float>(fg) - 2.0f) * 0.10f;
                     const Quat spreadQuat = quatToModel(
@@ -1652,7 +1645,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                     }
                 }
             }
-            if (detailed && handPose.thumbOpposition > 0.0f) {
+            if (handPose.thumbOpposition > 0.0f) {
                 const Quat opposition = quatToModel(math::fromAxisAngle(
                     {0.0f, 0.0f, 1.0f}, handPose.thumbOpposition * 0.34f *
                                             (sd == 0 ? -1.0f : 1.0f)));

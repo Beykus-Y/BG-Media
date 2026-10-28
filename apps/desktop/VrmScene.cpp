@@ -1,11 +1,19 @@
 #include "VrmScene.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <utility>
 
 namespace bgmedia::desktop {
 
+namespace {
+
+// Largest spring step the host feeds in one frame. A longer stall (window drag,
+// debugger, hidden window) is not simulated as one big impulse.
+constexpr double kMaxSpringFrameSeconds = 0.1;
+
+} // namespace
 
 struct VrmScene::Impl {
     sdlgpu::SdlGpuVrmRenderer renderer;
@@ -25,6 +33,8 @@ struct VrmScene::Impl {
     double lastRetargetMs = 0.0;
     double lastMediaTime = 0.0;
     bool haveMediaTime = false;
+    std::chrono::steady_clock::time_point lastFrameWall{};
+    bool haveFrameWall = false;
 
     void destroyTexture() {
         if (texture) {
@@ -35,10 +45,25 @@ struct VrmScene::Impl {
         textureHeight = 0;
     }
 
+    // Spring time is WALL-clock time: the hair keeps settling while playback is
+    // paused and does not speed up or slow down with the playback rate. Only
+    // seeks are detected from the media position.
+    [[nodiscard]] double wallFrameSeconds() {
+        const auto now = std::chrono::steady_clock::now();
+        double dt = 0.0;
+        if (haveFrameWall) {
+            dt = std::chrono::duration<double>(now - lastFrameWall).count();
+        }
+        lastFrameWall = now;
+        haveFrameWall = true;
+        return std::clamp(dt, 0.0, kMaxSpringFrameSeconds);
+    }
+
     void applySecondary(double mediaTime) {
         if (!secondary || !secondary->available()) {
             return;
         }
+        const double wallDt = wallFrameSeconds();
         const bool seek = haveMediaTime &&
                           (mediaTime < lastMediaTime - 0.05 ||
                            mediaTime > lastMediaTime + 0.5);
@@ -49,9 +74,8 @@ struct VrmScene::Impl {
             secondary->update(lastPose, 0.0, secondarySettings);
             return;
         }
-        const double dt = std::max(0.0, mediaTime - lastMediaTime);
         lastMediaTime = mediaTime;
-        secondary->update(lastPose, dt, secondarySettings);
+        secondary->update(lastPose, wallDt, secondarySettings);
     }
 };
 
