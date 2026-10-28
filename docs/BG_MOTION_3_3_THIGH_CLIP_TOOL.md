@@ -41,9 +41,11 @@ Footwork follows the desktop app: the authored foot tracks are re-planned for th
 (`setLegGeometry`). `--raw-footwork` measures the authored tracks as stored.
 Overlays are on, as in the app (`--overlay 0` turns them off).
 
-## Command for the owner (Model1 on Nemesis)
+## Command for the owner (Nemesis and Model1)
 
-From the repository root, with `Model1.vrm` at `models/Model1.vrm` (untracked, private):
+From the repository root, with both private models under `models/` (untracked). The
+Nemesis file name below is a placeholder: use the local file name. Nemesis is the model
+issue #12 is about; Model1 is the regression check (its Hip-Hop must stay at 0 crossings).
 
 Linux:
 
@@ -52,10 +54,12 @@ cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DBGMEDIA_BUILD_DESKT
       -DBGMEDIA_BUILD_TESTS=ON -DBGMEDIA_BUILD_TOOLS=ON -DBGMEDIA_BUILD_MINIAUDIO=ON
 cmake --build build/ci --parallel --target bgmedia_mesh_clip
 mkdir -p out/issue12
-for fps in 30 60 120; do
-  ./build/ci/bin/bgmedia_mesh_clip --legs --model models/Model1.vrm \
-    --clips hiphop,sidestep --fps $fps --seconds 40 \
-    --json out/issue12/legs_${fps}.json | tee out/issue12/legs_${fps}.txt
+for m in Nemesis Model1; do
+  for fps in 30 60 120; do
+    ./build/ci/bin/bgmedia_mesh_clip --legs --model models/$m.vrm \
+      --clips hiphop,sidestep --fps $fps --seconds 40 \
+      --json out/issue12/${m}_legs_${fps}.json | tee out/issue12/${m}_legs_${fps}.txt
+  done
 done
 ```
 
@@ -64,10 +68,12 @@ Windows (PowerShell, build tree `build\windows` as in the README):
 ```powershell
 cmake --build build\windows --parallel --target bgmedia_mesh_clip
 New-Item -ItemType Directory -Force out\issue12 | Out-Null
-foreach ($fps in 30, 60, 120) {
-  build\windows\bin\bgmedia_mesh_clip.exe --legs --model models\Model1.vrm `
-    --clips hiphop,sidestep --fps $fps --seconds 40 `
-    --json out\issue12\legs_$fps.json | Tee-Object out\issue12\legs_$fps.txt
+foreach ($m in 'Nemesis', 'Model1') {
+  foreach ($fps in 30, 60, 120) {
+    build\windows\bin\bgmedia_mesh_clip.exe --legs --model models\$m.vrm `
+      --clips hiphop,sidestep --fps $fps --seconds 40 `
+      --json out\issue12\${m}_legs_$fps.json | Tee-Object out\issue12\${m}_legs_$fps.txt
+  }
 }
 ```
 
@@ -80,12 +86,12 @@ Options that matter: `--top N` (worst frames listed per clip, default 10),
 
 ## What to send back
 
-1. The three console reports `out/issue12/legs_30.txt`, `legs_60.txt`, `legs_120.txt`.
-2. The three JSON files `out/issue12/legs_30.json`, `legs_60.json`, `legs_120.json`.
+1. The six console reports `out/issue12/<model>_legs_<fps>.txt`.
+2. The six JSON files `out/issue12/<model>_legs_<fps>.json`.
 3. The commit the tool was built from: `git rev-parse --short HEAD`.
 
-The JSON holds no mesh geometry, but its numbers are measured from `Model1.vrm`, and the
-model's licence is Redistribution_Prohibited. Check the licence before sending the files
+The JSON holds no mesh geometry, but its numbers are measured from the private models, and
+Model1's licence is Redistribution_Prohibited. Check the licence before sending the files
 anywhere outside the owner's own use.
 
 ## JSON layout
