@@ -1304,12 +1304,20 @@ LoopBlend loopBlendAt(double clipBeat, double loopBeats, double halfWindowBeats)
     const double seam = std::round(loopPos);
     const double half = std::min(std::max(halfWindowBeats, 0.0), 0.5 * loopBeats);
     const double distance = (loopPos - seam) * loopBeats;  // beats from the nearest seam
+    // Loops start at 0. The time before beat 0 (a fade-in) is the first pass, so no blend ever
+    // reaches a negative loop: the first pass is the authored choreography, bit for bit.
+    const auto loopIndex = [](double index) {
+        return static_cast<std::int64_t>(std::max(0.0, index));
+    };
     if (half <= 1e-9 || std::abs(distance) >= half) {
-        blend.from = blend.to = static_cast<std::int64_t>(std::floor(loopPos));
+        blend.from = blend.to = loopIndex(std::floor(loopPos));
         return blend;
     }
-    blend.from = static_cast<std::int64_t>(seam) - 1;
-    blend.to = static_cast<std::int64_t>(seam);
+    blend.from = loopIndex(seam - 1.0);
+    blend.to = loopIndex(seam);
+    if (blend.from == blend.to) {
+        return blend;  // the seam is the clip origin: no loop before it to blend from
+    }
     blend.w = smootherstepUnit(static_cast<float>((distance + half) / (2.0 * half)));
     return blend;
 }

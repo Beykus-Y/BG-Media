@@ -1523,10 +1523,14 @@ TEST_CASE(dance.loop_blend_is_periodic_and_continuous_across_seams) {
         if (std::abs(distance) >= half) {
             CHECK(lb.from == lb.to);
             CHECK(lb.w == 0.0f);
-            CHECK(lb.from == static_cast<std::int64_t>(std::floor(beat / loopBeats)));
-        } else {
+            CHECK(lb.from == std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor(beat / loopBeats))));
+        } else if (seam >= 1.0) {
             CHECK(lb.from == static_cast<std::int64_t>(seam) - 1);
             CHECK(lb.to == static_cast<std::int64_t>(seam));
+        } else {
+            // The clip origin has no loop before it: nothing is blended there.
+            CHECK(lb.from == 0 && lb.to == 0);
+            CHECK(lb.w == 0.0f);
         }
         // The effective loop value (loop index, blended across the window) changes continuously.
         const double effective = static_cast<double>(lb.from) + static_cast<double>(lb.to - lb.from) * lb.w;
@@ -1534,11 +1538,44 @@ TEST_CASE(dance.loop_blend_is_periodic_and_continuous_across_seams) {
             CHECK(std::abs(effective - previous) <= 0.01 * maxSlope + 1e-6);
         }
         previous = effective;
-        // Periodic: one loop later, the same blend one loop further on.
-        const motion::LoopBlend next = motion::loopBlendAt(beat + loopBeats, loopBeats, half);
-        CHECK(next.from == lb.from + 1 && next.to == lb.to + 1);
-        CHECK_NEAR(next.w, lb.w, 1e-6);
+        // Periodic: one loop later, the same blend one loop further on. The clip origin is the
+        // exception: it has no blend and no loop before it, so periodicity starts after its window.
+        if (beat >= half) {
+            const motion::LoopBlend next = motion::loopBlendAt(beat + loopBeats, loopBeats, half);
+            CHECK(next.from == lb.from + 1 && next.to == lb.to + 1);
+            CHECK_NEAR(next.w, lb.w, 1e-6);
+        }
     }
+}
+
+TEST_CASE(dance.first_pass_is_authored_exactly) {
+    // Loop 0, the fade-in before beat 0 included, is never blended with a loop before it: the
+    // choice is loop 0 with weight 0, so its amplitude is exactly 1 and its cues are its own.
+    const double loopBeats = 8.0;
+    for (double beat = -20.0; beat <= 0.5 + 1e-9; beat += 0.01) {
+        const motion::LoopBlend lb = motion::loopBlendAt(beat, loopBeats, 0.5);
+        CHECK(lb.from == 0);
+        CHECK(lb.to == 0);
+        CHECK(lb.w == 0.0f);
+    }
+
+    // The same through the dance: the authored clip plays unchanged at and just after beat 0.
+    const motion::HumanoidClip& groove = *library().find("groove");
+    const double bpm = groove.bpm;
+    motion::DanceDirector director(&library());
+    director.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+    director.reset(0.0);
+    director.select(motion::DanceStyle::Groove, 0.0, false, true);
+    // The frame's own clip beat is used: the beat clock works in float time, so the clip beat is
+    // the musical beat only to about 1e-4 beats. The tolerance is far below any amplitude change.
+    for (double beat = 0.0; beat <= 0.5 + 1e-9; beat += 1.0 / 64.0) {
+        const motion::DanceFrame frame = director.sample(beat * 60.0 / bpm);
+        CHECK_NEAR(frame.clipBeat, beat, 1e-3);
+        CHECK(maxComponentDiff(frame.pose, motion::sampleClip(groove, frame.clipBeat)) < 1e-4);
+    }
+    // Sanity: the variation does act once the second loop starts.
+    const motion::DanceFrame second = director.sample((groove.beats + 0.25) * 60.0 / bpm);
+    CHECK(maxComponentDiff(second.pose, motion::sampleClip(groove, second.clipBeat)) > 1e-3);
 }
 
 TEST_CASE(dance.loop_variation_is_bounded_deterministic_and_seamless) {

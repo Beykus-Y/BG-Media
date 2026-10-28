@@ -232,9 +232,10 @@ inline constexpr const char* kMirrorSuffix = "~m";
 [[nodiscard]] vrm::HumanoidBone mirroredBone(vrm::HumanoidBone bone);
 
 // Loop-seam blend of a per-loop choice. Loops are counted from the clip origin:
-// loop = floor(clipBeat / beats). Within `halfWindowBeats` of a seam the choice is blended
-// from the loop before the seam to the loop after it (smootherstep over the window). Outside
-// the window `from == to` and `w == 0`. Pure function of its inputs, continuous in clipBeat.
+// loop = floor(clipBeat / beats), never below 0 (the time before beat 0 is loop 0, so no blend
+// ever uses a negative loop). Within `halfWindowBeats` of a seam the choice is blended from the
+// loop before the seam to the loop after it (smootherstep over the window). Outside the window
+// `from == to` and `w == 0`. Pure function of its inputs, continuous in clipBeat.
 struct LoopBlend {
     std::int64_t from = 0;
     std::int64_t to = 0;
