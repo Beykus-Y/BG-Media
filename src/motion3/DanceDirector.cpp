@@ -269,9 +269,110 @@ double DanceSchedule::segmentClipBeat(const ScheduleSegment& segment, double med
     return mapping.beat;
 }
 
-ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
-                               const MusicalTimeline& timeline,
-                               const WarpProfile& warp, float* transition) const {
+namespace {
+
+// Bones carried by the inertial transition: spine, head and both arms with hands.
+// Hips, legs and feet keep the smootherstep blend (planted contacts must not drift).
+bool isInertialBone(std::size_t bone) {
+    using B = vrm::HumanoidBone;
+    const auto at = [](B b) { return static_cast<std::size_t>(b); };
+    return (bone >= at(B::Spine) && bone <= at(B::Head)) ||
+           (bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+           (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
+}
+
+// Critically damped decay of an offset, rescaled so it is exactly 1 at the transition
+// start and exactly 0 at the fade's end (no jump when the blend hands over to the
+// incoming clip). The slope at the start is non-zero, so the outgoing motion is carried
+// forward rather than eased to rest.
+float inertialDecay(double elapsed, double fadeSeconds) {
+    constexpr double kLambdaFades = 5.0;
+    const auto raw = [](double x) { return (1.0 + x) * std::exp(-x); };
+    const double atEnd = raw(kLambdaFades);
+    const double x = std::max(elapsed, 0.0) / fadeSeconds * kLambdaFades;
+    return static_cast<float>(std::max(0.0, (raw(x) - atEnd) / (1.0 - atEnd)));
+}
+
+} // namespace
+
+namespace {
+
+// BG Motion 3.3 (#9) follow-through. A spring x'' + c x' + k x = -g w(t), driven by the
+// bone's angular velocity w, is evaluated as a finite convolution with its impulse
+// response over a fixed window of history. The window is clamped to the segment start.
+constexpr double kFollowPi = 3.14159265358979323846;
+constexpr double kFollowHz = 2.5;        // natural frequency of the lag
+constexpr double kFollowDamping = 0.45;  // damping ratio
+constexpr double kFollowGain = 6.0;      // drive, 1/s
+constexpr double kFollowStep = 1.0 / 120.0;
+constexpr double kFollowWindow = 0.6;    // seconds of history
+constexpr float kFollowMaxRad = 0.2f;    // cap on the lag per bone
+
+bool isFollowBone(std::size_t bone) {
+    using B = vrm::HumanoidBone;
+    return bone == static_cast<std::size_t>(B::Head) ||
+           bone == static_cast<std::size_t>(B::LeftHand) ||
+           bone == static_cast<std::size_t>(B::RightHand);
+}
+
+// Impulse response of x'' + c x' + k x = u, for tau >= 0.
+double followImpulse(double tau) {
+    const double w0 = 2.0 * kFollowPi * kFollowHz;
+    const double k = w0 * w0;
+    const double c = 2.0 * kFollowDamping * w0;
+    const double wd = std::sqrt(k - c * c / 4.0);
+    return std::exp(-c * tau / 2.0) * std::sin(wd * tau) / wd;
+}
+
+// Angular velocity (rad/s, local frame) between two orientations one step apart.
+Vec3 angularVelocity(const Quat& earlier, const Quat& later) {
+    Quat rel = (later * conjugate(earlier)).normalized();
+    if (rel.w < 0.0f) {
+        rel = {-rel.x, -rel.y, -rel.z, -rel.w};
+    }
+    const float scale = static_cast<float>(2.0 / kFollowStep);
+    return {rel.x * scale, rel.y * scale, rel.z * scale};
+}
+
+} // namespace
+
+void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
+                                       const MusicalTimeline& timeline,
+                                       const WarpProfile& warp) const {
+    const double startTime = segments_[index].startTime;
+    const int samples = static_cast<int>(std::lround(kFollowWindow / kFollowStep));
+    // Base poses at the window times, newest first: entry j is at mediaTime - j * step.
+    std::vector<ClipPose> history;
+    history.reserve(static_cast<std::size_t>(samples + 2));
+    for (int j = 0; j <= samples + 1; ++j) {
+        const double t = std::max(startTime, mediaTime - static_cast<double>(j) * kFollowStep);
+        history.push_back(basePose(index, t, timeline, warp, nullptr));
+    }
+    for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+        if (!isFollowBone(bone)) {
+            continue;
+        }
+        Vec3 lag{};
+        for (int j = 0; j <= samples; ++j) {
+            const auto at = static_cast<std::size_t>(j);
+            const Vec3 w = angularVelocity(history[at + 1].bone[bone], history[at].bone[bone]);
+            const auto weight = static_cast<float>(
+                -kFollowGain * followImpulse(static_cast<double>(j) * kFollowStep) * kFollowStep);
+            lag = lag + w * weight;
+        }
+        const float length = std::sqrt(dot(lag, lag));
+        if (length > kFollowMaxRad) {
+            lag = lag * (kFollowMaxRad / length);
+        }
+        // Small-angle rotation vector as a quaternion, applied in the parent frame.
+        const Quat offset = Quat{lag.x * 0.5f, lag.y * 0.5f, lag.z * 0.5f, 1.0f}.normalized();
+        pose.bone[bone] = (offset * pose.bone[bone]).normalized();
+    }
+}
+
+ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
+                                 const MusicalTimeline& timeline,
+                                 const WarpProfile& warp, double* clipBeat) const {
     const ScheduleSegment& segment = segments_[index];
     const Mapping stable = mapSegment(segment, mediaTime, timeline.grid(), &timeline,
                                       WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f},
@@ -289,23 +390,79 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
     }
-    if (decorator_) {
-        decorator_(own, segment, mapped.beat);
+    if (clipBeat) {
+        *clipBeat = mapped.beat;
     }
+    return own;
+}
+
+ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
+                                const MusicalTimeline& timeline,
+                                const WarpProfile& warp) const {
+    double clipBeat = 0.0;
+    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat);
+    if (followThrough_) {
+        applyFollowThrough(own, index, mediaTime, timeline, warp);
+    }
+    if (decorator_) {
+        decorator_(own, segments_[index], clipBeat);
+    }
+    return own;
+}
+
+ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
+                               const MusicalTimeline& timeline,
+                               const WarpProfile& warp, float* transition,
+                               PoseMemo& memo) const {
+    const auto key = std::make_pair(index, mediaTime);
+    if (const auto found = memo.find(key); found != memo.end()) {
+        return found->second;
+    }
+    const ScheduleSegment& segment = segments_[index];
+    ClipPose result;
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
         if (u < 1.0) {
             if (transition) {
                 *transition = static_cast<float>(std::clamp(u, 0.0, 1.0));
             }
+            // The incoming pose is evaluated first, as before: decorator consumers rely on
+            // its call being the first one of a sample.
+            const ClipPose own = ownPose(index, mediaTime, timeline, warp);
             if (u <= 0.0) {
-                return poseOf(index - 1, mediaTime, timeline, warp, nullptr);
+                result = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
+                memo.emplace(key, result);
+                return result;
             }
-            const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr);
-            return blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
+            result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            if (inertialTransitions_) {
+                // Inertialization: the offset between the outgoing and incoming upper body
+                // is fixed at the transition start, so it depends only on the segment and
+                // not on how the time was reached (seek and playback stay identical).
+                const double startTime = segment.startTime;
+                const ClipPose outgoingAtStart =
+                    poseOf(index - 1, startTime, timeline, warp, nullptr, memo);
+                const ClipPose incomingAtStart = ownPose(index, startTime, timeline, warp);
+                const float decay = inertialDecay(mediaTime - startTime, segment.fadeSeconds);
+                for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+                    if (!isInertialBone(bone)) {
+                        continue;
+                    }
+                    const Quat offset =
+                        (outgoingAtStart.bone[bone] * conjugate(incomingAtStart.bone[bone]))
+                            .normalized();
+                    result.bone[bone] =
+                        (math::slerp(Quat::identity(), offset, decay) * own.bone[bone]).normalized();
+                }
+            }
+            memo.emplace(key, result);
+            return result;
         }
     }
-    return own;
+    result = ownPose(index, mediaTime, timeline, warp);
+    memo.emplace(key, result);
+    return result;
 }
 
 DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock) const {
@@ -339,7 +496,8 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
         }
     }
     float transition = -1.0f;
-    frame.pose = poseOf(k, mediaTime, timeline, warp, &transition);
+    PoseMemo memo;
+    frame.pose = poseOf(k, mediaTime, timeline, warp, &transition, memo);
     frame.transitionProgress = transition;
 
     const ScheduleSegment& current = segments_[k];

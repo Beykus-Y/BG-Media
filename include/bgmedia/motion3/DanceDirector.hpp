@@ -21,7 +21,9 @@
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
 #include <functional>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -92,6 +94,16 @@ class DanceSchedule {
 public:
     void clear() { segments_.clear(); }
     void setPoseDecorator(PoseDecorator decorator) { decorator_ = std::move(decorator); }
+    // Opt-in (BG Motion 3.3, #8). Upper-body bones carry the outgoing pose through a
+    // segment crossfade as a decaying rotation offset instead of a smootherstep blend.
+    // Off by default: the blend stays the reference behaviour until A/B-tested.
+    void setInertialTransitions(bool enabled) { inertialTransitions_ = enabled; }
+    [[nodiscard]] bool inertialTransitions() const { return inertialTransitions_; }
+    // Opt-in (BG Motion 3.3, #9). Head and hands lag behind their own motion through a
+    // second-order spring driven by angular velocity. Evaluated per media time from a
+    // fixed window of history, so seeking and playback agree. Off by default.
+    void setFollowThrough(bool enabled) { followThrough_ = enabled; }
+    [[nodiscard]] bool followThrough() const { return followThrough_; }
     void append(ScheduleSegment segment);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
@@ -118,11 +130,25 @@ public:
                                                 double* deviation = nullptr);
 
 private:
+    // Pose of one segment at one time, memoized per sample() call: with overlapping
+    // fades the recursion would otherwise revisit the same (segment, time) pairs.
+    using PoseMemo = std::map<std::pair<std::size_t, double>, ClipPose>;
     [[nodiscard]] ClipPose poseOf(std::size_t index, double mediaTime,
                                   const MusicalTimeline& timeline,
-                                  const WarpProfile& warp, float* transition) const;
+                                  const WarpProfile& warp, float* transition,
+                                  PoseMemo& memo) const;
+    [[nodiscard]] ClipPose basePose(std::size_t index, double mediaTime,
+                                    const MusicalTimeline& timeline,
+                                    const WarpProfile& warp, double* clipBeat) const;
+    [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
+                                   const MusicalTimeline& timeline,
+                                   const WarpProfile& warp) const;
+    void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
+                            const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;
     PoseDecorator decorator_;
+    bool inertialTransitions_ = false;
+    bool followThrough_ = false;
 };
 
 enum class DanceMode { Manual, Auto };

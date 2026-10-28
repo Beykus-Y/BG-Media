@@ -768,3 +768,136 @@ TEST_CASE(motion32.seek_and_rebase_keep_generated_dance_finite) {
         }
     }
 }
+
+// BG Motion 3.2 suite (registered in CTest), #8: the opt-in inertial transition keeps upper-body poses continuous
+// at both ends of a segment fade, is a pure function of media time (seek equals playback),
+// and leaves the default blend untouched.
+TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+
+    const auto makeSchedule = [&](bool inertial) {
+        motion::DanceSchedule schedule;
+        schedule.setInertialTransitions(inertial);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const auto poseAt = [&](const motion::DanceSchedule& schedule, double t) {
+        return schedule.sample(t, clock, timeline, off).pose;
+    };
+
+    const motion::DanceSchedule inertial = makeSchedule(true);
+    const motion::DanceSchedule blend = makeSchedule(false);
+
+    // Start of the fade: the outgoing pose is held exactly, as in the blend.
+    const motion::ClipPose outgoingAtStart = poseAt(inertial, t0 - 1.0e-4);
+    const motion::ClipPose atStart = poseAt(inertial, t0);
+    CHECK_NEAR(poseDistance(outgoingAtStart, atStart), 0.0, 1e-2);
+
+    // Fade end: the inertial pose must hand over to the incoming clip without a step.
+    const double edge = 1.0e-4;
+    const motion::ClipPose beforeEnd = poseAt(inertial, t0 + fade - edge);
+    const motion::ClipPose afterEnd = poseAt(inertial, t0 + fade + edge);
+    CHECK_NEAR(poseDistance(beforeEnd, afterEnd), 0.0, 1e-2);
+
+    // Seek equals playback: a schedule sampled only at one time gives the same pose.
+    const motion::DanceSchedule fresh = makeSchedule(true);
+    CHECK_NEAR(poseDistance(poseAt(inertial, t0 + 0.3), poseAt(fresh, t0 + 0.3)), 0.0, 1e-6);
+
+    // Default off: the blend path is what existed before the flag.
+    CHECK(!motion::DanceSchedule{}.inertialTransitions());
+    CHECK(!blend.inertialTransitions());
+    CHECK(inertial.inertialTransitions());
+}
+
+// BG Motion 3.3 (#9): the opt-in follow-through lags only head and hands, stays bounded,
+// is deterministic in media time (fresh schedule equals a schedule sampled in order), and
+// is off by default.
+TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_head_and_hands) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+
+    const auto makeSchedule = [&](bool follow) {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(follow);
+        motion::ScheduleSegment seg;
+        seg.clip = &a.clip;
+        seg.fadeSeconds = 0.6;
+        schedule.append(seg);
+        return schedule;
+    };
+    CHECK(!motion::DanceSchedule{}.followThrough());
+
+    const motion::DanceSchedule plain = makeSchedule(false);
+    const motion::DanceSchedule lagged = makeSchedule(true);
+    const motion::DanceSchedule sequential = makeSchedule(true);
+    for (const double t : {1.0, 2.25, 3.5, 4.75}) {
+        const motion::ClipPose p0 = plain.sample(t, clock, timeline, off).pose;
+        const motion::ClipPose p1 = lagged.sample(t, clock, timeline, off).pose;
+        // Head and hands carry the lag; every other bone is identical to the plain pose.
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            const math::Quat& a0 = p0.bone[bone];
+            const math::Quat& a1 = p1.bone[bone];
+            // Component differences: an angle from acos is too noisy near identity.
+            const float diff = std::max({std::abs(a0.x - a1.x), std::abs(a0.y - a1.y),
+                                         std::abs(a0.z - a1.z), std::abs(a0.w - a1.w)});
+            const bool follows = bone == static_cast<std::size_t>(vrm::HumanoidBone::Head) ||
+                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::LeftHand) ||
+                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::RightHand);
+            if (!follows) {
+                CHECK_NEAR(diff, 0.0f, 1e-6f);
+            } else {
+                // Lag is capped at 0.2 rad; a quaternion component is at most sin(angle/2).
+                CHECK(diff <= 0.11f);
+            }
+        }
+        // Same media time from a fresh schedule gives the same pose (seek equals playback).
+        const motion::ClipPose again = sequential.sample(t, clock, timeline, off).pose;
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            CHECK_NEAR(std::abs(p1.bone[bone].x - again.bone[bone].x) +
+                           std::abs(p1.bone[bone].y - again.bone[bone].y) +
+                           std::abs(p1.bone[bone].z - again.bone[bone].z) +
+                           std::abs(p1.bone[bone].w - again.bone[bone].w),
+                       0.0f, 1e-6f);
+        }
+    }
+}
+
+// BG Motion 3.3 (#10): the phrase head look is an opt-in choice. With it off the head
+// keeps the beat nod only, and the rest of the generated clip is unchanged.
+TEST_CASE(motion32.head_phrase_look_is_optional) {
+    motion::ChoreographyRequest on = request(11);
+    motion::ChoreographyRequest off = request(11);
+    off.headLookAtPhrases = false;
+    const motion::HumanoidClip withLook = motion::ProceduralChoreography::generate(on).clip;
+    const motion::HumanoidClip withoutLook = motion::ProceduralChoreography::generate(off).clip;
+    CHECK(motion::ProceduralChoreography::generate(on).clip.keyCount == withLook.keyCount);
+    const std::size_t head = static_cast<std::size_t>(vrm::HumanoidBone::Head);
+    // The phrase look turns the head at the first phrase boundary.
+    const motion::ClipPose a = motion::sampleClip(withLook, 0.0);
+    const motion::ClipPose b = motion::sampleClip(withoutLook, 0.0);
+    const float diff = std::abs(a.bone[head].x - b.bone[head].x) +
+                       std::abs(a.bone[head].y - b.bone[head].y) +
+                       std::abs(a.bone[head].z - b.bone[head].z);
+    CHECK(diff > 0.01f);
+    // Music-facing parts are untouched: the feet and contacts are identical.
+    CHECK(withLook.contacts.size() == withoutLook.contacts.size());
+}

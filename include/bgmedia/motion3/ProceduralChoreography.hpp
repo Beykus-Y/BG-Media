@@ -39,6 +39,10 @@ struct ChoreographyRequest {
     int keysPerBeat = 8;
     bool includeOverlays = true;
     bool loop = true;
+    // BG Motion 3.3 (#10): the phrase-level head look toward the leading side. On by
+    // default (the existing behaviour). Off keeps the head to the beat nod only, for
+    // choreography where a fixed look-at reads as wrong.
+    bool headLookAtPhrases = true;
 };
 
 struct ChoreographyStats {
