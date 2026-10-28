@@ -628,3 +628,51 @@ TEST_CASE(soft_ik.arm_soft_band_fades_in_with_collision_depth) {
     CHECK(distance(before.wrist, after.wrist) < 5.0e-4f);
     CHECK(distance(before.elbow, after.elbow) < 5.0e-4f);
 }
+
+TEST_CASE(soft_ik.arm_stable_bend_fades_in_with_collision_depth) {
+    // Second issue #26 reproduction: left elbow 0.4 rad about clip Y, left upper arm clip-Z
+    // near -1.43722 rad. With the soft band off (armSoftReach 0), the stable bend alone used
+    // to switch on at the torso surface and move the elbow about 87 mm across it.
+    auto rig = makeRig();
+    CHECK(rig != nullptr);
+    if (!rig) {
+        return;
+    }
+    const vrm::VrmModel& m = *rig->loaded.model;
+    const auto& retargeter = *rig->retargeter;
+    RetargetOptions on;
+    on.softIK = true;
+    on.armSoftReach = 0.0f;
+
+    struct ArmAt {
+        Vec3 elbow, wrist;
+        float raw;
+    };
+    const auto armAt = [&](double shoulderZ) {
+        motion::ClipPose pose = motion::neutralClipPose();
+        pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm)] =
+            math::fromAxisAngle({0.0f, 0.0f, 1.0f}, static_cast<float>(shoulderZ));
+        pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::LeftLowerArm)] =
+            math::fromAxisAngle({0.0f, 1.0f, 0.0f}, 0.4f);
+        const RetargetedPose p = retargeter.applyClip(pose, 0.0, on);
+        return ArmAt{p.bonePosition(vrm::HumanoidBone::LeftLowerArm, m),
+                     p.bonePosition(vrm::HumanoidBone::LeftHand, m), p.stats.armClearanceRaw};
+    };
+
+    double lo = -1.4380, hi = -1.4365;
+    const bool loOutside = armAt(lo).raw > 0.0f;
+    CHECK(loOutside != (armAt(hi).raw > 0.0f));
+    for (int i = 0; i < 60; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if ((armAt(mid).raw > 0.0f) == loOutside) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const double crossing = 0.5 * (lo + hi);
+    const ArmAt before = armAt(crossing - 1.0e-5);
+    const ArmAt after = armAt(crossing + 1.0e-5);
+    CHECK(distance(before.elbow, after.elbow) < 5.0e-4f);
+    CHECK(distance(before.wrist, after.wrist) < 5.0e-4f);
+}

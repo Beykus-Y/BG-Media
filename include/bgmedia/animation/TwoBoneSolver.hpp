@@ -32,6 +32,10 @@ struct TwoBoneLimits {
     // Blend the pole's bend direction toward the rest bend as the pole nears the
     // reach line, so a nearly straight or folded limb keeps a stable bend side.
     bool stableBend = false;
+    // Strength of that blend, 0..1. 0 keeps the BG Motion 3.2 pole rule; the arm
+    // collision re-solve fades it in with collision depth so contact does not snap
+    // the elbow.
+    float stableBendWeight = 1.0f;
     // Flexion window: the angle between the two bones (0 = straight), in radians.
     // Converted to a distance window by the law of cosines, so it does not depend
     // on the rig's axes.

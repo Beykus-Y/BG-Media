@@ -862,13 +862,17 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         samples(E, W);
         float armRaw = *std::min_element(c.begin(), c.end());
         rawMin = std::min(rawMin, armRaw);
-        // The soft band fades in with the collision depth: full at 1 cm of height inside
+        // The soft band and the stable bend fade in with the collision depth: full at 1 cm of height inside
         // the torso, zero at the surface. Without the fade, the band would switch on as the
         // arm crosses the surface and jump the wrist (6.5 mm on the issue #26 reproduction).
         // Soft off: softReach is already 0, so the weight changes nothing.
         {
             const float depthT = std::clamp(-armRaw / (0.01f * height), 0.0f, 1.0f);
-            armLimits.softReach *= depthT * depthT * (3.0f - 2.0f * depthT);
+            const float fade = depthT * depthT * (3.0f - 2.0f * depthT);
+            armLimits.softReach *= fade;
+            // The stable bend fades in the same way: the authored arm (FK) uses the pole
+            // rule, so a full blend on the first collision solve snaps the elbow.
+            armLimits.stableBendWeight = fade;
         }
 
         // A few bounded iterations: moving the elbow changes the forearm sample.

@@ -32,19 +32,32 @@ float smoothstep01(float x) {
 // cancels and the rest bend is used: a point of the bend field that no blend can make
 // continuous (see docs/BG_MOTION_3_3_SOFT_IK.md, section 5).
 math::Vec3 bendSide(math::Vec3 direction, math::Vec3 pole, const TwoBoneChain& chain,
-                    bool stable, float straightWeight, float poleEpsilon, bool& blended) {
+                    bool stable, float stableWeight, float straightWeight, float poleEpsilon,
+                    bool& blended) {
     const auto perp = [&](math::Vec3 v) {
         return v - direction * math::dot(v, direction);
     };
-    if (stable) {
+    // BG Motion 3.2 behaviour: the pole, then the right and forward axes.
+    math::Vec3 legacy = perp(pole);
+    if (legacy.lengthSquared() < poleEpsilon) {
+        legacy = math::cross(chain.right, direction);
+    }
+    if (legacy.lengthSquared() < poleEpsilon) {
+        legacy = math::cross(chain.forward, direction);
+    }
+    legacy = math::normalize(legacy);
+    if (stable && stableWeight > 0.0f) {
         const math::Vec3 rest = perp(chain.restBend);
         const float restLength2 = rest.lengthSquared();
         const float poleLength = pole.length();
         if (restLength2 > 1.0e-8f && poleLength > kTiny) {
             const math::Vec3 poleOff = perp(pole);
             const float sine = std::sqrt(poleOff.lengthSquared()) / poleLength;
-            const float w = smoothstep01((sine - kStableFrom) / (kStableTo - kStableFrom)) *
-                            straightWeight;
+            // pull: how far the rest bend replaces the pole (1 = fully); stableWeight
+            // scales it, so weight 0 is the 3.2 rule exactly.
+            const float pull = 1.0f - smoothstep01((sine - kStableFrom) / (kStableTo - kStableFrom)) *
+                                          straightWeight;
+            const float w = 1.0f - std::clamp(stableWeight, 0.0f, 1.0f) * pull;
             if (w < 1.0f) {
                 blended = true;
             }
@@ -53,21 +66,13 @@ math::Vec3 bendSide(math::Vec3 direction, math::Vec3 pole, const TwoBoneChain& c
                 return restUnit;
             }
             if (w >= 1.0f) {
-                return math::normalize(poleOff);
+                return legacy;
             }
-            const math::Vec3 mixed = math::normalize(poleOff) * w + restUnit * (1.0f - w);
+            const math::Vec3 mixed = legacy * w + restUnit * (1.0f - w);
             return mixed.lengthSquared() > 1.0e-8f ? math::normalize(mixed) : restUnit;
         }
     }
-    // BG Motion 3.2 behaviour: the pole, then the right and forward axes.
-    math::Vec3 bend = perp(pole);
-    if (bend.lengthSquared() < poleEpsilon) {
-        bend = math::cross(chain.right, direction);
-    }
-    if (bend.lengthSquared() < poleEpsilon) {
-        bend = math::cross(chain.forward, direction);
-    }
-    return math::normalize(bend);
+    return legacy;
 }
 
 } // namespace
@@ -144,7 +149,8 @@ TwoBoneSolution solveTwoBone(math::Vec3 root, math::Vec3 target, math::Vec3 pole
     const float meanLength = std::max(kTiny, 0.5f * (l1 + l2));
     const float straightWeight = smoothstep01((lift / meanLength - kStraightFrom) /
                                               (kStraightTo - kStraightFrom));
-    const math::Vec3 bend = bendSide(direction, pole, chain, limits.stableBend, straightWeight,
+    const math::Vec3 bend = bendSide(direction, pole, chain, limits.stableBend,
+                                     limits.stableBendWeight, straightWeight,
                                      limits.poleEpsilon,
                                      out.bendBlended);
     out.knee = root + direction * along + bend * lift;

@@ -129,6 +129,13 @@ moves them 0.08 mm and 0.04 mm, the same as with soft IK off. With
 `softIK` off the band is zero, so nothing changes. Test:
 `arm_soft_band_fades_in_with_collision_depth`.
 
+The stable bend uses the same weight (`TwoBoneLimits::stableBendWeight`): at the
+surface the re-solve uses the 3.2 pole rule, the same as the authored arm, and the
+rest-bend blend reaches full strength at 1 cm of depth. Without it, the blend
+switched on with the first collision solve even with `armSoftReach = 0`: with the
+left elbow at 0.4 rad and the upper arm clip Z near -1.43722 rad, a 2e-5 rad step
+moved the elbow about 87 mm. Test: `arm_stable_bend_fades_in_with_collision_depth`.
+
 The arm re-solve keeps BG Motion 3.2's pole threshold (squared length 1e-10, set by
 `TwoBoneLimits::poleEpsilon`). The legs use 1e-8. A pole 5e-5 m off the reach line
 still sets the arm's bend side at the 3.2 threshold. At 1e-8 it would fall back to
