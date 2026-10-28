@@ -186,6 +186,11 @@ struct CompositionOptions {
     bool allowTorso = true;
     bool allowHead = true;
     int maxUpperBodyLayers = 3;
+    // Seconds per clip beat, used to give a cue's gesture a real duration. A
+    // gesture needs time to read as motion: when the cue is shorter than the
+    // primitive needs, the compositor performs a smaller version of it instead
+    // of a faster one (see samplePrimitive). 0 keeps the legacy behaviour.
+    float cueSecondsPerBeat = 0.0f;
 };
 
 struct CompositionDiagnostics {
@@ -208,9 +213,14 @@ struct ComposedPose {
 
 // Evaluates one primitive at a local phase (0..1) and intensity. This is a pure
 // function; the scheduler and the compositor are the only callers.
+// `cueSeconds` is the cue's real duration. When it is positive, a gesture that
+// does not have time for its full size is performed smaller (see the amplitude
+// scale inside), so a short cue cannot turn a hand flick into a wrist snap.
+// 0 keeps the legacy amplitude.
 [[nodiscard]] PrimitivePose samplePrimitive(PrimitiveKind kind, float phase,
                                             float intensity, int side,
-                                            float accent = 0.0f);
+                                            float accent = 0.0f,
+                                            float cueSeconds = 0.0f);
 
 // Combines a base pose with active cues. Deterministic; cue order does not
 // affect the result because cues are sorted by priority and beat.

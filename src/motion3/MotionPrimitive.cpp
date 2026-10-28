@@ -31,6 +31,21 @@ float smoothstep(float t) {
     return t * t * (3.0f - 2.0f * t);
 }
 
+// A gesture needs real time to read as motion, not as a twitch. Below
+// kFullGestureSeconds the primitive keeps its timing (the accent stays on the
+// authored phase) but is performed smaller, which bounds its peak velocity by
+// the time it actually has. A 0.5-beat hand flick at 92 BPM (0.33 s) keeps 60 %
+// of its size, a 0.25-beat cue 35 %; a full beat or longer is unchanged.
+constexpr float kFullGestureSeconds = 0.55f;
+constexpr float kMinGestureScale = 0.35f;
+
+float gestureTimeScale(float cueSeconds) {
+    if (!(cueSeconds > 0.0f)) {
+        return 1.0f;  // legacy callers keep the old amplitudes
+    }
+    return std::clamp(cueSeconds / kFullGestureSeconds, kMinGestureScale, 1.0f);
+}
+
 float bell(float phase, float attack, float release) {
     const float a = attack > kTiny ? smoothstep(phase / attack) : 1.0f;
     const float r = release > kTiny ? smoothstep((1.0f - phase) / release) : 1.0f;
@@ -374,7 +389,7 @@ bool masksConflict(BodyMask a, BodyMask b) {
 }
 
 PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
-                              int side, float accent) {
+                              int side, float accent, float cueSeconds) {
     PrimitivePose pose;
     pose.bone.fill(Quat::identity());
     relaxHands(pose, 0.30f);
@@ -385,7 +400,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
     accent = clamp01(accent);
     pose.localPhase = phase;
 
-    const float amp = intensity * (1.0f + 0.28f * accent);
+    const float amp = intensity * (1.0f + 0.28f * accent) * gestureTimeScale(cueSeconds);
     const float env = bell(phase, 0.18f - 0.10f * accent, 0.28f);
     const float snap = bell(phase, 0.08f, 0.45f);
     const float wave = std::sin(phase * 6.2831853f);
@@ -837,7 +852,8 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
             // base choreography owns contact. Only the feet it actually lifts
             // count; a touching foot is protected inside the application loop.
             const PrimitivePose probe =
-                samplePrimitive(cue.kind, 0.5f, 1.0f, cue.side, 0.0f);
+                samplePrimitive(cue.kind, 0.5f, 1.0f, cue.side, 0.0f,
+                                cue.durationBeats * options.cueSecondsPerBeat);
             bool blocked = false;
             for (int f = 0; f < 2; ++f) {
                 const bool lifts =
@@ -858,9 +874,10 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         if (weight <= 1.0e-4f) {
             continue;
         }
+        const float cueSeconds = cue.durationBeats * options.cueSecondsPerBeat;
         ActiveCue entry;
         entry.cue = &cue;
-        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
+        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f, cueSeconds);
         entry.weight = weight;
         {
             const auto smooth = [](float x) {

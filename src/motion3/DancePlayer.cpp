@@ -350,6 +350,10 @@ DanceFrame DancePlayer::update(double mediaTime) {
             if (cues.empty()) {
                 return;
             }
+            // The cue envelope must know how long the gesture really is: a short
+            // cue performed at its full size is a snap, not a gesture.
+            options.cueSecondsPerBeat =
+                static_cast<float>(60.0 / std::max(20.0, segment.clip->bpm));
             const ComposedPose composed = composeMotion(
                 pose, cues, clipBeat, segment.clip->beats, segment.clip->loop, options);
             pose = composed.pose;
