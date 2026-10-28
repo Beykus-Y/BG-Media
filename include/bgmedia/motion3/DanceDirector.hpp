@@ -34,12 +34,6 @@ struct ScheduleSegment {
     double alignTime = 0.0;        // media seconds: musical reference for the entry beat
     double entryClipBeat = 0.0;    // clip beat at alignTime
     double rate = 1.0;             // clip beats per music beat (metric level 0.5 / 1 / 2)
-    // Real duration of one clip beat when this segment was planned: 60 / (tempo *
-    // rate) for tempo-synchronised clips, 60 / authored bpm otherwise. It is a
-    // property of the segment, not of the sample, so a tempo change does not jump
-    // the pose at the rebase instant; the next planned segment picks up the new
-    // tempo. 0 means "derive from the clip's authored tempo".
-    double secondsPerClipBeat = 0.0;
     double fadeSeconds = 0.6;      // blend length from the previous segment
     bool loop = true;
     std::string reason;            // why the planner chose this segment
@@ -47,6 +41,13 @@ struct ScheduleSegment {
     bool barPhaseTrusted = true;   // the musical bar phase was trusted at entry
     int meter = 4;                 // musical meter used for the entry
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
+    // Real duration of one clip beat when this segment was planned: 60 / (tempo *
+    // rate) for tempo-synchronised clips, 60 / authored bpm otherwise. It is a
+    // property of the segment, not of the sample, so a tempo change does not jump
+    // the pose at the rebase instant; the next planned segment picks up the new
+    // tempo. 0 means "derive from the clip's authored tempo". Declared last so the
+    // existing field order of this public aggregate is unchanged.
+    double secondsPerClipBeat = 0.0;
 };
 
 // Optional per-segment pose post-process (BG Motion 3.2 overlays). It is applied
