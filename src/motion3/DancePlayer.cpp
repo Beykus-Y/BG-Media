@@ -22,8 +22,9 @@ const char* overlayModeName(OverlayMode mode) {
 namespace {
 
 // A jump of the host clock (seek, long stall) is hidden by a short smootherstep blend
-// from the last output pose.
+// from the last output pose. A plan or tempo change blends a little longer.
 constexpr double kSeekBlendSeconds = 0.18;
+constexpr double kPlanBlendSeconds = 0.5;
 
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
@@ -225,11 +226,14 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
         // from the analysis must keep the rich timeline (accents/downbeat
         // confidence) instead of replacing it with a bare grid.
         if (clock.constantGrid()) {
+            armIfMoved(director_.beatClock(), clock, now);
             director_.setBeatClock(std::move(clock));
         } else if (analysis_ && !analysis_->empty()) {
             const MusicalTimeline timeline = MusicalTimeline::fromAnalysis(*analysis_);
+            armIfMoved(director_.beatClock(), timeline.grid(), now);
             director_.setMusicalTimeline(timeline);
         } else {
+            armIfMoved(director_.beatClock(), clock, now);
             director_.setBeatClock(std::move(clock));
         }
         return;
@@ -243,6 +247,7 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
 
 void DancePlayer::setMusicalTimeline(MusicalTimeline timeline, double now) {
     if (mode_ == DanceMode::Auto) {
+        armIfMoved(director_.beatClock(), timeline.grid(), now);
         director_.setMusicalTimeline(std::move(timeline));
         return;
     }
@@ -256,6 +261,7 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
 void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
     if (mode_ == DanceMode::Auto) {
+        armBlend(now, kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -279,6 +285,7 @@ void DancePlayer::setMode(DanceMode mode, double now) {
     mode_ = mode;
     if (mode_ == DanceMode::Auto) {
         // The plan replaces the Manual schedule: the dancer carries on from the current pose.
+        armBlend(now, kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -326,6 +333,14 @@ void DancePlayer::armBlend(double at, double seconds) {
     blend_.from = lastPose_;
     blend_.start = at;
     blend_.seconds = seconds;
+}
+
+void DancePlayer::armIfMoved(const BeatClock& before, const BeatClock& after, double now) {
+    const double beatDelta = std::abs(before.beatAt(now) - after.beatAt(now));
+    const double bpmDelta = std::abs(before.bpmAt(now) - after.bpmAt(now));
+    if (beatDelta > 1.0e-4 || bpmDelta > 0.05) {
+        armBlend(now, kPlanBlendSeconds);
+    }
 }
 
 void DancePlayer::applyBlend(DanceFrame& frame, double mediaTime) {

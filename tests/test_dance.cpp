@@ -877,7 +877,9 @@ double worstBoneAngle(const motion::ClipPose& a, const motion::ClipPose& b) {
 void steadyPlayer(motion::DancePlayer& player, const std::string& clipId) {
     player.loadLibrary(dancesDir());
     player.setGrid(motion::BeatClock::constant(100.0, 0.0), 0.0);
-    player.selectClip(clipId, 0.0, true);
+    if (!player.selectClip(clipId, 0.0, true)) {
+        throw std::runtime_error("clip not found in the library: " + clipId);
+    }
 }
 
 } // namespace
@@ -941,4 +943,20 @@ TEST_CASE(dance.seek_is_deterministic_and_pure_after_the_blend) {
     const motion::DanceFrame a = direct.update(90.5);
     const motion::DanceFrame b = wandering.update(90.5);
     CHECK(worstBoneAngle(a.pose, b.pose) < 1e-3);
+}
+
+TEST_CASE(dance.plan_and_grid_changes_fade_from_the_current_pose) {
+    // Manual -> Auto with no music keeps the Manual dance; a tempo change in Auto must
+    // still start from the pose the viewer had, not jump to the new grid.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setGrid(motion::BeatClock::constant(100.0, 0.0), 0.0);
+    player.select(motion::DanceStyle::SideStep, 0.0, true);
+    const motion::DanceFrame before = player.update(9.0);
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    const motion::DanceFrame after = player.update(9.0);
+    CHECK(worstBoneAngle(before.pose, after.pose) < 1e-3);
+    const motion::DanceFrame next = player.update(9.02);
+    CHECK(worstBoneAngle(after.pose, next.pose) < 15.0);   // only natural motion in 20 ms
 }

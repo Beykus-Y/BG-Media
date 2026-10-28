@@ -125,6 +125,7 @@ private:
     // Stateful hand-over from the last output pose (BG Motion 3.3, A3/A4). The schedule
     // stays a pure function of media time; only this blend remembers where it started.
     void armBlend(double at, double seconds);
+    void armIfMoved(const BeatClock& before, const BeatClock& after, double now);
     [[nodiscard]] DanceFrame sampleFrame(double mediaTime);
     void applyBlend(DanceFrame& frame, double mediaTime);
 
