@@ -752,6 +752,9 @@ struct ActiveCue {
     const PrimitiveCue* cue = nullptr;
     PrimitivePose pose;
     float weight = 0.0f;
+    // Support and contact gate (1 = open). Scales the cue's body layers; the foot lift is
+    // scaled per foot by its own swing weight instead.
+    float gate = 1.0f;
     // How strongly this cue makes weaker cues yield. It follows the cue's weight but never
     // faster than kYieldBeats at either end: a one-beat accent with a 2-frame attack must
     // not pull a large arm gesture back by 45 degrees in 2 frames.
@@ -771,10 +774,19 @@ float regionShare(const ActiveCue& cue, BodyMask bit) {
     return cue.share[static_cast<std::size_t>(std::countr_zero(bit))];
 }
 
-bool footPlanted(const ClipPose& pose, int foot) {
+// How planted a foot is, 0 = swinging .. 1 = planted (BG Motion 3.3, A6). Clip poses carry
+// a continuous contact, which is ramped so overlays fade with the foot instead of switching
+// on a threshold. Hand-built poses without contact data fall back to the discrete phase.
+float plantedWeight(const ClipPose& pose, int foot) {
     const auto& f = pose.foot[static_cast<std::size_t>(foot)];
-    return f.contact > 0.35f || f.phase == FootPhase::Stance ||
-           f.phase == FootPhase::Plant || f.phase == FootPhase::Pivot;
+    if (f.contact > 0.0f) {
+        const float t = clamp01((f.contact - 0.2f) / 0.3f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+    return f.phase == FootPhase::Stance || f.phase == FootPhase::Plant ||
+                   f.phase == FootPhase::Pivot
+               ? 1.0f
+               : 0.0f;
 }
 
 }  // namespace
@@ -828,29 +840,37 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
             ++out.diagnostics.rejectedByMask;
             continue;
         }
-        if (metadata.needsSupport && !footPlanted(base, 0) && !footPlanted(base, 1)) {
-            ++out.diagnostics.rejectedBySupport;
-            continue;
+        // Support and contact are gates on the cue's weight, not switches. A cue is rejected
+        // only when the gate is closed (no planted foot to support it, or a lifted foot is
+        // fully planted); between those the cue fades with the contact instead of popping.
+        float gate = 1.0f;
+        if (metadata.needsSupport) {
+            const float support = std::max(plantedWeight(base, 0), plantedWeight(base, 1));
+            if (support <= 1.0e-4f) {
+                ++out.diagnostics.rejectedBySupport;
+                continue;
+            }
+            gate *= support;
         }
         if (metadata.altersFeet) {
             // A primitive may animate a swing foot, never a planted one. The
             // base choreography owns contact. Only the feet it actually lifts
-            // count; a touching foot is protected inside the application loop.
+            // count; the application loop lifts each foot by its own swing weight.
             const PrimitivePose probe =
                 samplePrimitive(cue.kind, 0.5f, 1.0f, cue.side, 0.0f);
-            bool blocked = false;
+            float swingGate = 1.0f;
             for (int f = 0; f < 2; ++f) {
                 const bool lifts =
                     std::abs(probe.footLift[static_cast<std::size_t>(f)]) > 1.0e-6f;
-                if (lifts && footPlanted(base, f) &&
-                    (mask & (f == 0 ? body::LeftFoot : body::RightFoot)) != 0u) {
-                    blocked = true;
+                if (lifts && (mask & (f == 0 ? body::LeftFoot : body::RightFoot)) != 0u) {
+                    swingGate = std::min(swingGate, 1.0f - plantedWeight(base, f));
                 }
             }
-            if (blocked) {
+            if (swingGate <= 1.0e-4f) {
                 ++out.diagnostics.rejectedByContact;
                 continue;
             }
+            gate *= swingGate;
         }
         const float phase = clamp01(local / cue.durationBeats);
         const float envelope = bell(phase, 0.16f, 0.24f);
@@ -862,6 +882,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         entry.cue = &cue;
         entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
         entry.weight = weight;
+        entry.gate = gate;
         {
             const auto smooth = [](float x) {
                 x = std::clamp(x, 0.0f, 1.0f);
@@ -967,7 +988,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
 
     for (const ActiveCue& entry : active) {
         const PrimitivePose& primitive = entry.pose;
-        const float w = entry.weight;
+        const float w = entry.weight * entry.gate;
         for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
             const Quat& delta = primitive.bone[b];
             if (std::abs(delta.w) > 0.999999f) {
@@ -994,9 +1015,13 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         out.pose.hips = out.pose.hips + primitive.hips * (w * regionShare(entry, body::Pelvis));
         if (options.allowFootwork && primitive.touchesFeet) {
             for (int f = 0; f < 2; ++f) {
-                if (!footPlanted(base, f)) {
+                // Each foot follows its own swing weight, so a foot that is coming off the
+                // floor lifts in step with its contact and never switches on at once.
+                const float swing = 1.0f - plantedWeight(base, f);
+                if (swing > 0.0f) {
                     const float wf =
-                        w * regionShare(entry, f == 0 ? body::LeftFoot : body::RightFoot);
+                        entry.weight * swing *
+                        regionShare(entry, f == 0 ? body::LeftFoot : body::RightFoot);
                     out.pose.foot[static_cast<std::size_t>(f)].position.y +=
                         primitive.footLift[static_cast<std::size_t>(f)] * wf;
                     out.pose.foot[static_cast<std::size_t>(f)].toePitch +=

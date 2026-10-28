@@ -21,6 +21,11 @@ const char* overlayModeName(OverlayMode mode) {
 
 namespace {
 
+// A jump of the host clock (seek, long stall) is hidden by a short smootherstep blend
+// from the last output pose. A plan or tempo change blends a little longer.
+constexpr double kSeekBlendSeconds = 0.18;
+constexpr double kPlanBlendSeconds = 0.5;
+
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -207,7 +212,7 @@ bool DancePlayer::selectClip(const std::string& clipId, double now, bool immedia
     if (mode_ != DanceMode::Manual) {
         const DanceFrame frame = director_.sample(now);
         director_.dropFuture(now);
-        director_.setSelectedStyle(frame.style);
+        director_.setSelectedClip(frame.clipId, frame.style);
         mode_ = DanceMode::Manual;
         autoNote_.clear();
     }
@@ -221,10 +226,14 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
         // from the analysis must keep the rich timeline (accents/downbeat
         // confidence) instead of replacing it with a bare grid.
         if (clock.constantGrid()) {
+            armIfMoved(director_.beatClock(), clock, now);
             director_.setBeatClock(std::move(clock));
         } else if (analysis_ && !analysis_->empty()) {
-            director_.setMusicalTimeline(MusicalTimeline::fromAnalysis(*analysis_));
+            const MusicalTimeline timeline = MusicalTimeline::fromAnalysis(*analysis_);
+            armIfMoved(director_.beatClock(), timeline.grid(), now);
+            director_.setMusicalTimeline(timeline);
         } else {
+            armIfMoved(director_.beatClock(), clock, now);
             director_.setBeatClock(std::move(clock));
         }
         return;
@@ -238,6 +247,7 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
 
 void DancePlayer::setMusicalTimeline(MusicalTimeline timeline, double now) {
     if (mode_ == DanceMode::Auto) {
+        armIfMoved(director_.beatClock(), timeline.grid(), now);
         director_.setMusicalTimeline(std::move(timeline));
         return;
     }
@@ -251,6 +261,7 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
 void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
     if (mode_ == DanceMode::Auto) {
+        armBlend(now, kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -273,6 +284,8 @@ void DancePlayer::setMode(DanceMode mode, double now) {
     }
     mode_ = mode;
     if (mode_ == DanceMode::Auto) {
+        // The plan replaces the Manual schedule: the dancer carries on from the current pose.
+        armBlend(now, kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -283,7 +296,7 @@ void DancePlayer::setMode(DanceMode mode, double now) {
         // Continue with whatever is dancing now; the user takes over from here.
         const DanceFrame frame = director_.sample(now);
         director_.dropFuture(now);
-        director_.setSelectedStyle(frame.style);
+        director_.setSelectedClip(frame.clipId, frame.style);
         autoNote_.clear();
     }
 }
@@ -292,7 +305,7 @@ void DancePlayer::select(DanceStyle style, double now, bool immediate) {
     if (mode_ != DanceMode::Manual) {
         const DanceFrame frame = director_.sample(now);
         director_.dropFuture(now);
-        director_.setSelectedStyle(frame.style);
+        director_.setSelectedClip(frame.clipId, frame.style);
         mode_ = DanceMode::Manual;
         autoNote_.clear();
     }
@@ -312,13 +325,61 @@ void DancePlayer::startSequence(const std::vector<DanceStyle>& styles, double no
     director_.startSequence(styles, now, beatsPerStyle, immediate);
 }
 
+void DancePlayer::armBlend(double at, double seconds) {
+    if (!haveLastPose_) {
+        return;
+    }
+    blend_.active = true;
+    blend_.from = lastPose_;
+    blend_.start = at;
+    blend_.seconds = seconds;
+}
+
+void DancePlayer::armIfMoved(const BeatClock& before, const BeatClock& after, double now) {
+    const double beatDelta = std::abs(before.beatAt(now) - after.beatAt(now));
+    const double bpmDelta = std::abs(before.bpmAt(now) - after.bpmAt(now));
+    if (beatDelta > 1.0e-4 || bpmDelta > 0.05) {
+        armBlend(now, kPlanBlendSeconds);
+    }
+}
+
+void DancePlayer::applyBlend(DanceFrame& frame, double mediaTime) {
+    if (!blend_.active) {
+        return;
+    }
+    const double u = (mediaTime - blend_.start) / blend_.seconds;
+    if (u >= 1.0) {
+        blend_.active = false;
+        return;
+    }
+    const auto w = static_cast<float>(std::clamp(u, 0.0, 1.0));
+    frame.pose = blendPoses(blend_.from, frame.pose, w * w * (3.0f - 2.0f * w));
+}
+
 DanceFrame DancePlayer::update(double mediaTime) {
-    const bool seek = lastTime_ > -1.0e8 &&
+    // A jump of the host clock is not a pose change the viewer should see: the new pose
+    // is reached from the last one. The schedule itself is pure and needs no reseed; only
+    // a time before its first segment (no segment covers it) rebuilds the Manual dance.
+    const bool jump = lastTime_ > -1.0e8 &&
                       (mediaTime < lastTime_ - 0.02 || mediaTime > lastTime_ + 0.5);
-    if (seek && mode_ == DanceMode::Manual) {
+    if (jump) {
+        armBlend(mediaTime, kSeekBlendSeconds);
+    }
+    const std::vector<ScheduleSegment>& segments = director_.schedule().segments();
+    if (mode_ == DanceMode::Manual && !segments.empty() &&
+        mediaTime < segments.front().startTime) {
+        armBlend(mediaTime, kSeekBlendSeconds);
         director_.reseed(mediaTime);
     }
     lastTime_ = mediaTime;
+    DanceFrame frame = sampleFrame(mediaTime);
+    applyBlend(frame, mediaTime);
+    lastPose_ = frame.pose;
+    haveLastPose_ = true;
+    return frame;
+}
+
+DanceFrame DancePlayer::sampleFrame(double mediaTime) {
     if (overlayMode_ == OverlayMode::Off) {
         return director_.sample(mediaTime);
     }

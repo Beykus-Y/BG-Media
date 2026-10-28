@@ -20,6 +20,7 @@
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
+#include <array>
 #include <functional>
 #include <map>
 #include <string>
@@ -143,6 +144,16 @@ private:
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;
+    // BG Motion 3.3 (A1). Stage-position hand-over of each foot of segment `index`. The
+    // foot keeps its outgoing position until the incoming clip starts a swing for it, then
+    // moves to the incoming position with smootherstep over that swing. `active` is false
+    // once the hand-over has completed. Pure function of media time.
+    struct FootHandOver {
+        float progress = 1.0f;  // 0 = outgoing position, 1 = incoming position
+        bool active = false;
+    };
+    [[nodiscard]] std::array<FootHandOver, 2> footHandOver(std::size_t index, double mediaTime,
+                                                           const MusicalTimeline& timeline) const;
     void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
                             const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;
@@ -199,8 +210,8 @@ public:
     void planAuto(const AnalysisResult& analysis, const AutoPlanOptions& options = {});
     // Fresh schedule that is just Idle.
     void reset(double now = 0.0);
-    // Restarts the selected style at `now`, aligned to the bar structure of the
-    // grid, without a fade (used after a seek).
+    // Restarts the selected clip at `now`, aligned to the bar structure of the
+    // grid, without a fade (used when the time precedes the schedule).
     void reseed(double now);
     // Installs a new beat grid while keeping the current clip and its phase, so
     // a tempo change never makes the pose jump.
@@ -216,7 +227,13 @@ public:
     [[nodiscard]] std::string describeSchedule() const;
     [[nodiscard]] DanceSchedule& schedule() { return schedule_; }
     [[nodiscard]] DanceStyle selectedStyle() const { return selected_; }
-    void setSelectedStyle(DanceStyle style) { selected_ = style; }
+    // The clip the Manual selection plays. Generated Custom clips share one style, so a
+    // reseed must follow the clip id, not the style.
+    [[nodiscard]] const std::string& selectedClipId() const { return selectedClip_; }
+    void setSelectedClip(const std::string& clipId, DanceStyle style) {
+        selectedClip_ = clipId;
+        selected_ = style;
+    }
     [[nodiscard]] const DanceLibrary* library() const { return library_; }
 
     // Next point where a manual switch can start without breaking the bar.
@@ -229,6 +246,10 @@ public:
                                            bool* limited = nullptr);
 
 private:
+    // BG Motion 3.3 (A5). Re-anchors the schedule after the grid changed from `before` to
+    // clock_/timeline_ at `now`: active segments keep their blend and their clip beat at
+    // `now`, pending segments keep their musical alignment beat. Used by rebase().
+    void reanchorSchedule(double now, const BeatClock& before);
     [[nodiscard]] double fadeFor(double atTime) const;
     [[nodiscard]] const HumanoidClip* clipFor(DanceStyle style) const;
     [[nodiscard]] double entryTimeFor(const HumanoidClip& clip, double now,
@@ -240,6 +261,7 @@ private:
     WarpProfile warp_;
     DanceSchedule schedule_;
     DanceStyle selected_ = DanceStyle::Idle;
+    std::string selectedClip_;
 };
 
 } // namespace bgmedia::motion

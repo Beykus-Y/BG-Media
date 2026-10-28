@@ -497,6 +497,12 @@ ClipPose sampleClip(const HumanoidClip& clip, double clipBeat) {
     return pose;
 }
 
+float footContactAt(const HumanoidClip& clip, int foot, double clipBeat) {
+    float contact = 0.0f;
+    footPhaseAt(clip, foot, clipBeat, contact);
+    return contact;
+}
+
 float clipAccentStrength(const HumanoidClip& clip, double clipBeat) {
     return accentEnvelope(clip, clipBeat);
 }

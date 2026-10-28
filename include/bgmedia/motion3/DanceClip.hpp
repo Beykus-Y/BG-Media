@@ -168,6 +168,9 @@ struct ClipPose {
 // Samples at a clip beat. Looping clips wrap; one-shot clips clamp.
 void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out);
 [[nodiscard]] ClipPose sampleClip(const HumanoidClip& clip, double clipBeat);
+// Contact (0 swing .. 1 planted) of one foot at a clip beat. Same value sampleClip reports,
+// without evaluating the bone tracks.
+[[nodiscard]] float footContactAt(const HumanoidClip& clip, int foot, double clipBeat);
 
 // Authored accent envelope at a clip beat (0..1). Used by the musical time
 // warp when no external BG Beat accent map exists (Motion Lab clips).

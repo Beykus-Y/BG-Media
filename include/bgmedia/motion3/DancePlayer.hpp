@@ -122,6 +122,22 @@ public:
 
 private:
     void replanAuthored();
+    // Stateful hand-over from the last output pose (BG Motion 3.3, A3/A4). The schedule
+    // stays a pure function of media time; only this blend remembers where it started.
+    void armBlend(double at, double seconds);
+    void armIfMoved(const BeatClock& before, const BeatClock& after, double now);
+    [[nodiscard]] DanceFrame sampleFrame(double mediaTime);
+    void applyBlend(DanceFrame& frame, double mediaTime);
+
+    struct PoseBlend {
+        bool active = false;
+        ClipPose from;
+        double start = 0.0;
+        double seconds = 0.0;
+    };
+    PoseBlend blend_;
+    bool haveLastPose_ = false;
+    ClipPose lastPose_;
 
     DanceLibrary library_;
     std::vector<HumanoidClip> authored_;
