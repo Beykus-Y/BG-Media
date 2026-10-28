@@ -9,6 +9,7 @@
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/version.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
@@ -47,6 +48,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using ui::Rect;
+
+// Personality of the idle life layer (breathing phase, look-around rhythm).
+constexpr std::uint32_t kAliveSeed = 0x6d61736cU;
 
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -1250,8 +1254,10 @@ struct DesktopApp::Impl {
         if (danceUi()) {
             const double danceNow = danceTime();
             updateDance();
+            const motion::ClipPose pose =
+                composeDancePose(danceFrame.pose, animationTime, danceIdle.mix(animationTime));
             std::string danceError;
-            if (!vrm.renderClip(danceFrame.pose, danceNow, vrmCamera, vrm.renderSettings(),
+            if (!vrm.renderClip(pose, danceNow, vrmCamera, vrm.renderSettings(),
                                 &danceError)) {
                 vrmFrameError = danceError;
             } else {
@@ -1275,6 +1281,8 @@ struct DesktopApp::Impl {
     // ---------------------------------------------------------------------
     motion::DancePlayer dance;
     motion::DanceFrame danceFrame;
+    // Dance <-> Idle crossfade for a stopped transport (wall-clock driven).
+    motion::IdleCrossfade danceIdle;
     bool useClips = true;
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
@@ -1299,6 +1307,37 @@ struct DesktopApp::Impl {
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
     [[nodiscard]] double danceTime() const {
         return track ? currentPosition() : danceLabTime;
+    }
+
+    // Whether the dance transport is moving. Scrubbing and capture drive the dance
+    // from the position, so they never count as stopped.
+    [[nodiscard]] bool danceTransportRunning() const {
+        if (!track) {
+            return syntheticDemo ? syntheticPlaying : danceLabRunning;
+        }
+        return captureMode || scrubbing || playing();
+    }
+
+    // The pose the 3D character shows this frame. The dance is frozen while the
+    // transport is stopped; once it has been stopped for a moment the pose eases
+    // to the Idle clip, sampled on wall time. The alive layer (breathing, weight
+    // shift, head look-around) comes last, with its energy taken from the blended
+    // pose: full strength at idle, reduced while dancing.
+    [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
+                                                    double wallNow, float idleMix) const {
+        motion::ClipPose pose = dancePose;
+        if (idleMix > 0.0f) {
+            const motion::HumanoidClip* idle =
+                dance.library().forStyle(motion::DanceStyle::Idle);
+            motion::ClipPose idlePose = motion::neutralClipPose();
+            if (idle && idle->bpm > 0.0) {
+                // Idle has a wall-clock time axis (tempoSync false): one beat per 60 / bpm s.
+                idlePose = motion::sampleClip(*idle, wallNow * idle->bpm / 60.0);
+            }
+            pose = motion::blendPoses(dancePose, idlePose, idleMix);
+        }
+        motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f);
+        return pose;
     }
 
     [[nodiscard]] motion::BeatClock danceGrid() const {
@@ -5208,6 +5247,7 @@ int DesktopApp::Impl::run() {
             updateDemo(deltaSeconds);
             updatePlayback();
             animationTime = static_cast<double>(frameStart) / 1e9;
+            danceIdle.update(danceTransportRunning(), animationTime);
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
