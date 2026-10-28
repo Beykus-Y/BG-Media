@@ -51,11 +51,20 @@ bool finiteQuat(const math::Quat& q) {
            std::isfinite(q.w);
 }
 
+// Angle between the bone rotations. Measured from the chord |p - q| rather than acos(dot):
+// acos turns float rounding of identical rotations into ~7e-4 rad near 1.
 float poseDistance(const motion::ClipPose& a, const motion::ClipPose& b) {
     float worst = 0.0f;
     for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
-        const float d = std::abs(math::dot(a.bone[i], b.bone[i]));
-        worst = std::max(worst, 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f)));
+        const math::Quat& p = a.bone[i];
+        const math::Quat& q = b.bone[i];
+        const float sign = math::dot(p, q) < 0.0f ? -1.0f : 1.0f;
+        const float dx = p.x - sign * q.x;
+        const float dy = p.y - sign * q.y;
+        const float dz = p.z - sign * q.z;
+        const float dw = p.w - sign * q.w;
+        const float chord = std::sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
+        worst = std::max(worst, 2.0f * std::asin(std::min(1.0f, 0.5f * chord)));
     }
     return worst;
 }
@@ -898,6 +907,101 @@ TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
     CHECK(!motion::DanceSchedule{}.inertialTransitions());
     CHECK(!blend.inertialTransitions());
     CHECK(inertial.inertialTransitions());
+}
+
+// BG Motion 3.3 (A8): the inertial transition carries the outgoing upper-body velocity through
+// the fade start. The review found it only C0 (its offset started at zero velocity). Here the
+// one-sided angular velocities either side of the fade start must agree: the jump is the
+// step in velocity, which for a C1 hand-over is only the acceleration times the sampling step.
+TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+    const double h = 1.0 / 240.0;
+
+    const auto makeSchedule = [&](bool inertial) {
+        motion::DanceSchedule schedule;
+        schedule.setInertialTransitions(inertial);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const auto poseAt = [&](const motion::DanceSchedule& schedule, double t) {
+        return schedule.sample(t, clock, timeline, off).pose;
+    };
+    // Upper body only: the inertial transition does not touch hips and legs.
+    const auto upperBody = [](std::size_t bone) {
+        using B = vrm::HumanoidBone;
+        const auto at = [](B value) { return static_cast<std::size_t>(value); };
+        return (bone >= at(B::Spine) && bone <= at(B::Head)) ||
+               (bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+               (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
+    };
+    // Angular velocity (world frame, rad/s) of one bone between two samples. The angle is
+    // taken from the chord-free form 2 atan2(|xyz|, |w|), which is exact for small steps.
+    using Velocity = std::array<double, 3>;
+    const auto velocity = [&](const motion::ClipPose& from, const motion::ClipPose& to,
+                              std::size_t bone) {
+        const math::Quat d = (to.bone[bone] * conjugate(from.bone[bone])).normalized();
+        const double sign = d.w < 0.0f ? -1.0 : 1.0;
+        const double x = sign * d.x;
+        const double y = sign * d.y;
+        const double z = sign * d.z;
+        const double s = std::sqrt(x * x + y * y + z * z);
+        const double k = s > 1.0e-12 ? 2.0 * std::atan2(s, sign * d.w) / s / h : 2.0 / h;
+        return Velocity{k * x, k * y, k * z};
+    };
+    // Velocity step across the fade start for each upper-body bone: the left derivative
+    // (outgoing side) against the right derivative (incoming side).
+    struct Jump {
+        double step = 0.0;
+        double outgoing = 0.0;
+    };
+    const auto jumpAtStart = [&](const motion::DanceSchedule& schedule) {
+        const motion::ClipPose before1 = poseAt(schedule, t0 - h);
+        const motion::ClipPose at = poseAt(schedule, t0);
+        const motion::ClipPose after1 = poseAt(schedule, t0 + h);
+        Jump worst;
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            if (!upperBody(bone)) {
+                continue;
+            }
+            const Velocity left = velocity(before1, at, bone);
+            const Velocity right = velocity(at, after1, bone);
+            const double step = std::sqrt((right[0] - left[0]) * (right[0] - left[0]) +
+                                          (right[1] - left[1]) * (right[1] - left[1]) +
+                                          (right[2] - left[2]) * (right[2] - left[2]));
+            const double outgoing = std::sqrt(left[0] * left[0] + left[1] * left[1] +
+                                              left[2] * left[2]);
+            if (step > worst.step) {
+                worst.step = step;
+                worst.outgoing = outgoing;
+            }
+        }
+        return worst;
+    };
+    const Jump inertial = jumpAtStart(makeSchedule(true));
+    const Jump blend = jumpAtStart(makeSchedule(false));
+    CHECK(std::isfinite(inertial.step));
+    // Carrying the offset velocity removes most of the step the zero-velocity offset left
+    // (about the outgoing speed itself).
+    CHECK(inertial.step < 0.5 * std::max(inertial.outgoing, 0.5));
+    // The blend already hands over smoothly at the start (smootherstep), so the carried
+    // velocity does not beat it there; DanceSchedule keeps the blend as its default.
+    CHECK(blend.step < 0.25 * std::max(inertial.outgoing, 0.5));
 }
 
 // BG Motion 3.3 (#9): the opt-in follow-through lags only head and hands, stays bounded,

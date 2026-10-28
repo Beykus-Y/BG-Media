@@ -281,16 +281,71 @@ bool isInertialBone(std::size_t bone) {
            (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
 }
 
-// Critically damped decay of an offset, rescaled so it is exactly 1 at the transition
-// start and exactly 0 at the fade's end (no jump when the blend hands over to the
-// incoming clip). The slope at the start is non-zero, so the outgoing motion is carried
-// forward rather than eased to rest.
-float inertialDecay(double elapsed, double fadeSeconds) {
-    constexpr double kLambdaFades = 5.0;
-    const auto raw = [](double x) { return (1.0 + x) * std::exp(-x); };
-    const double atEnd = raw(kLambdaFades);
-    const double x = std::max(elapsed, 0.0) / fadeSeconds * kLambdaFades;
-    return static_cast<float>(std::max(0.0, (raw(x) - atEnd) / (1.0 - atEnd)));
+// Inertialization of a bone offset (BG Motion 3.3, A8). The offset is a rotation vector o
+// (axis times angle). In decay time x = elapsed * 5 / fade it follows
+//   o(x) = o0 p(x) + v q(x) - g(x) (o0 p(5) + v q(5)),
+// with p(x) = (1 + x) e^-x and q(x) = x e^-x, so o(0) = o0 and the slope at 0 is the offset's
+// own velocity v (in decay time). g(x) = u^2 (3 - 2u), u = min(x / 5, 1), brings the offset to
+// exactly 0 at the fade's end with zero slope there, so the blend hands over without a step.
+// The offset's velocity is carried through the fade start: the outgoing motion goes on, and
+// the incoming clip's own motion is added to it.
+using RotationVector = std::array<double, 3>;
+
+RotationVector rotationVectorOf(const Quat& q) {
+    double x = q.x;
+    double y = q.y;
+    double z = q.z;
+    double w = q.w;
+    if (w < 0.0) {
+        x = -x;
+        y = -y;
+        z = -z;
+        w = -w;
+    }
+    const double s = std::sqrt(x * x + y * y + z * z);
+    const double angle = 2.0 * std::atan2(s, w);
+    const double k = s > 1.0e-12 ? angle / s : 2.0;
+    return {k * x, k * y, k * z};
+}
+
+Quat quaternionOf(const RotationVector& v) {
+    const double angle = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (angle < 1.0e-12) {
+        return Quat{static_cast<float>(v[0] * 0.5), static_cast<float>(v[1] * 0.5),
+                    static_cast<float>(v[2] * 0.5), 1.0f}
+            .normalized();
+    }
+    const double k = std::sin(angle * 0.5) / angle;
+    return Quat{static_cast<float>(k * v[0]), static_cast<float>(k * v[1]),
+                static_cast<float>(k * v[2]), static_cast<float>(std::cos(angle * 0.5))}
+        .normalized();
+}
+
+// `o0` is the offset at the transition start, `velocity` its rate of change (rad/s).
+Quat inertialOffset(const RotationVector& o0, const RotationVector& velocity, double elapsed,
+                    double fadeSeconds) {
+    constexpr double kLambda = 5.0;
+    // Velocity in decay time: d/dx = (fade / lambda) d/dt.
+    const double scale = fadeSeconds / kLambda;
+    const double x = std::min(std::max(elapsed, 0.0) / fadeSeconds, 1.0) * kLambda;
+    const auto raw = [&](double at) {
+        const double p = (1.0 + at) * std::exp(-at);
+        const double q = at * std::exp(-at);
+        RotationVector r{};
+        for (std::size_t i = 0; i < 3; ++i) {
+            r[i] = o0[i] * p + velocity[i] * scale * q;
+        }
+        return r;
+    };
+    const RotationVector atX = raw(x);
+    const RotationVector atEnd = raw(kLambda);
+    const double u = x / kLambda;
+    const double g = u * u * (3.0 - 2.0 * u);
+    RotationVector o{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        o[i] = atX[i] - g * atEnd[i];
+    }
+    return quaternionOf(o);
 }
 
 } // namespace
@@ -556,11 +611,17 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
                 // Inertialization: the offset between the outgoing and incoming upper body
                 // is fixed at the transition start, so it depends only on the segment and
                 // not on how the time was reached (seek and playback stay identical).
+                // The offset's velocity at the start is sampled one step later, so the
+                // outgoing motion is carried through the fade start, not frozen there.
                 const double startTime = segment.startTime;
+                constexpr double kVelocityStep = 1.0 / 240.0;
                 const ClipPose outgoingAtStart =
                     poseOf(index - 1, startTime, timeline, warp, nullptr, memo);
                 const ClipPose incomingAtStart = ownPose(index, startTime, timeline, warp);
-                const float decay = inertialDecay(mediaTime - startTime, segment.fadeSeconds);
+                const ClipPose outgoingNext =
+                    poseOf(index - 1, startTime + kVelocityStep, timeline, warp, nullptr, memo);
+                const ClipPose incomingNext =
+                    ownPose(index, startTime + kVelocityStep, timeline, warp);
                 for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
                     if (!isInertialBone(bone)) {
                         continue;
@@ -568,8 +629,17 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
                     const Quat offset =
                         (outgoingAtStart.bone[bone] * conjugate(incomingAtStart.bone[bone]))
                             .normalized();
-                    result.bone[bone] =
-                        (math::slerp(Quat::identity(), offset, decay) * own.bone[bone]).normalized();
+                    const Quat offsetNext =
+                        (outgoingNext.bone[bone] * conjugate(incomingNext.bone[bone])).normalized();
+                    const RotationVector before = rotationVectorOf(offset);
+                    const RotationVector after = rotationVectorOf(offsetNext);
+                    RotationVector velocity{};
+                    for (std::size_t i = 0; i < 3; ++i) {
+                        velocity[i] = (after[i] - before[i]) / kVelocityStep;
+                    }
+                    const Quat carried = inertialOffset(before, velocity, mediaTime - startTime,
+                                                        segment.fadeSeconds);
+                    result.bone[bone] = (carried * own.bone[bone]).normalized();
                 }
             }
             memo.emplace(key, result);
