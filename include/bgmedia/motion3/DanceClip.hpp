@@ -284,6 +284,9 @@ private:
     std::vector<ClipDiagnostic> diagnostics_;
     // Lazily created mirrors (stable addresses). Indexed by the original id, so a copied
     // library owns its own mirrors.
+    // Not thread-safe: find() and mirrorOf() are const but fill this cache, so they must not run
+    // concurrently. A library is for single-threaded use; share it between threads only behind a
+    // lock, or give each thread its own copy.
     mutable std::deque<HumanoidClip> mirrors_;
     mutable std::map<std::string, std::size_t> mirrorIndex_;
 };
