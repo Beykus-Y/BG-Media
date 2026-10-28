@@ -1179,3 +1179,84 @@ TEST_CASE(quality.generated_accent_ties_keep_the_strongest_mark) {
     }
     CHECK(checked >= 3);
 }
+TEST_CASE(quality.cue_duration_refreshes_after_a_tempo_change) {
+    // A tempo change re-plans by copying the segment, so the gesture that is
+    // already running must not jump; later gestures must use the new tempo
+    // instead of the planned one forever.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setExpression(motion::MotionExpression::Off);
+    player.setGrid(motion::BeatClock::constant(104.0, 0.0, 4), 0.0);
+    REQUIRE(player.selectClip("neonPulse", 0.0, true));
+    const motion::DanceFrame before = player.update(4.0);
+    CHECK_NEAR(before.secondsPerClipBeat, 60.0 / 104.0, 2.0e-3);
+
+    player.setGrid(motion::BeatClock::constant(130.0, 0.0, 4), 4.0);
+    const motion::DanceFrame atChange = player.update(4.0);
+    const motion::DanceFrame later = player.update(5.5);
+    std::cout << "\n            s/clip beat: before " << before.secondsPerClipBeat
+              << ", at the change " << atChange.secondsPerClipBeat
+              << ", 1.5 s later " << later.secondsPerClipBeat;
+    CHECK(maxBoneAngle(before.pose, atChange.pose) < 0.02f);  // no jump at the instant
+    CHECK_NEAR(atChange.secondsPerClipBeat, 60.0 / 104.0, 2.0e-3);  // still the old one
+    CHECK_NEAR(later.secondsPerClipBeat, 60.0 / 130.0, 2.0e-3);     // new tempo afterwards
+}
+
+TEST_CASE(quality.wrist_roll_keeps_its_phase_when_the_cue_is_short) {
+    // The duration scale must reduce the displacement of a wrist roll, not its
+    // phase: with `angle = 360 * phase * amp` a short cue used to keep the full
+    // 24 deg and move the peak from phase 0.25 to 0.71.
+    using motion::PrimitiveKind;
+    const auto hand = static_cast<std::size_t>(vrm::HumanoidBone::LeftHand);
+    const auto rollAt = [&](float phase, float seconds) {
+        const auto pose = motion::samplePrimitive(PrimitiveKind::WristRoll, phase, 1.0f, 0,
+                                                  0.0f, seconds);
+        const math::Quat& q = pose.bone[hand];
+        return 2.0f * std::atan2(std::abs(q.z), std::abs(q.w)) * 180.0f / 3.14159265f;
+    };
+    float peakPhaseLong = 0.0f;
+    float peakPhaseShort = 0.0f;
+    float peakLong = 0.0f;
+    float peakShort = 0.0f;
+    for (int i = 0; i <= 40; ++i) {
+        const float phase = static_cast<float>(i) / 40.0f;
+        const float l = rollAt(phase, 1.0f);
+        const float s = rollAt(phase, 0.18f);
+        if (l > peakLong) { peakLong = l; peakPhaseLong = phase; }
+        if (s > peakShort) { peakShort = s; peakPhaseShort = phase; }
+    }
+    std::cout << "\n            wrist roll peak " << peakLong << " deg at phase "
+              << peakPhaseLong << " (1.0 s) vs " << peakShort << " deg at phase "
+              << peakPhaseShort << " (0.18 s)";
+    CHECK_NEAR(peakPhaseLong, 0.25f, 0.06f);
+    CHECK_NEAR(peakPhaseShort, 0.25f, 0.06f);  // the peak did not move
+    CHECK(peakShort < 0.75f * peakLong);       // it is a smaller roll, not a slower one
+}
+
+TEST_CASE(quality.short_dances_have_no_out_of_range_accents) {
+    // A 4- or 6-bar request used to receive the fixed phrase/turn/heel/toe marks
+    // up to beat 28, beyond its period. A reader then computed a negative circular
+    // distance and an ordinary beat inherited the strong accent.
+    for (int bars : {4, 6, 8}) {
+        motion::ChoreographyRequest request;
+        request.id = "short";
+        request.bars = bars;
+        const motion::GeneratedDance dance = motion::ProceduralChoreography::generate(request);
+        const float beats = dance.clip.beats;
+        REQUIRE(!dance.clip.accents.empty());
+        int outside = 0;
+        for (const motion::AccentMark& mark : dance.clip.accents) {
+            if (mark.beat < 0.0f || mark.beat >= beats) ++outside;
+        }
+        CHECK(outside == 0);
+        const int kpb = std::max(1, dance.clip.keysPerBeat);
+        const auto depth = [&](int beat) {
+            return dance.clip.hips[static_cast<std::size_t>(beat) * static_cast<std::size_t>(kpb)].y;
+        };
+        // Beats 1 and 2 are both plain beats of the same section.
+        CHECK_NEAR(depth(1), depth(2), 1.0e-6);
+        std::cout << "\n            " << bars << " bars (" << beats << " beats): "
+                  << dance.clip.accents.size() << " marks, " << outside << " outside, "
+                  << "beat1 " << depth(1) << " beat2 " << depth(2);
+    }
+}
