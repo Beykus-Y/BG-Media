@@ -1712,7 +1712,8 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
     // of a style alternates between the authored clip and its mirror image, so a style that
     // comes back does not repeat the same bit-identical swing. The mirror is a library-owned
     // clip, so the segment's pointer stays valid.
-    std::array<bool, 6> mirrorNext{};  // per DanceStyle: the next segment of it is mirrored
+    // Per DanceStyle: the next segment of that style is mirrored.
+    std::array<bool, kDanceStyleCount> mirrorNext{};
     std::size_t index = 0;
     bool anySegment = false;
     for (int p = 0; p < phraseCount; ++p, ++index) {

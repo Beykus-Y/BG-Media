@@ -21,7 +21,7 @@
 #include "bgmedia/vrm/VrmModel.hpp"
 
 #include <array>
-#include <cstdint>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -46,6 +46,10 @@ enum class DanceStyle : std::uint8_t {
     Energetic,
     Custom
 };
+
+// Number of DanceStyle values, for per-style tables. Derived from the last enumerator, so a new
+// style cannot outgrow a table indexed by style.
+inline constexpr std::size_t kDanceStyleCount = static_cast<std::size_t>(DanceStyle::Custom) + 1;
 
 [[nodiscard]] const char* styleName(DanceStyle style);
 [[nodiscard]] DanceStyle styleFromName(const std::string& name);
