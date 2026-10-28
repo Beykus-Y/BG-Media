@@ -42,6 +42,17 @@ struct ScheduleSegment {
     bool barPhaseTrusted = true;   // the musical bar phase was trusted at entry
     int meter = 4;                 // musical meter used for the entry
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
+    // Planted-foot hand-over window per foot (BG Motion 3.3, A1). DanceSchedule::append with a
+    // timeline resolves it once, from the swing that is in the window at scheduling time. It is
+    // kept in media seconds: a rebase shifts a pending window with the segment's alignment and
+    // never searches the swing again. An unresolved window is searched on demand.
+    struct FootSwingWindow {
+        double begin = 0.0;    // media seconds: the foot leaves its outgoing position
+        double end = 0.0;      // media seconds: the foot reaches its incoming position
+        bool slide = false;    // no swing in the window: the foot slides through the fade
+        bool resolved = false;
+    };
+    std::array<FootSwingWindow, 2> footSwing{};
 };
 
 // Optional per-segment pose post-process (BG Motion 3.2 overlays). It is applied
@@ -106,6 +117,13 @@ public:
     void setFollowThrough(bool enabled) { followThrough_ = enabled; }
     [[nodiscard]] bool followThrough() const { return followThrough_; }
     void append(ScheduleSegment segment);
+    // Appends and resolves the planted-foot hand-over windows against the predecessor, the
+    // grid and the warp in effect now. Use it when scheduling: later grid changes then keep
+    // the windows instead of moving the foot hand-over.
+    void append(ScheduleSegment segment, const MusicalTimeline& timeline, const WarpProfile& warp);
+    // Searches again the hand-over windows of every segment after the grid changed without a
+    // re-anchor (a plain setBeatClock / setMusicalTimeline). A re-anchored rebase keeps them.
+    void refreshFootSwings(const MusicalTimeline& timeline, const WarpProfile& warp);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
     void truncateAfter(double time);
@@ -153,7 +171,12 @@ private:
         bool active = false;
     };
     [[nodiscard]] std::array<FootHandOver, 2> footHandOver(std::size_t index, double mediaTime,
-                                                           const MusicalTimeline& timeline) const;
+                                                           const MusicalTimeline& timeline,
+                                                           const WarpProfile& warp) const;
+    // Searches the hand-over window of one foot of segment `index` (see FootSwingWindow).
+    [[nodiscard]] ScheduleSegment::FootSwingWindow findFootSwing(std::size_t index, int foot,
+                                                                 const MusicalTimeline& timeline,
+                                                                 const WarpProfile& warp) const;
     void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
                             const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;

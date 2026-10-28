@@ -1062,3 +1062,46 @@ TEST_CASE(dance.paused_tempo_change_does_not_stick) {
     CHECK(worstBoneAngle(settled.pose, before.pose) > 1e-3);   // the tempo change is visible
 }
 
+TEST_CASE(dance.rebase_keeps_foot_targets_across_handover) {
+    // A grid change while a foot is in its hand-over, or in the window the hand-over still
+    // needs after the fade, must not move the feet. The swing is kept in media time, so a
+    // tempo change moves nothing at the moment of the change.
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kMetresPerHeight = 1.7;
+    double worstSame = 0.0;
+    double worstChanged = 0.0;
+    for (motion::DanceStyle from : styles) {
+        for (motion::DanceStyle to : styles) {
+            if (from == to) continue;
+            for (double u : {0.3, 0.7, 1.2}) {
+                for (double bpmAfter : {100.0, 112.0}) {
+                    motion::DanceDirector director(&library());
+                    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+                    director.select(from, 0.0, false, true);
+                    director.select(to, 5.37);
+                    const motion::ScheduleSegment& incoming = director.schedule().segments().back();
+                    const double now = incoming.startTime + u * incoming.fadeSeconds;
+                    const motion::ClipPose before = director.sample(now).pose;
+                    director.rebase(now, motion::BeatClock::constant(bpmAfter, 0.0));
+                    const motion::ClipPose after = director.sample(now).pose;
+                    double jump = 0.0;
+                    for (std::size_t f = 0; f < 2; ++f) {
+                        const double metres =
+                            (before.foot[f].position - after.foot[f].position).length() *
+                            kMetresPerHeight;
+                        jump = std::max(jump, metres);
+                    }
+                    if (bpmAfter == 100.0) {
+                        worstSame = std::max(worstSame, jump);
+                    } else {
+                        worstChanged = std::max(worstChanged, jump);
+                    }
+                }
+            }
+        }
+    }
+    CHECK(worstSame < 0.001);      // unchanged tempo: under 1 mm
+    CHECK(worstChanged < 0.01);    // 100 -> 112 BPM: under 1 cm
+}
