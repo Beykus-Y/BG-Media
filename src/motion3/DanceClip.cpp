@@ -142,9 +142,11 @@ float accentEnvelope(const HumanoidClip& clip, double beat) {
     }
     float best = 0.0f;
     for (const AccentMark& mark : clip.accents) {
-        // A mark outside the clip has no valid circular distance; ignoring it is
+        // A mark *beyond* the clip has no valid circular distance; ignoring it is
         // what keeps a short generated dance from inheriting accents it never has.
-        if (!(mark.beat >= 0.0f) || mark.beat >= clip.beats) {
+        // `beat == clip.beats` is the legal final hit (validateClip permits it), so
+        // only strictly out-of-range marks are rejected.
+        if (!(mark.beat >= 0.0f) || mark.beat > clip.beats + 1.0e-4f) {
             continue;
         }
         double d = std::abs(b - mark.beat);

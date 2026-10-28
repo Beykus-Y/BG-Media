@@ -1287,3 +1287,28 @@ TEST_CASE(quality.cue_duration_survives_consecutive_tempo_changes) {
     CHECK_NEAR(second.secondsPerClipBeat, 60.0 / 130.0, 2.0e-3);  // carried over
     CHECK_NEAR(later.secondsPerClipBeat, 60.0 / 140.0, 2.0e-3);
 }
+TEST_CASE(quality.final_beat_accent_is_not_discarded) {
+    // validateClip permits an accent at exactly `clip.beats` (the final hit of a
+    // one-shot clip); only marks strictly beyond the clip are invalid.
+    motion::HumanoidClip clip;
+    clip.beats = 4.0f;
+    clip.beatsPerBar = 4;
+    clip.loop = false;
+    motion::AccentMark final;
+    final.beat = 4.0f;
+    final.strength = 0.8f;
+    final.confidence = 1.0f;
+    clip.accents.push_back(final);
+    motion::AccentMark beyond;
+    beyond.beat = 6.0f;
+    beyond.strength = 1.0f;
+    beyond.confidence = 1.0f;
+    clip.accents.push_back(beyond);
+    const float atEnd = motion::clipAccentStrength(clip, 4.0);
+    const float justBefore = motion::clipAccentStrength(clip, 3.9);
+    std::cout << "\n            accent at the final beat: strength at 4.0 = " << atEnd
+              << ", at 3.9 = " << justBefore;
+    CHECK(atEnd > 0.7f);          // the final hit survives
+    CHECK(justBefore > 0.15f);    // and its approach is still visible
+    CHECK(atEnd <= 1.0f);         // a mark beyond the clip cannot inflate it
+}

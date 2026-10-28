@@ -764,8 +764,10 @@ float Choreographer::accentStrengthAt(float beat) const {
     float nearest = 1.0e9f;
     float strength = 0.55f;
     for (const AccentMark& mark : accents_) {
-        if (!(mark.beat >= 0.0f) || mark.beat >= period_) {
-            continue;  // a mark outside the loop has no circular distance
+        // Marks beyond the loop have no circular distance. `beat == period_` is the
+        // legal final hit (it aliases beat 0), so only strictly beyond is rejected.
+        if (!(mark.beat >= 0.0f) || mark.beat > period_ + 1.0e-4f) {
+            continue;
         }
         const float raw = std::abs(mark.beat - beat);
         const float distance = std::min(raw, std::max(0.0f, period_ - raw));
