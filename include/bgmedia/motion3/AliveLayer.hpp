@@ -23,10 +23,15 @@ namespace bgmedia::motion {
 //             about 0.35 and above = the dancing level. Non-finite = 0.
 //   seed      per-character phase and frequency jitter.
 //   weight    0..1 overall strength. 0 leaves the pose untouched (identity).
+//   bodyWeight 0..1 extra scale on breathing and the weight shift (chest,
+//             shoulders, hips). The host lowers it as the Idle clip takes over,
+//             because Idle already breathes and shifts its weight.
+//   headWeight 0..1 extra scale on the head and neck look-around.
+// The two extra weights multiply `weight`; the defaults keep the full layer.
 // Offsets are composed like the other overlays: bone = delta * bone, with the
 // delta authored about the clip-frame axes (+X left, +Y up, +Z forward).
 void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t seed,
-                float weight);
+                float weight, float bodyWeight = 1.0f, float headWeight = 1.0f);
 
 // Amplitude multiplier the energy input produces: 1 at idle, about 0.3 when
 // dancing. Exposed for diagnostics and tests.

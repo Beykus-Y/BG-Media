@@ -1326,6 +1326,7 @@ struct DesktopApp::Impl {
     [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
                                                     double wallNow, float idleMix) const {
         motion::ClipPose pose = dancePose;
+        float bodyWeight = 1.0f;
         if (idleMix > 0.0f) {
             const motion::HumanoidClip* idle =
                 dance.library().forStyle(motion::DanceStyle::Idle);
@@ -1337,8 +1338,11 @@ struct DesktopApp::Impl {
             // The dancer keeps the dance root and the feet are handed over one at a
             // time, so a travelled dancer does not glide back to the Idle origin.
             pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix);
+            // Idle already breathes and shifts its weight, so the alive layer's
+            // breathing and weight shift fade out as it takes over. The head look stays.
+            bodyWeight = 1.0f - std::clamp(idleMix, 0.0f, 1.0f);
         }
-        motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f);
+        motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f, bodyWeight, 1.0f);
         return pose;
     }
 

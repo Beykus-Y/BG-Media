@@ -158,53 +158,69 @@ float aliveEnergyScale(float energy) {
 }
 
 void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t seed,
-                float weight) {
+                float weight, float bodyWeight, float headWeight) {
     const float strength = std::isfinite(weight) ? std::clamp(weight, 0.0f, 1.0f) : 0.0f;
     if (strength <= 0.0f) {
         return;  // weight 0 is exactly the identity
     }
-    const double amplitude = static_cast<double>(strength) * aliveEnergyScale(energy);
+    const float bodyScale =
+        std::isfinite(bodyWeight) ? std::clamp(bodyWeight, 0.0f, 1.0f) : 0.0f;
+    const float headScale =
+        std::isfinite(headWeight) ? std::clamp(headWeight, 0.0f, 1.0f) : 0.0f;
+    const double energyScale = aliveEnergyScale(energy);
+    // Breathing and weight shift, and the head look, get separate amplitudes. With the
+    // defaults both are strength * energyScale, exactly as before.
+    const double bodyAmplitude = static_cast<double>(strength) * bodyScale * energyScale;
+    const double headAmplitude = static_cast<double>(strength) * headScale * energyScale;
     const double t = std::isfinite(wallTime) ? wallTime : 0.0;
 
     // --- breathing -----------------------------------------------------------
-    // Energy only scales the amplitude; the phase stays a plain function of wall time.
-    const double breathPeriod = kBreathPeriodSeconds;
-    // -1..1, inhale = positive. Positive pitch about +X tilts the top of the torso
-    // forward, so the inhale (chest lifts and tips back) uses the negative sign.
-    const double breath = wave(t / breathPeriod, unitHash(seed, 1));
-    composeBone(pose, HumanoidBone::UpperChest,
-                pitchQuat(-kUpperChestPitchDeg * amplitude * breath));
-    composeBone(pose, HumanoidBone::Chest, pitchQuat(-kChestPitchDeg * amplitude * breath));
-    // Shoulders lift together on the inhale: +Z roll lifts the left (+X) shoulder,
-    // so the right (-X) shoulder takes the opposite sign.
-    const double shoulder = kShoulderLiftDeg * amplitude * breath;
-    composeBone(pose, HumanoidBone::LeftShoulder, rollQuat(shoulder));
-    composeBone(pose, HumanoidBone::RightShoulder, rollQuat(-shoulder));
-    if (std::isfinite(pose.hips.x) && std::isfinite(pose.hips.y) && std::isfinite(pose.hips.z)) {
-        const double hipsY = kBreathHipsCm / kReferenceHeightCm * amplitude * breath;
-        pose.hips.y += static_cast<float>(hipsY);
-    }
+    if (bodyAmplitude > 0.0) {
+        const double amplitude = bodyAmplitude;
+        // Energy only scales the amplitude; the phase stays a plain function of wall time.
+        const double breathPeriod = kBreathPeriodSeconds;
+        // -1..1, inhale = positive. Positive pitch about +X tilts the top of the torso
+        // forward, so the inhale (chest lifts and tips back) uses the negative sign.
+        const double breath = wave(t / breathPeriod, unitHash(seed, 1));
+        composeBone(pose, HumanoidBone::UpperChest,
+                    pitchQuat(-kUpperChestPitchDeg * amplitude * breath));
+        composeBone(pose, HumanoidBone::Chest,
+                    pitchQuat(-kChestPitchDeg * amplitude * breath));
+        // Shoulders lift together on the inhale: +Z roll lifts the left (+X) shoulder,
+        // so the right (-X) shoulder takes the opposite sign.
+        const double shoulder = kShoulderLiftDeg * amplitude * breath;
+        composeBone(pose, HumanoidBone::LeftShoulder, rollQuat(shoulder));
+        composeBone(pose, HumanoidBone::RightShoulder, rollQuat(-shoulder));
+        if (std::isfinite(pose.hips.x) && std::isfinite(pose.hips.y) &&
+            std::isfinite(pose.hips.z)) {
+            const double hipsY = kBreathHipsCm / kReferenceHeightCm * amplitude * breath;
+            pose.hips.y += static_cast<float>(hipsY);
+        }
 
-    // --- slow weight shift ---------------------------------------------------
-    // Hips only. The feet are IK targets in stage space (footIK), so the pelvis
-    // moves over planted feet instead of dragging them.
-    const double shiftPeriod =
-        kWeightShiftMinSeconds + kWeightShiftSpanSeconds * unitHash(seed, 2);
-    const double shift = wave(t / shiftPeriod, unitHash(seed, 3));
-    if (std::isfinite(pose.hips.x)) {
-        const double hipsX = kWeightShiftCm / kReferenceHeightCm * amplitude * shift;
-        pose.hips.x += static_cast<float>(hipsX);
+        // --- slow weight shift -------------------------------------------------
+        // Hips only. The feet are IK targets in stage space (footIK), so the pelvis
+        // moves over planted feet instead of dragging them.
+        const double shiftPeriod =
+            kWeightShiftMinSeconds + kWeightShiftSpanSeconds * unitHash(seed, 2);
+        const double shift = wave(t / shiftPeriod, unitHash(seed, 3));
+        if (std::isfinite(pose.hips.x)) {
+            const double hipsX = kWeightShiftCm / kReferenceHeightCm * amplitude * shift;
+            pose.hips.x += static_cast<float>(hipsX);
+        }
     }
 
     // --- head micro look-around ----------------------------------------------
-    const double yaw = kLookYawDeg * amplitude * lookSum(kYawFrequencyHz, kYawWeight, t, seed, 16);
-    const double pitch =
-        kLookPitchDeg * amplitude * lookSum(kPitchFrequencyHz, kPitchWeight, t, seed, 40);
-    const math::Quat neck = yawQuat(kNeckShare * yaw) * pitchQuat(kNeckShare * pitch);
-    const math::Quat head = yawQuat((1.0 - kNeckShare) * yaw) *
-                            pitchQuat((1.0 - kNeckShare) * pitch);
-    composeBone(pose, HumanoidBone::Neck, neck);
-    composeBone(pose, HumanoidBone::Head, head);
+    if (headAmplitude > 0.0) {
+        const double yaw =
+            kLookYawDeg * headAmplitude * lookSum(kYawFrequencyHz, kYawWeight, t, seed, 16);
+        const double pitch =
+            kLookPitchDeg * headAmplitude * lookSum(kPitchFrequencyHz, kPitchWeight, t, seed, 40);
+        const math::Quat neck = yawQuat(kNeckShare * yaw) * pitchQuat(kNeckShare * pitch);
+        const math::Quat head = yawQuat((1.0 - kNeckShare) * yaw) *
+                                pitchQuat((1.0 - kNeckShare) * pitch);
+        composeBone(pose, HumanoidBone::Neck, neck);
+        composeBone(pose, HumanoidBone::Head, head);
+    }
 }
 
 ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix) {

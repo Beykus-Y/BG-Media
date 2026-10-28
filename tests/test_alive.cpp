@@ -317,6 +317,97 @@ TEST_CASE(alive.idle_crossfade_is_driven_by_wall_time_not_update_rate) {
     CHECK_NEAR(fine[3], 0.376, 0.02);  // 5.5 s: 0.25 s into the 0.6 s ease
 }
 
+// --- body / head weights (desktop: body fades out as the Idle clip takes over) ---
+
+TEST_CASE(alive.default_weights_match_the_explicit_full_weights) {
+    const ClipPose input = sampleInput();
+    for (const std::uint32_t seed : kSeeds) {
+        for (double t = 0.0; t < 30.0; t += 0.37) {
+            ClipPose implicit = input;
+            ClipPose explicitFull = input;
+            motion::applyAlive(implicit, t, 0.6f, seed, 0.8f);
+            motion::applyAlive(explicitFull, t, 0.6f, seed, 0.8f, 1.0f, 1.0f);
+            CHECK(poseIdentical(implicit, explicitFull));
+        }
+    }
+}
+
+TEST_CASE(alive.body_weight_zero_stops_breathing_and_shift_but_keeps_the_look) {
+    const ClipPose base = motion::neutralClipPose();
+    double maxHead = 0.0;
+    for (const std::uint32_t seed : kSeeds) {
+        for (double t = 0.0; t < 60.0; t += 0.05) {
+            ClipPose pose = base;
+            motion::applyAlive(pose, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            // Breathing and weight-shift bones and hips are exactly the input.
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::UpperChest)],
+                                base.bone[idx(HumanoidBone::UpperChest)]));
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::Chest)],
+                                base.bone[idx(HumanoidBone::Chest)]));
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::LeftShoulder)],
+                                base.bone[idx(HumanoidBone::LeftShoulder)]));
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::RightShoulder)],
+                                base.bone[idx(HumanoidBone::RightShoulder)]));
+            CHECK(vecIdentical(pose.hips, base.hips));
+            maxHead = std::max(maxHead, angleOf(pose, HumanoidBone::Head));
+        }
+    }
+    // The head still looks around.
+    CHECK(maxHead > 1.5);
+}
+
+TEST_CASE(alive.head_weight_zero_stops_the_look_but_keeps_breathing) {
+    const ClipPose base = motion::neutralClipPose();
+    double maxChest = 0.0;
+    for (const std::uint32_t seed : kSeeds) {
+        for (double t = 0.0; t < 60.0; t += 0.05) {
+            ClipPose pose = base;
+            motion::applyAlive(pose, t, 0.0f, seed, 1.0f, 1.0f, 0.0f);
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::Head)],
+                                base.bone[idx(HumanoidBone::Head)]));
+            CHECK(quatIdentical(pose.bone[idx(HumanoidBone::Neck)],
+                                base.bone[idx(HumanoidBone::Neck)]));
+            maxChest = std::max(maxChest, angleOf(pose, HumanoidBone::Chest));
+        }
+    }
+    CHECK(maxChest > 0.3);
+}
+
+TEST_CASE(alive.body_weight_scales_the_breathing_linearly) {
+    // Breathing and weight shift are linear in their amplitude, so half the body
+    // weight is exactly half the chest tilt, shoulder lift and hip sway. The head is
+    // untouched by the body weight.
+    const ClipPose base = motion::neutralClipPose();
+    for (double t = 0.0; t < 30.0; t += 0.05) {
+        ClipPose full = base;
+        ClipPose half = base;
+        motion::applyAlive(full, t, 0.0f, 42u, 1.0f);
+        motion::applyAlive(half, t, 0.0f, 42u, 1.0f, 0.5f, 1.0f);
+        CHECK_NEAR(angleOf(half, HumanoidBone::Chest), 0.5 * angleOf(full, HumanoidBone::Chest),
+                   1.0e-3);
+        CHECK_NEAR(angleOf(half, HumanoidBone::LeftShoulder),
+                   0.5 * angleOf(full, HumanoidBone::LeftShoulder), 1.0e-3);
+        CHECK_NEAR(static_cast<double>(half.hips.y), 0.5 * static_cast<double>(full.hips.y),
+                   1.0e-6);
+        CHECK_NEAR(static_cast<double>(half.hips.x), 0.5 * static_cast<double>(full.hips.x),
+                   1.0e-6);
+        CHECK(quatIdentical(half.bone[idx(HumanoidBone::Head)], full.bone[idx(HumanoidBone::Head)]));
+    }
+}
+
+TEST_CASE(alive.non_finite_body_and_head_weights_are_identity) {
+    const ClipPose input = sampleInput();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    ClipPose pose = input;
+    motion::applyAlive(pose, 3.3, 0.0f, 7u, 1.0f, nan, 1.0f);
+    // Body off: breathing identical to the input, look still applied.
+    CHECK(vecIdentical(pose.hips, input.hips));
+    CHECK(quatIdentical(pose.bone[idx(HumanoidBone::Chest)], input.bone[idx(HumanoidBone::Chest)]));
+    pose = input;
+    motion::applyAlive(pose, 3.3, 0.0f, 7u, 1.0f, 1.0f, nan);
+    CHECK(quatIdentical(pose.bone[idx(HumanoidBone::Head)], input.bone[idx(HumanoidBone::Head)]));
+}
+
 // --- dance -> Idle blend with the feet handed over one at a time ---
 
 namespace {
