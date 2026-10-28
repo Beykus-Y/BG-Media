@@ -451,6 +451,42 @@ TEST_CASE(motion32.detailed_hand_pose_moves_finger_bones) {
     CHECK(moved > 0.002f);
 }
 
+TEST_CASE(motion32.scalar_curl_and_relaxed_detailed_hand_pose_the_same_fingers) {
+    // A clip without detailed hands and the same clip with the relaxed detailed pose of its
+    // curl must pose every finger identically (BG Motion 3.3, A7). They differed before, so
+    // turning detailedHands on popped the fingers. Needs a model with finger bones.
+    const std::filesystem::path path = model1Path();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    Rig rig = makeRig(path);
+    REQUIRE(rig.ok());
+    for (const float curl : {0.0f, 0.4f, 1.0f}) {
+        motion::ClipPose scalar = motion::neutralClipPose();
+        scalar.hand[0] = curl;
+        scalar.hand[1] = curl;
+        motion::ClipPose detailed = scalar;
+        detailed.detailedHands = true;
+        detailed.handPose[0] = motion::relaxedHandPose(curl);
+        detailed.handPose[1] = motion::relaxedHandPose(curl);
+        const animation::RetargetedPose a = rig.rig->applyClip(scalar, 0.0);
+        const animation::RetargetedPose b = rig.rig->applyClip(detailed, 0.0);
+        for (int side = 0; side < 2; ++side) {
+            for (int finger = 0; finger < 5; ++finger) {
+                for (int joint = 0; joint < 3; ++joint) {
+                    const int node = rig.loaded.model->fingerNode(side, finger, joint);
+                    REQUIRE(node >= 0);
+                    const auto qa =
+                        a.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                    const auto qb =
+                        b.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                    CHECK(std::abs(math::dot(qa, qb)) > 0.99999f);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE(motion32.finger_fallback_is_honest) {
     Rig rig = makeRig(minimalVrm());
     REQUIRE(rig.ok());
