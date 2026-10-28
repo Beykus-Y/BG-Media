@@ -128,21 +128,28 @@ numbers because the overlay layer is model independent.
 
 | clip | LHand rad/s | Head rad/s | RHand rad/s | LHand m/s² | Head m/s² |
 |---|---|---|---|---|---|
-| neonPulse | 14.14 → 7.42 (−47 %) | 7.41 → 3.03 (−59 %) | 11.94 → 6.55 (−45 %) | 78.5 → 113.7 (**+45 %**) | 45.3 → 35.8 (−21 %) |
-| energetic | 15.99 → 6.93 (−57 %) | 9.11 → 3.19 (−65 %) | 8.79 → 4.07 (−54 %) | 87.5 → 61.2 (−30 %) | 54.0 → 37.2 (−31 %) |
-| streetCurrent | 10.91 → 6.24 (−43 %) | 7.74 → 3.63 (−53 %) | 7.72 → 4.39 (−43 %) | 68.5 → 62.7 (−8 %) | 36.8 → 31.1 (−15 %) |
-| sidestep | 7.36 → 3.77 (−49 %) | 7.53 → 3.03 (−60 %) | 4.07 → 4.07 | 32.5 → 29.3 | 29.0 → 22.5 (−22 %) |
+| neonPulse | 14.14 → 7.42 (−47 %) | 7.41 → 3.03 (−59 %) | 11.94 → 6.55 (−45 %) | 78.5 → **59.9 (−24 %)** | 45.3 → 37.2 (−18 %) |
+| energetic | 15.99 → 6.93 (−57 %) | 9.11 → 3.19 (−65 %) | 8.79 → 4.07 (−54 %) | 87.5 → 73.8 (−16 %) | 54.0 → 45.3 (−16 %) |
+| streetCurrent | 10.91 → 6.24 (−43 %) | 7.74 → 3.63 (−53 %) | 7.72 → 4.39 (−43 %) | 68.5 → 62.7 (−8 %) | 36.8 → 29.9 (−19 %) |
+| sidestep | 7.36 → 3.77 (−49 %) | 7.53 → 3.03 (−60 %) | 4.07 → 4.07 | 32.5 → 29.3 (−10 %) | 29.0 → 24.1 (−17 %) |
 | groove | 4.40 → 2.54 (−42 %) | 7.50 → 3.39 (−55 %) | 5.51 → 3.13 (−43 %) | 44.6 → 29.3 (−34 %) | 27.2 → 27.2 |
-| fluidSignal | 5.95 → 5.26 (−12 %) | 7.54 → 2.93 (−61 %) | 4.32 → 4.22 | 71.4 → 64.0 (−10 %) | 34.3 → 25.2 (−27 %) |
-| hiphop | 4.01 → 4.01 | 7.59 → 3.63 (−52 %) | 5.92 → 3.51 (−41 %) | 88.3 → 100.1 (**+13 %**) | 58.6 → 56.2 |
+| fluidSignal | 5.95 → 5.26 (−12 %) | 7.54 → 2.93 (−61 %) | 4.32 → 4.22 | 71.4 → 51.1 (−28 %) | 34.3 → 28.1 (−18 %) |
+| hiphop | 4.01 → 4.01 | 7.59 → 3.63 (−52 %) | 5.92 → 3.51 (−41 %) | 88.3 → 100.9 (max **+14 %**, mean −5 %, p99 −2 %) | 58.6 → 56.0 (−4 %) |
 
-Median change: hand angular −42 %, head angular −57 %, hand linear acceleration
-−9 %. Two regressions are disclosed rather than tuned away: hiphop's left-hand
-linear acceleration (+13 %, from the longer travel of the new accent-shaped
-release) and neonPulse's left hand (+45 %) — the left arm now sweeps from a
-hanging neutral to the raised gesture, a longer path over the same beats. Both
-stay inside the range the existing clips already use (energetic 87–146 m/s²) and
-the two clips' angular speeds still fell by 47–57 %.
+Median change: hand angular −45 %, head angular −56 %, hand linear acceleration
+−9 % and p99 of hand acceleration −14 %.
+
+The hiphop +14 % is a single-frame maximum: the distribution mean falls 5 % and p99
+falls 2 %, so it is a peak that moved, not a distribution shift. It is reported
+rather than smoothed away.
+
+The earlier +45 % on neonPulse's hand acceleration was traced to the intro: an
+"open again" arm key sat a quarter of a beat before the first motif key, so with a
+low neutral the arm had to cover a large arc and stop in 0.14 s. Giving the
+arrival a full beat removes it (−47 % against the previous commit, −24 % against
+`d472c3c`). An elbow/wrist follow lag was tried first and rejected: it lowered
+neonPulse by 7 % but raised energetic's hand acceleration by 21 % and the median
+was 0 %.
 
 Mesh level (`bgmedia_mesh_clip`, Model1, 40 s, arm groups): neonPulse and
 streetCurrent keep **0** crossing frames; fluidSignal keeps its pre-existing
@@ -226,3 +233,66 @@ it on; it stays off.
 5. Visual assessment of *motion* (as opposed to pose) could not be done in this
    environment: the videos in `out/quality_pass_3_3/visual/videos` were rendered
    but not watched; the pose sheets were reviewed frame by frame.
+
+## 8. Review follow-up (Codex P2 findings on PR #27)
+
+**8.1 Cue duration must follow the playback mapping, not the authored BPM.**
+Reproduced: at 130 BPM `neonPulse` plays at metric level 1, so a half-beat cue
+really lasts 0.231 s; the implementation used the authored 104 BPM (0.288 s), i.e.
+25 % too large, and slower playback was attenuated instead. Fixed by planning the
+duration with the segment (`ScheduleSegment::secondsPerClipBeat = 60 / (tempo *
+rate)`, or `60 / authored bpm` when `tempoSync` is false) and scaling it per
+sample by the continuous warp rate. Planning it per segment is deliberate: a
+rebase copies the segment, so the pose at a tempo change does not jump
+(`dance.tempo_change_does_not_jump_the_pose`, `sync31.tempo_change_rebases_*`
+stay green), and the next planned segment picks up the new tempo.
+
+Verified at four tempos (unit test and real fixtures):
+
+| tempo | s / clip beat | effective speed | note |
+|---|---|---|---|
+| 90 BPM | 0.6667 | 0.865 | rate 1 |
+| 104 BPM (authored) | 0.5769 | 1.000 | rate 1 |
+| 130 BPM | 0.4615 | 1.250 | rate 1, cue 25 % shorter than assumed |
+| 180 BPM | 0.6667 | 0.865 | rate 0.5, same dance as 90 |
+
+End to end over 8 s of `neonPulse`, the overlay rotation the gesture adds is
+59.8 rad at 90 BPM, 53.6 rad at 130 (−10 %) and 59.6 rad at 180 (half-time ≡ 90).
+`idle` (not tempo-synchronised) keeps 1.0 s/clip beat at any music tempo.
+
+**8.2 The strongest accent must win when several marks share a beat.**
+Reproduced: `accentStrengthAt` used a strict `<` on the distance, so the bar mark
+(0.82) that is appended first always beat the phrase hit (1.0) at the same
+timestamp. Beats 12 and 20 had exactly the same hip depth as beat 8. Ties on the
+nearest distance now resolve to the strongest mark:
+
+| beat | marks | depth before | depth after |
+|---|---|---|---|
+| 8 | bar 0.82 | −71.9 mm | −71.9 mm |
+| 12 | bar 0.82 + phrase hit 1.0 | −71.9 mm | **−76.2 mm** |
+| 20 | bar 0.82 + turn 1.0 | −71.9 mm | **−76.2 mm** |
+| 4 | bar 0.82 + phrase 0.9 | −55.9 mm | **−57.4 mm** |
+
+**8.3 neonPulse hand acceleration (+45 %) — traced and fixed.**
+The regression came from the intro, not from the low neutral itself: an "open
+again" arm key sat at `bar - 0.25`, a quarter of a beat before the first motif
+key, so the arm had to cover a large arc and decelerate in 0.14 s (hand speed
+5.0 → 0.3 m/s in four frames). The beat-3 pose now flows into the motif over a
+full beat: 113.7 → 59.9 m/s² at 60 FPS, and 59.9 against `d472c3c`'s 78.5
+(−24 %). No phrase loses a pose; the contact sheet of the intro shows the same
+rise, without the churn.
+
+An elbow/wrist follow lag (`armKey` writing the forearm 0.09 beat and the wrist
+0.15 beat after the shoulder) was implemented and measured first. It reduced
+neonPulse by 7 % but raised energetic's hand acceleration by 21 % and left the
+median unchanged, so it was reverted rather than kept as tuning.
+
+**8.4 After the follow-up, against `d472c3c` (60 FPS, both models):** hand
+angular −45 % median, head angular −56 %, hand linear acceleration −9 % median
+and −14 % at p99. Real-music runs at 92/123/163 BPM narrow the neonPulse hand
+acceleration from 91/167/75 to 50/87/47 m/s².
+
+Tempo sync, the warp, the accent map, footwork and the QA matrix were re-run
+after the change: `bgmedia_sync_qa` still differs from `docs/sync_qa_3_1.json`
+only in the timing fields and `footErrorMm`; issue #12 numbers are unchanged
+(Model1 12/20/40 frames, Nemesis 351/711/1422, 12.05 mm).
