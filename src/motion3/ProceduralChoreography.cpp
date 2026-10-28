@@ -671,11 +671,15 @@ void Choreographer::authorArms() {
         }
     };
 
-    // Intro: open, fold one arm, low sweep, then open again.
+    // Intro: open, fold one arm, low sweep, then into the first motif. The
+    // "open again" key used to sit at bar - 0.25, i.e. a quarter of a beat before
+    // the motif: with a low neutral the arm had to cover a large arc and stop in
+    // 0.14 s, which is where neonPulse's 114 m/s^2 hand deceleration came from.
+    // The beat-3 pose now goes straight into the motif, so the arrival has a full
+    // beat and no pose is lost.
     at(0.0f, presets[0], presets[0], true);
     at(bar * 0.5f, presets[2], presets[0], false);
     at(bar * 0.75f, presets[3], presets[4], false);
-    at(bar - 0.25f, presets[0], presets[0], false);
 
     // Development: a two-beat motif that swaps sides on the second beat. The
     // motif rotates every two bars so the four phrases are not the same.
@@ -742,14 +746,25 @@ void Choreographer::authorAccents() {
 }
 
 float Choreographer::accentStrengthAt(float beat) const {
+    // Nearest authored accent within half a beat; a plain beat moves less (0.55).
+    // Several marks may share one beat (a bar accent plus a phrase hit, a turn or
+    // a heel/toe mark). They must not be decided by array order: the strongest of
+    // the nearest marks wins, otherwise the authored phrase emphasis never reaches
+    // the body track.
+    constexpr float kTie = 1.0e-4f;
+    float nearest = 1.0e9f;
     float strength = 0.55f;
-    float nearest = 1.0f;
     for (const AccentMark& mark : accents_) {
         const float raw = std::abs(mark.beat - beat);
         const float distance = std::min(raw, std::max(0.0f, period_ - raw));
-        if (distance < nearest) {
+        if (distance > 0.5f) {
+            continue;
+        }
+        if (distance < nearest - kTie) {
             nearest = distance;
             strength = mark.strength;
+        } else if (distance <= nearest + kTie) {
+            strength = std::max(strength, mark.strength);
         }
     }
     return nearest <= 0.5f ? std::clamp(strength, 0.0f, 1.0f) : 0.55f;
