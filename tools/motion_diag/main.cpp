@@ -21,6 +21,7 @@
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/vrm/ThighColliders.hpp"
+#include "../../tests/motion_metrics.hpp"
 #include "support/MeshProbe.hpp"
 #include "support/PathUtf8.hpp"
 
@@ -412,9 +413,11 @@ int main(int argc, char** argv) {
     const float h = model.height;
     for (int ft = 0; ft < 2; ++ft) {
         const int ankleK = ft == 0 ? 8 : 9;
-        double maxSlide = 0, dragDist = 0, dragTime = 0, maxHorizSpeedPlanted = 0;
+        double maxSlide = 0;
         std::size_t runStart = 0;
         bool inRun = false;
+        std::vector<qa::FootSample> track;
+        track.reserve(n - skipIdx);
         for (std::size_t i = skipIdx; i < n; ++i) {
             const bool planted = frames[i].planted[ft];
             if (planted && !inRun) {
@@ -426,17 +429,16 @@ int main(int argc, char** argv) {
                 maxSlide = std::max<double>(maxSlide, std::hypot(d.x, d.z));
             }
             if (!planted) inRun = false;
-            if (i == skipIdx) continue;
-            const Vec3 d = frames[i].pos[ankleK] - frames[i - 1].pos[ankleK];
-            const double horiz = std::hypot(d.x, d.z);
-            if (!planted && frames[i].footTarget[ft].y < 0.012f && horiz / dt > 0.15) {
-                dragDist += horiz;
-                dragTime += dt;
-            }
+            track.push_back({frames[i].t, frames[i].pos[ankleK], frames[i].footTarget[ft].y, planted});
         }
-        (void)maxHorizSpeedPlanted;
-        std::printf("%s foot: max slide inside a planted run %.2f mm | GROUND DRAG (not planted, lift < %.1f cm, moving > 0.15 m/s): %.1f cm over %.2f s\n",
-                    ft == 0 ? "left " : "right", maxSlide * 1000.0, 0.012 * h * 100.0, dragDist * 100.0, dragTime);
+        // Drag is integrated on a fixed reference grid; the per-sample figure is what the
+        // reports showed before and is printed next to it so the sampling dependence is visible.
+        const qa::GroundDrag drag = qa::measureGroundDrag(track, 0.012f, 0.15);
+        const qa::GroundDrag legacy = qa::measureGroundDragPerSample(track, 0.012f, 0.15);
+        std::printf("%s foot: max slide inside a planted run %.2f mm | GROUND DRAG (not planted, lift < %.1f cm, moving > 0.15 m/s): %.1f cm over %.2f s "
+                    "(per-sample %.1f cm)\n",
+                    ft == 0 ? "left " : "right", maxSlide * 1000.0, 0.012 * h * 100.0, drag.distance * 100.0, drag.seconds,
+                    legacy.distance * 100.0);
     }
     int legFrames = 0, legMax = 0, armFrames = 0, armMax = 0, sampled = 0;
     for (const Frame& f : frames) {
