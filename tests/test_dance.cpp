@@ -1700,6 +1700,44 @@ TEST_CASE(dance.manual_seek_matches_continuous_play_in_later_loops) {
     }
 }
 
+TEST_CASE(dance.manual_seek_keeps_the_grid_bar_offset) {
+    // An analysed grid whose first beat is the third of its bar: continuous play enters the
+    // clip in phase with the bar, and a seek must land on the same clip beat, so the
+    // choreography stays on the musical bars (it was two beats off before).
+    AnalysisResult analysis;
+    analysis.info.duration = 120.0;
+    analysis.bpm = 96.0;
+    analysis.tempoStable = true;
+    analysis.bpmConfidence = 0.9f;
+    analysis.beatPhaseConfidence = 0.9f;
+    for (int i = 0; i < 180; ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / 96.0;
+        beat.beatInBar = (i + 2) % 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+    }
+    const motion::BeatClock clock = motion::BeatClock::fromAnalysis(analysis);
+    CHECK(clock.barOffset() == 2);
+    const auto makeDirector = [&] {
+        auto director = std::make_unique<motion::DanceDirector>(&library());
+        director->setBeatClock(clock);
+        director->reset(0.0);
+        director->select(motion::DanceStyle::Groove, 0.0, false, true);
+        return director;
+    };
+    const auto played = makeDirector();
+    for (double beat : {22.0, 37.5, 61.25}) {
+        const double t = clock.timeAtBeat(beat);
+        const auto seeked = makeDirector();
+        seeked->reseed(t);
+        for (double ahead : {1.0, 2.5}) {
+            const double when = clock.timeAtBeat(beat + ahead);
+            CHECK_NEAR(seeked->sample(when).clipBeat, played->sample(when).clipBeat, 1e-3);
+        }
+    }
+}
+
 TEST_CASE(dance.overlay_cues_change_per_loop_and_are_deterministic) {
     motion::DancePlayer player;
     player.loadLibrary(dancesDir());

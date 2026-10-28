@@ -1235,10 +1235,13 @@ void DanceDirector::reseed(double now) {
         // continuous play advances it. A wrapped (in-bar) phase would reset the loop index to 0,
         // and with it the per-loop variation, at every seek. Continuous play from the grid origin
         // has the same clip beat at every time, so a seek lands on its pose and its loop.
+        // With a trusted bar the count includes the grid's bar offset (an analysis whose first
+        // beat is not a downbeat), so musical downbeats stay on clip bar starts.
         const double beatPos = clock_.beatAt(now);
         const int inBar = clock_.beatInBar(beatPos);
         const double fraction = beatPos - std::floor(beatPos + 1e-6);
-        segment.entryClipBeat = beatPos * segment.rate;
+        const double barOffset = timeline_.downbeatTrusted() ? clock_.barOffset() : 0.0;
+        segment.entryClipBeat = (beatPos + barOffset) * segment.rate;
         segment.alignedToDownbeat =
             timeline_.downbeatTrusted() && inBar == 0 && fraction < 1e-4;
         segment.barPhaseTrusted = timeline_.downbeatTrusted();
