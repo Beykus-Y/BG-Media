@@ -162,9 +162,18 @@ Mapping mapSegment(const ScheduleSegment& segment, double mediaTime,
 
 // Real duration of one clip beat for a segment. The value planned with the segment
 // keeps the gesture that is already running continuous across a tempo change (a
-// rebase copies the segment), and it blends into the live tempo over half a second
-// so later gestures use the new tempo instead of the planned one forever. The warp
-// rate is continuous and is applied on top.
+// rebase carries the currently blended value over and restarts the blend), and it
+// settles into the live tempo over half a second so later gestures use the new
+// tempo instead of the planned one forever. The warp rate is continuous and is
+// applied on top.
+constexpr double kTimingBlendSeconds = 0.5;
+
+double blendPlannedSeconds(double planned, double live, double elapsed) {
+    double t = std::clamp(elapsed / kTimingBlendSeconds, 0.0, 1.0);
+    t = t * t * (3.0 - 2.0 * t);
+    return planned + (live - planned) * t;
+}
+
 double segmentSecondsPerClipBeat(const ScheduleSegment& segment, const Mapping& mapping,
                                  double mediaTime, const BeatClock& clock) {
     const double authored = segment.clip ? std::max(1.0, segment.clip->bpm) : 120.0;
@@ -172,10 +181,7 @@ double segmentSecondsPerClipBeat(const ScheduleSegment& segment, const Mapping& 
     const bool tempoSync = segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9;
     if (tempoSync) {
         const double live = 60.0 / std::max(1.0e-6, clock.bpmAt(mediaTime) * segment.rate);
-        constexpr double kTimingBlendSeconds = 0.5;
-        double t = std::clamp((mediaTime - segment.alignTime) / kTimingBlendSeconds, 0.0, 1.0);
-        t = t * t * (3.0 - 2.0 * t);
-        base += (live - base) * t;
+        base = blendPlannedSeconds(base, live, mediaTime - segment.alignTime);
     }
     const double warp = tempoSync ? mapping.rate / segment.rate : 1.0;
     return base / std::max(0.25, warp);
@@ -829,6 +835,15 @@ void DanceDirector::rebase(double now, BeatClock newClock) {
     }
     ScheduleSegment segment = segments[k];
     segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
+    // Snapshot the duration that is in force right now: the new clock must not jump
+    // the gesture that is already running (a second tempo change would otherwise
+    // revert to the duration planned for the first segment).
+    if (segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9 &&
+        segment.secondsPerClipBeat > 0.0) {
+        const double live = 60.0 / std::max(1.0e-6, clock_.bpmAt(now) * segment.rate);
+        segment.secondsPerClipBeat = blendPlannedSeconds(
+            segment.secondsPerClipBeat, live, now - segment.alignTime);
+    }
     setBeatClock(std::move(newClock));
     segment.alignTime = now;
     segment.startTime = now - 1.0e6;
@@ -857,6 +872,13 @@ void DanceDirector::rebase(double now, MusicalTimeline newTimeline) {
     ScheduleSegment segment = segments[k];
     segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
     const double previousBeat = segment.entryClipBeat;
+    // Same as the clock overload: carry the duration in force now into the new plan.
+    if (segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9 &&
+        segment.secondsPerClipBeat > 0.0) {
+        const double live = 60.0 / std::max(1.0e-6, clock_.bpmAt(now) * segment.rate);
+        segment.secondsPerClipBeat = blendPlannedSeconds(
+            segment.secondsPerClipBeat, live, now - segment.alignTime);
+    }
     setMusicalTimeline(std::move(newTimeline));
     segment.alignTime = now;
     segment.startTime = now - 1.0e6;

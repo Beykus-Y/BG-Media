@@ -1260,3 +1260,30 @@ TEST_CASE(quality.short_dances_have_no_out_of_range_accents) {
                   << "beat1 " << depth(1) << " beat2 " << depth(2);
     }
 }
+TEST_CASE(quality.cue_duration_survives_consecutive_tempo_changes) {
+    // A second tempo change must start the blend from the duration currently in
+    // force, not from the one planned for the first segment, or the pose jumps
+    // back to the old gesture scale.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setExpression(motion::MotionExpression::Off);
+    player.setGrid(motion::BeatClock::constant(104.0, 0.0, 4), 0.0);
+    REQUIRE(player.selectClip("neonPulse", 0.0, true));
+    (void)player.update(4.0);
+
+    player.setGrid(motion::BeatClock::constant(130.0, 0.0, 4), 4.0);
+    const motion::DanceFrame first = player.update(4.0);
+    const motion::DanceFrame settled = player.update(6.0);
+    CHECK_NEAR(first.secondsPerClipBeat, 60.0 / 104.0, 2.0e-3);
+    CHECK_NEAR(settled.secondsPerClipBeat, 60.0 / 130.0, 2.0e-3);
+
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0, 4), 6.0);
+    const motion::DanceFrame second = player.update(6.0);
+    const motion::DanceFrame later = player.update(7.0);
+    std::cout << "\n            consecutive changes: " << first.secondsPerClipBeat
+              << " -> " << settled.secondsPerClipBeat << " -> at change "
+              << second.secondsPerClipBeat << " -> 1 s later " << later.secondsPerClipBeat;
+    CHECK(maxBoneAngle(settled.pose, second.pose) < 0.02f);
+    CHECK_NEAR(second.secondsPerClipBeat, 60.0 / 130.0, 2.0e-3);  // carried over
+    CHECK_NEAR(later.secondsPerClipBeat, 60.0 / 140.0, 2.0e-3);
+}
