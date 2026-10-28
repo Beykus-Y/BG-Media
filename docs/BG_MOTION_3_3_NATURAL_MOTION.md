@@ -296,3 +296,32 @@ Tempo sync, the warp, the accent map, footwork and the QA matrix were re-run
 after the change: `bgmedia_sync_qa` still differs from `docs/sync_qa_3_1.json`
 only in the timing fields and `footErrorMm`; issue #12 numbers are unchanged
 (Model1 12/20/40 frames, Nemesis 351/711/1422, 12.05 mm).
+
+### 8.5 Second review round (`ad943fa`, `3e7e60a`)
+
+Three more P2 findings were reproduced and fixed:
+
+1. **A tempo change left the planned duration stale.** Keeping the per-segment
+   value fixed the pose jump but froze the gesture size for the rest of a manual
+   session (104 → 130 BPM still reported 0.576923 s). The duration now blends from
+   the planned value to the live tempo over 0.5 s after the segment's alignment:
+   0.576923 at the change instant (pose step < 0.02 rad) and 0.461538 s at +1.5 s.
+   With an unchanged tempo the blend is a no-op.
+2. **`WristRoll` scaled its phase instead of its displacement.**
+   `angle = 360 * phase * amp` moved the peak from phase 0.25 to 0.71 for a short
+   cue and the 24° term had no amplitude factor. The phase is now independent of
+   the duration scale: peak at 0.25 for a 1.0 s and a 0.18 s cue, 24° vs 8.4°.
+   This is also why the right hand improved further: median angular speed
+   −43 % (was −20 %).
+3. **Short dances carried out-of-range accents.** A 4-bar request received the
+   fixed phrase/turn/heel/toe marks up to beat 28 although the clip is 16 beats;
+   the circular distance then went negative and beat 1 inherited the 1.0 accent.
+   Marks outside `[0, period)` are no longer authored, ignored when read
+   (`accentStrengthAt`, `accentEnvelope`), so a 4/6-bar dance shapes its own beats
+   and beats 1 and 2 are identical.
+
+New tests: `quality.cue_duration_refreshes_after_a_tempo_change`,
+`quality.wrist_roll_keeps_its_phase_when_the_cue_is_short`,
+`quality.short_dances_have_no_out_of_range_accents`. After this round, against
+`d472c3c` at 60 FPS: median left-hand angular −44 %, right-hand angular −43 %,
+head −56 %, left-hand acceleration −10 %.
