@@ -572,7 +572,7 @@ TEST_CASE(alive.blend_to_idle_does_not_lift_a_foot_that_barely_moves) {
     idle.rootX = dance.rootX;
     idle.rootZ = dance.rootZ;
     idle.rootYaw = dance.rootYaw;
-    // Right foot: 0.2 cm of travel, under the 1 cm threshold, so no lift.
+    // Right foot: 0.2 cm of travel, under the 0.5 cm start of the lift fade, so no lift.
     idle.foot[1].position = {dance.foot[1].position.x + 0.002f, 0.0f,
                              dance.foot[1].position.z + 0.002f};
     for (int i = 50; i <= 100; ++i) {
@@ -690,4 +690,23 @@ TEST_CASE(alive.blend_to_idle_keeps_a_latched_foot_order) {
     for (std::size_t f = 0; f < 2; ++f) {
         CHECK(footDistanceXZ(before.foot[f].position, after.foot[f].position) < 1.0e-6f);
     }
+}
+
+TEST_CASE(alive.blend_to_idle_lift_is_continuous_in_the_dance_contact) {
+    // On resume the dance pose moves under a foot that is mid hand-over: its contact
+    // crossing 0.5 must not drop the lift arch in one frame.
+    const ClipPose idle = idleStance();
+    ClipPose dance = travelledDance();
+    float previous = -1.0f;
+    float worst = 0.0f;
+    for (int i = 0; i <= 1000; ++i) {
+        dance.foot[0].contact = static_cast<float>(i) / 1000.0f;
+        const float y = motion::blendToIdleKeepingFeet(dance, idle, 0.75f, 1).foot[0].position.y;
+        if (i > 0) {
+            worst = std::max(worst, std::abs(y - previous));
+        }
+        previous = y;
+    }
+    CHECK(worst < 2.0e-4f);  // 0.001 of contact per step: no jump
+    CHECK(previous > 0.02f);  // fully planted: the full step arch
 }

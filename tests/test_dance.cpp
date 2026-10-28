@@ -1128,3 +1128,32 @@ TEST_CASE(dance.frame_reports_the_idle_share_through_a_crossfade) {
     CHECK(sawFade);
     CHECK(director.sample(12.0).idleWeight == 0.0f);
 }
+
+TEST_CASE(dance.plan_blend_keeps_planted_feet_in_place) {
+    // A tempo change re-maps the schedule: the body blends over to the new grid, but a
+    // foot that stays planted must not slide there with it.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    player.setOverlayMode(motion::OverlayMode::Off);
+    for (double t = 0.0; t <= 9.0; t += 1.0 / 120.0) {
+        (void)player.update(t);
+    }
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    motion::DanceFrame previous = player.update(9.0);
+    double worstSlide = 0.0;
+    for (double t = 9.0 + 1.0 / 240.0; t <= 10.0; t += 1.0 / 240.0) {
+        const motion::DanceFrame frame = player.update(t);
+        for (std::size_t f = 0; f < 2; ++f) {
+            if (previous.pose.foot[f].contact >= 0.999f && frame.pose.foot[f].contact >= 0.999f) {
+                const motion::Vec3 d = frame.pose.foot[f].position - previous.pose.foot[f].position;
+                worstSlide = std::max(worstSlide,
+                                      static_cast<double>(std::sqrt(d.x * d.x + d.z * d.z)));
+            }
+        }
+        previous = frame;
+    }
+    // Per 240 Hz frame, a planted foot creeps by at most the slow fallback, never the
+    // 0.5 s body blend (which moved it ~33 cm, ~1 cm per frame).
+    CHECK(worstSlide < 0.0015);
+}

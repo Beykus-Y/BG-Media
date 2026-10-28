@@ -25,6 +25,10 @@ namespace {
 // from the last output pose. A plan or tempo change blends a little longer.
 constexpr double kSeekBlendSeconds = 0.18;
 constexpr double kPlanBlendSeconds = 0.5;
+// Carried planted-foot offsets: paid off with time constant kSwingCarrySeconds while the
+// shown foot swings, and kPlantedCarrySeconds while it stays planted.
+constexpr double kSwingCarrySeconds = 0.08;
+constexpr double kPlantedCarrySeconds = 3.0;
 
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
@@ -267,7 +271,7 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
 void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
     if (mode_ == DanceMode::Auto) {
-        armBlend(kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds, true);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -291,7 +295,7 @@ void DancePlayer::setMode(DanceMode mode, double now) {
     mode_ = mode;
     if (mode_ == DanceMode::Auto) {
         // The plan replaces the Manual schedule: the dancer carries on from the current pose.
-        armBlend(kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds, true);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -331,9 +335,15 @@ void DancePlayer::startSequence(const std::vector<DanceStyle>& styles, double no
     director_.startSequence(styles, now, beatsPerStyle, immediate);
 }
 
-void DancePlayer::armBlend(double seconds) {
+void DancePlayer::armBlend(double seconds, bool carryFeet) {
     if (!haveLastPose_) {
         return;
+    }
+    // A seek is a jump in the music; its short blend may move the feet. A plan or grid
+    // change keeps dancing in place, so planted feet stay where they are.
+    carry_.pending = carryFeet;
+    if (!carryFeet) {
+        carry_.remaining = {0.0, 0.0};
     }
     blend_.active = true;
     blend_.hold = true;  // the first frame after arming still shows the outgoing pose
@@ -346,7 +356,7 @@ void DancePlayer::armIfMoved(const BeatClock& before, const BeatClock& after, do
     const double beatDelta = std::abs(before.beatAt(now) - after.beatAt(now));
     const double bpmDelta = std::abs(before.bpmAt(now) - after.bpmAt(now));
     if (beatDelta > 1.0e-4 || bpmDelta > 0.05) {
-        armBlend(kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds, true);
     }
 }
 
@@ -377,12 +387,51 @@ void DancePlayer::applyBlend(DanceFrame& frame) {
     frame.pose = blendPoses(blend_.from, frame.pose, w * w * (3.0f - 2.0f * w));
 }
 
+void DancePlayer::advanceFootCarry(double travelled) {
+    for (std::size_t f = 0; f < 2; ++f) {
+        if (carry_.remaining[f] <= 0.0) {
+            continue;
+        }
+        if (travelled <= 1.0e-9) {
+            // Paused host: like the body blend, land on the schedule.
+            carry_.remaining[f] = 0.0;
+            continue;
+        }
+        const double swing = 1.0 - std::clamp(static_cast<double>(carry_.contact[f]), 0.0, 1.0);
+        const double rate = swing / kSwingCarrySeconds + 1.0 / kPlantedCarrySeconds;
+        carry_.remaining[f] *= std::exp(-rate * travelled);
+        if (carry_.remaining[f] < 1.0e-4) {
+            carry_.remaining[f] = 0.0;
+        }
+    }
+}
+
+void DancePlayer::applyFootCarry(DanceFrame& frame) {
+    if (carry_.pending && blend_.active) {
+        // First frame of the blend: it still shows the outgoing pose, so the offset from
+        // the schedule is exactly where the feet are now.
+        carry_.pending = false;
+        for (std::size_t f = 0; f < 2; ++f) {
+            // Every foot is carried: one the new schedule swings right now pays its
+            // offset off in that swing, one it keeps planted holds until its next swing.
+            const ClipPose::Foot& from = blend_.from.foot[f];
+            const ClipPose::Foot& to = frame.pose.foot[f];
+            carry_.offset[f] = from.position - to.position;
+            const float turn = from.yaw - to.yaw;  // turns: take the short way round
+            carry_.yaw[f] = turn - std::round(turn);
+            carry_.remaining[f] = 1.0;
+        }
+    }
+}
+
 DanceFrame DancePlayer::update(double mediaTime) {
     // A jump of the host clock is not a pose change the viewer should see: the new pose
     // is reached from the last one. The schedule itself is pure and needs no reseed; only
     // a time before its first segment (no segment covers it) rebuilds the Manual dance.
     const bool haveTime = lastTime_ > -1.0e8;
-    advanceBlend(haveTime ? std::abs(mediaTime - lastTime_) : 0.0);
+    const double travelled = haveTime ? std::abs(mediaTime - lastTime_) : 0.0;
+    advanceBlend(travelled);
+    advanceFootCarry(travelled);
     const bool jump = haveTime && (mediaTime < lastTime_ - 0.02 || mediaTime > lastTime_ + 0.5);
     // Only the first frame of a run of jumps (the start of a seek or a scrub) arms the blend.
     // A scrub frame after frame is followed by the schedule itself: re-arming per frame would
@@ -400,7 +449,22 @@ DanceFrame DancePlayer::update(double mediaTime) {
     lastTime_ = mediaTime;
     lastJump_ = jump;
     DanceFrame frame = sampleFrame(mediaTime);
+    const std::array<ClipPose::Foot, 2> scheduleFeet = frame.pose.foot;
+    applyFootCarry(frame);
     applyBlend(frame);
+    for (std::size_t f = 0; f < 2; ++f) {
+        if (carry_.remaining[f] > 0.0) {
+            // Over the body blend too: the carried foot is the schedule's foot plus what is
+            // left of the offset, never a lerp of two planted positions.
+            const ClipPose::Foot& target = scheduleFeet[f];
+            const auto k = static_cast<float>(carry_.remaining[f]);
+            frame.pose.foot[f].position = target.position + carry_.offset[f] * k;
+            frame.pose.foot[f].yaw = target.yaw + carry_.yaw[f] * k;
+        }
+        // The offset is paid off by the contact the viewer sees, so a foot shown planted
+        // never moves.
+        carry_.contact[f] = frame.pose.foot[f].contact;
+    }
     blend_.hold = false;
     lastPose_ = frame.pose;
     haveLastPose_ = true;

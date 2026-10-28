@@ -302,9 +302,15 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
         const double dz = static_cast<double>(to.position.z) - from.position.z;
         const double travel = std::sqrt(dx * dx + dz * dz);
         // A foot that is already in the air just comes down; only a planted foot steps.
-        if (travel >= kFootLiftMinTravel && arch > 0.0f && from.contact >= 0.5f) {
+        // Both gates are smooth: on resume the dance pose moves again, so its contact and
+        // the travel change under a foot that is mid hand-over, and a switch would pop.
+        if (arch > 0.0f) {
+            const double planted = smoothstep01(0.25f, 0.75f, from.contact);
+            const double far = smoothstep01(static_cast<float>(0.5 * kFootLiftMinTravel),
+                                             static_cast<float>(1.5 * kFootLiftMinTravel),
+                                             static_cast<float>(travel));
             const double lift = std::min(kFootLiftCapHeights, kFootLiftFraction * travel);
-            position.y += static_cast<float>(lift) * arch;
+            position.y += static_cast<float>(lift * planted * far) * arch;
         }
         foot.position = position;
         foot.yaw = turnLerp(from.yaw, to.yaw, p);

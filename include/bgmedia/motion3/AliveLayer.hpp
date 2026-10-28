@@ -46,8 +46,8 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
 // moves over 0.5..1 (ties: left first). At every mix at least one foot sits
 // exactly on one of its endpoints (the Idle end re-anchored by idleFeetAtDanceRoot),
 // so one foot is always on an endpoint. A moving planted foot
-// lifts by min(0.03, 0.5 * travel) model heights, sine-shaped, unless its travel is
-// under 1 cm. Its contact is min(lerp(dance, idle, p), 1 - sin(pi p)): it never rises
+// lifts by min(0.03, 0.5 * travel) model heights, sine-shaped; the lift fades in
+// smoothly with the foot's dance contact (0.25..0.75) and its travel (0.5..1.5 cm). Its contact is min(lerp(dance, idle, p), 1 - sin(pi p)): it never rises
 // above either end, and it drops while the foot moves. Yaw and toe roll follow the
 // same p. Bones, hips and hands use the plain crossfade with `mix`.
 // `firstFoot` (0 or 1) fixes which foot moves first; any other value picks it from
