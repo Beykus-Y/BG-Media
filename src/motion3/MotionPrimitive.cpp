@@ -889,7 +889,9 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
             };
             const float into = smooth(local / kYieldBeats);
             const float outOf = smooth((cue.durationBeats - local) / kYieldBeats);
-            entry.influence = std::min(weight, std::min(into, outOf));
+            // The gate scales the cue's say in arbitration too: a cue the contact has
+            // almost closed must not keep suppressing other cues until it is rejected.
+            entry.influence = std::min(weight, std::min(into, outOf)) * gate;
         }
         entry.mask = mask;
         entry.pose.mask = mask;
