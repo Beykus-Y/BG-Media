@@ -160,18 +160,24 @@ Mapping mapSegment(const ScheduleSegment& segment, double mediaTime,
     return mapping;
 }
 
-// Real duration of one clip beat for a segment: the value planned with the
-// segment (so a tempo change cannot jump the pose) scaled by the current warp
-// rate (which is continuous and belongs to the pose the segment is sampled with).
-double segmentSecondsPerClipBeat(const ScheduleSegment& segment, const Mapping& mapping) {
+// Real duration of one clip beat for a segment. The value planned with the segment
+// keeps the gesture that is already running continuous across a tempo change (a
+// rebase copies the segment), and it blends into the live tempo over half a second
+// so later gestures use the new tempo instead of the planned one forever. The warp
+// rate is continuous and is applied on top.
+double segmentSecondsPerClipBeat(const ScheduleSegment& segment, const Mapping& mapping,
+                                 double mediaTime, const BeatClock& clock) {
     const double authored = segment.clip ? std::max(1.0, segment.clip->bpm) : 120.0;
-    const double base = segment.secondsPerClipBeat > 0.0
-                            ? segment.secondsPerClipBeat
-                            : 60.0 / authored;
-    double warp = 1.0;
-    if (segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9) {
-        warp = mapping.rate / segment.rate;
+    double base = segment.secondsPerClipBeat > 0.0 ? segment.secondsPerClipBeat : 60.0 / authored;
+    const bool tempoSync = segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9;
+    if (tempoSync) {
+        const double live = 60.0 / std::max(1.0e-6, clock.bpmAt(mediaTime) * segment.rate);
+        constexpr double kTimingBlendSeconds = 0.5;
+        double t = std::clamp((mediaTime - segment.alignTime) / kTimingBlendSeconds, 0.0, 1.0);
+        t = t * t * (3.0 - 2.0 * t);
+        base += (live - base) * t;
     }
+    const double warp = tempoSync ? mapping.rate / segment.rate : 1.0;
     return base / std::max(0.25, warp);
 }
 
@@ -412,7 +418,8 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
     if (secondsPerClipBeat) {
         // A cue's real length. The segment value is the tempo at planning time
         // (so a rebase does not jump the pose); the warp rate is continuous.
-        *secondsPerClipBeat = segmentSecondsPerClipBeat(segment, mapped);
+        *secondsPerClipBeat = segmentSecondsPerClipBeat(segment, mapped, mediaTime,
+                                                        timeline.grid());
     }
     return own;
 }
@@ -559,7 +566,7 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
     // Real length of one clip beat of the segment being shown (planned tempo x
     // metric level x warp). Diagnostics and the overlay cue timing share it.
     frame.secondsPerClipBeat =
-        static_cast<float>(segmentSecondsPerClipBeat(*shown, mapping));
+        static_cast<float>(segmentSecondsPerClipBeat(*shown, mapping, mediaTime, clock));
     if (shown->clip->tempoSync) {
         const double effective = frame.bpm * shown->rate;
         frame.playbackSpeed = static_cast<float>(effective / shown->clip->bpm);

@@ -463,8 +463,11 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         for (int sd = 0; sd < 2; ++sd) {
             if (side >= 0 && sd != side) continue;
             const ArmSet arm = armSet(sd);
-            const float angle = 360.0f * phase * amp;
-            rollWrist(pose, arm, 24.0f * std::sin(angle * kDeg));
+            // The roll phase is the cue phase: the duration scale must change the
+            // displacement, not the phase, or a short cue would move the peak of
+            // the roll later inside the gesture.
+            const float angle = 360.0f * phase;
+            rollWrist(pose, arm, 24.0f * std::sin(angle * kDeg) * amp);
             setBone(pose, arm.hand, axisAngle(kY, 20.0f * std::cos(angle * kDeg) * amp));
             for (int fg = 1; fg < 5; ++fg) {
                 setFinger(pose, sd, fg, 0.22f + 0.18f * (0.5f + 0.5f * std::sin(angle * kDeg)),

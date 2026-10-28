@@ -731,18 +731,27 @@ void Choreographer::authorArms() {
 void Choreographer::authorAccents() {
     const float bar = static_cast<float>(std::max(2, request_.beatsPerBar));
     const int bars = std::max(4, request_.bars);
+    // Only marks inside the clip. Short requests (4 or 6 bars) used to receive the
+    // fixed phrase/turn/heel/toe marks up to beat 28, i.e. beyond the clip's
+    // period; a reader then computed a negative circular distance and ordinary
+    // beats inherited strong accents.
+    const auto add = [&](float at, float strength, const char* kind) {
+        if (at >= 0.0f && at < period_) {
+            accent(at, strength, kind);
+        }
+    };
     for (int b = 0; b < bars; ++b) {
         const float at = static_cast<float>(b) * bar;
-        accent(at, b == 0 ? 1.0f : 0.82f, b % 2 == 0 ? "downbeat" : "bar");
+        add(at, b == 0 ? 1.0f : 0.82f, b % 2 == 0 ? "downbeat" : "bar");
         if (b % 2 == 0) {
-            accent(at + bar * 0.5f, 0.55f, "offbeat");
+            add(at + bar * 0.5f, 0.55f, "offbeat");
         }
     }
-    accent(bar * 1.0f, 0.9f, "phrase");
-    accent(bar * 3.0f, 1.0f, "phrase hit");
-    accent(bar * 5.0f, 1.0f, "turn accent");
-    accent(bar * 6.0f, 0.85f, "heel");
-    accent(bar * 7.0f, 0.9f, "toe");
+    add(bar * 1.0f, 0.9f, "phrase");
+    add(bar * 3.0f, 1.0f, "phrase hit");
+    add(bar * 5.0f, 1.0f, "turn accent");
+    add(bar * 6.0f, 0.85f, "heel");
+    add(bar * 7.0f, 0.9f, "toe");
 }
 
 float Choreographer::accentStrengthAt(float beat) const {
@@ -755,6 +764,9 @@ float Choreographer::accentStrengthAt(float beat) const {
     float nearest = 1.0e9f;
     float strength = 0.55f;
     for (const AccentMark& mark : accents_) {
+        if (!(mark.beat >= 0.0f) || mark.beat >= period_) {
+            continue;  // a mark outside the loop has no circular distance
+        }
         const float raw = std::abs(mark.beat - beat);
         const float distance = std::min(raw, std::max(0.0f, period_ - raw));
         if (distance > 0.5f) {
