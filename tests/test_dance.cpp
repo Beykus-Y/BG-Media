@@ -1225,9 +1225,11 @@ TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
     for (motion::DanceStyle from : styles) {
         for (motion::DanceStyle to : styles) {
             if (from == to) continue;
-            for (double u : {0.01, 0.2, 0.5, 0.8}) {
+            // u < 0 rebases before the queued transition starts; 140 BPM moves its entry
+            // into the past.
+            for (double u : {-1.0, 0.01, 0.2, 0.5, 0.8}) {
                 const double steady = plantedSlide(from, to, u, 100.0, 100.0);
-                for (double bpmAfter : {80.0, 125.0}) {
+                for (double bpmAfter : {80.0, 125.0, 140.0}) {
                     worstExcess =
                         std::max(worstExcess, plantedSlide(from, to, u, 100.0, bpmAfter) - steady);
                 }

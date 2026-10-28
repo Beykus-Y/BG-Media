@@ -1112,6 +1112,7 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
     // progress. Segments before it have finished blending and no longer affect the pose.
     const std::size_t keepFrom = first == 0 ? 0 : first - 1;
     std::vector<ScheduleSegment> kept;
+    std::vector<bool> pending(old.size(), false);  // by index in `kept`
     for (std::size_t i = keepFrom; i < old.size(); ++i) {
         ScheduleSegment segment = old[i];
         if (!segment.clip) {
@@ -1131,36 +1132,40 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
         } else {
             // Pending: keep the musical beat it was aligned to, placed on the new grid.
             const double oldAlign = segment.alignTime;
-            const double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
+            double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
             const double fade = segment.fadeSeconds;
+            if (alignTime < now) {
+                // A faster grid moved the entry into the past: enter again as a fresh
+                // selection at `now` would, so the clip does not start mid-way past its
+                // entry (and past the swing that carries its planted feet over).
+                double error = 0.0;
+                bool aligned = false;
+                alignTime = segment.clip->tempoSync
+                                ? entryTimeFor(*segment.clip, now, &aligned, &error)
+                                : now;
+            }
             const bool loop = segment.loop;
             const std::string reason = segment.reason;
             const double alignmentError = segment.alignmentErrorSeconds;
-            const auto swings = segment.footSwing;
             segment = makeSegment(*segment.clip, std::max(now, alignTime - fade * 0.5),
                                   alignTime, fade);
             segment.loop = loop;
             segment.reason = reason;
             segment.alignmentErrorSeconds = alignmentError;
-            // The planted-foot swings are not searched again: they travel with the segment's
-            // alignment, keeping their musical place. A swing that would start before `now`
-            // starts at `now`, where the hand-over progress is still zero.
-            const double shift = alignTime - oldAlign;
-            for (std::size_t f = 0; f < 2; ++f) {
-                ScheduleSegment::FootSwingWindow window = swings[f];
-                if (window.resolved && !window.slide) {
-                    const double duration = window.end - window.begin;
-                    window.begin = std::max(now, window.begin + shift);
-                    window.end = window.begin + duration;
-                }
-                segment.footSwing[f] = window;
-            }
+            // Nothing of a pending segment has been shown yet, so its planted-foot swings
+            // are searched again from its new start on the new grid (append below). Kept
+            // windows could land before that start when a faster grid moves the entry into
+            // the past, and the hand-over would then be complete on its first frame.
+            pending[kept.size()] = true;
         }
         kept.push_back(std::move(segment));
     }
     // The swing windows' media seconds follow their clip beats on the new grid, so the
     // hand-over lifetime (handOverEnd) lasts until the rebased swing has landed.
     for (std::size_t k = 1; k < kept.size(); ++k) {
+        if (pending[k]) {
+            continue;
+        }
         for (auto& window : kept[k].footSwing) {
             if (!window.resolved || window.slide) {
                 continue;
@@ -1171,8 +1176,12 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
         }
     }
     schedule_.clear();
-    for (auto& segment : kept) {
-        schedule_.append(std::move(segment));
+    for (std::size_t k = 0; k < kept.size(); ++k) {
+        if (pending[k]) {
+            schedule_.append(std::move(kept[k]), timeline_, warp_);
+        } else {
+            schedule_.append(std::move(kept[k]));
+        }
     }
 }
 
