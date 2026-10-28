@@ -51,11 +51,25 @@ bool finiteQuat(const math::Quat& q) {
            std::isfinite(q.w);
 }
 
+// Angle of the relative rotation between two bone quaternions.
+//
+// The earlier form `2*acos(|dot|)` is mathematically the same but numerically
+// unusable here: its derivative is ~2/sqrt(1-dot^2), so a single float ULP of
+// `dot` near 1 (dot = 1 - 6e-8) turns into 6.9e-4 rad. That made a comparison
+// of two poses that agree to 1e-9 report a 0.04 deg difference and fail a
+// 1e-6 tolerance. atan2 of the relative rotation's vector/scalar parts has no
+// such amplification and is exact at zero.
+float quatAngle(const math::Quat& a, const math::Quat& b) {
+    const math::Quat d = (a * math::conjugate(b)).normalized();
+    const float w = std::abs(d.w);
+    const float s = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    return 2.0f * std::atan2(s, w);
+}
+
 float poseDistance(const motion::ClipPose& a, const motion::ClipPose& b) {
     float worst = 0.0f;
     for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
-        const float d = std::abs(math::dot(a.bone[i], b.bone[i]));
-        worst = std::max(worst, 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f)));
+        worst = std::max(worst, quatAngle(a.bone[i], b.bone[i]));
     }
     return worst;
 }
@@ -669,20 +683,22 @@ TEST_CASE(motion32.generated_to_generated_transition_is_finite) {
     (void)player.selectClip("neonPulse", 0.0, true);
     (void)player.update(0.3);
     (void)player.selectClip("streetCurrent", 0.8, false);
-    math::Quat previous{};
+    motion::ClipPose previous{};
     for (int i = 0; i <= 120; ++i) {
         const double t = 0.8 + i / 240.0;
         const motion::DanceFrame frame = player.update(t);
         CHECK(std::isfinite(frame.pose.hips.x));
-        for (const math::Quat& q : frame.pose.bone) {
+        for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+            const math::Quat& q = frame.pose.bone[b];
             CHECK(finiteQuat(q));
             if (i > 0) {
-                const float d = std::abs(math::dot(q, previous));
-                const float angle = 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f));
-                CHECK(angle < 1.8f);  // no instant flip between clips
+                // Each bone against its own previous value. The old check compared
+                // every bone with the previous LeftUpperArm, so it was measuring the
+                // arm-to-torso angle, not a flip.
+                CHECK(quatAngle(q, previous.bone[b]) < 1.8f);  // no instant flip
             }
         }
-        previous = frame.pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm)];
+        previous = frame.pose;
     }
 }
 
@@ -901,3 +917,4 @@ TEST_CASE(motion32.head_phrase_look_is_optional) {
     // Music-facing parts are untouched: the feet and contacts are identical.
     CHECK(withLook.contacts.size() == withoutLook.contacts.size());
 }
+

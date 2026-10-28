@@ -288,6 +288,11 @@ float maxBoneAngle(const motion::ClipPose& a, const motion::ClipPose& b) {
     return worst;
 }
 
+float boneAngle(const math::Quat& a, const math::Quat& b) {
+    const float d = std::abs(math::dot(a, b));
+    return 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f));
+}
+
 }  // namespace
 
 TEST_CASE(quality.crossfade_keeps_each_clips_overlays_until_the_blend_ends) {
@@ -884,4 +889,99 @@ TEST_CASE(quality.ground_drag_ignores_planted_and_raised_feet) {
         sample.targetY = 0.05f;  // 5 cm: a swing, not a drag
     }
     CHECK(qa::measureGroundDrag(track, 0.012f, 0.15).distance == 0.0);
+}
+
+TEST_CASE(quality.a_short_cue_performs_a_smaller_gesture_not_a_faster_one) {
+    // BG Motion 3.3 quality pass: a cue that is too short for the gesture used
+    // to get the full amplitude in less time, i.e. a wrist snap (14 rad/s on
+    // neonPulse/Model1). The primitive now keeps its phase (the accent stays on
+    // the authored beat) and is performed smaller.
+    using motion::PrimitiveKind;
+    const auto full = motion::samplePrimitive(PrimitiveKind::HandFlick, 0.5f, 1.0f, 0, 0.0f, 1.0f);
+    const auto shortCue = motion::samplePrimitive(PrimitiveKind::HandFlick, 0.5f, 1.0f, 0, 0.0f, 0.18f);
+    const auto legacy = motion::samplePrimitive(PrimitiveKind::HandFlick, 0.5f, 1.0f, 0, 0.0f, 0.0f);
+    const auto hand = static_cast<std::size_t>(vrm::HumanoidBone::LeftHand);
+    const float fullAngle = boneAngle(full.bone[hand], math::Quat::identity());
+    const float shortAngle = boneAngle(shortCue.bone[hand], math::Quat::identity());
+    const float legacyAngle = boneAngle(legacy.bone[hand], math::Quat::identity());
+    std::cout << "\n            hand flick at phase 0.5: full=" << fullAngle
+              << " short(0.18 s)=" << shortAngle << " legacy(no duration)=" << legacyAngle;
+    CHECK(fullAngle > 0.05f);
+    CHECK(shortAngle < 0.75f * fullAngle);
+    CHECK(std::abs(legacyAngle - fullAngle) < 1.0e-5f);
+    // The gesture still peaks at the same phase: the accent does not move.
+    const auto early = motion::samplePrimitive(PrimitiveKind::HandFlick, 0.35f, 1.0f, 0, 0.0f, 0.18f);
+    const auto earlyFull = motion::samplePrimitive(PrimitiveKind::HandFlick, 0.35f, 1.0f, 0, 0.0f, 1.0f);
+    CHECK(boneAngle(early.bone[hand], math::Quat::identity()) <
+          boneAngle(earlyFull.bone[hand], math::Quat::identity()));
+}
+
+TEST_CASE(quality.overlay_gestures_stay_below_a_twitch_at_60_fps) {
+    // Companion guard at the playback level: no hand or head bone may rotate
+    // faster than 12 rad/s (0.20 rad per 1/60 s frame). Before the 3.3 quality
+    // pass neonPulse/energetic reached 14-16 rad/s (0.24-0.27 rad/frame) on
+    // Model1 while the same clips were at 0-3 rad/s with overlays off, i.e. the
+    // overlay layer, not the choreography, was the source.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setOverlayMode(motion::OverlayMode::Full);
+    const std::array<const char*, 4> clips = {"neonPulse", "streetCurrent", "energetic", "sidestep"};
+    const std::array<vrm::HumanoidBone, 3> watched = {
+        vrm::HumanoidBone::LeftHand, vrm::HumanoidBone::RightHand, vrm::HumanoidBone::Head};
+    float worst = 0.0f;
+    std::string worstWhere;
+    for (const char* id : clips) {
+        REQUIRE(player.selectClip(id, 0.0, true));
+        motion::ClipPose previous;
+        bool have = false;
+        double worstAt = 0.0;
+        float clipWorst = 0.0f;
+        for (int i = 0; i <= 600; ++i) {  // 10 s at 60 FPS
+            const double t = static_cast<double>(i) / 60.0;
+            const motion::DanceFrame frame = player.update(t);
+            if (have) {
+                for (vrm::HumanoidBone bone : watched) {
+                    const auto b = static_cast<std::size_t>(bone);
+                    const float step = boneAngle(frame.pose.bone[b], previous.bone[b]);
+                    clipWorst = std::max(clipWorst, step);
+                    if (step > worst) {
+                        worst = step;
+                        worstAt = t;
+                        worstWhere = std::string(id) + " bone " + std::to_string(b);
+                    }
+                }
+            }
+            previous = frame.pose;
+            have = true;
+        }
+        std::cout << "\n            " << id << " worst hand/head step "
+                  << 60.0f * clipWorst << " rad/s (t=" << worstAt << ")";
+    }
+    std::cout << "\n            worst=" << worst << " rad/frame at 60 FPS (" << worstWhere << ")";
+    CHECK(worst <= 0.20f);
+}
+
+TEST_CASE(quality.generated_clip_wrist_plane_has_no_threshold_step) {
+    // The procedural generator used to bake `elev > 80 ? 22 : 9` degrees of
+    // wrist roll. Crossing that value between two keys put a 13 deg step in the
+    // hand track. The roll is now a ramp and a signed azimuth; the check is the
+    // resulting angular speed of the hand bone in the baked track.
+    const auto dances = motion::ProceduralChoreography::showcase();
+    REQUIRE(!dances.empty());
+    float worst = 0.0f;  // deg/s
+    for (const motion::GeneratedDance& dance : dances) {
+        const double keySeconds = 60.0 / std::max(1.0, dance.clip.bpm) /
+                                  std::max(1, dance.clip.keysPerBeat);
+        for (std::size_t hand : {static_cast<std::size_t>(vrm::HumanoidBone::LeftHand),
+                                 static_cast<std::size_t>(vrm::HumanoidBone::RightHand)}) {
+            const auto& track = dance.clip.bones[hand];
+            for (std::size_t i = 1; i < track.size(); ++i) {
+                const float step = boneAngle(track[i], track[i - 1]);
+                worst = std::max(worst,
+                                 static_cast<float>(step * 180.0 / 3.14159265 / keySeconds));
+            }
+        }
+    }
+    std::cout << "\n            worst hand key speed " << worst << " deg/s";
+    CHECK(worst < 300.0f);
 }
