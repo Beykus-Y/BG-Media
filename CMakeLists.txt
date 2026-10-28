@@ -89,6 +89,7 @@ endif()
 add_library(bgmedia_vrm STATIC
     src/vrm/VrmModel.cpp
     src/vrm/VrmLoader.cpp
+    src/vrm/ThighColliders.cpp
     src/vrm/CgltfImpl.cpp
     src/vrm/StbImageImpl.cpp
 )
