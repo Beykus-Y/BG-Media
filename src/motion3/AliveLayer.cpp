@@ -253,7 +253,12 @@ std::array<ClipPose::Foot, 2> idleFeetAtDanceRoot(const ClipPose& dance, const C
     return idleFeet;
 }
 
-ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix) {
+int airborneFootFirst(const ClipPose& dance) {
+    return dance.foot[1].contact < dance.foot[0].contact ? 1 : 0;
+}
+
+ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix,
+                                int firstFoot) {
     const float m = std::isfinite(mix) ? std::clamp(mix, 0.0f, 1.0f) : 0.0f;
     if (m <= 0.0f) {
         return dance;
@@ -275,7 +280,10 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
     // lands first, over mix 0..0.5; the supporting foot moves over 0.5..1, once the other
     // foot is down. Ties go left first. At every mix one of the two feet has p = 0 or p = 1,
     // so it sits exactly on an endpoint.
-    const std::size_t first = dance.foot[1].contact < dance.foot[0].contact ? 1 : 0;
+    // The caller latches the order for a whole transition (firstFoot 0 or 1): a dance pose
+    // that keeps moving during a resume must not swap the feet's intervals mid-way.
+    const std::size_t first = static_cast<std::size_t>(
+        firstFoot == 0 || firstFoot == 1 ? firstFoot : airborneFootFirst(dance));
     for (std::size_t f = 0; f < 2; ++f) {
         const float start = f == first ? 0.0f : 0.5f;
         const float p = smootherstep01((m - start) / 0.5f);

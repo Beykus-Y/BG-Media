@@ -50,8 +50,14 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
 // under 1 cm. Its contact is min(lerp(dance, idle, p), 1 - sin(pi p)): it never rises
 // above either end, and it drops while the foot moves. Yaw and toe roll follow the
 // same p. Bones, hips and hands use the plain crossfade with `mix`.
+// `firstFoot` (0 or 1) fixes which foot moves first; any other value picks it from
+// `dance` with airborneFootFirst. Latch it once per transition when `dance` keeps moving.
 [[nodiscard]] ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle,
-                                              float mix);
+                                              float mix, int firstFoot = -1);
+
+// The foot that lands first in blendToIdleKeepingFeet: the one with less contact
+// (airborne), ties left (0).
+[[nodiscard]] int airborneFootFirst(const ClipPose& dance);
 
 // The Idle feet moved from Idle's root to the dance root: each foot keeps its offset
 // from the root in the root's frame (the retargeter reads foot targets as absolute

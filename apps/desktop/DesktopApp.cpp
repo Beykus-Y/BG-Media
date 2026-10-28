@@ -1254,9 +1254,17 @@ struct DesktopApp::Impl {
         if (danceUi()) {
             const double danceNow = danceTime();
             updateDance();
+            // The foot order of the pause hand-over is chosen once, from the pose the
+            // dancer stopped in, and kept until the blend is fully back to the dance.
+            const float idleMix = danceIdle.mix(animationTime);
+            if (idleMix <= 0.0f) {
+                danceIdleFirstFoot = -1;
+            } else if (danceIdleFirstFoot < 0) {
+                danceIdleFirstFoot = motion::airborneFootFirst(danceFrame.pose);
+            }
             const motion::ClipPose pose =
-                composeDancePose(danceFrame.pose, animationTime, danceIdle.mix(animationTime),
-                                 danceFrame.idleWeight);
+                composeDancePose(danceFrame.pose, animationTime, idleMix,
+                                 danceFrame.idleWeight, danceIdleFirstFoot);
             std::string danceError;
             if (!vrm.renderClip(pose, danceNow, vrmCamera, vrm.renderSettings(),
                                 &danceError)) {
@@ -1284,6 +1292,7 @@ struct DesktopApp::Impl {
     motion::DanceFrame danceFrame;
     // Dance <-> Idle crossfade for a stopped transport (wall-clock driven).
     motion::IdleCrossfade danceIdle;
+    int danceIdleFirstFoot = -1;  // latched foot order of the pause hand-over
     bool useClips = true;
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
@@ -1328,7 +1337,8 @@ struct DesktopApp::Impl {
     // a one-shot's return, an Auto silence segment): that pose already breathes too.
     [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
                                                     double wallNow, float idleMix,
-                                                    float scheduledIdle) const {
+                                                    float scheduledIdle,
+                                                    int firstFoot) const {
         motion::ClipPose pose = dancePose;
         float bodyWeight = 1.0f - std::clamp(scheduledIdle, 0.0f, 1.0f);
         if (idleMix > 0.0f) {
@@ -1341,7 +1351,7 @@ struct DesktopApp::Impl {
             }
             // The dancer keeps the dance root and the feet are handed over one at a
             // time, so a travelled dancer does not glide back to the Idle origin.
-            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix);
+            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix, firstFoot);
             // Idle already breathes and shifts its weight, so the alive layer's
             // breathing and weight shift fade out as it takes over. The head look stays.
             bodyWeight *= 1.0f - std::clamp(idleMix, 0.0f, 1.0f);

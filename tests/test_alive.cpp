@@ -673,3 +673,21 @@ TEST_CASE(alive.blend_to_idle_lands_the_airborne_foot_first) {
     const ClipPose landed = motion::blendToIdleKeepingFeet(dance, idle, 0.5f);
     CHECK(vecIdentical(landed.foot[1].position, idleFeet[1].position));
 }
+
+TEST_CASE(alive.blend_to_idle_keeps_a_latched_foot_order) {
+    // On resume the dance pose moves again while the mix falls; a contact that flips in
+    // that pose must not swap the feet's intervals when the order is latched.
+    const ClipPose idle = idleStance();
+    ClipPose dance = travelledDance();
+    dance.foot[0].contact = 1.0f;
+    dance.foot[1].contact = 1.0f;
+    const int first = motion::airborneFootFirst(dance);
+    CHECK(first == 0);
+    const ClipPose before = motion::blendToIdleKeepingFeet(dance, idle, 0.75f, first);
+    dance.foot[1].contact = 0.99f;  // the right foot starts to lift
+    CHECK(motion::airborneFootFirst(dance) == 1);
+    const ClipPose after = motion::blendToIdleKeepingFeet(dance, idle, 0.75f, first);
+    for (std::size_t f = 0; f < 2; ++f) {
+        CHECK(footDistanceXZ(before.foot[f].position, after.foot[f].position) < 1.0e-6f);
+    }
+}
