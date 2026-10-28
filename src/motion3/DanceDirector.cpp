@@ -509,76 +509,149 @@ Quat inertialOffset(const RotationVector& o0, const RotationVector& velocity, do
 
 namespace {
 
-// BG Motion 3.3 (#9) follow-through. A spring x'' + c x' + k x = -g w(t), driven by the
-// bone's angular velocity w, is evaluated as a finite convolution with its impulse
-// response over a fixed window of history. The window is clamped to the segment start.
-constexpr double kFollowPi = 3.14159265358979323846;
-constexpr double kFollowHz = 2.5;        // natural frequency of the lag
-constexpr double kFollowDamping = 0.45;  // damping ratio
-constexpr double kFollowGain = 6.0;      // drive, 1/s
-constexpr double kFollowStep = 1.0 / 120.0;
-constexpr double kFollowWindow = 0.6;    // seconds of history
-constexpr float kFollowMaxRad = 0.2f;    // cap on the lag per bone
+// BG Motion 3.3 (#9) follow-through, per-bone table (WP-E). A chain bone is displayed at its
+// chain rotation delayed by its lag share: weight * kFollowLagSeconds. The chain rotation is the
+// product of the bone deltas from the hips down; the retargeter composes deltas the same way, so
+// a hand with a still track follows its arm and lags it. Each bone's offset from its own
+// base motion is soft-capped at its angle limit, which keeps the lag bounded and continuous.
+// Everything reads basePose at earlier media times: the result is a pure function of media time,
+// so seeks, pauses and every frame rate agree.
+constexpr double kFollowLagSeconds = 0.12;
+constexpr double kFollowDegToRad = 3.14159265358979323846 / 180.0;
 
-bool isFollowBone(std::size_t bone) {
+// Parent first: a bone's offset is taken against its displayed parent.
+constexpr std::array<DanceSchedule::FollowThroughBone, 12> kFollowTable{{
+    {vrm::HumanoidBone::Chest, 0.3f, 3.0f},
+    {vrm::HumanoidBone::UpperChest, 0.5f, 4.0f},
+    {vrm::HumanoidBone::Neck, 0.6f, 6.0f},
+    {vrm::HumanoidBone::Head, 1.0f, 10.0f},
+    {vrm::HumanoidBone::LeftShoulder, 0.2f, 3.0f},
+    {vrm::HumanoidBone::LeftUpperArm, 0.3f, 8.0f},
+    {vrm::HumanoidBone::LeftLowerArm, 0.6f, 12.0f},
+    {vrm::HumanoidBone::LeftHand, 1.0f, 20.0f},
+    {vrm::HumanoidBone::RightShoulder, 0.2f, 3.0f},
+    {vrm::HumanoidBone::RightUpperArm, 0.3f, 8.0f},
+    {vrm::HumanoidBone::RightLowerArm, 0.6f, 12.0f},
+    {vrm::HumanoidBone::RightHand, 1.0f, 20.0f},
+}};
+
+// Parent in the humanoid chain. Hips is the root and returns Count.
+vrm::HumanoidBone parentOf(vrm::HumanoidBone bone) {
     using B = vrm::HumanoidBone;
-    return bone == static_cast<std::size_t>(B::Head) ||
-           bone == static_cast<std::size_t>(B::LeftHand) ||
-           bone == static_cast<std::size_t>(B::RightHand);
-}
-
-// Impulse response of x'' + c x' + k x = u, for tau >= 0.
-double followImpulse(double tau) {
-    const double w0 = 2.0 * kFollowPi * kFollowHz;
-    const double k = w0 * w0;
-    const double c = 2.0 * kFollowDamping * w0;
-    const double wd = std::sqrt(k - c * c / 4.0);
-    return std::exp(-c * tau / 2.0) * std::sin(wd * tau) / wd;
-}
-
-// Angular velocity (rad/s, local frame) between two orientations one step apart.
-Vec3 angularVelocity(const Quat& earlier, const Quat& later) {
-    Quat rel = (later * conjugate(earlier)).normalized();
-    if (rel.w < 0.0f) {
-        rel = {-rel.x, -rel.y, -rel.z, -rel.w};
+    switch (bone) {
+    case B::Spine: return B::Hips;
+    case B::Chest: return B::Spine;
+    case B::UpperChest: return B::Chest;
+    case B::Neck:
+    case B::LeftShoulder:
+    case B::RightShoulder: return B::UpperChest;
+    case B::Head: return B::Neck;
+    case B::LeftUpperArm: return B::LeftShoulder;
+    case B::RightUpperArm: return B::RightShoulder;
+    case B::LeftLowerArm: return B::LeftUpperArm;
+    case B::RightLowerArm: return B::RightUpperArm;
+    case B::LeftHand: return B::LeftLowerArm;
+    case B::RightHand: return B::RightLowerArm;
+    default: return B::Count;
     }
-    const float scale = static_cast<float>(2.0 / kFollowStep);
-    return {rel.x * scale, rel.y * scale, rel.z * scale};
+}
+
+// Chain rotation of `bone`: the deltas from the hips down to the bone, parent first.
+// Count yields the identity, so a root's parent is handled without a special case.
+Quat chainRotation(const ClipPose& pose, vrm::HumanoidBone bone) {
+    using B = vrm::HumanoidBone;
+    std::array<B, 8> chain{};
+    std::size_t depth = 0;
+    for (B at = bone; at != B::Count && depth < chain.size(); at = parentOf(at)) {
+        chain[depth++] = at;
+    }
+    Quat rotation = Quat::identity();
+    while (depth > 0) {
+        rotation = rotation * pose.bone[static_cast<std::size_t>(chain[--depth])];
+    }
+    return rotation;
+}
+
+// Bounds the rotation angle of `q` by `capRadians` smoothly: angle -> cap * tanh(angle / cap).
+// Small offsets pass almost unchanged, large ones saturate, and nothing is discontinuous.
+// A non-finite input gives the identity.
+Quat softCapAngle(const Quat& q, double capRadians) {
+    double w = q.w;
+    double x = q.x;
+    double y = q.y;
+    double z = q.z;
+    if (w < 0.0) {
+        w = -w;
+        x = -x;
+        y = -y;
+        z = -z;
+    }
+    const double s = std::sqrt(x * x + y * y + z * z);
+    if (!(s > 1.0e-12)) {
+        return Quat::identity();
+    }
+    const double angle = 2.0 * std::atan2(s, w);
+    const double capped = capRadians * std::tanh(angle / capRadians);
+    const double k = std::sin(0.5 * capped) / s;
+    return Quat{static_cast<float>(k * x), static_cast<float>(k * y), static_cast<float>(k * z),
+                static_cast<float>(std::cos(0.5 * capped))}
+        .normalized();
 }
 
 } // namespace
 
+const std::array<DanceSchedule::FollowThroughBone, 12>& DanceSchedule::followThroughBones() {
+    return kFollowTable;
+}
+
 void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
                                        const MusicalTimeline& timeline,
                                        const WarpProfile& warp) const {
+    using B = vrm::HumanoidBone;
+    constexpr std::size_t kCount = kFollowTable.size();
     const double startTime = segments_[index].startTime;
-    const int samples = static_cast<int>(std::lround(kFollowWindow / kFollowStep));
-    // Base poses at the window times, newest first: entry j is at mediaTime - j * step.
-    std::vector<ClipPose> history;
-    history.reserve(static_cast<std::size_t>(samples + 2));
-    for (int j = 0; j <= samples + 1; ++j) {
-        const double t = std::max(startTime, mediaTime - static_cast<double>(j) * kFollowStep);
-        history.push_back(basePose(index, t, timeline, warp, nullptr));
-    }
-    for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
-        if (!isFollowBone(bone)) {
+    const ClipPose base = pose;
+
+    // Lagged chain rotation of each table bone. Bones with the same weight share one sample.
+    std::array<Quat, kCount> lagged{};
+    std::array<bool, kCount> sampled{};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        if (sampled[i]) {
             continue;
         }
-        Vec3 lag{};
-        for (int j = 0; j <= samples; ++j) {
-            const auto at = static_cast<std::size_t>(j);
-            const Vec3 w = angularVelocity(history[at + 1].bone[bone], history[at].bone[bone]);
-            const auto weight = static_cast<float>(
-                -kFollowGain * followImpulse(static_cast<double>(j) * kFollowStep) * kFollowStep);
-            lag = lag + w * weight;
+        const float weight = kFollowTable[i].weight;
+        const double at = std::max(startTime, mediaTime - weight * kFollowLagSeconds);
+        const ClipPose past = basePose(index, at, timeline, warp, nullptr);
+        for (std::size_t j = i; j < kCount; ++j) {
+            if (!sampled[j] && kFollowTable[j].weight == weight) {
+                lagged[j] = chainRotation(past, kFollowTable[j].bone);
+                sampled[j] = true;
+            }
         }
-        const float length = std::sqrt(dot(lag, lag));
-        if (length > kFollowMaxRad) {
-            lag = lag * (kFollowMaxRad / length);
+    }
+
+    // Parent-first pass: each local offset is relative to the parent as it is displayed, so the
+    // lag accumulates down the chain. Bones outside the table keep their base rotation.
+    std::array<Quat, kCount> shown{};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const B bone = kFollowTable[i].bone;
+        const B parent = parentOf(bone);
+        Quat parentChain = chainRotation(base, parent);
+        for (std::size_t j = 0; j < i; ++j) {
+            if (kFollowTable[j].bone == parent) {
+                parentChain = shown[j];
+                break;
+            }
         }
-        // Small-angle rotation vector as a quaternion, applied in the parent frame.
-        const Quat offset = Quat{lag.x * 0.5f, lag.y * 0.5f, lag.z * 0.5f, 1.0f}.normalized();
-        pose.bone[bone] = (offset * pose.bone[bone]).normalized();
+        const Quat& own = base.bone[static_cast<std::size_t>(bone)];
+        // Local delta that puts the chain on its lagged rotation, then the bounded offset of the
+        // bone's own motion (parent frame, same convention as the retargeter's deltas).
+        const Quat wanted = conjugate(parentChain) * lagged[i];
+        const Quat offset = softCapAngle((wanted * conjugate(own)).normalized(),
+                                         kFollowTable[i].capDegrees * kFollowDegToRad);
+        const Quat local = (offset * own).normalized();
+        pose.bone[static_cast<std::size_t>(bone)] = local;
+        shown[i] = (parentChain * local).normalized();
     }
 }
 

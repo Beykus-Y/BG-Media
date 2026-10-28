@@ -120,11 +120,20 @@ public:
     // Off by default: the blend stays the reference behaviour until A/B-tested.
     void setInertialTransitions(bool enabled) { inertialTransitions_ = enabled; }
     [[nodiscard]] bool inertialTransitions() const { return inertialTransitions_; }
-    // Opt-in (BG Motion 3.3, #9). Head and hands lag behind their own motion through a
-    // second-order spring driven by angular velocity. Evaluated per media time from a
-    // fixed window of history, so seeking and playback agree. Off by default.
+    // Opt-in (BG Motion 3.3, #9; WP-E). Upper-body follow-through: each bone of followThroughBones()
+    // is displayed at its chain rotation delayed by its lag share, so motion overlaps down the
+    // chain (hand behind forearm behind upper arm). Pure function of media time: it reads basePose
+    // at earlier times, so seeking and playback agree and the frame rate does not matter. Hips,
+    // spine, legs, feet, toes and eyes are never changed. Off by default, and DancePlayer does not
+    // enable it: a lagged child raises the bone acceleration of keyed clips (see the WP-E report).
     void setFollowThrough(bool enabled) { followThrough_ = enabled; }
     [[nodiscard]] bool followThrough() const { return followThrough_; }
+    struct FollowThroughBone {
+        vrm::HumanoidBone bone;
+        float weight;      // share of the lag: delay = weight * 0.12 s
+        float capDegrees;  // bound on the offset from the bone's own motion
+    };
+    [[nodiscard]] static const std::array<FollowThroughBone, 12>& followThroughBones();
     void append(ScheduleSegment segment);
     // Appends and resolves the planted-foot hand-over windows against the predecessor, the
     // grid and the warp in effect now. Use it when scheduling: later grid changes then keep
