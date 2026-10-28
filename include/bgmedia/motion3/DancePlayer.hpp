@@ -124,19 +124,23 @@ private:
     void replanAuthored();
     // Stateful hand-over from the last output pose (BG Motion 3.3, A3/A4). The schedule
     // stays a pure function of media time; only this blend remembers where it started.
-    void armBlend(double at, double seconds);
+    // Its progress is media time travelled, so it works for a paused or scrubbed host too.
+    void armBlend(double seconds);
     void armIfMoved(const BeatClock& before, const BeatClock& after, double now);
+    void advanceBlend(double travelled);
     [[nodiscard]] DanceFrame sampleFrame(double mediaTime);
-    void applyBlend(DanceFrame& frame, double mediaTime);
+    void applyBlend(DanceFrame& frame);
 
     struct PoseBlend {
         bool active = false;
+        bool hold = false;     // armed since the last frame: that frame shows the outgoing pose
         ClipPose from;
-        double start = 0.0;
+        double progress = 0.0; // media seconds travelled since the blend was armed
         double seconds = 0.0;
     };
     PoseBlend blend_;
     bool haveLastPose_ = false;
+    bool lastJump_ = false;
     ClipPose lastPose_;
 
     DanceLibrary library_;

@@ -991,3 +991,74 @@ TEST_CASE(dance.rebase_keeps_crossfade_and_pending_one_shot_return) {
     oneShot.rebase(1.0, motion::BeatClock::constant(120.0, 0.0));
     CHECK(oneShot.sample(60.0).style == motion::DanceStyle::Idle);
 }
+
+TEST_CASE(dance.paused_seek_reaches_the_correct_pose) {
+    // The host is paused: media time stands still after the seek. The seek hand-over must
+    // still finish on the schedule's pose instead of holding the pose from before the seek.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    const motion::DanceFrame before = player.update(10.0);
+    motion::DanceFrame settled;
+    for (int i = 0; i < 100; ++i) {
+        settled = player.update(60.0);
+    }
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "hiphop");
+    CHECK(worstBoneAngle(settled.pose, reference.update(60.0).pose) < 1e-3);
+    CHECK(std::abs(settled.pose.hips.y - reference.update(60.0).pose.hips.y) < 1e-4);
+    // ...and the seek itself did not pop: the first frame after it still shows the old pose.
+    motion::DancePlayer again;
+    steadyPlayer(again, "hiphop");
+    (void)again.update(10.0);
+    CHECK(worstBoneAngle(again.update(60.0).pose, before.pose) < 1e-3);
+}
+
+TEST_CASE(dance.continuous_backward_scrub_follows_the_scrub_position) {
+    // A scrub moves the media time backwards a little every frame. Each frame is a jump of the
+    // host clock, but the pose must follow the scrub position, not stay at the pose where the
+    // scrub started. Overlays are off so the schedule can be compared with a pure reference.
+    motion::DancePlayer player;
+    player.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(player, "hiphop");
+    for (double t = 0.0; t <= 60.0 + 1e-9; t += 1.0 / 60.0) {
+        (void)player.update(t);
+    }
+    const motion::DanceFrame atStart = player.update(60.0);
+    motion::DancePlayer reference;
+    reference.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(reference, "hiphop");
+
+    double t = 60.0;
+    double worstAfterWindow = 0.0;
+    double farthestFromStart = 0.0;
+    for (int frame = 1; frame <= 60; ++frame) {   // one second of scrubbing at 60 fps
+        t -= 0.05;
+        const motion::DanceFrame scrubbed = player.update(t);
+        const motion::ClipPose target = reference.director().sample(t).pose;
+        if (frame * 0.05 > 0.5) {   // the hand-over itself lasts a fraction of a second
+            worstAfterWindow = std::max(worstAfterWindow, worstBoneAngle(scrubbed.pose, target));
+        }
+        farthestFromStart = std::max(farthestFromStart, worstBoneAngle(scrubbed.pose, atStart.pose));
+    }
+    CHECK(worstAfterWindow < 1e-3);
+    CHECK(farthestFromStart > 5.0);   // it moved: the pose is not frozen at the scrub's start
+}
+
+TEST_CASE(dance.paused_tempo_change_does_not_stick) {
+    // Auto without music keeps the Manual schedule, but a constant grid change moves the clip
+    // beat at the same media time. While the host is paused the first frame holds the pose the
+    // viewer had, and the next frame is the schedule on the new grid, not a blend stuck on the
+    // old pose.
+    motion::DancePlayer player;
+    player.setOverlayMode(motion::OverlayMode::Off);
+    steadyPlayer(player, "sidestep");
+    const motion::DanceFrame before = player.update(9.0);
+    player.setMode(motion::DanceMode::Auto, 9.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 9.0);
+    const motion::DanceFrame held = player.update(9.0);
+    CHECK(worstBoneAngle(held.pose, before.pose) < 1e-3);
+    const motion::DanceFrame settled = player.update(9.0);
+    CHECK(worstBoneAngle(settled.pose, player.director().sample(9.0).pose) < 1e-3);
+    CHECK(worstBoneAngle(settled.pose, before.pose) > 1e-3);   // the tempo change is visible
+}
+

@@ -138,6 +138,9 @@ std::size_t DancePlayer::loadLibrary(const std::filesystem::path& directory) {
     director_.setLibrary(&library_);
     director_.reset(0.0);
     lastTime_ = -1.0e9;
+    blend_ = PoseBlend{};
+    haveLastPose_ = false;
+    lastJump_ = false;
     return library_.clips().size();
 }
 
@@ -239,9 +242,12 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
         return;
     }
     if (!clock.constantGrid() && analysis_ && !analysis_->empty()) {
-        director_.rebase(now, MusicalTimeline::fromAnalysis(*analysis_));
+        const MusicalTimeline timeline = MusicalTimeline::fromAnalysis(*analysis_);
+        armIfMoved(director_.beatClock(), timeline.grid(), now);
+        director_.rebase(now, timeline);
         return;
     }
+    armIfMoved(director_.beatClock(), clock, now);
     director_.rebase(now, std::move(clock));
 }
 
@@ -261,7 +267,7 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
 void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
     if (mode_ == DanceMode::Auto) {
-        armBlend(now, kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -285,7 +291,7 @@ void DancePlayer::setMode(DanceMode mode, double now) {
     mode_ = mode;
     if (mode_ == DanceMode::Auto) {
         // The plan replaces the Manual schedule: the dancer carries on from the current pose.
-        armBlend(now, kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds);
         if (analysis_ && !analysis_->empty()) {
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
@@ -325,13 +331,14 @@ void DancePlayer::startSequence(const std::vector<DanceStyle>& styles, double no
     director_.startSequence(styles, now, beatsPerStyle, immediate);
 }
 
-void DancePlayer::armBlend(double at, double seconds) {
+void DancePlayer::armBlend(double seconds) {
     if (!haveLastPose_) {
         return;
     }
     blend_.active = true;
+    blend_.hold = true;  // the first frame after arming still shows the outgoing pose
     blend_.from = lastPose_;
-    blend_.start = at;
+    blend_.progress = 0.0;
     blend_.seconds = seconds;
 }
 
@@ -339,15 +346,29 @@ void DancePlayer::armIfMoved(const BeatClock& before, const BeatClock& after, do
     const double beatDelta = std::abs(before.beatAt(now) - after.beatAt(now));
     const double bpmDelta = std::abs(before.bpmAt(now) - after.bpmAt(now));
     if (beatDelta > 1.0e-4 || bpmDelta > 0.05) {
-        armBlend(now, kPlanBlendSeconds);
+        armBlend(kPlanBlendSeconds);
     }
 }
 
-void DancePlayer::applyBlend(DanceFrame& frame, double mediaTime) {
+void DancePlayer::advanceBlend(double travelled) {
+    if (!blend_.active || blend_.hold) {
+        return;
+    }
+    if (travelled > 1.0e-9) {
+        // The hand-over runs on the media time the host travelled, forwards or backwards.
+        blend_.progress += travelled;
+    } else {
+        // A stopped media clock (paused host) would never finish the hand-over. Its last
+        // frame shows the old pose, and the next one lands on the schedule.
+        blend_.progress = blend_.seconds;
+    }
+}
+
+void DancePlayer::applyBlend(DanceFrame& frame) {
     if (!blend_.active) {
         return;
     }
-    const double u = (mediaTime - blend_.start) / blend_.seconds;
+    const double u = blend_.seconds > 0.0 ? blend_.progress / blend_.seconds : 1.0;
     if (u >= 1.0) {
         blend_.active = false;
         return;
@@ -360,20 +381,27 @@ DanceFrame DancePlayer::update(double mediaTime) {
     // A jump of the host clock is not a pose change the viewer should see: the new pose
     // is reached from the last one. The schedule itself is pure and needs no reseed; only
     // a time before its first segment (no segment covers it) rebuilds the Manual dance.
-    const bool jump = lastTime_ > -1.0e8 &&
-                      (mediaTime < lastTime_ - 0.02 || mediaTime > lastTime_ + 0.5);
-    if (jump) {
-        armBlend(mediaTime, kSeekBlendSeconds);
+    const bool haveTime = lastTime_ > -1.0e8;
+    advanceBlend(haveTime ? std::abs(mediaTime - lastTime_) : 0.0);
+    const bool jump = haveTime && (mediaTime < lastTime_ - 0.02 || mediaTime > lastTime_ + 0.5);
+    // Only the first frame of a run of jumps (the start of a seek or a scrub) arms the blend.
+    // A scrub frame after frame is followed by the schedule itself: re-arming per frame would
+    // hold the start pose, and re-arming after the blend completed would hold a frame behind
+    // every few frames.
+    if (jump && !lastJump_) {
+        armBlend(kSeekBlendSeconds);
     }
     const std::vector<ScheduleSegment>& segments = director_.schedule().segments();
     if (mode_ == DanceMode::Manual && !segments.empty() &&
         mediaTime < segments.front().startTime) {
-        armBlend(mediaTime, kSeekBlendSeconds);
+        armBlend(kSeekBlendSeconds);
         director_.reseed(mediaTime);
     }
     lastTime_ = mediaTime;
+    lastJump_ = jump;
     DanceFrame frame = sampleFrame(mediaTime);
-    applyBlend(frame, mediaTime);
+    applyBlend(frame);
+    blend_.hold = false;
     lastPose_ = frame.pose;
     haveLastPose_ = true;
     return frame;
