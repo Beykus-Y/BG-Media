@@ -24,6 +24,7 @@
 #include "bgmedia/motion3/DanceClip.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace bgmedia::motion {
@@ -43,6 +44,7 @@ struct ArmIntent {
     ArmIntentSource source = ArmIntentSource::None;
 
     Vec3 wrist{};            // chest-relative wrist position, height units
+    Vec3 shoulder{};         // chest-relative shoulder joint of this pose (moves with the clavicle)
     Quat wristOrientation{}; // hand orientation in the chest frame
     Vec3 elbowPole{0.0f, -1.0f, 0.0f};  // unit: direction the elbow bends
     float reach = 0.0f;      // shoulder-to-wrist distance / kReferenceArmReach
@@ -55,6 +57,10 @@ struct ArmIntent {
 struct TaskSpaceIntent {
     std::array<ArmIntent, 2> arm{};  // [0] left, [1] right
 };
+
+// Shoulder joint (upper arm root) of the reference skeleton, chest-relative, in
+// height units. side 0 = left, 1 = right. Constant: the chest frame is rigid.
+[[nodiscard]] math::Vec3 referenceShoulder(std::size_t side);
 
 // FK on the reference skeleton for one sampled pose. Velocity is left at zero.
 [[nodiscard]] TaskSpaceIntent extractTaskSpaceIntent(const ClipPose& pose);

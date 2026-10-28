@@ -54,6 +54,7 @@ ArmIntent armIntent(const Joint& chest, const Quat& chestInverse, Vec3 shoulder,
     intent.valid = true;
     intent.source = ArmIntentSource::Extracted;
     intent.wrist = rotate(chestInverse, hand.position - chest.position);
+    intent.shoulder = rotate(chestInverse, shoulder - chest.position);
     intent.wristOrientation = (chestInverse * hand.rotation).normalized();
 
     const Vec3 reachVector = hand.position - shoulder;
@@ -78,6 +79,17 @@ ArmIntent armIntent(const Joint& chest, const Quat& chestInverse, Vec3 shoulder,
 }
 
 } // namespace
+
+math::Vec3 referenceShoulder(std::size_t side) {
+    // Rest chest frame: the upper arm root is at the chest level plus the upper
+    // chest, shoulder and upper arm offsets, mirrored for the right side.
+    const Joint chest{kHipsBind + kSpineOffset + kChestOffset, Quat::identity()};
+    const Joint upperChest = attach(chest, kUpperChestOffset, Quat::identity());
+    const float sign = side == 0 ? 1.0f : -1.0f;
+    const Joint shoulder = attach(upperChest, {sign * kShoulderX, 0.0f, 0.0f}, Quat::identity());
+    const Joint upper = attach(shoulder, {sign * kUpperArmX, 0.0f, 0.0f}, Quat::identity());
+    return upper.position - chest.position;
+}
 
 TaskSpaceIntent extractTaskSpaceIntent(const ClipPose& pose) {
     const auto boneRotation = [&pose](HumanoidBone bone) {
