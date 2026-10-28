@@ -34,6 +34,12 @@ struct ScheduleSegment {
     double alignTime = 0.0;        // media seconds: musical reference for the entry beat
     double entryClipBeat = 0.0;    // clip beat at alignTime
     double rate = 1.0;             // clip beats per music beat (metric level 0.5 / 1 / 2)
+    // Real duration of one clip beat when this segment was planned: 60 / (tempo *
+    // rate) for tempo-synchronised clips, 60 / authored bpm otherwise. It is a
+    // property of the segment, not of the sample, so a tempo change does not jump
+    // the pose at the rebase instant; the next planned segment picks up the new
+    // tempo. 0 means "derive from the clip's authored tempo".
+    double secondsPerClipBeat = 0.0;
     double fadeSeconds = 0.6;      // blend length from the previous segment
     bool loop = true;
     std::string reason;            // why the planner chose this segment
@@ -47,8 +53,13 @@ struct ScheduleSegment {
 // to each segment's own pose *before* segments are crossfaded, so an outgoing
 // clip keeps its own overlays while it fades and an incoming clip fades its
 // overlays in, instead of the overlay set flipping mid-transition.
-using PoseDecorator =
-    std::function<void(ClipPose& pose, const ScheduleSegment& segment, double clipBeat)>;
+//
+// `secondsPerClipBeat` is the real duration of one clip beat at this media time:
+// it follows the musical tempo, the segment's metric level and the time warp, so
+// a cue's real length is known (BG Motion 3.3 quality pass). It is 60/rate of the
+// clip's authored tempo only for clips that are not tempo-synchronised.
+using PoseDecorator = std::function<void(ClipPose& pose, const ScheduleSegment& segment,
+                                         double clipBeat, double secondsPerClipBeat)>;
 
 struct DanceFrame {
     ClipPose pose;
@@ -61,6 +72,7 @@ struct DanceFrame {
     float phase = 0.0f;            // 0..1 inside the current clip
     float playbackSpeed = 1.0f;    // musical tempo relative to the clip's authored tempo
     float effectiveSpeed = 1.0f;   // playbackSpeed * warpRate
+    float secondsPerClipBeat = 0.0f;  // real duration of one clip beat (tempo + rate + warp)
     bool speedLimited = false;     // tempo outside the clip's comfortable range
     float transitionProgress = -1.0f;  // 0..1 while crossfading, else -1
     double bpm = 0.0;
@@ -139,7 +151,8 @@ private:
                                   PoseMemo& memo) const;
     [[nodiscard]] ClipPose basePose(std::size_t index, double mediaTime,
                                     const MusicalTimeline& timeline,
-                                    const WarpProfile& warp, double* clipBeat) const;
+                                    const WarpProfile& warp, double* clipBeat,
+                                    double* secondsPerClipBeat = nullptr) const;
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;

@@ -342,7 +342,7 @@ DanceFrame DancePlayer::update(double mediaTime) {
     } diag;
     director_.schedule().setPoseDecorator(
         [this, &options, &diag](ClipPose& pose, const ScheduleSegment& segment,
-                                double clipBeat) {
+                                double clipBeat, double secondsPerClipBeat) {
             if (!segment.clip) {
                 return;
             }
@@ -350,10 +350,13 @@ DanceFrame DancePlayer::update(double mediaTime) {
             if (cues.empty()) {
                 return;
             }
-            // The cue envelope must know how long the gesture really is: a short
-            // cue performed at its full size is a snap, not a gesture.
+            // The cue envelope must know how long the gesture really is, in real
+            // seconds: a short cue performed at its full size is a snap, not a
+            // gesture. The schedule supplies the duration of one clip beat for the
+            // active tempo, metric level and time warp, so a fast playback shrinks
+            // the gesture instead of speeding it up.
             options.cueSecondsPerBeat =
-                static_cast<float>(60.0 / std::max(20.0, segment.clip->bpm));
+                static_cast<float>(std::clamp(secondsPerClipBeat, 0.05, 4.0));
             const ComposedPose composed = composeMotion(
                 pose, cues, clipBeat, segment.clip->beats, segment.clip->loop, options);
             pose = composed.pose;

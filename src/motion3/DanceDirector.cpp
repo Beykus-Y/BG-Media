@@ -160,6 +160,21 @@ Mapping mapSegment(const ScheduleSegment& segment, double mediaTime,
     return mapping;
 }
 
+// Real duration of one clip beat for a segment: the value planned with the
+// segment (so a tempo change cannot jump the pose) scaled by the current warp
+// rate (which is continuous and belongs to the pose the segment is sampled with).
+double segmentSecondsPerClipBeat(const ScheduleSegment& segment, const Mapping& mapping) {
+    const double authored = segment.clip ? std::max(1.0, segment.clip->bpm) : 120.0;
+    const double base = segment.secondsPerClipBeat > 0.0
+                            ? segment.secondsPerClipBeat
+                            : 60.0 / authored;
+    double warp = 1.0;
+    if (segment.clip && segment.clip->tempoSync && segment.rate > 1.0e-9) {
+        warp = mapping.rate / segment.rate;
+    }
+    return base / std::max(0.25, warp);
+}
+
 bool anyFootContact(const ClipPose& pose) {
     for (const ClipPose::Foot& foot : pose.foot) {
         if (foot.contact >= 0.5f) {
@@ -372,7 +387,8 @@ void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double
 
 ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
                                  const MusicalTimeline& timeline,
-                                 const WarpProfile& warp, double* clipBeat) const {
+                                 const WarpProfile& warp, double* clipBeat,
+                                 double* secondsPerClipBeat) const {
     const ScheduleSegment& segment = segments_[index];
     const Mapping stable = mapSegment(segment, mediaTime, timeline.grid(), &timeline,
                                       WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f},
@@ -393,6 +409,11 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
     if (clipBeat) {
         *clipBeat = mapped.beat;
     }
+    if (secondsPerClipBeat) {
+        // A cue's real length. The segment value is the tempo at planning time
+        // (so a rebase does not jump the pose); the warp rate is continuous.
+        *secondsPerClipBeat = segmentSecondsPerClipBeat(segment, mapped);
+    }
     return own;
 }
 
@@ -400,12 +421,13 @@ ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
                                 const MusicalTimeline& timeline,
                                 const WarpProfile& warp) const {
     double clipBeat = 0.0;
-    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat);
+    double secondsPerClipBeat = 0.0;
+    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat, &secondsPerClipBeat);
     if (followThrough_) {
         applyFollowThrough(own, index, mediaTime, timeline, warp);
     }
     if (decorator_) {
-        decorator_(own, segments_[index], clipBeat);
+        decorator_(own, segments_[index], clipBeat, secondsPerClipBeat);
     }
     return own;
 }
@@ -534,6 +556,10 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
     }
     frame.phase = static_cast<float>(wrapped / length);
     frame.bpm = clock.bpmAt(mediaTime);
+    // Real length of one clip beat of the segment being shown (planned tempo x
+    // metric level x warp). Diagnostics and the overlay cue timing share it.
+    frame.secondsPerClipBeat =
+        static_cast<float>(segmentSecondsPerClipBeat(*shown, mapping));
     if (shown->clip->tempoSync) {
         const double effective = frame.bpm * shown->rate;
         frame.playbackSpeed = static_cast<float>(effective / shown->clip->bpm);
@@ -697,9 +723,14 @@ ScheduleSegment DanceDirector::makeSegment(const HumanoidClip& clip, double star
         segment.rate = 1.0;
         segment.entryClipBeat = 0.0;
         segment.alignedToDownbeat = false;
+        segment.secondsPerClipBeat = 60.0 / std::max(1.0, clip.bpm);
         return segment;
     }
     segment.rate = chooseRate(clip, clock_.bpmAt(alignTime));
+    // Planned once per segment: the tempo at the alignment point, so a later
+    // tempo change cannot jump the pose at the rebase instant.
+    segment.secondsPerClipBeat =
+        60.0 / std::max(1.0e-6, clock_.bpmAt(alignTime) * segment.rate);
     const double beatPos = clock_.beatAt(alignTime);
     const int inBar = clock_.beatInBar(beatPos);
     const double fraction = beatPos - std::floor(beatPos + 1e-6);
