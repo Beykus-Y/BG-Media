@@ -6,7 +6,7 @@
 //
 //   bgmedia_motion_diag --model M.vrm --audio T.mp3 --clip fluidSignal [--mode manual|auto]
 //       [--overlay off|light|full|hands] [--warp off|soft|expressive] [--spring 0|1]
-//       [--fps 60] [--from 0] [--to 30] [--select-at 0] [--immediate 0|1]
+//       [--thigh-colliders 0|1] [--fps 60] [--from 0] [--to 30] [--select-at 0] [--immediate 0|1]
 //       [--mesh-hz 15] [--csv out.csv] [--focus 1.16] [--seek 1.16]
 //
 // Playback is always sequential from `--from`, one fresh DancePlayer per run (a reused
@@ -20,6 +20,7 @@
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "bgmedia/vrm/ThighColliders.hpp"
 #include "support/MeshProbe.hpp"
 #include "support/PathUtf8.hpp"
 
@@ -44,6 +45,7 @@ struct Options {
     std::string clip = "fluidSignal";
     std::string mode = "manual", overlay = "full", warp = "off";
     bool spring = false, immediate = false;
+    bool thighColliders = false;  // BG Motion 3.3 opt-in thigh/hip spring colliders
     double fps = 60.0, from = 0.0, to = 30.0, selectAt = 0.0, mesh_hz = 15.0, focus = -1.0, seek = -1.0;
     bool legMesh = true, armMesh = true;
     bool legProxy = false, armProxy = true;
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
         else if (a == "--overlay") o.overlay = next();
         else if (a == "--warp") o.warp = next();
         else if (a == "--spring") o.spring = std::atoi(next().c_str()) != 0;
+        else if (a == "--thigh-colliders") o.thighColliders = std::atoi(next().c_str()) != 0;
         else if (a == "--immediate") o.immediate = std::atoi(next().c_str()) != 0;
         else if (a == "--fps") o.fps = std::atof(next().c_str());
         else if (a == "--from") o.from = std::atof(next().c_str());
@@ -145,6 +148,17 @@ int main(int argc, char** argv) {
     if (!loaded.ok()) {
         std::fprintf(stderr, "model load failed: %s\n", loaded.error.c_str());
         return 1;
+    }
+    if (o.thighColliders) {
+        // Must run before SecondaryDynamics is constructed: the collider groups are read at build time.
+        vrm::ThighColliderOptions thigh;
+        thigh.enabled = true;
+        const vrm::ThighColliderReport report = vrm::synthesizeThighColliders(*loaded.model, thigh);
+        std::printf("thigh colliders: %s (groups %d, spheres %d, chains %d, radius L %.4f R %.4f m%s)\n",
+                    report.applied ? "added" : report.skipReason.c_str(), report.groupsAdded,
+                    report.spheresAdded, report.chainsTouched, report.leftRadius, report.rightRadius,
+                    report.applied && (report.leftRadiusFromMesh || report.rightRadiusFromMesh)
+                        ? ", mesh-fitted" : "");
     }
     const vrm::VrmModel& model = *loaded.model;
     animation::HumanoidRetargeter rig(model);
