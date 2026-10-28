@@ -1183,7 +1183,8 @@ TEST_CASE(dance.plan_blend_never_pushes_a_landed_foot_below_the_floor) {
 TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
     // A tempo rebase during a hand-over changes when the clip's swing happens. The hand-over
     // follows the swing's clip beats, so a planted foot is not dragged to its new place while
-    // the clip still holds it down (HipHop 100 BPM -> Energetic, then 80 BPM mid-fade). The
+    // the clip still holds it down (HipHop 100 BPM -> Energetic, then 80 BPM mid-fade), and the
+    // hand-over lasts until the rebased swing has landed (Idle 180 -> Energetic, then 100). The
     // planted slide after the rebase is compared with the same transition without a tempo
     // change, so slides a pair has anyway (no swing in the window) do not count.
     const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
@@ -1192,9 +1193,9 @@ TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
     constexpr double kMetresPerHeight = 1.7;
     constexpr double kStep = 1.0 / 120.0;
     const auto plantedSlide = [&](motion::DanceStyle from, motion::DanceStyle to, double u,
-                                  double bpmAfter) {
+                                  double bpmBefore, double bpmAfter) {
         motion::DanceDirector director(&library());
-        director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+        director.setBeatClock(motion::BeatClock::constant(bpmBefore, 0.0));
         director.select(from, 0.0, false, true);
         director.select(to, 5.37);
         const motion::ScheduleSegment& incoming = director.schedule().segments().back();
@@ -1204,7 +1205,8 @@ TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
         motion::ClipPose previous = director.sample(now).pose;
         std::array<double, 2> run{0.0, 0.0};
         double worst = 0.0;
-        for (double t = now + kStep; t < now + 5.0; t += kStep) {
+        // Long enough for a swing a slower tempo pushed past the original search window.
+        for (double t = now + kStep; t < now + 10.0; t += kStep) {
             const motion::ClipPose pose = director.sample(t).pose;
             for (std::size_t f = 0; f < 2; ++f) {
                 if (previous.foot[f].contact <= 0.95f || pose.foot[f].contact <= 0.95f) {
@@ -1223,14 +1225,22 @@ TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
     for (motion::DanceStyle from : styles) {
         for (motion::DanceStyle to : styles) {
             if (from == to) continue;
-            for (double u : {0.2, 0.5, 0.8}) {
-                const double steady = plantedSlide(from, to, u, 100.0);
+            for (double u : {0.01, 0.2, 0.5, 0.8}) {
+                const double steady = plantedSlide(from, to, u, 100.0, 100.0);
                 for (double bpmAfter : {80.0, 125.0}) {
                     worstExcess =
-                        std::max(worstExcess, plantedSlide(from, to, u, bpmAfter) - steady);
+                        std::max(worstExcess, plantedSlide(from, to, u, 100.0, bpmAfter) - steady);
                 }
+                // 180 -> 100 BPM moves a swing past the window the transition was planned
+                // with: the hand-over must last until that swing lands.
+                const double fast = plantedSlide(from, to, u, 180.0, 180.0);
+                worstExcess =
+                    std::max(worstExcess, plantedSlide(from, to, u, 180.0, 100.0) - fast);
             }
         }
     }
-    CHECK(worstExcess < 0.01);   // a rebase adds under 1 cm of planted slide
+    // A rebase adds under 3 cm of planted slide. What remains is the settling tail of a
+    // landing (shown contact 0.95..1 while the hand-over finishes); the bugs this guards
+    // against slid a planted foot by 38 to 48 cm.
+    CHECK(worstExcess < 0.03);
 }

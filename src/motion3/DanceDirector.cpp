@@ -23,8 +23,16 @@ constexpr int kHandOverSamples = static_cast<int>(kHandOverWindow / kHandOverSte
 // A segment's hand-over can hold its feet until this media time. Every place that keeps or
 // drops segments uses this one lifetime, so a predecessor is never dropped while it still
 // anchors a planted foot.
+// A swing found in the window ends inside it, but a rebase to a slower tempo can move it
+// later; its own end then extends the lifetime.
 double handOverEnd(const ScheduleSegment& segment) {
-    return segment.startTime + segment.fadeSeconds + kHandOverWindow;
+    double end = segment.startTime + segment.fadeSeconds + kHandOverWindow;
+    for (const auto& window : segment.footSwing) {
+        if (window.resolved && !window.slide) {
+            end = std::max(end, window.end);
+        }
+    }
+    return end;
 }
 
 double circularDistance(double a, double b, double period) {
@@ -103,6 +111,20 @@ float accentAtNextBoundary(const ScheduleSegment& segment, double musicBeat,
                           : std::clamp(std::max(0.35f, beatConfidence), 0.0f, 1.0f);
     }
     return std::clamp(accent, 0.0f, 1.0f);
+}
+
+// Inverse of the linear (unwarped) clip-beat mapping: the media time at which `segment`
+// reaches linear clip beat `beat` on `clock`.
+double timeAtLinearClipBeat(const ScheduleSegment& segment, double beat, const BeatClock& clock) {
+    if (!segment.clip) {
+        return segment.alignTime;
+    }
+    if (!segment.clip->tempoSync) {
+        return segment.alignTime + (beat - segment.entryClipBeat) * 60.0 / segment.clip->bpm;
+    }
+    const double rate = std::max(segment.rate, 1e-6);
+    return clock.timeAtBeat(clock.beatAt(segment.alignTime) +
+                            (beat - segment.entryClipBeat) / rate);
 }
 
 Mapping mapSegment(const ScheduleSegment& segment, double mediaTime,
@@ -1135,6 +1157,18 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             }
         }
         kept.push_back(std::move(segment));
+    }
+    // The swing windows' media seconds follow their clip beats on the new grid, so the
+    // hand-over lifetime (handOverEnd) lasts until the rebased swing has landed.
+    for (std::size_t k = 1; k < kept.size(); ++k) {
+        for (auto& window : kept[k].footSwing) {
+            if (!window.resolved || window.slide) {
+                continue;
+            }
+            const ScheduleSegment& source = window.fromOutgoing ? kept[k - 1] : kept[k];
+            window.begin = timeAtLinearClipBeat(source, window.beginBeat, clock_);
+            window.end = timeAtLinearClipBeat(source, window.endBeat, clock_);
+        }
     }
     schedule_.clear();
     for (auto& segment : kept) {

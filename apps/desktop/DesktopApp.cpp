@@ -1327,7 +1327,9 @@ struct DesktopApp::Impl {
     // from the position, so they never count as stopped.
     [[nodiscard]] bool danceTransportRunning() const {
         if (!track) {
-            return syntheticDemo ? syntheticPlaying : danceLabRunning;
+            // Without a track the dance clock is danceLabTime, which only advances while
+            // Motion Lab runs (the synthetic demo's own play state does not move it).
+            return captureMode || danceLabRunning;
         }
         return captureMode || scrubbing || playing();
     }
