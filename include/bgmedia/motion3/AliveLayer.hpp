@@ -12,6 +12,7 @@
 
 #include "bgmedia/motion3/DanceClip.hpp"
 
+#include <array>
 #include <cstdint>
 
 namespace bgmedia::motion {
@@ -42,13 +43,21 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
 //   root (rootX, rootZ, rootYaw), so a dancer who has travelled stays where they are.
 // Feet are handed over one at a time: foot 0 (left) moves over mix 0..0.5, foot 1
 // (right) over 0.5..1, each with a smootherstep. At every mix at least one foot sits
-// exactly on one of its endpoints, so one foot is always planted. A moving foot
+// exactly on one of its endpoints (the Idle end re-anchored by idleFeetAtDanceRoot),
+// so one foot is always planted. A moving foot
 // lifts by min(0.03, 0.5 * travel) model heights, sine-shaped, unless its travel is
 // under 1 cm. Its contact is min(lerp(dance, idle, p), 1 - sin(pi p)): it never rises
 // above either end, and it drops while the foot moves. Yaw and toe roll follow the
 // same p. Bones, hips and hands use the plain crossfade with `mix`.
 [[nodiscard]] ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle,
                                               float mix);
+
+// The Idle feet moved from Idle's root to the dance root: each foot keeps its offset
+// from the root in the root's frame (the retargeter reads foot targets as absolute
+// stage positions), and its yaw keeps its angle to the root heading. With equal roots
+// this is exactly idle.foot. blendToIdleKeepingFeet hands the feet over to these.
+[[nodiscard]] std::array<ClipPose::Foot, 2> idleFeetAtDanceRoot(const ClipPose& dance,
+                                                               const ClipPose& idle);
 
 // Wall-clock crossfade between the dance and the Idle clip, used when the
 // transport has stopped (paused, ended or stopped). It holds the dance for a

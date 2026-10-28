@@ -1,6 +1,7 @@
 #include "bgmedia/motion3/AliveLayer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 
@@ -33,6 +34,10 @@ constexpr double kWeightShiftSpanSeconds = 4.0;
 constexpr double kFootLiftCapHeights = 0.03;                      // about 4.8 cm at 1.6 m
 constexpr double kFootLiftMinTravel = 1.0 / kReferenceHeightCm;   // 1 cm
 constexpr double kFootLiftFraction = 0.5;                         // lift = 0.5 * travel, capped
+// Half the distance between the bind ankles, in height units (left foot at +x). The
+// retargeter turns foot targets around the ankle midpoint; the real width is model
+// dependent, this typical value keeps the re-anchored stance within a few mm.
+constexpr double kBindAnkleHalfWidth = 0.06;
 
 // Head look-around: total yaw +-4 deg and pitch +-2 deg, split neck 40 % / head 60 %.
 constexpr double kLookYawDeg = 4.0;
@@ -223,6 +228,31 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
     }
 }
 
+std::array<ClipPose::Foot, 2> idleFeetAtDanceRoot(const ClipPose& dance, const ClipPose& idle) {
+    std::array<ClipPose::Foot, 2> idleFeet = idle.foot;
+    if (dance.rootX == idle.rootX && dance.rootZ == idle.rootZ && dance.rootYaw == idle.rootYaw) {
+        return idleFeet;  // same root: exactly the Idle feet
+    }
+    const double turn = (static_cast<double>(dance.rootYaw) - idle.rootYaw) * kTwoPi;
+    const double c = std::cos(turn);
+    const double sn = std::sin(turn);
+    for (std::size_t f = 0; f < 2; ++f) {
+        const double ankle = f == 0 ? kBindAnkleHalfWidth : -kBindAnkleHalfWidth;
+        // Offset from the root, measured from the ankle midpoint like the retargeter.
+        const double x = ankle + idle.foot[f].position.x - idle.rootX;
+        const double z = static_cast<double>(idle.foot[f].position.z) - idle.rootZ;
+        // Rotation about +y in clip axes (x left, y up, z forward; right handed).
+        const double rx = c * x + sn * z;
+        const double rz = -sn * x + c * z;
+        if (std::isfinite(rx) && std::isfinite(rz)) {
+            idleFeet[f].position.x = static_cast<float>(rx + dance.rootX - ankle);
+            idleFeet[f].position.z = static_cast<float>(rz + dance.rootZ);
+            idleFeet[f].yaw = idle.foot[f].yaw - idle.rootYaw + dance.rootYaw;
+        }
+    }
+    return idleFeet;
+}
+
 ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix) {
     const float m = std::isfinite(mix) ? std::clamp(mix, 0.0f, 1.0f) : 0.0f;
     if (m <= 0.0f) {
@@ -237,6 +267,10 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
     idleBody.rootYaw = dance.rootYaw;
     ClipPose out = blendPoses(dance, idleBody, m);
 
+    // Idle's own targets sit around Idle's root; move them to the kept dance root so the
+    // stance does not lean back to the origin or twist against the body's heading.
+    const std::array<ClipPose::Foot, 2> idleFeet = idleFeetAtDanceRoot(dance, idle);
+
     // Feet: one at a time. Foot 0 (left) moves over mix 0..0.5, foot 1 (right) over 0.5..1.
     // At every mix one of the two feet has p = 0 or p = 1, so it sits exactly on an endpoint.
     for (std::size_t f = 0; f < 2; ++f) {
@@ -247,7 +281,7 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
                                ? static_cast<float>(std::sin(kTwoPi * 0.5 * p))
                                : 0.0f;
         const ClipPose::Foot& from = dance.foot[f];
-        const ClipPose::Foot& to = idle.foot[f];
+        const ClipPose::Foot& to = idleFeet[f];
         ClipPose::Foot& foot = out.foot[f];
 
         Vec3 position{exactLerp(from.position.x, to.position.x, p),
