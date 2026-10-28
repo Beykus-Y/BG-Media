@@ -1635,6 +1635,40 @@ TEST_CASE(dance.loop_variation_is_bounded_deterministic_and_seamless) {
     CHECK(seam <= 1.3 * interior + 0.05);
 }
 
+TEST_CASE(dance.library_rejects_mirror_suffix_ids) {
+    // "<base>~m" names the mirror of "<base>". A stored clip with that id would be shadowed by
+    // the mirror in find(), so the library refuses it, from add(), replace() and file loading.
+    motion::DanceLibrary lib;
+    lib.loadDirectory(dancesDir());
+    const motion::HumanoidClip groove = *lib.find("groove");
+    motion::HumanoidClip imposter = groove;
+    imposter.id = "groove" + std::string(motion::kMirrorSuffix);
+    const std::size_t count = lib.clips().size();
+    CHECK(!lib.add(imposter));
+    CHECK(!lib.replace(imposter));
+    CHECK(lib.clips().size() == count);
+    CHECK(!lib.diagnostics().empty());
+
+    // The id still resolves to the mirror of the original clip, the one the library owns.
+    const motion::HumanoidClip* mirror = lib.find(imposter.id);
+    CHECK(mirror != nullptr);
+    if (mirror) {
+        CHECK(maxComponentDiff(motion::sampleClip(*mirror, 1.25),
+                               motion::sampleClip(motion::mirrorClip(groove), 1.25)) == 0.0);
+    }
+
+    // A clip file with such an id is reported and skipped.
+    const std::string needle = "\"id\":\"tiny\"";
+    std::string text = tinyClipJson();
+    text.replace(text.find(needle), needle.size(), "\"id\":\"tiny" + std::string(motion::kMirrorSuffix) + "\"");
+    const motion::ClipLoadResult loaded = motion::parseClipJson(text, "tiny~m.json");
+    CHECK(loaded.ok);
+    motion::DanceLibrary other;
+    CHECK(!other.add(loaded.clip));
+    CHECK(other.empty());
+    CHECK(!other.diagnostics().empty());
+}
+
 TEST_CASE(dance.manual_seek_matches_continuous_play_in_later_loops) {
     // A re-aligned Manual dance (a seek before its schedule) has the pose that continuous play has
     // at the same time, in later loops too: the seek does not reset the per-loop variation.

@@ -1223,6 +1223,14 @@ std::string toggleSuffix(const std::string& text, const std::string& suffix) {
     return text + suffix;
 }
 
+// True for an id that names a mirror (base id + kMirrorSuffix). The library never stores such
+// an id: find() would resolve it to the mirror of a base clip instead.
+bool endsWithMirrorSuffix(const std::string& id) {
+    const std::string suffix = kMirrorSuffix;
+    return id.size() > suffix.size() &&
+           id.compare(id.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 }  // namespace
 
 vrm::HumanoidBone mirroredBone(vrm::HumanoidBone bone) {
@@ -1346,6 +1354,9 @@ std::uint64_t variationHash(const std::string& text) {
 // --- library ---------------------------------------------------------------
 
 bool DanceLibrary::replace(const HumanoidClip& clip) {
+    if (endsWithMirrorSuffix(clip.id)) {
+        return false;  // never stored, see add()
+    }
     for (HumanoidClip& existing : clips_) {
         if (existing.id == clip.id) {
             existing = clip;
@@ -1369,6 +1380,14 @@ const HumanoidClip* DanceLibrary::mirrorOf(const HumanoidClip& clip) const {
 }
 
 bool DanceLibrary::add(HumanoidClip clip) {
+    if (endsWithMirrorSuffix(clip.id)) {
+        // "<base>~m" is the mirror of "<base>" in find(); a stored clip with that id would be
+        // shadowed by it, so the clip is refused and must be renamed.
+        diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,
+                                "clip id '" + clip.id + "' ends with the mirror suffix '" +
+                                    kMirrorSuffix + "'; rename the clip"});
+        return false;
+    }
     if (find(clip.id)) {
         diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,
                                 "duplicate clip id '" + clip.id + "'"});
@@ -1414,8 +1433,8 @@ const HumanoidClip* DanceLibrary::find(const std::string& id) const {
     if (const HumanoidClip* clip = findOriginal(id)) {
         return clip;
     }
-    const std::string suffix = kMirrorSuffix;
-    if (id.size() > suffix.size() && id.compare(id.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    if (endsWithMirrorSuffix(id)) {
+        const std::string suffix = kMirrorSuffix;
         if (const HumanoidClip* original = findOriginal(id.substr(0, id.size() - suffix.size()))) {
             const HumanoidClip* mirror = mirrorOf(*original);
             return mirror->id == id ? mirror : nullptr;

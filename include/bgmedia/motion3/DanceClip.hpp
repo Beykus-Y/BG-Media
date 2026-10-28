@@ -255,6 +255,7 @@ public:
     // Loads every *.json file in the directory. Invalid clips are reported in
     // diagnostics() and skipped; they never abort loading of the others.
     void loadDirectory(const std::filesystem::path& directory);
+    // Refuses a duplicate id, and an id that ends with kMirrorSuffix (reported in diagnostics()).
     bool add(HumanoidClip clip);
 
     // Also resolves the mirrored id of a loaded clip (id + kMirrorSuffix).
