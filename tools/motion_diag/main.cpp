@@ -47,6 +47,7 @@ struct Options {
     double fps = 60.0, from = 0.0, to = 30.0, selectAt = 0.0, mesh_hz = 15.0, focus = -1.0, seek = -1.0;
     bool legMesh = true, armMesh = true;
     bool legProxy = false, armProxy = true;
+    bool softIK = false;  // BG Motion 3.3 soft reach, stable bend and joint limits
     float footworkGap = 2.5f;
     std::string footwork = "model";  // off | ref | model (authored footwork pre-pass)
     double skip = 0.0;  // ignore the first seconds in the summaries (clip fade-in transient)
@@ -134,6 +135,8 @@ int main(int argc, char** argv) {
         else if (a == "--seek") o.seek = std::atof(next().c_str());
         else if (a == "--no-leg-proxy") o.legProxy = false;
         else if (a == "--leg-proxy") o.legProxy = true;
+        else if (a == "--soft-ik") o.softIK = true;
+        else if (a == "--no-soft-ik") o.softIK = false;
         else if (a == "--footwork") o.footwork = next();
         else if (a == "--footwork-gap") o.footworkGap = static_cast<float>(std::atof(next().c_str()));
         else if (a == "--no-arm-proxy") o.armProxy = false;
@@ -242,6 +245,11 @@ int main(int argc, char** argv) {
     const int total = static_cast<int>((o.to - o.from) * o.fps);
     const int meshEvery = std::max(1, static_cast<int>(o.fps / std::max(1.0, o.mesh_hz)));
     double lastMedia = -1e9;
+    // BG Motion 3.3 soft IK counters, summed over the played frames (--soft-ik).
+    long softSolves = 0, bendBlends = 0, flexLimits = 0, plantedFlex = 0, plantedReach = 0;
+    float softCompression = 0.0f;
+    double ikErrorSum = 0.0;
+    int ikErrorCount = 0;
     for (int f = 0; f < total; ++f) {
         const double t = o.from + f * dt;
         if (!selected && t >= o.selectAt) {
@@ -254,6 +262,7 @@ int main(int argc, char** argv) {
         const motion::DanceFrame df = player.update(t);
         animation::RetargetOptions ropt;
         ropt.legCollision = o.legProxy;
+        ropt.softIK = o.softIK;
         ropt.armCollision = o.armProxy;
         animation::RetargetedPose pose = rig.applyClip(df.pose, t, ropt);
         if (o.spring) {
@@ -297,6 +306,16 @@ int main(int argc, char** argv) {
         fr.legCorr = pose.stats.legCorrection;
         fr.legClear = pose.stats.legClearanceRaw;
         fr.legConflict = pose.stats.legConflictPlanted;
+        if (o.softIK && f >= static_cast<int>(o.skip * o.fps)) {
+            softSolves += pose.stats.softReachSolves;
+            softCompression = std::max(softCompression, pose.stats.softReachCompression);
+            bendBlends += pose.stats.bendBlends;
+            flexLimits += pose.stats.flexLimits;
+            plantedFlex += pose.stats.plantedFlexConflicts;
+            plantedReach += pose.stats.plantedReachConflicts;
+            ikErrorSum += pose.stats.maxFootError;
+            ++ikErrorCount;
+        }
         if (f % meshEvery == 0) {
             meshProbe.skin(pose);
             if (o.legMesh) fr.legCross = static_cast<int>(meshProbe.crossings(probe::Region::LegL, probe::Region::LegR).size());
@@ -450,6 +469,12 @@ int main(int argc, char** argv) {
         }
         std::printf("LEG PROXY: %d frames corrected, max foot-target move %.1f mm, %d frames with both feet planted and overlapping (not movable)\n",
                     corrected, maxCorr * 1000.0, conflicts);
+    }
+    if (o.softIK) {
+        std::printf("SOFT IK: %ld soft-reach solves (max shortfall %.1f mm), %ld bend blends, %ld flexion-limited free solves, "
+                    "planted: %ld flexion conflicts, %ld beyond-reach; mean max foot error %.2f cm\n",
+                    softSolves, softCompression * 1000.0, bendBlends, flexLimits, plantedFlex, plantedReach,
+                    ikErrorCount > 0 ? 100.0 * ikErrorSum / ikErrorCount : 0.0);
     }
     // list leg-crossing time ranges
     {

@@ -109,6 +109,7 @@ endif()
 
 add_library(bgmedia_rig STATIC
     src/animation/HumanoidRetargeter.cpp
+    src/animation/TwoBoneSolver.cpp
     src/animation/SecondaryDynamics.cpp
     src/motion3/BeatClock.cpp
     src/motion3/MusicalTimeline.cpp
