@@ -119,6 +119,7 @@ add_library(bgmedia_rig STATIC
     src/motion3/ProceduralChoreography.cpp
     src/motion3/DanceDirector.cpp
     src/motion3/DancePlayer.cpp
+    src/motion3/TaskSpaceIntent.cpp
 )
 add_library(BGMedia::Rig ALIAS bgmedia_rig)
 target_include_directories(bgmedia_rig
