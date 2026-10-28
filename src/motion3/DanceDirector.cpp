@@ -847,7 +847,9 @@ ScheduleSegment DanceDirector::makeSegment(const HumanoidClip& clip, double star
 void DanceDirector::reset(double now) {
     schedule_.clear();
     selected_ = DanceStyle::Idle;
+    selectedClip_.clear();
     if (const HumanoidClip* idle = clipFor(DanceStyle::Idle)) {
+        selectedClip_ = idle->id;
         ScheduleSegment segment;
         segment.clip = idle;
         segment.startTime = now - 1.0e6;
@@ -861,7 +863,10 @@ void DanceDirector::reset(double now) {
 }
 
 void DanceDirector::reseed(double now) {
-    const HumanoidClip* clip = clipFor(selected_);
+    const HumanoidClip* clip = library_ ? library_->find(selectedClip_) : nullptr;
+    if (!clip) {
+        clip = clipFor(selected_);
+    }
     if (!clip) {
         clip = clipFor(DanceStyle::Idle);
     }
@@ -958,6 +963,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
         reset(now - 0.01);
     }
     selected_ = style;
+    selectedClip_ = clip->id;
     schedule_.truncateAfter(now);
 
     double align = now;
@@ -1001,6 +1007,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
         reset(now - 0.01);
     }
     selected_ = clip->style;
+    selectedClip_ = clip->id;
     schedule_.truncateAfter(now);
 
     double align = now;
@@ -1086,6 +1093,7 @@ void DanceDirector::startSequence(const std::vector<DanceStyle>& styles, double 
         schedule_.append(segment);
         first = false;
         selected_ = style;
+        selectedClip_ = clip->id;
         beat += step;
     }
 }

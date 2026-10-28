@@ -210,8 +210,8 @@ public:
     void planAuto(const AnalysisResult& analysis, const AutoPlanOptions& options = {});
     // Fresh schedule that is just Idle.
     void reset(double now = 0.0);
-    // Restarts the selected style at `now`, aligned to the bar structure of the
-    // grid, without a fade (used after a seek).
+    // Restarts the selected clip at `now`, aligned to the bar structure of the
+    // grid, without a fade (used when the time precedes the schedule).
     void reseed(double now);
     // Installs a new beat grid while keeping the current clip and its phase, so
     // a tempo change never makes the pose jump.
@@ -227,7 +227,13 @@ public:
     [[nodiscard]] std::string describeSchedule() const;
     [[nodiscard]] DanceSchedule& schedule() { return schedule_; }
     [[nodiscard]] DanceStyle selectedStyle() const { return selected_; }
-    void setSelectedStyle(DanceStyle style) { selected_ = style; }
+    // The clip the Manual selection plays. Generated Custom clips share one style, so a
+    // reseed must follow the clip id, not the style.
+    [[nodiscard]] const std::string& selectedClipId() const { return selectedClip_; }
+    void setSelectedClip(const std::string& clipId, DanceStyle style) {
+        selectedClip_ = clipId;
+        selected_ = style;
+    }
     [[nodiscard]] const DanceLibrary* library() const { return library_; }
 
     // Next point where a manual switch can start without breaking the bar.
@@ -251,6 +257,7 @@ private:
     WarpProfile warp_;
     DanceSchedule schedule_;
     DanceStyle selected_ = DanceStyle::Idle;
+    std::string selectedClip_;
 };
 
 } // namespace bgmedia::motion

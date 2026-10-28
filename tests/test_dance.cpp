@@ -861,3 +861,84 @@ TEST_CASE(dance.planted_feet_hold_during_fades) {
     }
     CHECK(worst < 0.005);
 }
+
+namespace {
+
+double worstBoneAngle(const motion::ClipPose& a, const motion::ClipPose& b) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
+        worst = std::max(worst, qa::angleBetween(a.bone[i], b.bone[i]));
+    }
+    return worst;
+}
+
+// A player that plays `clipId` from time zero without any jump: the reference for
+// "where the dance should be" at a given media time.
+void steadyPlayer(motion::DancePlayer& player, const std::string& clipId) {
+    player.loadLibrary(dancesDir());
+    player.setGrid(motion::BeatClock::constant(100.0, 0.0), 0.0);
+    player.selectClip(clipId, 0.0, true);
+}
+
+} // namespace
+
+TEST_CASE(dance.seek_keeps_a_generated_clip) {
+    // Generated Custom clips share one style with the other showcase clips. A seek must
+    // keep playing the selected clip, not the first clip of that style.
+    motion::DancePlayer player;
+    steadyPlayer(player, "streetCurrent");
+    for (double t : {50.0, 3.0, 120.0, 7.5, 0.25}) {
+        CHECK(player.update(t).clipId == "streetCurrent");
+    }
+    CHECK(player.selectedStyle() == motion::DanceStyle::Custom);
+}
+
+TEST_CASE(dance.hitch_does_not_move_the_pose) {
+    // A stall of more than half a second is a jump of the host clock, not a new pose.
+    motion::DancePlayer player;
+    steadyPlayer(player, "groove");
+    const motion::DanceFrame before = player.update(10.0);
+    const motion::DanceFrame after = player.update(10.6);
+    CHECK(worstBoneAngle(before.pose, after.pose) < 1e-3);
+    // ...and playback picks the schedule up again: after the blend it is the pure pose.
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "groove");
+    const motion::DanceFrame settled = player.update(10.6 + 0.25);
+    CHECK(worstBoneAngle(settled.pose, reference.update(10.85).pose) < 1e-3);
+    CHECK(std::abs(settled.pose.hips.y - reference.update(10.85).pose.hips.y) < 1e-4);
+}
+
+TEST_CASE(dance.seek_never_pops) {
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    motion::DancePlayer referenceAt60;
+    steadyPlayer(referenceAt60, "hiphop");
+    const motion::DanceFrame before = player.update(10.0);
+    // seek far away: the first frame after the seek is still the pose the viewer had
+    const motion::DanceFrame jumped = player.update(60.0);
+    CHECK(worstBoneAngle(before.pose, jumped.pose) < 1e-3);
+    // the blend moves on with media time and lands on the schedule
+    const motion::DanceFrame mid = player.update(60.09);
+    CHECK(worstBoneAngle(mid.pose, jumped.pose) > 1e-4);
+    CHECK(worstBoneAngle(mid.pose, referenceAt60.update(60.09).pose) > 1e-4);
+    motion::DancePlayer reference;
+    steadyPlayer(reference, "hiphop");
+    const motion::DanceFrame settled = player.update(60.3);
+    CHECK(worstBoneAngle(settled.pose, reference.update(60.3).pose) < 1e-3);
+}
+
+TEST_CASE(dance.seek_is_deterministic_and_pure_after_the_blend) {
+    // Two players reach the same media time by different paths: once the blend is over,
+    // the pose depends on the time only.
+    motion::DancePlayer direct;
+    steadyPlayer(direct, "sidestep");
+    motion::DancePlayer wandering;
+    steadyPlayer(wandering, "sidestep");
+    (void)wandering.update(40.0);
+    (void)wandering.update(3.0);
+    (void)wandering.update(90.0);
+    (void)direct.update(90.0);
+    const motion::DanceFrame a = direct.update(90.5);
+    const motion::DanceFrame b = wandering.update(90.5);
+    CHECK(worstBoneAngle(a.pose, b.pose) < 1e-3);
+}
