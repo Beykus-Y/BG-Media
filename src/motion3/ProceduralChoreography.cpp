@@ -584,7 +584,7 @@ void Choreographer::authorBody() {
               {Ctrl::ShRLift, leadLeft ? 8.0f : -4.0f}});
     }
     // Head looks toward the leading side, then settles through the phrase.
-    for (int phrase = 0; phrase < beats / 4; ++phrase) {
+    for (int phrase = 0; request_.headLookAtPhrases && phrase < beats / 4; ++phrase) {
         const float b = static_cast<float>(phrase) * 4.0f;
         const float sign = (phrase % 2 == 0) ? 1.0f : -1.0f;
         pose(b, false, 1.0f,

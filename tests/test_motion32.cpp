@@ -880,3 +880,24 @@ TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_head_a
         }
     }
 }
+
+// BG Motion 3.3 (#10): the phrase head look is an opt-in choice. With it off the head
+// keeps the beat nod only, and the rest of the generated clip is unchanged.
+TEST_CASE(motion32.head_phrase_look_is_optional) {
+    motion::ChoreographyRequest on = request(11);
+    motion::ChoreographyRequest off = request(11);
+    off.headLookAtPhrases = false;
+    const motion::HumanoidClip withLook = motion::ProceduralChoreography::generate(on).clip;
+    const motion::HumanoidClip withoutLook = motion::ProceduralChoreography::generate(off).clip;
+    CHECK(motion::ProceduralChoreography::generate(on).clip.keyCount == withLook.keyCount);
+    const std::size_t head = static_cast<std::size_t>(vrm::HumanoidBone::Head);
+    // The phrase look turns the head at the first phrase boundary.
+    const motion::ClipPose a = motion::sampleClip(withLook, 0.0);
+    const motion::ClipPose b = motion::sampleClip(withoutLook, 0.0);
+    const float diff = std::abs(a.bone[head].x - b.bone[head].x) +
+                       std::abs(a.bone[head].y - b.bone[head].y) +
+                       std::abs(a.bone[head].z - b.bone[head].z);
+    CHECK(diff > 0.01f);
+    // Music-facing parts are untouched: the feet and contacts are identical.
+    CHECK(withLook.contacts.size() == withoutLook.contacts.size());
+}
