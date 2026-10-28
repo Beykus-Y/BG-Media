@@ -75,6 +75,7 @@ struct DanceFrame {
     float effectiveSpeed = 1.0f;   // playbackSpeed * warpRate
     bool speedLimited = false;     // tempo outside the clip's comfortable range
     float transitionProgress = -1.0f;  // 0..1 while crossfading, else -1
+    float idleWeight = 0.0f;  // share of the Idle clip in the shown pose (0..1), crossfades included
     double bpm = 0.0;
     bool oneShotFinished = false;
     std::string reason;

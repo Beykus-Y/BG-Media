@@ -1255,7 +1255,8 @@ struct DesktopApp::Impl {
             const double danceNow = danceTime();
             updateDance();
             const motion::ClipPose pose =
-                composeDancePose(danceFrame.pose, animationTime, danceIdle.mix(animationTime));
+                composeDancePose(danceFrame.pose, animationTime, danceIdle.mix(animationTime),
+                                 danceFrame.idleWeight);
             std::string danceError;
             if (!vrm.renderClip(pose, danceNow, vrmCamera, vrm.renderSettings(),
                                 &danceError)) {
@@ -1323,10 +1324,13 @@ struct DesktopApp::Impl {
     // to the Idle clip, sampled on wall time. The alive layer (breathing, weight
     // shift, head look-around) comes last, with its energy taken from the blended
     // pose: full strength at idle, reduced while dancing.
+    // `scheduledIdle` is the Idle clip's share in the dance pose itself (Idle selected,
+    // a one-shot's return, an Auto silence segment): that pose already breathes too.
     [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
-                                                    double wallNow, float idleMix) const {
+                                                    double wallNow, float idleMix,
+                                                    float scheduledIdle) const {
         motion::ClipPose pose = dancePose;
-        float bodyWeight = 1.0f;
+        float bodyWeight = 1.0f - std::clamp(scheduledIdle, 0.0f, 1.0f);
         if (idleMix > 0.0f) {
             const motion::HumanoidClip* idle =
                 dance.library().forStyle(motion::DanceStyle::Idle);
@@ -1340,7 +1344,7 @@ struct DesktopApp::Impl {
             pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix);
             // Idle already breathes and shifts its weight, so the alive layer's
             // breathing and weight shift fade out as it takes over. The head look stays.
-            bodyWeight = 1.0f - std::clamp(idleMix, 0.0f, 1.0f);
+            bodyWeight *= 1.0f - std::clamp(idleMix, 0.0f, 1.0f);
         }
         motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f, bodyWeight, 1.0f);
         return pose;

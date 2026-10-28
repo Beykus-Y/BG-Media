@@ -752,6 +752,16 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
     frame.transitionProgress = transition;
 
     const ScheduleSegment& current = segments_[k];
+    {
+        const auto isIdle = [](const ScheduleSegment& s) {
+            return s.clip && s.clip->style == DanceStyle::Idle ? 1.0f : 0.0f;
+        };
+        const float incoming = isIdle(current);
+        frame.idleWeight = transition >= 0.0f && k > 0
+                               ? isIdle(segments_[k - 1]) +
+                                     (incoming - isIdle(segments_[k - 1])) * transition
+                               : incoming;
+    }
     const ScheduleSegment* shown = &current;
     const ScheduleSegment* next = k + 1 < segments_.size() ? &segments_[k + 1] : nullptr;
     if (transition >= 0.0f && transition < 0.5f && k > 0) {

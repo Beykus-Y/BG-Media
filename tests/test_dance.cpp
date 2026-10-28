@@ -1105,3 +1105,26 @@ TEST_CASE(dance.rebase_keeps_foot_targets_across_handover) {
     CHECK(worstSame < 0.001);      // unchanged tempo: under 1 mm
     CHECK(worstChanged < 0.01);    // 100 -> 112 BPM: under 1 cm
 }
+
+TEST_CASE(dance.frame_reports_the_idle_share_through_a_crossfade) {
+    // The desktop alive layer uses it to keep breathing from stacking on Idle's own.
+    motion::DanceDirector director(&library());
+    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    director.select(motion::DanceStyle::Idle, 0.0, false, true);
+    CHECK(director.sample(1.0).idleWeight == 1.0f);
+    director.select(motion::DanceStyle::Groove, 2.0);
+    float previous = 1.0f;
+    bool sawFade = false;
+    for (double t = 2.0; t < 12.0; t += 1.0 / 120.0) {
+        const motion::DanceFrame frame = director.sample(t);
+        CHECK(frame.idleWeight >= 0.0f && frame.idleWeight <= 1.0f);
+        CHECK(frame.idleWeight <= previous + 1.0e-6f);
+        if (frame.transitionProgress >= 0.0f) {
+            sawFade = true;
+            CHECK_NEAR(frame.idleWeight, 1.0 - frame.transitionProgress, 1.0e-6);
+        }
+        previous = frame.idleWeight;
+    }
+    CHECK(sawFade);
+    CHECK(director.sample(12.0).idleWeight == 0.0f);
+}
