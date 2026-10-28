@@ -326,17 +326,14 @@ bool isInertialBone(std::size_t bone) {
 // the incoming clip's own motion is added to it.
 using RotationVector = std::array<double, 3>;
 
+// The rotation vector of q as given: the caller picks the quaternion sign. Flipping it here
+// instead would move the vector to the opposite side at a half turn (w changing sign between
+// two samples), which reads as a velocity spike.
 RotationVector rotationVectorOf(const Quat& q) {
-    double x = q.x;
-    double y = q.y;
-    double z = q.z;
-    double w = q.w;
-    if (w < 0.0) {
-        x = -x;
-        y = -y;
-        z = -z;
-        w = -w;
-    }
+    const double x = q.x;
+    const double y = q.y;
+    const double z = q.z;
+    const double w = q.w;
     const double s = std::sqrt(x * x + y * y + z * z);
     const double angle = 2.0 * std::atan2(s, w);
     const double k = s > 1.0e-12 ? angle / s : 2.0;
@@ -684,11 +681,21 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
                     if (!isInertialBone(bone)) {
                         continue;
                     }
-                    const Quat offset =
+                    Quat offset =
                         (outgoingAtStart.bone[bone] * conjugate(incomingAtStart.bone[bone]))
                             .normalized();
-                    const Quat offsetNext =
+                    Quat offsetNext =
                         (outgoingNext.bone[bone] * conjugate(incomingNext.bone[bone])).normalized();
+                    // q and -q are the same rotation. The start takes the minimal (w >= 0)
+                    // representation, and the next sample is put in the same hemisphere, so the
+                    // velocity is the change of one continuous rotation vector.
+                    if (offset.w < 0.0f) {
+                        offset = Quat{-offset.x, -offset.y, -offset.z, -offset.w};
+                    }
+                    if (dot(offset, offsetNext) < 0.0f) {
+                        offsetNext = Quat{-offsetNext.x, -offsetNext.y, -offsetNext.z,
+                                          -offsetNext.w};
+                    }
                     const RotationVector before = rotationVectorOf(offset);
                     const RotationVector after = rotationVectorOf(offsetNext);
                     RotationVector velocity{};
