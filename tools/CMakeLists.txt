@@ -65,6 +65,7 @@ add_executable(bgmedia_mesh_clip
     mesh_clip/main.cpp
 )
 target_link_libraries(bgmedia_mesh_clip PRIVATE bgmedia_rig)
+target_include_directories(bgmedia_mesh_clip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(bgmedia_mesh_clip PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
 if(BGMEDIA_BUILD_MINIAUDIO)

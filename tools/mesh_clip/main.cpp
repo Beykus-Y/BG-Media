@@ -12,6 +12,12 @@
 // is merely close to a fold. Vertices that already "penetrate" in the neutral
 // (arms-out) pose are masked, so shoulder seams are not reported.
 // Hair is double-sided sheets, so for hair only proximity (< 4 mm) is reported.
+//
+// --legs switches to thigh-against-thigh triangle contact (LegMode.hpp): exact triangle pairs,
+// approximate depth, knee and pelvis state, foot contact, optional JSON (--json out.json).
+// Example: bgmedia_mesh_clip --legs --model models/Model1.vrm --clips hiphop,sidestep --fps 120
+
+#include "LegMode.hpp"
 
 #include "bgmedia/animation/HumanoidRetargeter.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
@@ -100,15 +106,32 @@ int main(int argc, char** argv) {
     double hz = 10.0;
     bool overlay = true;
     float depthThreshold = 0.008f;
+    // --legs options (defaults differ: the Hip-Hop and Side Step clips at 60 Hz)
+    bool legs = false;
+    bool clipsGiven = false;
+    bool hzGiven = false;
+    bool rawFootwork = false;
+    float crossingMm = 0.5f;
+    int top = 10;
+    std::filesystem::path jsonPath;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) modelPath = argv[++i];
         else if (a == "--dances" && i + 1 < argc) dances = argv[++i];
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atof(argv[++i]);
-        else if (a == "--hz" && i + 1 < argc) hz = std::atof(argv[++i]);
+        else if ((a == "--hz" || a == "--fps") && i + 1 < argc) {
+            hz = std::atof(argv[++i]);
+            hzGiven = true;
+        }
         else if (a == "--overlay" && i + 1 < argc) overlay = std::atoi(argv[++i]) != 0;
         else if (a == "--depth-mm" && i + 1 < argc) depthThreshold = static_cast<float>(std::atof(argv[++i])) * 0.001f;
+        else if (a == "--legs") legs = true;
+        else if (a == "--raw-footwork") rawFootwork = true;
+        else if (a == "--crossing-mm" && i + 1 < argc) crossingMm = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--top" && i + 1 < argc) top = std::atoi(argv[++i]);
+        else if (a == "--json" && i + 1 < argc) jsonPath = argv[++i];
         else if (a == "--clips" && i + 1 < argc) {
+            clipsGiven = true;
             clips.clear();
             std::string list = argv[++i];
             std::size_t at = 0;
@@ -120,6 +143,14 @@ int main(int argc, char** argv) {
             }
         }
     }
+    if (!jsonPath.empty() && !legs) {
+        std::fprintf(stderr, "--json is only written in --legs mode\n");
+        return 2;
+    }
+    if (!(hz > 0.0) || !(seconds > 0.0)) {
+        std::fprintf(stderr, "--hz/--fps and --seconds must be positive\n");
+        return 2;
+    }
     vrm::LoadResult loaded = vrm::VrmLoader::load(modelPath);
     if (!loaded.ok()) {
         std::fprintf(stderr, "load failed: %s\n", loaded.error.c_str());
@@ -130,6 +161,20 @@ int main(int argc, char** argv) {
     if (!rig.valid()) {
         std::fprintf(stderr, "retargeter invalid\n");
         return 1;
+    }
+    if (legs) {
+        meshclip::LegOptions opt;
+        opt.modelLabel = modelPath.string();
+        opt.clips = clipsGiven ? clips : std::vector<std::string>{"hiphop", "sidestep"};
+        opt.seconds = seconds;
+        opt.hz = hzGiven ? hz : 60.0;
+        opt.overlay = overlay;
+        opt.rawFootwork = rawFootwork;
+        opt.crossingM = crossingMm * 0.001f;
+        opt.top = top;
+        opt.dances = dances;
+        opt.json = jsonPath;
+        return meshclip::runLegMode(model, rig, opt);
     }
 
     // --- classify vertices ------------------------------------------------
