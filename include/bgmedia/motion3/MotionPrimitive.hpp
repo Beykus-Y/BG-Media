@@ -220,6 +220,19 @@ struct ComposedPose {
                                          bool looping,
                                          const CompositionOptions& options = {});
 
+// One loop of a looping overlay plan, composed without a crossfade. `loopCues` are the cues
+// planned for the loop that `localBeat` lies in (0 .. clipBeats; negative in the fade-in before
+// beat 0, where only the loop's own cues can start). `previousLoopCues` are the cues of the loop
+// before it: only those whose tails spill past the seam are used, shifted back by one loop so the
+// tails finish here. A later loop's cues are never passed in, so they cannot be active before
+// their own seam. The composition is non-looping: a cue is active only inside its own
+// [beat, beat + duration] on this loop's timeline. Empty cue sets leave the base pose untouched.
+[[nodiscard]] ComposedPose composeLoopCues(const ClipPose& base,
+                                           std::span<const PrimitiveCue> loopCues,
+                                           std::span<const PrimitiveCue> previousLoopCues,
+                                           double localBeat, double clipBeats,
+                                           const CompositionOptions& options = {});
+
 // Deterministic overlay planner. It looks at the clip's accents and bar
 // structure and schedules gestures that fit the music instead of firing a
 // gesture on every beat.

@@ -249,9 +249,10 @@ ClipPose adaptPose(const ClipPose& stable, const ClipPose& warped, bool fullBody
 // head and arm groups: a deterministic scale in [1 - span, 1 + span] that depends only on
 // (clip id, loop index, group). The swing is scaled about the clip's mean pose of each bone,
 // not about the bind pose, so the posture stays and only the swing grows or shrinks. The
-// scale changes between loops only inside a window around the seam, so the pose is continuous.
+// scale changes between loops only over the last beat before each seam, and reaches the next
+// loop's value exactly at the seam, so the pose is continuous.
 constexpr float kAmplitudeSpan = 0.08f;
-constexpr double kAmplitudeSeamBeats = 0.5;
+constexpr double kAmplitudeWindowBeats = 1.0;
 constexpr std::size_t kAmplitudeGroups = 3;
 
 // -1: not scaled (hips, legs, feet, eyes: planted contacts and the root must not change).
@@ -317,7 +318,7 @@ void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBea
     if (!clip.loop || !(clip.beats > 0.0f)) {
         return;
     }
-    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeSeamBeats);
+    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
     const std::uint64_t hash = variationHash(clip.id);
     std::array<float, kAmplitudeGroups> scale{};
     for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {

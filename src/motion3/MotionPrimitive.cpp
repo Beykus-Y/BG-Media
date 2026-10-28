@@ -1058,6 +1058,26 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
     return out;
 }
 
+ComposedPose composeLoopCues(const ClipPose& base, std::span<const PrimitiveCue> loopCues,
+                             std::span<const PrimitiveCue> previousLoopCues, double localBeat,
+                             double clipBeats, const CompositionOptions& options) {
+    const float beats = static_cast<float>(clipBeats);
+    std::vector<PrimitiveCue> cues(loopCues.begin(), loopCues.end());
+    for (PrimitiveCue cue : previousLoopCues) {
+        // Only a tail that spills past the seam still acts in this loop.
+        if (cue.beat + cue.durationBeats > beats) {
+            cue.beat -= beats;
+            cues.push_back(std::move(cue));
+        }
+    }
+    if (cues.empty()) {
+        ComposedPose out;
+        out.pose = base;
+        return out;
+    }
+    return composeMotion(base, cues, localBeat, clipBeats, false, options);
+}
+
 std::vector<PrimitiveCue> planPrimitiveOverlays(const HumanoidClip& clip,
                                                 std::uint32_t seed, float density,
                                                 bool includeHands) {

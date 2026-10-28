@@ -233,15 +233,16 @@ inline constexpr const char* kMirrorSuffix = "~m";
 
 // Loop-seam blend of a per-loop choice. Loops are counted from the clip origin:
 // loop = floor(clipBeat / beats), never below 0 (the time before beat 0 is loop 0, so no blend
-// ever uses a negative loop). Within `halfWindowBeats` of a seam the choice is blended from the
-// loop before the seam to the loop after it (smootherstep over the window). Outside the window
-// `from == to` and `w == 0`. Pure function of its inputs, continuous in clipBeat.
+// ever uses a negative loop). The last `windowBeats` before each seam blend the choice from the
+// loop before the seam to the loop after it (smootherstep over the window). The window ends at
+// the seam: at the seam the choice is the loop after it, and outside the window `from == to` and
+// `w == 0`. Pure function of its inputs, continuous in clipBeat.
 struct LoopBlend {
     std::int64_t from = 0;
     std::int64_t to = 0;
     float w = 0.0f;  // 0 = `from`, 1 = `to`
 };
-[[nodiscard]] LoopBlend loopBlendAt(double clipBeat, double loopBeats, double halfWindowBeats);
+[[nodiscard]] LoopBlend loopBlendAt(double clipBeat, double loopBeats, double windowBeats);
 
 // Platform independent integer hashing for deterministic per-clip, per-loop variation
 // (overlay seeds, amplitude draws). Never std::hash: its values differ between standard

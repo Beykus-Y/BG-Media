@@ -1295,21 +1295,22 @@ HumanoidClip mirrorClip(const HumanoidClip& clip) {
     return out;
 }
 
-LoopBlend loopBlendAt(double clipBeat, double loopBeats, double halfWindowBeats) {
+LoopBlend loopBlendAt(double clipBeat, double loopBeats, double windowBeats) {
     LoopBlend blend;
     if (!(loopBeats > 1e-9) || !std::isfinite(clipBeat)) {
         return blend;
     }
     const double loopPos = clipBeat / loopBeats;
-    const double seam = std::round(loopPos);
-    const double half = std::min(std::max(halfWindowBeats, 0.0), 0.5 * loopBeats);
-    const double distance = (loopPos - seam) * loopBeats;  // beats from the nearest seam
+    // The next seam at or after clipBeat, and the beats left until it.
+    const double seam = std::ceil(loopPos);
+    const double untilSeam = (seam - loopPos) * loopBeats;
+    const double window = std::min(std::max(windowBeats, 0.0), loopBeats);
     // Loops start at 0. The time before beat 0 (a fade-in) is the first pass, so no blend ever
     // reaches a negative loop: the first pass is the authored choreography, bit for bit.
     const auto loopIndex = [](double index) {
         return static_cast<std::int64_t>(std::max(0.0, index));
     };
-    if (half <= 1e-9 || std::abs(distance) >= half) {
+    if (window <= 1e-9 || untilSeam <= 0.0 || untilSeam > window) {
         blend.from = blend.to = loopIndex(std::floor(loopPos));
         return blend;
     }
@@ -1318,7 +1319,9 @@ LoopBlend loopBlendAt(double clipBeat, double loopBeats, double halfWindowBeats)
     if (blend.from == blend.to) {
         return blend;  // the seam is the clip origin: no loop before it to blend from
     }
-    blend.w = smootherstepUnit(static_cast<float>((distance + half) / (2.0 * half)));
+    // The window ends at the seam: the choice is `from` at its start and `to` from the seam on,
+    // so the seam itself is a pure `to` and the blend leaves no step at the seam.
+    blend.w = smootherstepUnit(static_cast<float>(1.0 - untilSeam / window));
     return blend;
 }
 

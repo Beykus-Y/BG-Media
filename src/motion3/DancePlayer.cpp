@@ -30,9 +30,6 @@ constexpr double kPlanBlendSeconds = 0.5;
 constexpr double kSwingCarrySeconds = 0.08;
 constexpr double kPlantedCarrySeconds = 3.0;
 
-// Overlay cue sets change from one loop to the next only inside this window around the seam
-// (half-width in beats); the composed poses are blended across it.
-constexpr double kOverlaySeamBeats = 0.5;
 // Upper bound of the per-(clip, loop) overlay memo. Plans are pure, so clearing is harmless.
 constexpr std::size_t kMaxOverlaySets = 256;
 
@@ -530,48 +527,36 @@ DanceFrame DancePlayer::sampleFrame(double mediaTime) {
                 return;
             }
             const HumanoidClip& clip = *segment.clip;
-            // Loop-seam blend of the cue sets: near a seam both loops' overlays are composed
-            // on the same base pose and blended, so the set changes without a step.
-            const LoopBlend loops = clip.loop
-                                        ? loopBlendAt(clipBeat, clip.beats, kOverlaySeamBeats)
-                                        : LoopBlend{};
-            const auto compose = [&](std::int64_t loop) {
-                // The reference returned by overlaysFor is used before the next call.
-                return composeMotion(pose, overlaysFor(clip.id, loop), clipBeat, clip.beats,
-                                     clip.loop, options);
-            };
-            if (loops.w <= 0.0f || loops.from == loops.to) {
-                if (overlaysFor(clip.id, loops.from).empty()) {
-                    return;
-                }
-                const ComposedPose composed = compose(loops.from);
-                pose = composed.pose;
-                if (diag.calls++ == 0) {
-                    diag.accepted = composed.diagnostics.acceptedCues;
-                    diag.rejected = composed.diagnostics.rejectedByConflict +
-                                    composed.diagnostics.rejectedByContact +
-                                    composed.diagnostics.rejectedBySupport +
-                                    composed.diagnostics.rejectedByMask;
-                    diag.weight = composed.diagnostics.maxWeight;
-                    diag.hands = composed.pose.detailedHands;
-                }
+            // Cues are planned per loop. A looping clip composes loop L at its beat inside the
+            // loop, plus the tails of loop L-1 that spill past the seam (composeLoopCues). The
+            // fade-in before beat 0 is loop 0. There is no crossfade between two loops' sets:
+            // every cue envelope starts and ends at zero, so a change of set at the seam is
+            // continuous, and a cue planned on the downbeat ramps in at full weight.
+            std::int64_t loop = 0;
+            double local = clipBeat;
+            if (clip.loop && clip.beats > 0.0f) {
+                loop = std::max<std::int64_t>(
+                    0, static_cast<std::int64_t>(std::floor(clipBeat / clip.beats)));
+                local = clipBeat - static_cast<double>(loop) * clip.beats;
+            }
+            // Copied: the lookup of loop L may evict the memo that a reference would point into.
+            const std::vector<PrimitiveCue> previous =
+                loop > 0 ? overlaysFor(clip.id, loop - 1) : std::vector<PrimitiveCue>{};
+            const std::vector<PrimitiveCue>& current = overlaysFor(clip.id, loop);
+            if (current.empty() && previous.empty()) {
                 return;
             }
-            if (overlaysFor(clip.id, loops.from).empty() && overlaysFor(clip.id, loops.to).empty()) {
-                return;
-            }
-            const ComposedPose before = compose(loops.from);
-            const ComposedPose after = compose(loops.to);
-            pose = blendPoses(before.pose, after.pose, loops.w);
+            const ComposedPose composed =
+                composeLoopCues(pose, current, previous, local, clip.beats, options);
+            pose = composed.pose;
             if (diag.calls++ == 0) {
-                const ComposedPose& shown = loops.w < 0.5f ? before : after;
-                diag.accepted = shown.diagnostics.acceptedCues;
-                diag.rejected = shown.diagnostics.rejectedByConflict +
-                                shown.diagnostics.rejectedByContact +
-                                shown.diagnostics.rejectedBySupport +
-                                shown.diagnostics.rejectedByMask;
-                diag.weight = shown.diagnostics.maxWeight;
-                diag.hands = shown.pose.detailedHands;
+                diag.accepted = composed.diagnostics.acceptedCues;
+                diag.rejected = composed.diagnostics.rejectedByConflict +
+                                composed.diagnostics.rejectedByContact +
+                                composed.diagnostics.rejectedBySupport +
+                                composed.diagnostics.rejectedByMask;
+                diag.weight = composed.diagnostics.maxWeight;
+                diag.hands = composed.pose.detailedHands;
             }
         });
     DanceFrame frame = director_.sample(mediaTime);

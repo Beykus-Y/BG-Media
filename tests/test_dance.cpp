@@ -1511,26 +1511,26 @@ TEST_CASE(dance.auto_mirrors_a_style_that_comes_back) {
 
 TEST_CASE(dance.loop_blend_is_periodic_and_continuous_across_seams) {
     const double loopBeats = 16.0;
-    const double half = 0.5;
-    const double maxSlope = 1.875 / (2.0 * half);  // derivative of the quintic smootherstep
+    const double window = 1.0;  // the last beat before each seam
+    const double maxSlope = 1.875 / window;  // derivative of the quintic smootherstep, per beat
     double previous = 0.0;
     for (int i = -3200; i <= 3200; ++i) {
         const double beat = i * 0.01;
-        const motion::LoopBlend lb = motion::loopBlendAt(beat, loopBeats, half);
+        const motion::LoopBlend lb = motion::loopBlendAt(beat, loopBeats, window);
         CHECK(lb.w >= 0.0f && lb.w <= 1.0f);
-        const double seam = std::round(beat / loopBeats);
-        const double distance = beat - seam * loopBeats;
-        if (std::abs(distance) >= half) {
-            CHECK(lb.from == lb.to);
-            CHECK(lb.w == 0.0f);
-            CHECK(lb.from == std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor(beat / loopBeats))));
-        } else if (seam >= 1.0) {
+        const double loopPos = beat / loopBeats;
+        const double seam = std::ceil(loopPos);
+        const double untilSeam = (seam - loopPos) * loopBeats;
+        if (seam >= 1.0 && untilSeam > 0.0 && untilSeam <= window) {
+            // Inside the window before a seam: blend from the loop before it to the loop after it.
             CHECK(lb.from == static_cast<std::int64_t>(seam) - 1);
             CHECK(lb.to == static_cast<std::int64_t>(seam));
         } else {
-            // The clip origin has no loop before it: nothing is blended there.
-            CHECK(lb.from == 0 && lb.to == 0);
+            // Outside the window, and at the seam itself, there is one loop and no blend. The
+            // clip origin has no loop before it, so nothing is blended there either.
+            CHECK(lb.from == lb.to);
             CHECK(lb.w == 0.0f);
+            CHECK(lb.from == std::max<std::int64_t>(0, static_cast<std::int64_t>(std::floor(loopPos))));
         }
         // The effective loop value (loop index, blended across the window) changes continuously.
         const double effective = static_cast<double>(lb.from) + static_cast<double>(lb.to - lb.from) * lb.w;
@@ -1538,14 +1538,23 @@ TEST_CASE(dance.loop_blend_is_periodic_and_continuous_across_seams) {
             CHECK(std::abs(effective - previous) <= 0.01 * maxSlope + 1e-6);
         }
         previous = effective;
-        // Periodic: one loop later, the same blend one loop further on. The clip origin is the
-        // exception: it has no blend and no loop before it, so periodicity starts after its window.
-        if (beat >= half) {
-            const motion::LoopBlend next = motion::loopBlendAt(beat + loopBeats, loopBeats, half);
+        // Periodic: one loop later, the same blend one loop further on (from the clip origin on).
+        if (beat >= 0.0) {
+            const motion::LoopBlend next = motion::loopBlendAt(beat + loopBeats, loopBeats, window);
             CHECK(next.from == lb.from + 1 && next.to == lb.to + 1);
             CHECK_NEAR(next.w, lb.w, 1e-6);
         }
     }
+
+    // The window ends at the seam: it starts a beat before it, the seam itself is the loop after
+    // it, and the blend is half done half a beat before the seam.
+    const auto at = [&](double beat) { return motion::loopBlendAt(beat, loopBeats, window); };
+    CHECK(at(loopBeats - 1.0).w == 0.0f);
+    CHECK(at(loopBeats - 1.0).from == 0 && at(loopBeats - 1.0).to == 1);
+    CHECK_NEAR(at(loopBeats - 0.5).w, 0.5, 1e-6);
+    CHECK(at(loopBeats - 1e-4).w > 0.999f);
+    CHECK(at(loopBeats).from == 1 && at(loopBeats).to == 1 && at(loopBeats).w == 0.0f);
+    CHECK(at(loopBeats - 1.0 - 1e-3).from == 0 && at(loopBeats - 1.0 - 1e-3).to == 0);
 }
 
 TEST_CASE(dance.first_pass_is_authored_exactly) {
@@ -1643,6 +1652,17 @@ TEST_CASE(dance.overlay_cues_change_per_loop_and_are_deterministic) {
         // Another host seed plans other cues, also after the first plan was cached.
         other.setOverlaySeed(77u);
         CHECK(!sameCues(other.overlaysFor(id, 1), loop1));
+
+        // Cues that start near the end of a loop spill past the seam. The composition carries
+        // those tails into the next loop, so the plans must contain some.
+        const motion::HumanoidClip& clip = *player.library().find(id);
+        int tails = 0;
+        for (std::int64_t loop = 0; loop < 4; ++loop) {
+            for (const motion::PrimitiveCue& cue : player.overlaysFor(id, loop)) {
+                if (cue.beat + cue.durationBeats > clip.beats) ++tails;
+            }
+        }
+        CHECK(tails > 0);
     }
 }
 
@@ -1675,4 +1695,88 @@ TEST_CASE(dance.full_pipeline_is_seamless_across_loops) {
     }
     CHECK(interior > 0.0);
     CHECK(seam <= 1.5 * interior + 0.5);
+}
+
+TEST_CASE(dance.loop_cues_carry_tails_and_start_at_full_weight) {
+    // The per-loop composition: a cue on the downbeat ramps in from zero and reaches its full
+    // weight, a tail that spills past the seam finishes in the next loop, and a cue that ends
+    // inside its loop does not come back. Loop sets are composed, never blended.
+    const motion::ClipPose base = motion::neutralClipPose();
+    const double beats = 8.0;
+
+    motion::PrimitiveCue downbeat;
+    downbeat.kind = motion::PrimitiveKind::ArmWave;
+    downbeat.beat = 0.0f;
+    downbeat.durationBeats = 1.0f;
+    downbeat.intensity = 1.0f;
+
+    motion::PrimitiveCue tail = downbeat;  // starts half a beat before the seam, ends 1.5 beats in
+    tail.beat = 7.5f;
+    tail.durationBeats = 2.0f;
+
+    motion::PrimitiveCue inside = downbeat;  // ends well inside its loop
+    inside.beat = 2.0f;
+
+    const std::vector<motion::PrimitiveCue> downbeatSet{downbeat};
+    const std::vector<motion::PrimitiveCue> tailSet{tail};
+    const std::vector<motion::PrimitiveCue> insideSet{inside};
+
+    // Downbeat: the envelope starts at zero, so the pose is the base on the downbeat, and at the
+    // peak it is exactly the single composition of the cue at full weight.
+    CHECK(maxComponentDiff(motion::composeLoopCues(base, downbeatSet, {}, 0.0, beats).pose, base) < 1e-9);
+    const motion::ComposedPose peak = motion::composeLoopCues(base, downbeatSet, {}, 0.5, beats);
+    const motion::ComposedPose alone = motion::composeMotion(base, downbeatSet, 0.5, beats, false);
+    CHECK(maxComponentDiff(peak.pose, alone.pose) == 0.0);
+    CHECK(maxComponentDiff(peak.pose, base) > 1e-3);
+
+    // The tail is active in the next loop until it ends; a cue that ends inside its loop is dropped.
+    CHECK(maxComponentDiff(motion::composeLoopCues(base, {}, tailSet, 0.25, beats).pose, base) > 1e-3);
+    CHECK(maxComponentDiff(motion::composeLoopCues(base, {}, tailSet, 1.6, beats).pose, base) == 0.0);
+    CHECK(maxComponentDiff(motion::composeLoopCues(base, {}, insideSet, 0.5, beats).pose, base) == 0.0);
+
+    // Across the seam the tail is continuous: the last instant of the loop equals the first
+    // instant of the next one.
+    const motion::ComposedPose lastOfLoop = motion::composeMotion(base, tailSet, beats, beats, false);
+    const motion::ComposedPose firstOfNext = motion::composeLoopCues(base, {}, tailSet, 0.0, beats);
+    CHECK(maxComponentDiff(lastOfLoop.pose, firstOfNext.pose) < 1e-6);
+}
+
+TEST_CASE(dance.overlay_pipeline_composes_each_loop_without_blending) {
+    // The player's overlays, frame by frame across three loops, against the per-loop formula:
+    // loop L's cues at its own beat, the tails of loop L-1 and nothing of loop L+1. A blend of two
+    // loops' sets at the seam, or a cue of the next loop leaking in early, would differ.
+    motion::DancePlayer off;
+    off.loadLibrary(dancesDir());
+    off.setOverlayMode(motion::OverlayMode::Off);
+    motion::DancePlayer full;
+    full.loadLibrary(dancesDir());
+    full.setOverlayMode(motion::OverlayMode::Full);
+    const motion::HumanoidClip& groove = *full.library().find("groove");
+    const double bpm = groove.bpm;
+    for (motion::DancePlayer* player : {&off, &full}) {
+        player->setGrid(motion::BeatClock::constant(bpm, 0.0), 0.0);
+        player->select(motion::DanceStyle::Groove, 0.0, true);
+    }
+
+    // Full overlays: every region is allowed, as the composition defaults are.
+    const motion::CompositionOptions options;
+    double worst = 0.0;
+    int overlaid = 0;
+    const int frames = static_cast<int>(3.0 * groove.beats * 60.0 / bpm * 120.0);
+    for (int i = 0; i <= frames; ++i) {
+        const double t = i / 120.0;
+        const motion::ClipPose base = off.update(t).pose;
+        const motion::DanceFrame frame = full.update(t);
+        const std::int64_t loop = std::max<std::int64_t>(
+            0, static_cast<std::int64_t>(std::floor(frame.clipBeat / groove.beats)));
+        const double local = frame.clipBeat - static_cast<double>(loop) * groove.beats;
+        const std::vector<motion::PrimitiveCue> previous =
+            loop > 0 ? full.overlaysFor(groove.id, loop - 1) : std::vector<motion::PrimitiveCue>{};
+        const motion::ComposedPose expected = motion::composeLoopCues(
+            base, full.overlaysFor(groove.id, loop), previous, local, groove.beats, options);
+        worst = std::max(worst, maxComponentDiff(frame.pose, expected.pose));
+        if (maxComponentDiff(expected.pose, base) > 1e-6) ++overlaid;
+    }
+    CHECK(worst < 1e-5);
+    CHECK(overlaid > frames / 4);
 }
