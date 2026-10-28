@@ -73,9 +73,11 @@ public:
     // Advances the simulation by `deltaSeconds` and writes the spring node globals
     // back into `pose`. The host passes WALL-clock time, not media time, so hair
     // keeps settling while playback is paused and does not speed up with playback
-    // speed. The written state is interpolated between the last two fixed steps, so
-    // the output is smooth at any frame rate. When disabled, the pose is left
-    // untouched and the accumulator is kept bounded.
+    // speed. Each fixed step samples the animated pose at its own time, and the written
+    // offset from the animated pose is interpolated between the last two steps. The
+    // output is smooth at any frame rate, and a steadily moving chain carries no lag
+    // from the frame cadence.
+    // When disabled, the pose is left untouched and the accumulator is kept bounded.
     void update(RetargetedPose& pose, double deltaSeconds,
                 const SecondarySettings& settings);
 
