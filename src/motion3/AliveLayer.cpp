@@ -16,9 +16,9 @@ constexpr double kDegree = kTwoPi / 360.0;
 // same 1.6 m reference body as the footwork planner.
 constexpr double kReferenceHeightCm = 160.0;
 
-// Breathing: period 4 s at rest, 3 s at full energy.
+// Breathing: a fixed 4 s period. An energy-dependent period would re-phase
+// t / period every frame while energy moves and make the chest jitter.
 constexpr double kBreathPeriodSeconds = 4.0;
-constexpr double kBreathPeriodEnergyShrink = 0.25;
 constexpr double kUpperChestPitchDeg = 1.5;
 constexpr double kChestPitchDeg = 0.75;
 constexpr double kShoulderLiftDeg = 1.0;
@@ -141,13 +141,11 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
         return;  // weight 0 is exactly the identity
     }
     const double amplitude = static_cast<double>(strength) * aliveEnergyScale(energy);
-    const double e = std::isfinite(energy) ? std::clamp(static_cast<double>(energy), 0.0, 1.0)
-                                           : 0.0;
     const double t = std::isfinite(wallTime) ? wallTime : 0.0;
 
     // --- breathing -----------------------------------------------------------
-    // Shorter and quicker with energy, but always a smooth sine in wall time.
-    const double breathPeriod = kBreathPeriodSeconds * (1.0 - kBreathPeriodEnergyShrink * e);
+    // Energy only scales the amplitude; the phase stays a plain function of wall time.
+    const double breathPeriod = kBreathPeriodSeconds;
     // -1..1, inhale = positive. Positive pitch about +X tilts the top of the torso
     // forward, so the inhale (chest lifts and tips back) uses the negative sign.
     const double breath = wave(t / breathPeriod, unitHash(seed, 1));
