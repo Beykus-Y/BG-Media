@@ -127,9 +127,31 @@ OVERSHOOT = 0.06        # a hit key overshoots by 6 % of the move that arrives a
 OVERSHOOT_MAX = 2.0     # ... but never by more than 2 control units (degrees, cm for hips)
 HIT_BRAKE = 0.5         # an accent brakes into its key: its tangent is scaled by this
 SETTLE_BEATS = 0.26     # ... and is back on its key within this many beats
-OVERSHOOT_PEAK = 0.12   # the overshoot peaks this many beats after its key
+OVERSHOOT_PEAK = 0.12   # the overshoot peaks this many beats after its key (floor, at slow tempos)
+OVERSHOOT_PEAK_S = 0.06 # ... and never sooner than this many seconds after it, so the reversal
+                        # is not a flick at fast tempos (see overshoot_timing)
 MIN_SETTLE_GAP = 0.12   # a hit closer than this to the next key gets no overshoot
 TENSION = 0.9           # default tangent scale: cardinal, a little softer than Catmull-Rom
+
+
+def overshoot_timing(bpm_max):
+    """(peak_beats, settle_beats) of the hit overshoot for a clip whose fastest tempo is
+    bpm_max. The timing is in beats, so at a fast tempo the reversal would be over in
+    a few tens of milliseconds and the joints would see a flick. Anchoring the peak to
+    OVERSHOOT_PEAK_S seconds at bpm_max keeps the reversal at the same real-time length
+    at the fastest tempo; the settle scales with it so the shape is kept. Clips up to
+    120 bpm keep the original beat timing."""
+    peak = max(OVERSHOOT_PEAK, OVERSHOOT_PEAK_S * bpm_max / 60.0)
+    return peak, SETTLE_BEATS * peak / OVERSHOOT_PEAK
+
+
+def tempo_gain(bpm_author, bpm_max):
+    """Scale for the L/R timing asymmetry at the fastest tempo. Acceleration grows with the
+    square of the time scale, and a timing offset of a fixed number of beats is a shorter
+    real-time gap at a faster tempo, so a clip authored at bpm_author and played up to
+    bpm_max gets (bpm_author / bpm_max)^2 of its authored timing break. At or below the
+    authored tempo it keeps all of it. The amplitude asymmetry is not scaled."""
+    return min(1.0, (bpm_author / float(bpm_max)) ** 2)
 
 
 class Curve:
@@ -152,11 +174,14 @@ class Curve:
     reach). ``monotone`` selects the shape-preserving tangent instead (used for
     root motion, which has to agree with the planted feet)."""
 
-    def __init__(self, period, default=0.0, bound=None, monotone=False):
+    def __init__(self, period, default=0.0, bound=None, monotone=False,
+                 peak_beats=OVERSHOOT_PEAK, settle_beats=SETTLE_BEATS):
         self.period = float(period)
         self.default = default
         self.bound = bound
         self.monotone = monotone
+        self.peak_beats = peak_beats      # overshoot peak, beats after its key
+        self.settle_beats = settle_beats  # back on the key, beats after it
         self.keys = []  # (t, v, hit, tension, hold)
         self._built = None
 
@@ -190,8 +215,8 @@ class Curve:
             ov = v + math.copysign(min(OVERSHOOT * abs(delta), OVERSHOOT_MAX), delta)
             if self.bound is not None:
                 ov = min(max(ov, self.bound[0]), self.bound[1])
-            pts.append([t + min(OVERSHOOT_PEAK, 0.35 * gap), ov, 1.0, False])
-            pts.append([t + min(SETTLE_BEATS, 0.7 * gap), v, 1.0, False])
+            pts.append([t + min(self.peak_beats, 0.35 * gap), ov, 1.0, False])
+            pts.append([t + min(self.settle_beats, 0.7 * gap), v, 1.0, False])
         return pts
 
     def _build(self):
@@ -577,13 +602,17 @@ class Dance:
         # variation: per-bar modulation and deterministic L/R break (off for idle)
         self.variation = variation
         self.jitter = variation
+        # L/R timing asymmetry, scaled at the fastest tempo (see tempo_gain)
+        self.timing_gain = tempo_gain(bpm, bpm_range[1])
         self.nod_bar = NOD_BAR
         self.accent_bar = ACCENT_BAR
         self.plane_bar = PLANE_BAR
+        peak, settle = overshoot_timing(bpm_range[1])
         self.curves = {
             k: Curve(self.beats, v,
                      bound=HIPS_Y_BOUND if k == "hips_y" else None,
-                     monotone=k.startswith("root_"))
+                     monotone=k.startswith("root_"),
+                     peak_beats=peak, settle_beats=settle)
             for k, v in CONTROL_DEFAULTS.items()
         }
         self.feet = {
@@ -707,7 +736,7 @@ class Dance:
         if not k.startswith("hand_"):
             rest = CONTROL_DEFAULTS[k]
             v = rest + (v - rest) * amp
-        return t + dt, v
+        return t + dt * self.timing_gain, v
 
     # --- baking ---
     def _loads(self, n):
