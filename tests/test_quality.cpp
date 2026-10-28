@@ -943,10 +943,12 @@ TEST_CASE(quality.overlay_gestures_stay_below_a_twitch_at_60_fps) {
                 for (vrm::HumanoidBone bone : watched) {
                     const auto b = static_cast<std::size_t>(bone);
                     const float step = boneAngle(frame.pose.bone[b], previous.bone[b]);
-                    clipWorst = std::max(clipWorst, step);
+                    if (step > clipWorst) {
+                        clipWorst = step;
+                        worstAt = t;
+                    }
                     if (step > worst) {
                         worst = step;
-                        worstAt = t;
                         worstWhere = std::string(id) + " bone " + std::to_string(b);
                     }
                 }
