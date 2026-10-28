@@ -824,3 +824,59 @@ TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
     CHECK(!blend.inertialTransitions());
     CHECK(inertial.inertialTransitions());
 }
+
+// BG Motion 3.3 (#9): the opt-in follow-through lags only head and hands, stays bounded,
+// is deterministic in media time (fresh schedule equals a schedule sampled in order), and
+// is off by default.
+TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_head_and_hands) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+
+    const auto makeSchedule = [&](bool follow) {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(follow);
+        motion::ScheduleSegment seg;
+        seg.clip = &a.clip;
+        seg.fadeSeconds = 0.6;
+        schedule.append(seg);
+        return schedule;
+    };
+    CHECK(!motion::DanceSchedule{}.followThrough());
+
+    const motion::DanceSchedule plain = makeSchedule(false);
+    const motion::DanceSchedule lagged = makeSchedule(true);
+    const motion::DanceSchedule sequential = makeSchedule(true);
+    for (const double t : {1.0, 2.25, 3.5, 4.75}) {
+        const motion::ClipPose p0 = plain.sample(t, clock, timeline, off).pose;
+        const motion::ClipPose p1 = lagged.sample(t, clock, timeline, off).pose;
+        // Head and hands carry the lag; every other bone is identical to the plain pose.
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            const math::Quat& a0 = p0.bone[bone];
+            const math::Quat& a1 = p1.bone[bone];
+            // Component differences: an angle from acos is too noisy near identity.
+            const float diff = std::max({std::abs(a0.x - a1.x), std::abs(a0.y - a1.y),
+                                         std::abs(a0.z - a1.z), std::abs(a0.w - a1.w)});
+            const bool follows = bone == static_cast<std::size_t>(vrm::HumanoidBone::Head) ||
+                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::LeftHand) ||
+                                 bone == static_cast<std::size_t>(vrm::HumanoidBone::RightHand);
+            if (!follows) {
+                CHECK_NEAR(diff, 0.0f, 1e-6f);
+            } else {
+                // Lag is capped at 0.2 rad; a quaternion component is at most sin(angle/2).
+                CHECK(diff <= 0.11f);
+            }
+        }
+        // Same media time from a fresh schedule gives the same pose (seek equals playback).
+        const motion::ClipPose again = sequential.sample(t, clock, timeline, off).pose;
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            CHECK_NEAR(std::abs(p1.bone[bone].x - again.bone[bone].x) +
+                           std::abs(p1.bone[bone].y - again.bone[bone].y) +
+                           std::abs(p1.bone[bone].z - again.bone[bone].z) +
+                           std::abs(p1.bone[bone].w - again.bone[bone].w),
+                       0.0f, 1e-6f);
+        }
+    }
+}

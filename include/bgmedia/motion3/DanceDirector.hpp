@@ -99,6 +99,11 @@ public:
     // Off by default: the blend stays the reference behaviour until A/B-tested.
     void setInertialTransitions(bool enabled) { inertialTransitions_ = enabled; }
     [[nodiscard]] bool inertialTransitions() const { return inertialTransitions_; }
+    // Opt-in (BG Motion 3.3, #9). Head and hands lag behind their own motion through a
+    // second-order spring driven by angular velocity. Evaluated per media time from a
+    // fixed window of history, so seeking and playback agree. Off by default.
+    void setFollowThrough(bool enabled) { followThrough_ = enabled; }
+    [[nodiscard]] bool followThrough() const { return followThrough_; }
     void append(ScheduleSegment segment);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
@@ -132,12 +137,18 @@ private:
                                   const MusicalTimeline& timeline,
                                   const WarpProfile& warp, float* transition,
                                   PoseMemo& memo) const;
+    [[nodiscard]] ClipPose basePose(std::size_t index, double mediaTime,
+                                    const MusicalTimeline& timeline,
+                                    const WarpProfile& warp, double* clipBeat) const;
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;
+    void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
+                            const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;
     PoseDecorator decorator_;
     bool inertialTransitions_ = false;
+    bool followThrough_ = false;
 };
 
 enum class DanceMode { Manual, Auto };
