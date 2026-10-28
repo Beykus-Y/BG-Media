@@ -30,23 +30,43 @@ REST = (16, 25, 10, 18)
 
 
 def build_idle():
-    d = Dance("idle", "Idle", "idle", bpm=60, beats=8, bpm_range=(30, 120), energy=0.0,
-              description="Standing breathing loop used before, between and after dances. "
-                          "Runs on wall-clock time (1 beat = 1 s), not on the music.",
-              keys_per_beat=12, tempo_sync=False)
-    for b in range(0, 8, 2):
-        d.pose(b, spine_bend=1.0, wave_upper=0.0, hips_y=-1.4, sh_l_lift=0.0, sh_r_lift=0.0)
-        d.pose(b + 1, spine_bend=1.4, wave_upper=1.2, hips_y=-1.2, sh_l_lift=1.2, sh_r_lift=1.2)
-    d.pose(0, hips_x=0.0, pelvis_roll=0.0, head_turn=0.0, head_nod=0.0, head_tilt=0.0)
-    d.pose(2.5, hips_x=0.8, pelvis_roll=1.2, head_turn=3.0, head_nod=1.0, head_tilt=1.5)
-    d.pose(5.5, hips_x=-0.8, pelvis_roll=-1.2, head_turn=-3.0, head_nod=-0.5, head_tilt=-1.5)
-    base = arms((18, 28, 10, 20), (18, 28, 10, 20))
-    d.poses(0, base)
-    d.poses(4, base, **{"arm_l_elev": 20, "arm_r_elev": 20, "arm_l_elbow": 24, "arm_r_elbow": 24})
+    # One loop is 28 s (1 beat = 1 s, wall clock). Every life sign is a whole number of
+    # cycles per loop, so the loop closes, but the periods do not nest:
+    #   breathing 7 cycles (4.0 s), weight shift 3 cycles (9.3 s), sway 5 cycles (5.6 s).
+    # Head glances are not periodic: four looks, unevenly spaced, each one eased.
+    d = Dance("idle", "Idle", "idle", bpm=60, beats=28, bpm_range=(30, 120), energy=0.0,
+              description="Standing idle loop used before, between and after dances: breathing "
+                          "every 4 s, a slow weight shift between the feet, a few quiet head "
+                          "glances. Runs on wall-clock time (1 beat = 1 s), not on the music.",
+              keys_per_beat=16, tempo_sync=False, variation=False)
+    d.poses(0, arms((18, 28, 10, 20), (18, 28, 10, 20)))
+    # breathing: chest pitch ~2.5 deg, every part of the chest a little later than the one below
+    d.wave("wave_lower", 0.6, 7, phase=0.0)
+    d.wave("wave_mid", 2.5, 7, phase=0.5)
+    d.wave("wave_upper", 1.5, 7, phase=1.0)
+    d.wave("hips_y", 0.4, 7, phase=0.5, offset=-1.4)   # soft knees, as before: the legs have reach
+    # slight shoulder lift on the breath, the two sides not quite together
+    d.wave("sh_l_lift", 1.2, 7, phase=1.3)
+    d.wave("sh_r_lift", 1.2, 7, phase=1.5)
+    # weight shift between the feet: hips sway sideways, pelvis rolls, arms follow lightly
+    d.wave("hips_x", 0.9, 3)
+    d.wave("pelvis_roll", 1.0, 3, phase=0.4)
+    d.wave("arm_l_elbow", 1.5, 3, offset=20.0)
+    d.wave("arm_r_elbow", 1.5, 3, phase=3.14, offset=20.0)
+    d.wave("arm_l_elev", 1.0, 5, offset=18.0)
+    d.wave("arm_r_elev", 1.0, 5, phase=2.0, offset=18.0)
+    # head: slow pitch (about 2 deg) and a small tilt, plus glances of about 4-5 deg of yaw.
+    # head yaw = 0.65 x head_turn (the neck takes the rest), so the controls are yaw / 0.65
+    d.wave("head_nod", 3.0, 3, phase=0.8)
+    d.wave("head_tilt", 1.8, 5, phase=0.2)
+    d.glance("head_turn", 2.0, 4.5 / 0.65)
+    d.glance("head_turn", 9.0, -4.0 / 0.65)
+    d.glance("head_turn", 15.5, 3.5 / 0.65)
+    d.glance("head_turn", 21.5, -5.0 / 0.65)
     d.entry = [0.0]
     d.exit = [0.0]
-    d.feet["left"].hold(8)
-    d.feet["right"].hold(8)
+    d.feet["left"].hold(28)
+    d.feet["right"].hold(28)
     return d
 
 

@@ -313,8 +313,10 @@ def build_energetic():
     d.poses(2.0, arms(up_wide, up_wide), hit=True)
     d.poses(3.0, arms((70, 25, 5, 90), (70, 25, 5, 90)))
     d.poses(4.0, arms((30, 40, 10, 60), (30, 40, 10, 60)))
-    d.poses(5.0, arms((168, 20, 0, 10), (40, -35, 10, 15)), hit=True)
-    d.poses(6.0, arms((40, -35, 10, 15), (168, 20, 0, 10)), hit=True)
+    # the lunges are freezes (explicit holds, no velocity carried through): as accents they
+    # would sweep the arms through the key at full speed and break the 900 deg/s gate at 180 BPM
+    d.poses(5.0, arms((168, 20, 0, 10), (40, -35, 10, 15)), hold=True)
+    d.poses(6.0, arms((40, -35, 10, 15), (168, 20, 0, 10)), hold=True)
     d.poses(7.0, arms((50, 50, 0, 100), (50, 50, 0, 100)))
     d.poses(8.0, arms(sweep_l, (60, 10, 5, 30)))
     d.poses(9.4, arms((130, 30, 0, 30), (100, 60, 0, 90)), hit=True)

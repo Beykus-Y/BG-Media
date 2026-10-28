@@ -5,8 +5,18 @@ small choreography DSL, not a bone-by-bone sine generator:
 
   * A dance is a sequence of KEY POSES placed on musical beats. Every body
     control (pelvis, spine, head, shoulders, arms ...) has its own curve through
-    those keys (shape-preserving cubic, so a hold stays a hold and a pose is
-    reached with natural ease-in / ease-out; ``hit=True`` forces a full stop).
+    those keys: a cardinal (Catmull-Rom) cubic, so velocity carries through a
+    reversal. Explicit holds (``hold=True``, or a key that repeats its neighbour)
+    stop dead. ``hit=True`` is an accent: the move overshoots its key by a few
+    percent and settles within a fraction of a beat.
+  * Successive breaking: each body part is sampled a little later than its
+    parent (chest after pelvis, elbow after shoulder, wrist after elbow, head
+    after neck). The delay wraps around the loop, so the seam stays closed.
+  * Wrist drag and forearm follow are derived from the forearm swing, finger
+    curl has a relaxed resting value with a small ripple on accents.
+  * Left and right limbs get a deterministic per-key amplitude (+-8..12 %) and
+    timing (+-0.03..0.06 beat) difference, so the dance is never mirror-perfect.
+    The hash is fixed, so the output is reproducible.
   * Feet are authored as FOOTSTEPS (hold / step / pivot) in stage space, never
     as joint angles. A planted foot is mathematically fixed, so choreography
     cannot skate. Contact segments are exported with the clip.
@@ -20,6 +30,7 @@ Conventions (identical to the engine, "dance frame"): +X = character LEFT,
 of a 160 cm reference character; they are stored as fractions of height.
 """
 
+import hashlib
 import json
 import math
 
@@ -109,26 +120,47 @@ def smootherstep(t):
 
 
 # ----------------------------------------------------------------------------
-# cyclic shape-preserving curve
+# cyclic curve
 # ----------------------------------------------------------------------------
+
+OVERSHOOT = 0.06        # a hit key overshoots by 6 % of the move that arrives at it ...
+OVERSHOOT_MAX = 2.0     # ... but never by more than 2 control units (degrees, cm for hips)
+HIT_BRAKE = 0.5         # an accent brakes into its key: its tangent is scaled by this
+SETTLE_BEATS = 0.26     # ... and is back on its key within this many beats
+OVERSHOOT_PEAK = 0.12   # the overshoot peaks this many beats after its key
+MIN_SETTLE_GAP = 0.12   # a hit closer than this to the next key gets no overshoot
+TENSION = 0.9           # default tangent scale: cardinal, a little softer than Catmull-Rom
 
 
 class Curve:
     """Periodic scalar curve through keys (beat, value).
 
-    Between keys the curve is a monotone cubic Hermite (Fritsch-Carlson), so it
-    never overshoots a key on its own: a hold stays a hold, accents land
-    exactly on their key. Authors add explicit anticipation / overshoot keys.
-    ``hit`` keys have zero velocity (a full stop). ``tension`` > 1 makes the
-    curve arrive faster (snappier), < 1 softer."""
+    Between keys the curve is a cardinal (Catmull-Rom) cubic Hermite with
+    non-uniform tangents. ``tension`` scales the tangent (1.0 = Catmull-Rom,
+    0.8-0.9 is softer). Velocity carries through a reversal, so a pose-to-pose
+    path does not stop dead on every extreme.
 
-    def __init__(self, period, default=0.0):
+    Only two things stop the curve:
+      * ``hold=True`` keys have zero tangent (an explicit hold);
+      * a key whose value equals a neighbour's is a plateau and holds too, so a
+        repeated pose stays put instead of bulging past its value.
+
+    ``hit=True`` keys are accents: the move that arrives at them continues
+    through the key, overshoots it by OVERSHOOT of the move and settles back
+    within SETTLE_BEATS. ``bound`` limits how far an overshoot may go (used for
+    the pelvis height, so an accent never dips the hips below what the legs can
+    reach). ``monotone`` selects the shape-preserving tangent instead (used for
+    root motion, which has to agree with the planted feet)."""
+
+    def __init__(self, period, default=0.0, bound=None, monotone=False):
         self.period = float(period)
         self.default = default
-        self.keys = []  # (t, v, hit, tension)
+        self.bound = bound
+        self.monotone = monotone
+        self.keys = []  # (t, v, hit, tension, hold)
         self._built = None
 
-    def key(self, t, v, hit=False, tension=1.0):
+    def key(self, t, v, hit=False, tension=1.0, hold=False):
         t = float(t)
         if t < -1e-9 or t > self.period + 1e-9:
             raise ValueError("key at %.3f outside [0,%.3f]" % (t, self.period))
@@ -136,8 +168,31 @@ class Curve:
         if abs(t - self.period) < 1e-9:
             t = 0.0
         self.keys = [k for k in self.keys if abs(k[0] - t) > 1e-9]
-        self.keys.append((t, float(v), bool(hit), float(tension)))
+        self.keys.append((t, float(v), bool(hit), float(tension), bool(hold)))
         self._built = None
+
+    def _points(self):
+        """Base keys plus the synthetic overshoot and settle keys of every hit."""
+        ks = sorted(self.keys)
+        n = len(ks)
+        pts = []  # [t, v, tension, hold]
+        for i, (t, v, hit, tens, hold) in enumerate(ks):
+            pts.append([t, v, tens * (HIT_BRAKE if hit else 1.0), hold])
+            if not hit or hold or n < 2:
+                continue
+            delta = v - ks[i - 1][1]  # i == 0 wraps to the last key
+            if abs(delta) < 1e-9:
+                continue
+            nt = ks[(i + 1) % n][0] + (self.period if i == n - 1 else 0.0)
+            gap = nt - t
+            if gap < MIN_SETTLE_GAP:
+                continue
+            ov = v + math.copysign(min(OVERSHOOT * abs(delta), OVERSHOOT_MAX), delta)
+            if self.bound is not None:
+                ov = min(max(ov, self.bound[0]), self.bound[1])
+            pts.append([t + min(OVERSHOOT_PEAK, 0.35 * gap), ov, 1.0, False])
+            pts.append([t + min(SETTLE_BEATS, 0.7 * gap), v, 1.0, False])
+        return pts
 
     def _build(self):
         if self._built is not None:
@@ -145,33 +200,35 @@ class Curve:
         if not self.keys:
             self._built = ([], [], [])
             return
-        ks = sorted(self.keys)
-        if len(ks) == 1:
-            self._built = ([ks[0][0]], [ks[0][1]], [0.0])
+        if len(self.keys) == 1:
+            self._built = ([self.keys[0][0]], [self.keys[0][1]], [0.0])
             return
+        base = self._points()
         ext = []
         for rep in (-1, 0, 1):
-            for t, v, hit, tens in ks:
-                ext.append((t + rep * self.period, v, hit, tens))
+            for t, v, tens, hold in base:
+                ext.append((t + rep * self.period, v, tens, hold))
         ts = [e[0] for e in ext]
         vs = [e[1] for e in ext]
         n = len(ext)
-        h = [ts[i + 1] - ts[i] for i in range(n - 1)]
-        d = [(vs[i + 1] - vs[i]) / h[i] for i in range(n - 1)]
         m = [0.0] * n
         for i in range(1, n - 1):
-            if ext[i][2]:
-                m[i] = 0.0
-                continue
-            if d[i - 1] * d[i] <= 0:
-                m[i] = 0.0
+            if ext[i][3]:
+                continue  # explicit hold
+            if abs(vs[i] - vs[i - 1]) < 1e-9 or abs(vs[i + 1] - vs[i]) < 1e-9:
+                continue  # plateau: the pose holds
+            h0 = ts[i] - ts[i - 1]
+            h1 = ts[i + 1] - ts[i]
+            s0 = (vs[i] - vs[i - 1]) / h0
+            s1 = (vs[i + 1] - vs[i]) / h1
+            if self.monotone:
+                if s0 * s1 <= 0:
+                    continue
+                w1 = 2 * h1 + h0
+                w2 = h1 + 2 * h0
+                m[i] = (w1 + w2) / (w1 / s0 + w2 / s1)
             else:
-                w1 = 2 * h[i] + h[i - 1]
-                w2 = h[i] + 2 * h[i - 1]
-                m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
-                m[i] *= ext[i][3]
-        m[0] = d[0]
-        m[-1] = d[-1]
+                m[i] = ext[i][2] * (s0 * h1 + s1 * h0) / (h0 + h1)
         self._built = (ts, vs, m)
 
     def at(self, t):
@@ -340,11 +397,61 @@ CONTROL_DEFAULTS = {
     "head_nod": 0.0, "head_tilt": 0.0, "head_turn": 0.0,
     "sh_l_lift": 0.0, "sh_l_fwd": 0.0, "sh_r_lift": 0.0, "sh_r_fwd": 0.0,
     "root_x": 0.0, "root_z": 0.0, "root_yaw": 0.0,         # cm, cm, degrees
-    "hand_l": 0.3, "hand_r": 0.3,                           # finger curl 0 open .. 1 fist
+    # finger curl: a relaxed hand rests a little open, the two hands differ
+    "hand_l": 0.28, "hand_r": 0.33,                         # 0 open .. 1 fist
 }
 for _s in ("l", "r"):
     for _k, _v in ARM_REST.items():
         CONTROL_DEFAULTS["arm_%s_%s" % (_s, _k)] = _v
+
+# successive breaking: how late each body part samples its controls, in beats
+# (relative to the authored key time; the chain runs pelvis -> spine -> chest ->
+# upper chest -> neck -> head, and shoulder -> elbow -> wrist)
+LAG = {
+    "pelvis": 0.0,
+    "spine": 0.01,
+    "chest": 0.02,
+    "upper": 0.03,      # upperChest
+    "shoulder": 0.03,
+    "neck": 0.04,
+    "head": 0.08,
+    "upper_arm": 0.02,
+    "elbow": 0.06,
+    "hand": 0.12,
+}
+FOREARM_FOLLOW = 0.35   # forearm twists this fraction of the upper arm twist (relative to rest)
+WRIST_DRAG = 0.12       # wrist flex in degrees per degree/beat of forearm swing (opposite sign)
+WRIST_MAX = 25.0        # soft clamp of the wrist flex, degrees
+WRIST_SMOOTH = 0.07     # beats: the wrist's inertia (low-pass of the drag)
+CURL_DRIFT = 0.035      # slow finger-curl drift, 3 cycles per loop
+CURL_RIPPLE = 0.10      # finger-curl ripple on each accent
+FINE = 64               # samples per beat for the fine periodic helper tracks
+
+
+def _smooth_periodic(vals, sigma):
+    """Gaussian low-pass of a periodic sample list (sigma in samples). Periodic, so the
+    loop seam stays closed."""
+    m = len(vals)
+    radius = max(1, int(3 * sigma))
+    kernel = [math.exp(-0.5 * (k / sigma) ** 2) for k in range(-radius, radius + 1)]
+    total = sum(kernel)
+    kernel = [k / total for k in kernel]
+    out = []
+    for j in range(m):
+        acc = 0.0
+        for k, w in zip(range(-radius, radius + 1), kernel):
+            acc += w * vals[(j + k) % m]
+        out.append(acc)
+    return out
+
+
+def _interp_periodic(vals, x):
+    """Linear interpolation of a periodic sample list at fractional index x."""
+    m = len(vals)
+    x = x % m
+    i = int(math.floor(x))
+    f = x - i
+    return vals[i % m] * (1.0 - f) + vals[(i + 1) % m] * f
 
 _LATERAL_NEGATE = {
     "hips_x", "pelvis_yaw", "pelvis_roll", "spine_side", "spine_twist",
@@ -376,8 +483,8 @@ def mirror(controls):
     return out
 
 
-def arm_quats(side, c):
-    """Upper arm, lower arm, hand quaternions for side 'l' or 'r'."""
+def arm_upper(side, c):
+    """Upper arm quaternion: the swing of the arm, then the upper arm twist."""
     p = "arm_%s_" % side
     elev = c[p + "elev"] * DEG
     azim = c[p + "azim"] * DEG
@@ -387,42 +494,56 @@ def arm_quats(side, c):
     if side == "l":
         d = (outward, down, forward)
         bind = (1.0, 0.0, 0.0)
-        hinge = -1.0
     else:
         d = (-outward, down, forward)
         bind = (-1.0, 0.0, 0.0)
-        hinge = 1.0
     swing = q_from_to(bind, d)
-    upper = q_mul(swing, rx(-c[p + "twist"]))
-    lower = q_mul(ry(hinge * c[p + "elbow"]), rx(-c[p + "ftwist"]))
-    wrist = c[p + "wrist"]
-    hand = rz(-wrist if side == "l" else wrist)
-    return upper, lower, hand
+    return q_mul(swing, rx(-c[p + "twist"]))
 
 
-def spine_chain(bend, side, twist, waves=(0.0, 0.0, 0.0)):
-    weights = (("spine", 0.30), ("chest", 0.34), ("upperChest", 0.36))
-    out = {}
-    for (name, w), wave in zip(weights, waves):
-        out[name] = q_chain(ry(twist * w), rz(-side * w), rx(bend * w + wave))
-    return out
+def arm_lower(side, c):
+    p = "arm_%s_" % side
+    hinge = -1.0 if side == "l" else 1.0
+    return q_mul(ry(hinge * c[p + "elbow"]), rx(-c[p + "ftwist"]))
 
 
-def controls_to_bones(c):
+def arm_hand(side, c):
+    wrist = c["arm_%s_wrist" % side]
+    return rz(-wrist if side == "l" else wrist)
+
+
+def arm_quats(side, c):
+    """Upper arm, lower arm, hand quaternions for side 'l' or 'r' from one control set."""
+    return arm_upper(side, c), arm_lower(side, c), arm_hand(side, c)
+
+
+SPINE_WEIGHTS = (0.30, 0.34, 0.36)  # spine, chest, upperChest share of the torso bend
+
+
+def controls_to_bones(g):
+    """g maps a body group to the control set sampled for it (see Dance.bake):
+    'pelvis', 'spine', 'chest', 'upper', 'neck', 'head', 'shoulder',
+    'arm_l_upper', 'arm_l_lower', 'arm_l_hand' and the same for 'r'."""
     bones = {}
+    c = g["pelvis"]
     bones["hips"] = q_chain(ry(c["pelvis_yaw"]), rz(c["pelvis_roll"]), rx(c["pelvis_pitch"]))
-    bones.update(spine_chain(c["spine_bend"], c["spine_side"], c["spine_twist"],
-                             (c["wave_lower"], c["wave_mid"], c["wave_upper"])))
-    nod, tilt, turn = c["head_nod"], c["head_tilt"], c["head_turn"]
-    bones["neck"] = q_chain(ry(turn * 0.35), rz(-tilt * 0.35), rx(nod * 0.35))
-    bones["head"] = q_chain(ry(turn * 0.65), rz(-tilt * 0.65), rx(nod * 0.65))
-    bones["leftShoulder"] = q_chain(ry(-c["sh_l_fwd"]), rz(c["sh_l_lift"]))
-    bones["rightShoulder"] = q_chain(ry(c["sh_r_fwd"]), rz(-c["sh_r_lift"]))
+    for name, key, wave, w in (("spine", "spine", "wave_lower", SPINE_WEIGHTS[0]),
+                               ("chest", "chest", "wave_mid", SPINE_WEIGHTS[1]),
+                               ("upperChest", "upper", "wave_upper", SPINE_WEIGHTS[2])):
+        s = g[key]
+        bones[name] = q_chain(ry(s["spine_twist"] * w), rz(-s["spine_side"] * w),
+                              rx(s["spine_bend"] * w + s[wave]))
+    n = g["neck"]
+    bones["neck"] = q_chain(ry(n["head_turn"] * 0.35), rz(-n["head_tilt"] * 0.35), rx(n["head_nod"] * 0.35))
+    h = g["head"]
+    bones["head"] = q_chain(ry(h["head_turn"] * 0.65), rz(-h["head_tilt"] * 0.65), rx(h["head_nod"] * 0.65))
+    s = g["shoulder"]
+    bones["leftShoulder"] = q_chain(ry(-s["sh_l_fwd"]), rz(s["sh_l_lift"]))
+    bones["rightShoulder"] = q_chain(ry(s["sh_r_fwd"]), rz(-s["sh_r_lift"]))
     for side, name in (("l", "left"), ("r", "right")):
-        upper, lower, hand = arm_quats(side, c)
-        bones[name + "UpperArm"] = upper
-        bones[name + "LowerArm"] = lower
-        bones[name + "Hand"] = hand
+        bones[name + "UpperArm"] = arm_upper(side, g["arm_%s_upper" % side])
+        bones[name + "LowerArm"] = arm_lower(side, g["arm_%s_lower" % side])
+        bones[name + "Hand"] = arm_hand(side, g["arm_%s_hand" % side])
     return bones
 
 
@@ -431,11 +552,17 @@ def controls_to_bones(c):
 # ----------------------------------------------------------------------------
 
 FOOT_HALF_CM = 7.0  # half distance between the bind ankles (balance only)
+HIPS_Y_BOUND = (-34.0, 12.0)  # cm: an accent may not dip the pelvis past what the legs reach
+
+# per bar (4 beats) modulation for the 16-beat loop: head nod, body accent, arm plane
+NOD_BAR = (1.0, 0.75, 1.15, 0.6)
+ACCENT_BAR = (1.0, 1.0, 1.0, 1.12)
+PLANE_BAR = (0.0, 0.0, 0.0, 10.0)   # degrees added to arm azimuth (the arm plane turns forward)
 
 
 class Dance:
     def __init__(self, id, name, style, bpm, beats, bpm_range, energy, description="",
-                 keys_per_beat=16, beats_per_bar=4, tempo_sync=True):
+                 keys_per_beat=16, beats_per_bar=4, tempo_sync=True, variation=True):
         self.id = id
         self.name = name
         self.style = style
@@ -447,7 +574,18 @@ class Dance:
         self.kpb = keys_per_beat
         self.bpb = beats_per_bar
         self.tempo_sync = tempo_sync
-        self.curves = {k: Curve(self.beats, v) for k, v in CONTROL_DEFAULTS.items()}
+        # variation: per-bar modulation and deterministic L/R break (off for idle)
+        self.variation = variation
+        self.jitter = variation
+        self.nod_bar = NOD_BAR
+        self.accent_bar = ACCENT_BAR
+        self.plane_bar = PLANE_BAR
+        self.curves = {
+            k: Curve(self.beats, v,
+                     bound=HIPS_Y_BOUND if k == "hips_y" else None,
+                     monotone=k.startswith("root_"))
+            for k, v in CONTROL_DEFAULTS.items()
+        }
         self.feet = {
             "left": Foot(self.beats, "left"),
             "right": Foot(self.beats, "right"),
@@ -461,17 +599,47 @@ class Dance:
         self.turns = []  # (t0, t1, (px, pz)): body yaw happens about a stage point
 
     # --- authoring ---
-    def pose(self, t, hit=False, tension=1.0, **controls):
+    def pose(self, t, hit=False, hold=False, tension=TENSION, **controls):
+        t = float(t)
         for k, v in controls.items():
             if k not in self.curves:
                 raise KeyError("unknown control '%s'" % k)
-            self.curves[k].key(t, v, hit=hit, tension=tension)
+            tt, vv = t, float(v)
+            if self.variation:
+                vv = self._bar_variant(k, vv, self._bar(t))
+            if self.jitter:
+                if k.startswith("arm_l_") or k.startswith("sh_l_") or k == "hand_l":
+                    tt, vv = self._side_variant("l", k, t, vv)
+                elif k.startswith("arm_r_") or k.startswith("sh_r_") or k == "hand_r":
+                    tt, vv = self._side_variant("r", k, t, vv)
+            self.curves[k].key(tt, vv, hit=hit, tension=tension, hold=hold)
         return self
 
-    def poses(self, t, preset, hit=False, tension=1.0, **overrides):
+    def poses(self, t, preset, hit=False, tension=TENSION, **overrides):
         merged = dict(preset)
         merged.update(overrides)
         return self.pose(t, hit=hit, tension=tension, **merged)
+
+    def wave(self, control, amp, cycles, phase=0.0, offset=0.0):
+        """A periodic sine written as dense keys. `cycles` must be a whole number so
+        that the loop closes. Used for breathing, weight shift and idle sway."""
+        if abs(cycles - round(cycles)) > 1e-9:
+            raise ValueError("wave needs a whole number of cycles per loop")
+        n = int(round(self.beats * self.kpb))
+        for i in range(n):
+            t = i / self.kpb
+            v = offset + amp * math.sin(2.0 * math.pi * cycles * t / self.beats + phase)
+            self.pose(t, **{control: v})
+        return self
+
+    def glance(self, control, t0, amp, rise=0.6, hold=1.5):
+        """A quick look: rest, turn to `amp` over `rise` beats, hold, turn back.
+        Eased at both ends (explicit holds), so it reads as a glance, not a jerk."""
+        self.pose(t0, hold=True, **{control: 0.0})
+        self.pose(t0 + rise, hold=True, **{control: amp})
+        self.pose(t0 + rise + hold, hold=True, **{control: amp})
+        self.pose(t0 + 2 * rise + hold, hold=True, **{control: 0.0})
+        return self
 
     def accent(self, beat, strength=1.0, kind="hit"):
         self.accents.append({"beat": beat, "strength": strength, "kind": kind})
@@ -499,6 +667,48 @@ class Dance:
         f = self.feet[side].at(t)
         return ((FOOT_HALF_CM if side == "left" else -FOOT_HALF_CM) + f[0], f[2])
 
+    # --- variation ---
+    def _bar(self, t):
+        nbars = max(1, int(round(self.beats / self.bpb)))
+        return int(math.floor(t / self.bpb + 1e-9)) % nbars
+
+    def _bar_variant(self, k, v, bar):
+        """Per-bar modulation: nods vary 0.6..1.2 across the bars, the last bar is
+        accented (bigger hips and torso, arms lifted a little further) and turns the
+        arm plane forward."""
+        if k == "head_nod":
+            return v * self.nod_bar[bar]
+        if k in ("hips_y", "spine_bend"):
+            return v * self.accent_bar[bar]
+        if k.startswith("arm_") and k.endswith("_elev"):
+            rest = CONTROL_DEFAULTS[k]
+            return min(175.0, rest + (v - rest) * self.accent_bar[bar])
+        if k.startswith("arm_") and k.endswith("_azim"):
+            return v + self.plane_bar[bar]
+        return v
+
+    def _jitter(self, side, t):
+        """Deterministic per-key (amplitude, timing) for one side. Pure function of the
+        dance id, the side and the key time, so the output never changes between runs."""
+        digest = hashlib.sha256(("%s|%s|%.4f" % (self.id, side, t)).encode("ascii")).digest()
+        a = digest[0] / 255.0
+        b = digest[1] / 255.0
+        # Both are at the low end of the requested bands (8..9 % and 0.03..0.04 beat).
+        # A wider spread multiplies the overhead accents of energetic (up to 19 deg per
+        # key) and pushes its peak past the 900 deg/s transitions gate at 180 BPM.
+        amp = 1.0 + (1.0 if digest[2] & 1 else -1.0) * (0.08 + 0.01 * a)
+        dt = (1.0 if digest[2] & 2 else -1.0) * (0.03 + 0.01 * b)
+        return amp, dt
+
+    def _side_variant(self, side, k, t, v):
+        if t < 0.1 or t > self.beats - 0.1:
+            return t, v  # loop anchors stay exact, the seam is never shifted
+        amp, dt = self._jitter(side, t)
+        if not k.startswith("hand_"):
+            rest = CONTROL_DEFAULTS[k]
+            v = rest + (v - rest) * amp
+        return t + dt, v
+
     # --- baking ---
     def _loads(self, n):
         """Per key load of each foot (0..1), derived from the swing phases."""
@@ -520,6 +730,33 @@ class Dance:
             loads[side] = [1.0 - v for v in sm]
         return loads
 
+    def _controls(self, t):
+        return {k: cur.at(t) for k, cur in self.curves.items()}
+
+    def _wrist_drag(self, side, e):
+        """Wrist flex for one arm on a fine periodic grid (FINE samples per beat).
+        The hand trails the forearm: flex = -WRIST_DRAG x swing velocity (deg/beat),
+        soft-clamped to +-WRIST_MAX, then low-passed so the hand has inertia and no
+        spikes on the accents. Sampled later at the hand's own lagged time."""
+        el = self.curves["arm_%s_elev" % side]
+        m = int(round(self.beats * FINE))
+        raw = []
+        for j in range(m):
+            th = j / float(FINE) - LAG["hand"]
+            vel = (el.at(th + e) - el.at(th - e)) / (2.0 * e)
+            raw.append(WRIST_MAX * math.tanh(-WRIST_DRAG * vel / WRIST_MAX))
+        return _smooth_periodic(raw, WRIST_SMOOTH * FINE)
+
+    def _curl(self, side, t, base):
+        """Finger curl: the authored value, a slow drift (3 cycles per loop) and a short
+        ripple after each accent, so the hand is never a constant."""
+        v = base + CURL_DRIFT * math.sin(2.0 * math.pi * 3.0 * t / self.beats + (0.0 if side == "l" else 1.3))
+        for a in self.accents:
+            d = (t - a["beat"]) % self.beats
+            if d < 0.6:
+                v += CURL_RIPPLE * a["strength"] * math.exp(-d / 0.12)
+        return min(1.0, max(0.0, v))
+
     def bake(self):
         for f in self.feet.values():
             f.close()
@@ -529,17 +766,47 @@ class Dance:
         hips_track, root_track, foot_tracks = [], [], {"left": [], "right": []}
         hand_tracks = {"left": [], "right": []}
         prev = {}
-        stats = {"max_elev": 0}
+        e = 1.0 / FINE
+        wrist_fine = {side: self._wrist_drag(side, e) for side in ("l", "r")}
         for i in range(n):
             t = i / self.kpb
-            c = {k: cur.at(t) for k, cur in self.curves.items()}
+            c = self._controls(t)
+            cache = {}
+
+            def sample(lag):
+                key = round(lag, 6)
+                if key not in cache:
+                    cache[key] = self._controls(t - lag) if key else c
+                return dict(cache[key])
+
             li = loads["left"][i % (n - 1)]
             ri = loads["right"][i % (n - 1)]
+            g = {
+                "pelvis": dict(c),
+                "spine": sample(LAG["spine"]),
+                "chest": sample(LAG["chest"]),
+                "upper": sample(LAG["upper"]),
+                "neck": sample(LAG["neck"]),
+                "head": sample(LAG["head"]),
+                "shoulder": sample(LAG["shoulder"]),
+            }
+            for side in ("l", "r"):
+                g["arm_%s_upper" % side] = sample(LAG["upper_arm"])
+                lower = sample(LAG["elbow"])
+                hand = sample(LAG["hand"])
+                # forearm twist follows the upper arm twist a little (relative to rest)
+                lower["arm_%s_ftwist" % side] += FOREARM_FOLLOW * (
+                    lower["arm_%s_twist" % side] - CONTROL_DEFAULTS["arm_%s_twist" % side])
+                # wrist drag: the hand trails the forearm swing, opposite to its velocity
+                hand["arm_%s_wrist" % side] = _interp_periodic(wrist_fine[side], t * FINE)
+                g["arm_%s_lower" % side] = lower
+                g["arm_%s_hand" % side] = hand
             if self.roll[0]:
                 auto = self.roll[0] * (li - ri)
-                c["pelvis_roll"] += auto
-                c["spine_side"] -= self.roll[1] * auto
-            bones = controls_to_bones(c)
+                g["pelvis"]["pelvis_roll"] += auto
+                for name in ("spine", "chest", "upper"):
+                    g[name]["spine_side"] -= self.roll[1] * auto
+            bones = controls_to_bones(g)
             for name, q in bones.items():
                 q = q_norm(q)
                 last = prev.get(name)
@@ -570,8 +837,8 @@ class Dance:
             hx = c["hips_x"] + com_x * self.balance[0]
             hz = c["hips_z"] + com_z * self.balance[1]
             hips_track.append((hx / REF_HEIGHT_CM, c["hips_y"] / REF_HEIGHT_CM, hz / REF_HEIGHT_CM))
-            hand_tracks["left"].append((min(1.0, max(0.0, c["hand_l"])),))
-            hand_tracks["right"].append((min(1.0, max(0.0, c["hand_r"])),))
+            hand_tracks["left"].append((self._curl("left", t, c["hand_l"]),))
+            hand_tracks["right"].append((self._curl("right", t, c["hand_r"]),))
             root_track.append((c["root_x"] / REF_HEIGHT_CM, c["root_z"] / REF_HEIGHT_CM, c["root_yaw"] / 360.0))
             for side, f in (("left", fl), ("right", fr)):
                 foot_tracks[side].append(
