@@ -6,6 +6,7 @@
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/motion3/MotionPrimitive.hpp"
 #include "FootworkTrack.hpp"
+#include "motion_metrics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -821,4 +822,66 @@ TEST_CASE(quality.dance_player_serves_planned_authored_clips_and_keeps_the_origi
         const motion::HumanoidClip* raw = player.library().find("hiphop");
         CHECK(raw != nullptr && raw->feet[0].position[100].x == original.feet[0].position[100].x);
     }
+}
+
+namespace {
+
+// Ankle travelling along x at 0.10 + 0.10 sin(2 pi t) m/s for three seconds, never
+// planted and 0.5 cm off the floor, so the drag gate (> 0.15 m/s) opens and closes
+// several times. Sampled at `hz`; the closed form gives the exact position.
+std::vector<qa::FootSample> slidingAnkle(double hz) {
+    constexpr double kTau = 6.283185307179586;
+    std::vector<qa::FootSample> track;
+    const int count = static_cast<int>(3.0 * hz);
+    for (int i = 0; i <= count; ++i) {
+        const double t = i / hz;
+        qa::FootSample sample;
+        sample.t = t;
+        sample.ankle = {static_cast<float>(0.10 * t + 0.10 * (1.0 - std::cos(kTau * t)) / kTau), 0.0f, 0.0f};
+        sample.targetY = 0.005f;
+        sample.planted = false;
+        track.push_back(sample);
+    }
+    return track;
+}
+
+// Ground truth: the same gate applied to the analytic speed on a 10 kHz grid.
+qa::GroundDrag analyticDrag() {
+    constexpr double kTau = 6.283185307179586;
+    qa::GroundDrag truth;
+    const double dt = 1.0 / 10000.0;
+    for (int i = 0; i < 30000; ++i) {
+        const double t = i * dt;
+        const double speed = 0.10 + 0.10 * std::sin(kTau * t);
+        if (speed > 0.15) {
+            truth.distance += speed * dt;
+            truth.seconds += dt;
+        }
+    }
+    return truth;
+}
+
+} // namespace
+
+TEST_CASE(quality.ground_drag_does_not_depend_on_the_sampling_rate) {
+    const qa::GroundDrag truth = analyticDrag();
+    CHECK(truth.distance > 0.1 && truth.seconds > 0.5);
+    for (double hz : {30.0, 60.0, 120.0, 240.0}) {
+        const qa::GroundDrag drag = qa::measureGroundDrag(slidingAnkle(hz), 0.012f, 0.15);
+        CHECK(std::abs(drag.distance - truth.distance) < 0.03 * truth.distance);
+        CHECK(std::abs(drag.seconds - truth.seconds) < 0.03 * truth.seconds);
+    }
+}
+
+TEST_CASE(quality.ground_drag_ignores_planted_and_raised_feet) {
+    std::vector<qa::FootSample> track = slidingAnkle(120.0);
+    for (qa::FootSample& sample : track) {
+        sample.planted = true;
+    }
+    CHECK(qa::measureGroundDrag(track, 0.012f, 0.15).distance == 0.0);
+    for (qa::FootSample& sample : track) {
+        sample.planted = false;
+        sample.targetY = 0.05f;  // 5 cm: a swing, not a drag
+    }
+    CHECK(qa::measureGroundDrag(track, 0.012f, 0.15).distance == 0.0);
 }
