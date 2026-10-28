@@ -80,6 +80,7 @@ struct SecondaryDynamics::Impl {
     std::vector<float> colliderRadii;
     std::vector<std::vector<int>> colliderLookup;  // group index -> flat collider indices
     double accumulator = 0.0;
+    float renderAlpha = 0.0f;  // accumulator / kFixedStep, set by writePose
     SecondaryStats stats;
     bool initialized = false;
     Vec3 rootOffset{};
@@ -279,6 +280,7 @@ void SecondaryDynamics::Impl::snapToAnimated() {
         }
     }
     accumulator = 0.0;
+    renderAlpha = 0.0f;
 }
 
 Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain) const {
@@ -417,6 +419,7 @@ void SecondaryDynamics::Impl::step(Chain& chain, const SecondarySettings& settin
 void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
                                         const SecondarySettings& settings) {
     const float intensity = std::clamp(settings.intensity, 0.0f, 2.0f);
+    renderAlpha = static_cast<float>(std::clamp(accumulator / kFixedStep, 0.0, 1.0));
     // Simulation points live in stage space (root yaw/translation applied) but
     // node rotations in the pose are character space. A direction change measured
     // in stage space must be re-expressed in the character frame before it is
@@ -427,16 +430,25 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
         const std::size_t points = chain.pointCount();
         std::vector<Vec3> rendered(points);
         for (std::size_t i = 0; i < points; ++i) {
-            Vec3 offset = chain.current[i] - chain.animated[i];
+            // Render interpolation: the fixed-step simulation runs at 120 Hz, so the
+            // newest state is `alpha` of the way from the previous step to the current
+            // one. This removes the judder of 0-or-2 steps per frame above 120 fps.
+            // The simulation state itself is never changed by this.
+            const Vec3 previous = i < chain.previous.size() ? chain.previous[i] : chain.current[i];
+            const Vec3 simulated = previous + (chain.current[i] - previous) * renderAlpha;
+            Vec3 offset = simulated - chain.animated[i];
             if (!finiteVec(offset)) {
                 offset = {};
             }
             rendered[i] = chain.animated[i] + offset * intensity;
         }
+        // The written limit sits a micron-scale margin inside the authored one: the
+        // round trip through the stage and character frames carries float error of
+        // the same order, and a point must never be reported beyond the limit.
         const float maxDisplacement =
             std::min(std::max(0.005f, settings.maxDisplacement),
                      std::max(0.006f, chain.totalRest * 0.45f)) *
-            std::max(1.0f, intensity);
+            std::max(1.0f, intensity) * (1.0f - 1.0e-4f);
         for (std::size_t i = 0; i < points; ++i) {
             Vec3 offset = rendered[i] - chain.animated[i];
             const float distance = offset.length();
