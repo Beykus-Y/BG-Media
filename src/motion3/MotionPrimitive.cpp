@@ -776,17 +776,16 @@ float regionShare(const ActiveCue& cue, BodyMask bit) {
 
 // How planted a foot is, 0 = swinging .. 1 = planted (BG Motion 3.3, A6). Clip poses carry
 // a continuous contact, which is ramped so overlays fade with the foot instead of switching
-// on a threshold. Hand-built poses without contact data fall back to the discrete phase.
+// on a threshold. A contact of exactly zero is a real value (a swing, or the first and last
+// sample of a contact segment), so only a stance or pivot phase with no contact data (a
+// hand-built pose) counts as planted without one.
 float plantedWeight(const ClipPose& pose, int foot) {
     const auto& f = pose.foot[static_cast<std::size_t>(foot)];
     if (f.contact > 0.0f) {
         const float t = clamp01((f.contact - 0.2f) / 0.3f);
         return t * t * (3.0f - 2.0f * t);
     }
-    return f.phase == FootPhase::Stance || f.phase == FootPhase::Plant ||
-                   f.phase == FootPhase::Pivot
-               ? 1.0f
-               : 0.0f;
+    return f.phase == FootPhase::Stance || f.phase == FootPhase::Pivot ? 1.0f : 0.0f;
 }
 
 }  // namespace

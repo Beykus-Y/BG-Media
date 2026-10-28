@@ -319,6 +319,35 @@ TEST_CASE(motion32.foot_overlay_fades_with_contact_instead_of_popping) {
     CHECK_NEAR(previous, 0.0, 1e-6);       // a planted foot is never lifted
 }
 
+TEST_CASE(motion32.contact_start_is_swinging_not_planted) {
+    // The first sample of a contact segment has contact 0 and phase Plant. Zero contact is a
+    // real value: the foot is swinging there, exactly as it is one sample earlier. Only a
+    // stance without any contact data (a hand-built pose) counts as planted by its phase.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    const auto liftAt = [&](float contact, motion::FootPhase phase) {
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = phase;
+        base.foot[0].contact = contact;
+        base.foot[0].position = {0.0f, 0.0f, 0.0f};
+        base.foot[1].phase = motion::FootPhase::Stance;
+        base.foot[1].contact = 1.0f;
+        base.foot[1].position = {0.0f, 0.0f, 0.0f};
+        return motion::composeMotion(base, cues, 0.25, 4.0, true).pose.foot[0].position.y;
+    };
+    const double atStart = liftAt(0.0f, motion::FootPhase::Plant);
+    const double justAfter = liftAt(1.0e-5f, motion::FootPhase::Plant);
+    CHECK(std::abs(atStart) > 1e-3);              // swinging: lifted
+    CHECK(std::abs(atStart - justAfter) < 0.005); // no step at the contact start
+    CHECK(std::abs(liftAt(0.0f, motion::FootPhase::Stance)) < 1e-6);  // hand-built stance: planted
+}
+
 TEST_CASE(motion32.arm_and_hand_layers_compose_without_conflict) {
     motion::ClipPose base = motion::neutralClipPose();
     base.foot[0].phase = motion::FootPhase::Stance;
