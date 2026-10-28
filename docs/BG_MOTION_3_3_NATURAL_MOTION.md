@@ -154,8 +154,8 @@ differs only in `analysisMs`, `timelineMs`, `sampleUs*` and `footErrorMm`
 (the same field set as the 3.2 pass); every beat, downbeat, accent, phase,
 slide and finiteness value is identical.
 
-Composition cost: 1.25 → 2.10 µs/frame (57 cues, 2000 iterations) — the
-compositor now calls `samplePrimitive` with a duration, nothing else.
+Composition cost: 1.25 → 1.44 µs/frame (+15 %, 57 cues, 2000 iterations;
+`bgmedia_motion_qa`, same machine, baseline binary vs this branch).
 
 ## 4. Verification
 
