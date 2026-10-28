@@ -1306,6 +1306,10 @@ struct DesktopApp::Impl {
     motion::ClipPose danceIdleAnchor;  // latched pose whose root places the Idle stance
     bool useClips = true;
     double danceLabTime = 0.0;
+    // Set once the user picks a dance mode or a style this session. Until then a
+    // loaded track starts in Auto (the out-of-box default), and the choice is not
+    // persisted, so every launch begins that way.
+    bool danceModeChosen = false;
     bool danceLabRunning = true;
     int danceLabBpm = 100;
     bool musicDebug = false;
@@ -1398,6 +1402,11 @@ struct DesktopApp::Impl {
         // away the downbeat confidence and the real accent map.
         if (!track || motionLabBpm > 0) {
             dance.setGrid(danceGrid(), danceTime());
+        }
+        // Default to Auto for a track the user has not steered in this session.
+        // setMode(Auto) builds the plan from the analysis set above.
+        if (track && !danceModeChosen && danceUi() && dance.mode() != motion::DanceMode::Auto) {
+            dance.setMode(motion::DanceMode::Auto, danceTime());
         }
         if (dance.mode() == motion::DanceMode::Auto && track) {
             std::fprintf(stderr, "BG Motion Auto plan:\n%s",
@@ -1513,6 +1522,10 @@ struct DesktopApp::Impl {
         if (!useClips) {
             return;
         }
+        if (!options.dancePlan.empty() || !options.dance.empty()) {
+            // A dance named on the command line is an explicit choice.
+            danceModeChosen = true;
+        }
         if (!options.dancePlan.empty()) {
             std::vector<motion::DanceStyle> styles;
             std::stringstream list(options.dancePlan);
@@ -1544,6 +1557,7 @@ struct DesktopApp::Impl {
             return;
         }
         generatedDanceIndex = -1;
+        danceModeChosen = true;
         dance.select(style, danceTime());
         const motion::HumanoidClip* clip = dance.library().forStyle(style);
         showToast(std::string("Dance: ") + (clip ? clip->name : motion::styleName(style)) +
@@ -1575,6 +1589,7 @@ struct DesktopApp::Impl {
             showToast("No procedural dances generated");
             return;
         }
+        danceModeChosen = true;
         generatedDanceIndex =
             (generatedDanceIndex + 1) % static_cast<int>(generated.size() + 1);
         if (generatedDanceIndex == static_cast<int>(generated.size())) {
@@ -1637,6 +1652,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.setMode(mode, danceTime());
         if (mode == motion::DanceMode::Auto) {
             showToast(dance.autoNote().empty() ? "Auto dance" : dance.autoNote());
@@ -1664,6 +1680,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.startTestDance(danceTime());
         showToast("TEST DANCE: Groove > Hip-Hop > Side Step > Energetic");
     }
