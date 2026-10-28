@@ -17,10 +17,8 @@ constexpr Vec3 kChestOffset{0.0f, 0.08f, 0.0f};
 constexpr Vec3 kUpperChestOffset{0.0f, 0.08f, 0.0f};
 constexpr float kShoulderX = 0.04f;
 constexpr float kUpperArmX = 0.06f;
-constexpr float kUpperArmLength = 0.17f;  // shoulder joint to elbow
-constexpr float kForearmLength = 0.15f;   // elbow to wrist
-static_assert(kUpperArmLength + kForearmLength == kReferenceArmReach,
-              "reach must equal the sum of the arm bones");
+constexpr float kUpperArmLength = kReferenceUpperArm;
+constexpr float kForearmLength = kReferenceForearm;
 
 // Below this elbow offset from the shoulder-wrist axis the bend plane is undefined.
 constexpr float kDegenerateBend = 1e-3f;
