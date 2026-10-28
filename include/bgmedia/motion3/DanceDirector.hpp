@@ -251,8 +251,9 @@ public:
     void planAuto(const AnalysisResult& analysis, const AutoPlanOptions& options = {});
     // Fresh schedule that is just Idle.
     void reset(double now = 0.0);
-    // Restarts the selected clip at `now`, aligned to the bar structure of the
-    // grid, without a fade (used when the time precedes the schedule).
+    // Restarts the selected clip at `now`, aligned to the musical beat of the grid, without a
+    // fade (used when the time precedes the schedule). The clip beat is the unwrapped musical
+    // beat, so the loop (and its per-loop variation) matches continuous play from the grid origin.
     void reseed(double now);
     // Installs a new beat grid while keeping the current clip and its phase, so
     // a tempo change never makes the pose jump.

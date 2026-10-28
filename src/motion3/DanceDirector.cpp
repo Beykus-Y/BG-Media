@@ -1231,20 +1231,16 @@ void DanceDirector::reseed(double now) {
     }
     ScheduleSegment segment = makeSegment(*clip, now - 1.0e6, now, 0.0);
     if (clip->tempoSync) {
+        // The clip beat is the unwrapped musical beat, counted from the grid origin, exactly as
+        // continuous play advances it. A wrapped (in-bar) phase would reset the loop index to 0,
+        // and with it the per-loop variation, at every seek. Continuous play from the grid origin
+        // has the same clip beat at every time, so a seek lands on its pose and its loop.
         const double beatPos = clock_.beatAt(now);
         const int inBar = clock_.beatInBar(beatPos);
         const double fraction = beatPos - std::floor(beatPos + 1e-6);
-        const double barLength = std::max(1, clip->beatsPerBar);
-        if (timeline_.downbeatTrusted()) {
-            segment.entryClipBeat =
-                wrapPositive((inBar + std::max(0.0, fraction)) * segment.rate, barLength);
-            segment.alignedToDownbeat = inBar == 0 && fraction < 1e-4;
-        } else {
-            // No trusted bar: preserve the fractional beat phase only.
-            segment.entryClipBeat =
-                wrapPositive(std::max(0.0, fraction) * segment.rate, barLength);
-            segment.alignedToDownbeat = false;
-        }
+        segment.entryClipBeat = beatPos * segment.rate;
+        segment.alignedToDownbeat =
+            timeline_.downbeatTrusted() && inBar == 0 && fraction < 1e-4;
         segment.barPhaseTrusted = timeline_.downbeatTrusted();
     } else {
         segment.entryClipBeat = 0.0;

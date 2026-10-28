@@ -1635,6 +1635,37 @@ TEST_CASE(dance.loop_variation_is_bounded_deterministic_and_seamless) {
     CHECK(seam <= 1.3 * interior + 0.05);
 }
 
+TEST_CASE(dance.manual_seek_matches_continuous_play_in_later_loops) {
+    // A re-aligned Manual dance (a seek before its schedule) has the pose that continuous play has
+    // at the same time, in later loops too: the seek does not reset the per-loop variation.
+    const motion::HumanoidClip& groove = *library().find("groove");
+    const double bpm = groove.bpm;
+    const auto makeDirector = [&] {
+        auto director = std::make_unique<motion::DanceDirector>(&library());
+        director->setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+        director->reset(0.0);
+        director->select(motion::DanceStyle::Groove, 0.0, false, true);
+        return director;
+    };
+    const auto played = makeDirector();
+    for (double beat : {2.0 * groove.beats + 3.25, 5.0 * groove.beats + 0.5, 2.0 * groove.beats + 15.9}) {
+        const double t = beat * 60.0 / bpm;
+        const auto seeked = makeDirector();
+        seeked->reseed(t);
+        // A seek fades the musical warp in over its first beat (the continuous dance has it all
+        // along), so the poses are compared from one beat after the seek on.
+        for (double ahead : {1.0, 1.25, 2.7}) {
+            const double when = t + ahead * 60.0 / bpm;
+            const motion::DanceFrame expected = played->sample(when);
+            const motion::DanceFrame got = seeked->sample(when);
+            CHECK_NEAR(got.clipBeat, expected.clipBeat, 1e-3);
+            CHECK(maxComponentDiff(got.pose, expected.pose) < 1e-5);
+            // The loop is genuinely varied here, so the comparison above is not vacuous.
+            CHECK(maxComponentDiff(expected.pose, motion::sampleClip(groove, expected.clipBeat)) > 1e-3);
+        }
+    }
+}
+
 TEST_CASE(dance.overlay_cues_change_per_loop_and_are_deterministic) {
     motion::DancePlayer player;
     player.loadLibrary(dancesDir());
