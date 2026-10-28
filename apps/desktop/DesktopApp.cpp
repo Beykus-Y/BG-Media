@@ -54,6 +54,13 @@ constexpr std::uint32_t kAliveSeed = 0x6d61736cU;
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Render-to-display latency compensation for the dance pose (about 15 to 30 ms
+// between sampling a frame and it reaching the screen). The dancer is sampled
+// this far ahead of the media clock so it lands on the beat the viewer hears.
+// Applies to the 3D character only: audio, the transport and UI cursors keep
+// the media time.
+constexpr double kDanceVisualLeadSeconds = 0.020;
+
 std::string toUtf8(const std::filesystem::path& path) {
     const std::u8string value = path.u8string();
     return std::string(reinterpret_cast<const char*>(value.data()), value.size());
@@ -1252,7 +1259,7 @@ struct DesktopApp::Impl {
         vrm.renderSettings().modelOffset.y =
             std::clamp(vrm.renderSettings().modelOffset.y, -0.5f, 0.5f);
         if (danceUi()) {
-            const double danceNow = danceTime();
+            const double danceNow = danceVisualTime();
             updateDance();
             // The foot order of the pause hand-over is chosen once, from the pose the
             // dancer stopped in, and kept until the blend is fully back to the dance.
@@ -1321,6 +1328,11 @@ struct DesktopApp::Impl {
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
     [[nodiscard]] double danceTime() const {
         return track ? currentPosition() : danceLabTime;
+    }
+    // Dance time for the character's pose on this frame: the media clock plus the
+    // render latency lead. Scheduling and the transport keep using danceTime().
+    [[nodiscard]] double danceVisualTime() const {
+        return track ? danceTime() + kDanceVisualLeadSeconds : danceTime();
     }
 
     // Whether the dance transport is moving. Scrubbing and capture drive the dance
@@ -1668,7 +1680,7 @@ struct DesktopApp::Impl {
     }
 
     void updateDance() {
-        danceFrame = dance.update(danceTime());
+        danceFrame = dance.update(danceVisualTime());
     }
 
     void recordDanceTrails() {
