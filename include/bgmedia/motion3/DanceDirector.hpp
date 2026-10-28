@@ -20,6 +20,7 @@
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
+#include <array>
 #include <functional>
 #include <map>
 #include <string>
@@ -143,6 +144,16 @@ private:
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;
+    // BG Motion 3.3 (A1). Stage-position hand-over of each foot of segment `index`. The
+    // foot keeps its outgoing position until the incoming clip starts a swing for it, then
+    // moves to the incoming position with smootherstep over that swing. `active` is false
+    // once the hand-over has completed. Pure function of media time.
+    struct FootHandOver {
+        float progress = 1.0f;  // 0 = outgoing position, 1 = incoming position
+        bool active = false;
+    };
+    [[nodiscard]] std::array<FootHandOver, 2> footHandOver(std::size_t index, double mediaTime,
+                                                           const MusicalTimeline& timeline) const;
     void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
                             const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;

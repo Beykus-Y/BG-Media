@@ -588,9 +588,21 @@ TEST_CASE(dance.transitions_are_continuous_between_all_styles) {
                                          motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
                                          motion::DanceStyle::Energetic};
     for (double bpm : {80.0, 123.0, 180.0}) {
-        for (motion::DanceStyle from : styles) {
-            for (motion::DanceStyle to : styles) {
-                if (from == to) continue;
+        // Foot speed of each style on its own (authored motion, no transition). A transition
+        // may not move a foot faster than the authored motion of the styles it joins.
+        double steadyFoot[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+        for (std::size_t s = 0; s < 5; ++s) {
+            motion::DanceDirector steady(&library());
+            steady.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+            steady.reset(0.0);
+            steady.select(styles[s], 0.0, false, true);
+            steadyFoot[s] = qa::measureWindow(steady, 2.0, 12.0, 240.0).maxFootStep;
+        }
+        for (std::size_t fromIndex = 0; fromIndex < 5; ++fromIndex) {
+            for (std::size_t toIndex = 0; toIndex < 5; ++toIndex) {
+                if (fromIndex == toIndex) continue;
+                const motion::DanceStyle from = styles[fromIndex];
+                const motion::DanceStyle to = styles[toIndex];
                 motion::DanceDirector director(&library());
                 director.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
                 director.reset(0.0);
@@ -603,7 +615,13 @@ TEST_CASE(dance.transitions_are_continuous_between_all_styles) {
                 CHECK(j.maxAngularAcceleration < 4.0e4);
                 CHECK(j.maxHipsStep < 0.006);
                 CHECK(j.maxRootStep < 0.006);
-                CHECK(j.maxFootStep < 0.02);             // no teleporting feet
+                // No teleporting feet. The largest step of a foot per 240 Hz frame must stay
+                // within the authored foot speed of the two styles (the crossfade adds no
+                // foot motion of its own), or within 3 m/s on a 1.7 m model, whichever is
+                // larger: a 25 cm stance change has to fit inside one swing.
+                const double authored = std::max(steadyFoot[fromIndex], steadyFoot[toIndex]);
+                const double physical = 3.0 / (1.7 * 240.0);
+                CHECK(j.maxFootStep < std::max(1.25 * authored, physical));
             }
         }
     }
@@ -626,7 +644,7 @@ TEST_CASE(dance.repeated_switching_stays_stable) {
     CHECK(j.finite);
     CHECK(j.maxAngularSpeed < 1100.0);
     CHECK(j.maxHipsStep < 0.008);
-    CHECK(j.maxFootStep < 0.025);
+    CHECK(j.maxFootStep < 0.025);   // switching every 0.2-0.5 s is faster than any real dance; loose on purpose
     CHECK(director.schedule().segments().size() < 80);
 }
 
@@ -773,4 +791,73 @@ TEST_CASE(dance.tempo_change_does_not_jump_the_pose) {
     }
     CHECK(worst < 0.1);
     CHECK_NEAR(before.clipBeat, after.clipBeat, 1e-6);
+}
+
+// Largest travel of a foot the viewer sees as planted (blended contact >= 0.999) while the
+// crossfade runs, including the window in which a planted foot waits for the incoming
+// swing. Each planted run is anchored at its first sample. Returns metres.
+namespace {
+struct PlantedTravel {
+    double worstM = 0.0;
+    double worstT = 0.0;
+    int worstFoot = 0;
+};
+
+PlantedTravel plantedTravelAcrossFade(motion::DanceDirector& director, double heightMetres) {
+    PlantedTravel out;
+    const auto& segs = director.schedule().segments();
+    if (segs.size() < 2) return out;
+    const motion::ScheduleSegment& incoming = segs.back();
+    const double t0 = incoming.startTime;
+    const double t1 = incoming.startTime + incoming.fadeSeconds + 2.0;
+    const double dt = 1.0 / 240.0;
+    for (int f = 0; f < 2; ++f) {
+        bool inRun = false;
+        math::Vec3 anchor{};
+        for (double t = t0; t <= t1 + 1e-9; t += dt) {
+            const motion::ClipPose::Foot foot = director.sample(t).pose.foot[static_cast<std::size_t>(f)];
+            if (foot.contact < 0.999f) {
+                inRun = false;
+                continue;
+            }
+            if (!inRun) {
+                inRun = true;
+                anchor = foot.position;
+                continue;
+            }
+            const double travel = (foot.position - anchor).length() * heightMetres;
+            if (travel > out.worstM) {
+                out.worstM = travel;
+                out.worstT = t;
+                out.worstFoot = f;
+            }
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE(dance.planted_feet_hold_during_fades) {
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kHeight = 1.7;
+    double worst = 0.0;
+    for (double bpm : {80.0, 123.0, 180.0}) {
+        for (motion::DanceStyle from : styles) {
+            for (motion::DanceStyle to : styles) {
+                if (from == to) continue;
+                motion::DanceDirector director(&library());
+                director.setBeatClock(motion::BeatClock::constant(bpm, 0.0));
+                director.reset(0.0);
+                director.select(from, 0.0, false, true);
+                const double switchAt = 60.0 / bpm * 9.37;
+                director.select(to, switchAt);
+                const PlantedTravel travel = plantedTravelAcrossFade(director, kHeight);
+                CHECK(travel.worstM < 0.005);   // under 5 mm of slide per planted run
+                worst = std::max(worst, travel.worstM);
+            }
+        }
+    }
+    CHECK(worst < 0.005);
 }

@@ -370,6 +370,13 @@ void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double
     }
 }
 
+// Search window of the planted-foot hand-over (A1): the next swing of the foot is
+// looked for over at most this many seconds after the fade starts.
+constexpr double kHandOverWindow = 4.0;
+constexpr double kHandOverStep = 1.0 / 60.0;
+constexpr double kHandOverMinSwing = 0.25;  // seconds a hand-over swing must last
+constexpr int kHandOverSamples = static_cast<int>(kHandOverWindow / kHandOverStep);
+
 ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
                                  const MusicalTimeline& timeline,
                                  const WarpProfile& warp, double* clipBeat) const {
@@ -394,6 +401,88 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
         *clipBeat = mapped.beat;
     }
     return own;
+}
+
+std::array<DanceSchedule::FootHandOver, 2> DanceSchedule::footHandOver(
+    std::size_t index, double mediaTime, const MusicalTimeline& timeline) const {
+    const ScheduleSegment& incoming = segments_[index];
+    const ScheduleSegment& outgoing = segments_[index - 1];
+    const double start = incoming.startTime;
+    const double fade = incoming.fadeSeconds;
+    const double linear = (mediaTime - start) / fade;
+
+    // Grid samples of one segment's foot contact, from the start of the fade.
+    struct Swing {
+        int begin = -1;  // sample index where the foot leaves the ground
+        int end = -1;    // sample index where it lands again
+    };
+    const auto findSwing = [&](const ScheduleSegment& segment, int foot) {
+        const auto contactAt = [&](int k) {
+            if (!segment.clip) return 0.0f;
+            const Mapping mapping =
+                mapSegment(segment, start + k * kHandOverStep, timeline.grid(), &timeline,
+                           WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f}, false);
+            return footContactAt(*segment.clip, foot, mapping.linearBeat);
+        };
+        Swing swing;
+        float previous = contactAt(0);
+        const float next = contactAt(1);
+        for (int k = 0; k <= kHandOverSamples; ++k) {
+            const float c = k == 0 ? previous : contactAt(k);
+            // A swing starts where the contact falls below one half (a lift); a foot that is
+            // already low and not rising at the fade start counts as swinging from the start.
+            // A planting ramp (rising contact) is not a swing.
+            const bool lifts = k == 0 ? (c < 0.5f && next <= c + 1e-6f)
+                                      : (previous >= 0.5f && c < 0.5f);
+            if (swing.begin < 0 && lifts) {
+                swing.begin = k;
+            } else if (swing.begin >= 0 && c >= 0.5f) {
+                // A remainder of a swing that lands within a few frames cannot carry the
+                // offset without a jump: look for the next lift instead.
+                if ((k - swing.begin) * kHandOverStep >= kHandOverMinSwing) {
+                    swing.end = k;
+                    break;
+                }
+                swing.begin = -1;
+            }
+            previous = c;
+        }
+        return swing;
+    };
+
+    std::array<FootHandOver, 2> out;
+    for (int f = 0; f < 2; ++f) {
+        FootHandOver& hand = out[static_cast<std::size_t>(f)];
+        // The hand-over follows whichever swing of this foot comes first: the incoming
+        // clip's own swing, or the outgoing clip's next lift when the incoming clip keeps
+        // the foot planted. The other clip holds the foot until then.
+        const Swing inSwing = findSwing(incoming, f);
+        const Swing outSwing = findSwing(outgoing, f);
+        const bool useIncoming = inSwing.begin >= 0 && inSwing.end >= 0 &&
+                                 (outSwing.begin < 0 || inSwing.begin <= outSwing.begin);
+        const bool useOutgoing = !useIncoming && outSwing.begin >= 0 && outSwing.end >= 0;
+        if (!useIncoming && !useOutgoing) {
+            // Neither clip swings this foot in the window: time-based hand-over inside the
+            // fade. The foot slides here; the entry choice keeps this rare.
+            hand.progress = smootherstep(static_cast<float>(linear));
+            hand.active = linear < 1.0;
+            continue;
+        }
+        const Swing& swing = useIncoming ? inSwing : outSwing;
+        const double tA = start + swing.begin * kHandOverStep;
+        const double tB = start + swing.end * kHandOverStep;
+        if (mediaTime <= tA) {
+            hand.progress = 0.0f;
+            hand.active = true;
+        } else if (mediaTime >= tB) {
+            hand.progress = 1.0f;
+            hand.active = false;
+        } else {
+            hand.progress = smootherstep(static_cast<float>((mediaTime - tA) / (tB - tA)));
+            hand.active = true;
+        }
+    }
+    return out;
 }
 
 ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
@@ -422,8 +511,10 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
     ClipPose result;
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
-        if (u < 1.0) {
-            if (transition) {
+        // A planted foot can outlast the fade: its hand-over ends at the incoming swing.
+        const bool mayHoldFeet = u < 1.0 + kHandOverWindow / segment.fadeSeconds;
+        if (u < 1.0 || mayHoldFeet) {
+            if (transition && u < 1.0) {
                 *transition = static_cast<float>(std::clamp(u, 0.0, 1.0));
             }
             // The incoming pose is evaluated first, as before: decorator consumers rely on
@@ -435,8 +526,33 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
                 return result;
             }
             const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
-            result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
-            if (inertialTransitions_) {
+            const auto hand = footHandOver(index, mediaTime, timeline);
+            const bool feetHeld = hand[0].active || hand[1].active;
+            if (u >= 1.0 && !feetHeld) {
+                memo.emplace(key, own);
+                return own;
+            }
+            if (u < 1.0) {
+                result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            } else {
+                result = own;
+            }
+            // A1: each planted foot is handed over by its own swing, not by the time blend.
+            for (std::size_t f = 0; f < 2; ++f) {
+                ClipPose::Foot& foot = result.foot[f];
+                const ClipPose::Foot& from = previous.foot[f];
+                const ClipPose::Foot& to = own.foot[f];
+                // Contact and phase follow the same progress as the position, so a foot
+                // that is moving is never reported as planted.
+                const float progress = hand[f].progress;
+                foot.position = from.position + (to.position - from.position) * progress;
+                float yawDelta = to.yaw - from.yaw;
+                yawDelta -= std::round(yawDelta);
+                foot.yaw = from.yaw + yawDelta * progress;
+                foot.contact = from.contact + (to.contact - from.contact) * progress;
+                foot.phase = progress < 0.5f ? from.phase : to.phase;
+            }
+            if (u < 1.0 && inertialTransitions_) {
                 // Inertialization: the offset between the outgoing and incoming upper body
                 // is fixed at the transition start, so it depends only on the segment and
                 // not on how the time was reached (seek and playback stay identical).
