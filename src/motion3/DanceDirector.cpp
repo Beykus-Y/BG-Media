@@ -340,10 +340,12 @@ bool isInertialBone(std::size_t bone) {
 
 // Inertialization of a bone offset (BG Motion 3.3, A8). The offset is a rotation vector o
 // (axis times angle). In decay time x = elapsed * 5 / fade it follows
-//   o(x) = o0 p(x) + v q(x) - g(x) (o0 p(5) + v q(5)),
+//   o(x) = o0 p(x) + v q(x) - g(x) (o0 p(5) + v q(5)) - h(x) S,
 // with p(x) = (1 + x) e^-x and q(x) = x e^-x, so o(0) = o0 and the slope at 0 is the offset's
 // own velocity v (in decay time). g(x) = u^2 (3 - 2u), u = min(x / 5, 1), brings the offset to
-// exactly 0 at the fade's end with zero slope there, so the blend hands over without a step.
+// exactly 0 at the fade's end; h(x) = u^2 (u - 1) times S, the slope (per u) of the first
+// two terms at x = 5, makes the slope 0 there too, so the hand-over to the incoming clip has
+// no step in value or velocity.
 // The offset's velocity is carried through the fade start: the outgoing motion goes on, and
 // the incoming clip's own motion is added to it.
 using RotationVector = std::array<double, 3>;
@@ -393,11 +395,20 @@ Quat inertialOffset(const RotationVector& o0, const RotationVector& velocity, do
     };
     const RotationVector atX = raw(x);
     const RotationVector atEnd = raw(kLambda);
+    // Slope of raw at the end, per unit u = x / lambda: p'(x) = -x e^-x, q'(x) = (1 - x) e^-x.
+    const double e = std::exp(-kLambda);
+    RotationVector slopeEnd{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        slopeEnd[i] = kLambda * (o0[i] * (-kLambda * e) + velocity[i] * scale * (1.0 - kLambda) * e);
+    }
+    // Cubic Hermite correction: g takes the end value away (g(1) = 1, g'(1) = 0) and h the end
+    // slope (h(1) = 0, h'(1) = 1); both are flat at u = 0, so the start keeps o0 and its slope.
     const double u = x / kLambda;
     const double g = u * u * (3.0 - 2.0 * u);
+    const double hEnd = u * u * (u - 1.0);
     RotationVector o{};
     for (std::size_t i = 0; i < 3; ++i) {
-        o[i] = atX[i] - g * atEnd[i];
+        o[i] = atX[i] - g * atEnd[i] - hEnd * slopeEnd[i];
     }
     return quaternionOf(o);
 }
@@ -1133,8 +1144,16 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             // Pending: keep the musical beat it was aligned to, placed on the new grid.
             const double oldAlign = segment.alignTime;
             double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
-            const double fade = segment.fadeSeconds;
-            if (alignTime < now) {
+            double fade = segment.fadeSeconds;
+            const bool oneShotReturn = segment.reason == "one-shot finished" && !kept.empty() &&
+                                       !kept.back().loop && kept.back().clip->tempoSync;
+            if (oneShotReturn) {
+                // A one-shot's return follows the one-shot's own end: the rebased clip keeps
+                // its beat at `now` and plays its remaining beats at the new rate.
+                const ScheduleSegment& shot = kept.back();
+                alignTime = timeAtLinearClipBeat(shot, shot.clip->beats, clock_);
+                fade = fadeFor(alignTime);
+            } else if (alignTime < now) {
                 // A faster grid moved the entry into the past: enter again as a fresh
                 // selection at `now` would, so the clip does not start mid-way past its
                 // entry (and past the swing that carries its planted feet over).

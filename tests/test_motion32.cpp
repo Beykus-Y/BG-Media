@@ -999,10 +999,10 @@ TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) 
         double step = 0.0;
         double outgoing = 0.0;
     };
-    const auto jumpAtStart = [&](const motion::DanceSchedule& schedule) {
-        const motion::ClipPose before1 = poseAt(schedule, t0 - h);
-        const motion::ClipPose at = poseAt(schedule, t0);
-        const motion::ClipPose after1 = poseAt(schedule, t0 + h);
+    const auto jumpAt = [&](const motion::DanceSchedule& schedule, double time) {
+        const motion::ClipPose before1 = poseAt(schedule, time - h);
+        const motion::ClipPose at = poseAt(schedule, time);
+        const motion::ClipPose after1 = poseAt(schedule, time + h);
         Jump worst;
         for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
             if (!upperBody(bone)) {
@@ -1022,8 +1022,8 @@ TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) 
         }
         return worst;
     };
-    const Jump inertial = jumpAtStart(makeSchedule(true));
-    const Jump blend = jumpAtStart(makeSchedule(false));
+    const Jump inertial = jumpAt(makeSchedule(true), t0);
+    const Jump blend = jumpAt(makeSchedule(false), t0);
     CHECK(std::isfinite(inertial.step));
     // Carrying the offset velocity removes most of the step the zero-velocity offset left
     // (about the outgoing speed itself).
@@ -1031,6 +1031,10 @@ TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) 
     // The blend already hands over smoothly at the start (smootherstep), so the carried
     // velocity does not beat it there; DanceSchedule keeps the blend as its default.
     CHECK(blend.step < 0.25 * std::max(inertial.outgoing, 0.5));
+    // Fade end: the offset reaches zero with zero velocity, so the hand-over to the incoming
+    // clip has no velocity step either (only the acceleration times the sampling step).
+    const Jump atEnd = jumpAt(makeSchedule(true), t0 + fade);
+    CHECK(atEnd.step < 0.05);
 }
 
 // BG Motion 3.3 (#9): the opt-in follow-through lags only head and hands, stays bounded,

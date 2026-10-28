@@ -1246,3 +1246,29 @@ TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
     // against slid a planted foot by 38 to 48 cm.
     CHECK(worstExcess < 0.03);
 }
+
+TEST_CASE(dance.rebased_one_shot_returns_after_its_remaining_beats) {
+    // The rebased one-shot keeps its clip beat and plays the rest at the new rate; its Idle
+    // return must follow that end, not the old absolute beat (Energetic 100 -> 180 BPM at 5 s
+    // cut the clip off at beat 8.3 of 16).
+    for (double bpmAfter : {80.0, 140.0, 180.0}) {
+        motion::DanceDirector director(&library());
+        director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+        director.select(motion::DanceStyle::Energetic, 0.0, true, true);
+        director.rebase(5.0, motion::BeatClock::constant(bpmAfter, 0.0));
+        const auto& segments = director.schedule().segments();
+        CHECK(segments.size() == 2);
+        if (segments.size() != 2) continue;
+        const motion::ScheduleSegment& shot = segments[0];
+        const motion::ScheduleSegment& back = segments[1];
+        const motion::BeatClock grid = motion::BeatClock::constant(bpmAfter, 0.0);
+        // The clip's last beat is reached at the return's alignment, within a sample.
+        const double endBeat =
+            motion::DanceSchedule::segmentClipBeat(shot, back.alignTime, grid);
+        CHECK_NEAR(endBeat, shot.clip->beats, 1e-6);
+        // Until the return's fade starts, the one-shot is what plays.
+        CHECK(director.sample(back.startTime - 0.01).style == motion::DanceStyle::Energetic);
+        CHECK(director.sample(back.startTime + back.fadeSeconds + 0.5).style ==
+              motion::DanceStyle::Idle);
+    }
+}
