@@ -271,10 +271,13 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
     // stance does not lean back to the origin or twist against the body's heading.
     const std::array<ClipPose::Foot, 2> idleFeet = idleFeetAtDanceRoot(dance, idle);
 
-    // Feet: one at a time. Foot 0 (left) moves over mix 0..0.5, foot 1 (right) over 0.5..1.
-    // At every mix one of the two feet has p = 0 or p = 1, so it sits exactly on an endpoint.
+    // Feet: one at a time. The foot with less contact in the dance pose (the airborne one)
+    // lands first, over mix 0..0.5; the supporting foot moves over 0.5..1, once the other
+    // foot is down. Ties go left first. At every mix one of the two feet has p = 0 or p = 1,
+    // so it sits exactly on an endpoint.
+    const std::size_t first = dance.foot[1].contact < dance.foot[0].contact ? 1 : 0;
     for (std::size_t f = 0; f < 2; ++f) {
-        const float start = f == 0 ? 0.0f : 0.5f;
+        const float start = f == first ? 0.0f : 0.5f;
         const float p = smootherstep01((m - start) / 0.5f);
         // Guarded: sin(pi) is not exactly 0 in floating point, and the endpoints must stay exact.
         const float arch = (p > 0.0f && p < 1.0f)
@@ -290,7 +293,8 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
         const double dx = static_cast<double>(to.position.x) - from.position.x;
         const double dz = static_cast<double>(to.position.z) - from.position.z;
         const double travel = std::sqrt(dx * dx + dz * dz);
-        if (travel >= kFootLiftMinTravel && arch > 0.0f) {
+        // A foot that is already in the air just comes down; only a planted foot steps.
+        if (travel >= kFootLiftMinTravel && arch > 0.0f && from.contact >= 0.5f) {
             const double lift = std::min(kFootLiftCapHeights, kFootLiftFraction * travel);
             position.y += static_cast<float>(lift) * arch;
         }

@@ -41,10 +41,11 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
 // Blend from a dance pose towards the Idle pose for a stopped transport.
 //   mix 0 returns `dance` exactly, mix 1 takes the Idle body but keeps the dance
 //   root (rootX, rootZ, rootYaw), so a dancer who has travelled stays where they are.
-// Feet are handed over one at a time: foot 0 (left) moves over mix 0..0.5, foot 1
-// (right) over 0.5..1, each with a smootherstep. At every mix at least one foot sits
+// Feet are handed over one at a time, each with a smootherstep: the foot with less
+// contact in the dance pose (airborne) lands over mix 0..0.5, then the supporting foot
+// moves over 0.5..1 (ties: left first). At every mix at least one foot sits
 // exactly on one of its endpoints (the Idle end re-anchored by idleFeetAtDanceRoot),
-// so one foot is always planted. A moving foot
+// so one foot is always on an endpoint. A moving planted foot
 // lifts by min(0.03, 0.5 * travel) model heights, sine-shaped, unless its travel is
 // under 1 cm. Its contact is min(lerp(dance, idle, p), 1 - sin(pi p)): it never rises
 // above either end, and it drops while the foot moves. Yaw and toe roll follow the

@@ -498,22 +498,23 @@ TEST_CASE(alive.blend_to_idle_hands_the_feet_over_one_at_a_time) {
     const ClipPose dance = travelledDance();
     const ClipPose idle = idleStance();
     const auto idleFeet = motion::idleFeetAtDanceRoot(dance, idle);
-    // Left foot (0) moves over the first half, right foot (1) over the second.
+    // The swinging right foot (1) lands over the first half while the planted left foot
+    // (0) holds; the left foot moves over the second half.
     for (int i = 0; i <= 50; ++i) {
         const float m = static_cast<float>(i) / 100.0f;  // 0 .. 0.5
         const ClipPose out = motion::blendToIdleKeepingFeet(dance, idle, m);
-        CHECK(vecIdentical(out.foot[1].position, dance.foot[1].position));
+        CHECK(vecIdentical(out.foot[0].position, dance.foot[0].position));
     }
     for (int i = 50; i <= 100; ++i) {
         const float m = static_cast<float>(i) / 100.0f;  // 0.5 .. 1
         const ClipPose out = motion::blendToIdleKeepingFeet(dance, idle, m);
-        CHECK(vecIdentical(out.foot[0].position, idleFeet[0].position));
+        CHECK(vecIdentical(out.foot[1].position, idleFeet[1].position));
     }
     // Mid-handover the moving foot is strictly between its endpoints.
     const ClipPose quarter = motion::blendToIdleKeepingFeet(dance, idle, 0.25f);
-    const motion::Vec3 a = dance.foot[0].position;
-    const motion::Vec3 b = idleFeet[0].position;
-    const motion::Vec3 q = quarter.foot[0].position;
+    const motion::Vec3 a = dance.foot[1].position;
+    const motion::Vec3 b = idleFeet[1].position;
+    const motion::Vec3 q = quarter.foot[1].position;
     CHECK(q.x > std::min(a.x, b.x) && q.x < std::max(a.x, b.x));
     CHECK(q.z > std::min(a.z, b.z) && q.z < std::max(a.z, b.z));
 }
@@ -542,9 +543,9 @@ TEST_CASE(alive.blend_to_idle_lifts_a_moving_foot_by_the_capped_arch) {
     const ClipPose dance = travelledDance();
     const ClipPose idle = idleStance();
     const auto idleFeet = motion::idleFeetAtDanceRoot(dance, idle);
-    // Foot 0 travels about 0.20 height units, so the cap (0.03) applies. At mix 0.25
-    // the handover is at its peak (p = 0.5): the foot is 0.03 up and half contact.
-    const ClipPose peak = motion::blendToIdleKeepingFeet(dance, idle, 0.25f);
+    // Planted foot 0 travels about 0.20 height units, so the cap (0.03) applies. It moves
+    // second; at mix 0.75 its handover is at its peak (p = 0.5): 0.03 up, no contact.
+    const ClipPose peak = motion::blendToIdleKeepingFeet(dance, idle, 0.75f);
     CHECK_NEAR(peak.foot[0].position.y, 0.03, 1.0e-5);
     CHECK_NEAR(peak.foot[0].contact, 0.0, 1.0e-5);
 
@@ -589,21 +590,22 @@ TEST_CASE(alive.blend_to_idle_crossfades_the_body_smoothly) {
     CHECK_NEAR(half.hips.x, 0.5 * (dance.hips.x + idle.hips.x), 1.0e-6);
     CHECK_NEAR(half.hips.y, 0.5 * (dance.hips.y + idle.hips.y), 1.0e-6);
     CHECK_NEAR(half.energy, 0.5 * (dance.energy + idle.energy), 1.0e-6);
-    // Feet turn with the same handover: the planted foot yaw matches its endpoint.
-    CHECK_NEAR(motion::blendToIdleKeepingFeet(dance, idle, 0.5f).foot[0].yaw, idleFeet[0].yaw,
+    // Feet turn with the same handover: at mix 0.5 the landed foot 1 has its Idle yaw and
+    // the still planted foot 0 its dance yaw.
+    CHECK_NEAR(motion::blendToIdleKeepingFeet(dance, idle, 0.5f).foot[1].yaw, idleFeet[1].yaw,
                1.0e-6);
-    CHECK_NEAR(motion::blendToIdleKeepingFeet(dance, idle, 0.5f).foot[1].yaw, dance.foot[1].yaw,
+    CHECK_NEAR(motion::blendToIdleKeepingFeet(dance, idle, 0.5f).foot[0].yaw, dance.foot[0].yaw,
                1.0e-6);
     // Toe roll follows the same p as the position: at the peak it is half way.
-    const ClipPose peak = motion::blendToIdleKeepingFeet(dance, idle, 0.25f);
+    const ClipPose peak = motion::blendToIdleKeepingFeet(dance, idle, 0.75f);
     CHECK_NEAR(peak.foot[0].toePitch, 0.5 * (dance.foot[0].toePitch + idle.foot[0].toePitch),
                1.0e-5);
-    // Contact is 0 at the peak of the handover of foot 1 (p = 0.5), and it never
+    // Contact is 0 at the peak of the handover of foot 0 (p = 0.5), and it never
     // exceeds the Idle contact it ends on.
-    CHECK_NEAR(motion::blendToIdleKeepingFeet(dance, idle, 0.75f).foot[1].contact, 0.0, 1.0e-5);
+    CHECK_NEAR(peak.foot[0].contact, 0.0, 1.0e-5);
     for (int i = 50; i <= 100; ++i) {
         const float m = static_cast<float>(i) / 100.0f;
-        CHECK(motion::blendToIdleKeepingFeet(dance, idle, m).foot[1].contact <= 1.0f + 1.0e-6f);
+        CHECK(motion::blendToIdleKeepingFeet(dance, idle, m).foot[0].contact <= 1.0f + 1.0e-6f);
     }
 }
 
@@ -647,4 +649,27 @@ TEST_CASE(alive.idle_feet_follow_the_kept_dance_root) {
     for (std::size_t f = 0; f < 2; ++f) {
         CHECK(vecIdentical(end.foot[f].position, moved[f].position));
     }
+}
+
+TEST_CASE(alive.blend_to_idle_lands_the_airborne_foot_first) {
+    // Paused mid-step: the right foot is in the air, the left foot carries the body. The
+    // left foot must not leave the floor until the right foot is down.
+    const ClipPose idle = idleStance();
+    ClipPose dance = idleStance();
+    dance.foot[0].position = {0.10f, 0.0f, 0.05f};
+    dance.foot[0].contact = 1.0f;
+    dance.foot[1].position = {-0.12f, 0.047f, -0.04f};
+    dance.foot[1].contact = 0.0f;
+    dance.foot[1].phase = motion::FootPhase::Swing;
+    const auto idleFeet = motion::idleFeetAtDanceRoot(dance, idle);
+    for (int i = 0; i <= 50; ++i) {
+        const float m = static_cast<float>(i) / 100.0f;
+        const ClipPose out = motion::blendToIdleKeepingFeet(dance, idle, m);
+        CHECK(vecIdentical(out.foot[0].position, dance.foot[0].position));
+        CHECK(out.foot[0].contact == 1.0f);
+        // The airborne foot only comes down: no extra step arch on top of its height.
+        CHECK(out.foot[1].position.y <= dance.foot[1].position.y + 1.0e-6f);
+    }
+    const ClipPose landed = motion::blendToIdleKeepingFeet(dance, idle, 0.5f);
+    CHECK(vecIdentical(landed.foot[1].position, idleFeet[1].position));
 }
