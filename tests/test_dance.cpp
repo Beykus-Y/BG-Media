@@ -1157,3 +1157,25 @@ TEST_CASE(dance.plan_blend_keeps_planted_feet_in_place) {
     // 0.5 s body blend (which moved it ~33 cm, ~1 cm per frame).
     CHECK(worstSlide < 0.0015);
 }
+
+TEST_CASE(dance.plan_blend_never_pushes_a_landed_foot_below_the_floor) {
+    // The carried anchor is horizontal: a foot planted before the change but airborne in
+    // the new schedule must land on the floor, not keep a negative height offset.
+    motion::DancePlayer player;
+    steadyPlayer(player, "hiphop");
+    player.setOverlayMode(motion::OverlayMode::Off);
+    for (double t = 0.0; t <= 2.0; t += 1.0 / 120.0) {
+        (void)player.update(t);
+    }
+    player.setMode(motion::DanceMode::Auto, 2.0);
+    player.setGrid(motion::BeatClock::constant(140.0, 0.0), 2.0);
+    double lowest = 0.0;
+    for (double t = 2.0; t <= 4.0; t += 1.0 / 240.0) {
+        const motion::DanceFrame frame = player.update(t);
+        for (std::size_t f = 0; f < 2; ++f) {
+            lowest = std::min(lowest, static_cast<double>(frame.pose.foot[f].position.y));
+        }
+    }
+    // HipHop itself dips to about -0.0025 (heel roll); the old carry reached -0.061.
+    CHECK(lowest > -0.005);
+}

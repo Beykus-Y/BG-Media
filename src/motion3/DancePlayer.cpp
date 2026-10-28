@@ -458,7 +458,10 @@ DanceFrame DancePlayer::update(double mediaTime) {
             // left of the offset, never a lerp of two planted positions.
             const ClipPose::Foot& target = scheduleFeet[f];
             const auto k = static_cast<float>(carry_.remaining[f]);
-            frame.pose.foot[f].position = target.position + carry_.offset[f] * k;
+            // Horizontal only: the height follows the body blend, so a foot the new
+            // schedule lifts or lands never keeps a vertical offset (under the floor).
+            frame.pose.foot[f].position.x = target.position.x + carry_.offset[f].x * k;
+            frame.pose.foot[f].position.z = target.position.z + carry_.offset[f].z * k;
             frame.pose.foot[f].yaw = target.yaw + carry_.yaw[f] * k;
         }
         // The offset is paid off by the contact the viewer sees, so a foot shown planted
