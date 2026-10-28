@@ -1,4 +1,4 @@
-// BG Motion 3.2 quality pass regression tests: motion composition, masks,
+﻿// BG Motion 3.2 quality pass regression tests: motion composition, masks,
 // transitions. Spatial retarget tests live in test_retarget.cpp.
 #include "framework.hpp"
 
@@ -289,8 +289,12 @@ float maxBoneAngle(const motion::ClipPose& a, const motion::ClipPose& b) {
 }
 
 float boneAngle(const math::Quat& a, const math::Quat& b) {
-    const float d = std::abs(math::dot(a, b));
-    return 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f));
+    // Stable form of 2*acos(|dot|): the relative rotation's vector part is the
+    // sine of half the angle, so small angles keep their precision.
+    const math::Quat d = (a * math::conjugate(b)).normalized();
+    const float w = std::abs(d.w);
+    const float s = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    return 2.0f * std::atan2(s, w);
 }
 
 }  // namespace
@@ -986,4 +990,192 @@ TEST_CASE(quality.generated_clip_wrist_plane_has_no_threshold_step) {
     }
     std::cout << "\n            worst hand key speed " << worst << " deg/s";
     CHECK(worst < 300.0f);
+}
+
+
+namespace {
+
+// Sum of the rotation the overlay layer adds over `seconds` of playback at `bpm`.
+// The Full pose and the Off pose come from the same player at the same media
+// time, so the difference is exactly the overlay contribution.
+double overlayRotation(double bpm, const char* clipId, double seconds) {
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setGrid(motion::BeatClock::constant(bpm, 0.0, 4), 0.0);
+    if (!player.selectClip(clipId, 0.0, true)) {
+        return -1.0;
+    }
+    const std::array<vrm::HumanoidBone, 3> bones = {
+        vrm::HumanoidBone::LeftHand, vrm::HumanoidBone::RightHand, vrm::HumanoidBone::Head};
+    double total = 0.0;
+    const int frames = static_cast<int>(seconds * 60.0);
+    for (int i = 0; i < frames; ++i) {
+        const double t = 0.05 + static_cast<double>(i) / 60.0;
+        player.setOverlayMode(motion::OverlayMode::Full);
+        const motion::DanceFrame full = player.update(t);
+        player.setOverlayMode(motion::OverlayMode::Off);
+        const motion::DanceFrame plain = player.update(t);
+        for (vrm::HumanoidBone bone : bones) {
+            total += boneAngle(full.pose.bone[static_cast<std::size_t>(bone)],
+                               plain.pose.bone[static_cast<std::size_t>(bone)]);
+        }
+    }
+    return total;
+}
+
+// A musical grid with a strong accent on every bar start, used to activate the warp.
+AnalysisResult accentGrid(double bpm, int beats) {
+    AnalysisResult analysis;
+    analysis.info.duration = beats * 60.0 / bpm;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 0.95f;
+    analysis.beatPhaseConfidence = 0.95f;
+    analysis.meterConfidence = 0.9f;
+    analysis.downbeatConfidence = 0.9f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    for (int i = 0; i < beats; ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / bpm;
+        beat.strength = (i % 4 == 0) ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+    }
+    return analysis;
+}
+
+}  // namespace
+
+TEST_CASE(quality.cue_duration_follows_the_playback_tempo) {
+    // BG Motion 3.3: a cue's real length is 60 / (tempo * metric level), not
+    // 60 / authored bpm. At 130 BPM neonPulse plays at rate 1, so a half-beat cue
+    // lasts 0.231 s and not the 0.288 s the authored 104 BPM implies.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setExpression(motion::MotionExpression::Off);  // pure tempo x metric level
+    const motion::HumanoidClip* clip = player.library().find("neonPulse");
+    REQUIRE(clip != nullptr);
+    std::vector<float> durations;
+    for (double bpm : {90.0, 104.0, 130.0, 180.0}) {
+        player.setGrid(motion::BeatClock::constant(bpm, 0.0, 4), 0.0);
+        REQUIRE(player.selectClip("neonPulse", 0.0, true));
+        const motion::DanceFrame frame = player.update(1.3);
+        const double expected = 60.0 / (frame.effectiveSpeed * clip->bpm);
+        CHECK_NEAR(frame.secondsPerClipBeat, static_cast<float>(expected), 1.0e-4);
+        CHECK(frame.secondsPerClipBeat > 0.25f && frame.secondsPerClipBeat < 1.2f);
+        durations.push_back(frame.secondsPerClipBeat);
+        std::cout << "\n            " << bpm << " BPM -> " << frame.secondsPerClipBeat
+                  << " s/clip beat, bpm " << frame.bpm << ", effective speed "
+                  << frame.effectiveSpeed;
+    }
+    // 130 BPM is rate 1 (0.4615 s), 104 is rate 1 (0.5769 s), 90 is rate 1
+    // (0.6667 s) and 180 is rate 0.5, i.e. the same clip-beat rate as 90.
+    CHECK_NEAR(durations[0], 60.0f / 90.0f, 2.0e-3f);
+    CHECK_NEAR(durations[1], 60.0f / 104.0f, 2.0e-3f);
+    CHECK_NEAR(durations[2], 60.0f / 130.0f, 2.0e-3f);
+    CHECK_NEAR(durations[3], 60.0f / 90.0f, 2.0e-3f);
+    CHECK(durations[2] < durations[1]);  // faster music, shorter clip beat
+    CHECK(durations[1] < durations[0]);
+}
+
+TEST_CASE(quality.cue_duration_is_wall_clock_for_non_tempo_synced_clips) {
+    // Idle runs on wall-clock time (1 beat = 1 s at its authored 60 BPM), so the
+    // music tempo must not change its cue durations.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    const motion::HumanoidClip* idle = player.library().find("idle");
+    REQUIRE(idle != nullptr);
+    REQUIRE(!idle->tempoSync);
+    for (double bpm : {90.0, 180.0}) {
+        player.setGrid(motion::BeatClock::constant(bpm, 0.0, 4), 0.0);
+        REQUIRE(player.selectClip("idle", 0.0, true));
+        const motion::DanceFrame frame = player.update(1.3);
+        CHECK_NEAR(frame.secondsPerClipBeat, 60.0 / idle->bpm, 1.0e-4);
+        CHECK_NEAR(frame.effectiveSpeed, 1.0, 1.0e-5);
+        std::cout << "\n            idle @ " << bpm << " BPM -> "
+                  << frame.secondsPerClipBeat << " s/clip beat";
+    }
+}
+
+TEST_CASE(quality.overlay_amplitude_follows_the_real_cue_duration) {
+    // End to end: the same clip danced to faster music must produce smaller
+    // overlay gestures (the cue really is shorter), and 180 BPM with metric level
+    // 0.5 must behave like 90 BPM.
+    const double at90 = overlayRotation(90.0, "neonPulse", 8.0);
+    const double at130 = overlayRotation(130.0, "neonPulse", 8.0);
+    const double at180 = overlayRotation(180.0, "neonPulse", 8.0);
+    std::cout << "\n            overlay rotation over 8 s: 90 BPM " << at90
+              << " rad, 130 BPM " << at130 << " rad, 180 BPM " << at180 << " rad";
+    REQUIRE(at90 > 0.0);
+    CHECK(at130 < 0.92 * at90);                   // faster music, smaller gestures
+    CHECK(std::abs(at180 - at90) < 0.15 * at90);  // half-time is the same dance
+}
+
+TEST_CASE(quality.cue_duration_includes_the_time_warp) {
+    // With the expressive warp the clip beat rate is segment.rate * warp rate.
+    // The cue duration must follow the same mapping the pose is sampled with.
+    AnalysisResult analysis = accentGrid(120.0, 64);
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setMusicalTimeline(motion::MusicalTimeline::fromAnalysis(analysis), 0.0);
+    player.setExpression(motion::MotionExpression::Expressive);
+    REQUIRE(player.selectClip("neonPulse", 0.0, true));
+    const motion::HumanoidClip* clip = player.library().find("neonPulse");
+    REQUIRE(clip != nullptr);
+    int warped = 0;
+    double worst = 0.0;
+    for (int i = 0; i < 600; ++i) {
+        const double t = 0.1 + i / 60.0;
+        const motion::DanceFrame frame = player.update(t);
+        const double error =
+            std::abs(frame.secondsPerClipBeat * frame.effectiveSpeed * clip->bpm - 60.0);
+        worst = std::max(worst, error);
+        if (frame.warpActive) ++warped;
+    }
+    std::cout << "\n            warped frames " << warped << ", worst identity error "
+              << worst << " (s/clip beat x speed x bpm)";
+    CHECK(warped > 30);
+    CHECK(worst < 60.0 * 0.01);
+}
+
+TEST_CASE(quality.generated_accent_ties_keep_the_strongest_mark) {
+    // The generator appends a bar accent and a phrase/turn/heel/toe accent on the
+    // same beat. Array order must not decide: the body must use the strongest one,
+    // so a beat with a tie is deeper than a plain beat of the same section.
+    const auto dances = motion::ProceduralChoreography::showcase();
+    REQUIRE(!dances.empty());
+    int checked = 0;
+    for (const motion::GeneratedDance& dance : dances) {
+        const auto& hips = dance.clip.hips;
+        const auto& marks = dance.clip.accents;
+        const int kpb = std::max(1, dance.clip.keysPerBeat);
+        const int beats = static_cast<int>(dance.clip.beats);
+        if (hips.size() != static_cast<std::size_t>(dance.clip.keyCount) || marks.empty()) {
+            continue;
+        }
+        const auto depth = [&](int beat) {
+            return hips[static_cast<std::size_t>(beat) * static_cast<std::size_t>(kpb)].y;
+        };
+        for (int beat = 0; beat + 1 < beats; ++beat) {
+            float strongest = 0.0f;
+            int count = 0;
+            for (const motion::AccentMark& mark : marks) {
+                float d = std::abs(mark.beat - static_cast<float>(beat));
+                d = std::min(d, dance.clip.beats - d);
+                if (d > 1.0e-4f) continue;
+                strongest = std::max(strongest, mark.strength);
+                ++count;
+            }
+            if (count < 2 || strongest < 0.88f) continue;
+            CHECK(depth(beat) <= depth(beat + 1) + 1.0e-5f);
+            ++checked;
+            std::cout << "\n            " << dance.clip.id << " beat " << beat
+                      << " (strongest " << strongest << ") depth " << depth(beat)
+                      << " vs plain beat " << beat + 1 << " depth " << depth(beat + 1);
+        }
+    }
+    CHECK(checked >= 3);
 }
