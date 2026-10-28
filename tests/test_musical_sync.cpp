@@ -95,7 +95,12 @@ TEST_CASE(sync31.seek_preserves_bar_phase_and_clears_phase_error) {
         double phase = std::fmod(frame.clipBeat - beat, 4.0);
         if (phase > 2.0) phase -= 4.0;
         if (phase < -2.0) phase += 4.0;
-        CHECK_NEAR(phase, 0.0, 1e-6);
+        // A seek no longer reseeds (BG Motion 3.3, A3), so the warp is not re-zeroed at the
+        // jump: the phase error is exactly the warp's own correction, which is bounded by
+        // A/pi < 0.5/pi beats (deviation = A/(2 pi) (cos - 1), A < 0.5).
+        const double warpBound = 0.5 / std::acos(-1.0);
+        CHECK(std::abs(phase) < warpBound + 1e-9);
+        CHECK_NEAR(phase, frame.warpDeviationBeats, 1e-6);
         CHECK(frame.warpActive || std::abs(frame.warpRate - 1.0) < 1e-9);
     }
 }

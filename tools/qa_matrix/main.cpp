@@ -243,7 +243,7 @@ Scenario runScenario(const std::string& modelName, const vrm::VrmModel& model,
                 throw std::runtime_error("clip not found in the library: " + clip);
             }
             // Start from the replay's first time so the jump goes through the seek path.
-            jumper.update(o.from);
+            (void)jumper.update(o.from);
             const double t = o.from + jumpAt[j] / fps;
             (void)jumper.update(t);
             const double settle = o.from + (jumpAt[j] + settleSteps) / fps;
