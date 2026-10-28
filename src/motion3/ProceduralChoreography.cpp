@@ -445,7 +445,8 @@ private:
 };
 
 void Choreographer::armKey(float beat, int side, float elev, float azim, float twist,
-                           float elbow, float wrist, bool hit) {    if (side == 0) {
+                           float elbow, float wrist, bool hit) {
+    if (side == 0) {
         pose(beat, hit, 1.0f, {{Ctrl::ArmLElev, elev}, {Ctrl::ArmLAzim, azim},
                               {Ctrl::ArmLTwist, twist}, {Ctrl::ArmLElbow, elbow},
                               {Ctrl::ArmLWrist, wrist}});
@@ -754,7 +755,8 @@ float Choreographer::accentStrengthAt(float beat) const {
     return nearest <= 0.5f ? std::clamp(strength, 0.0f, 1.0f) : 0.55f;
 }
 
-void Choreographer::authorStructure() {    structure_.clear();
+void Choreographer::authorStructure() {
+    structure_.clear();
     structure_.push_back("Section: intro groove");
     structure_.push_back("Section: development (side-touch, cross-step)");
     structure_.push_back("Section: build (pivot, arms)");
