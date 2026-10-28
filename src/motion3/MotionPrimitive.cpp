@@ -753,8 +753,9 @@ struct ActiveCue {
     PrimitivePose pose;
     float weight = 0.0f;
     // Support and contact gate (1 = open). Scales the cue's body layers; the foot lift is
-    // scaled per foot by its own swing weight instead.
+    // scaled per foot by its own swing weight and by the support part of the gate.
     float gate = 1.0f;
+    float supportGate = 1.0f;  // the support part of `gate` (needsSupport cues)
     // How strongly this cue makes weaker cues yield. It follows the cue's weight but never
     // faster than kYieldBeats at either end: a one-beat accent with a 2-frame attack must
     // not pull a large arm gesture back by 45 degrees in 2 frames.
@@ -843,6 +844,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         // only when the gate is closed (no planted foot to support it, or a lifted foot is
         // fully planted); between those the cue fades with the contact instead of popping.
         float gate = 1.0f;
+        float supportGate = 1.0f;
         if (metadata.needsSupport) {
             const float support = std::max(plantedWeight(base, 0), plantedWeight(base, 1));
             if (support <= 1.0e-4f) {
@@ -850,6 +852,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                 continue;
             }
             gate *= support;
+            supportGate = support;
         }
         if (metadata.altersFeet) {
             // A primitive may animate a swing foot, never a planted one. The
@@ -882,6 +885,7 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
         entry.weight = weight;
         entry.gate = gate;
+        entry.supportGate = supportGate;
         {
             const auto smooth = [](float x) {
                 x = std::clamp(x, 0.0f, 1.0f);
@@ -1020,8 +1024,10 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
                 // floor lifts in step with its contact and never switches on at once.
                 const float swing = 1.0f - plantedWeight(base, f);
                 if (swing > 0.0f) {
+                    // The support gate fades the lift too: when support goes, the
+                    // foot comes down with the rest of the cue instead of at rejection.
                     const float wf =
-                        entry.weight * swing *
+                        entry.weight * swing * entry.supportGate *
                         regionShare(entry, f == 0 ? body::LeftFoot : body::RightFoot);
                     out.pose.foot[static_cast<std::size_t>(f)].position.y +=
                         primitive.footLift[static_cast<std::size_t>(f)] * wf;

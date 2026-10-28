@@ -44,11 +44,19 @@ struct ScheduleSegment {
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
     // Planted-foot hand-over window per foot (BG Motion 3.3, A1). DanceSchedule::append with a
     // timeline resolves it once, from the swing that is in the window at scheduling time. It is
-    // kept in media seconds: a rebase shifts a pending window with the segment's alignment and
-    // never searches the swing again. An unresolved window is searched on demand.
+    // never searched again: a rebase shifts a pending window's media seconds with the segment's
+    // alignment, and the progress follows the swing's clip beats. An unresolved window is
+    // searched on demand.
     struct FootSwingWindow {
         double begin = 0.0;    // media seconds: the foot leaves its outgoing position
         double end = 0.0;      // media seconds: the foot reaches its incoming position
+        // The same swing in linear clip beats of the clip it was found in (the outgoing
+        // segment's when `fromOutgoing`). The hand-over progress is read from these, so a
+        // tempo rebase, which keeps each clip's beat at the rebase time, keeps the progress
+        // continuous and the hand-over on the swing at the new tempo.
+        double beginBeat = 0.0;
+        double endBeat = 0.0;
+        bool fromOutgoing = false;
         bool slide = false;    // no swing in the window: the foot slides through the fade
         bool resolved = false;
     };

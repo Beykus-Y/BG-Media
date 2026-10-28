@@ -555,8 +555,12 @@ ScheduleSegment::FootSwingWindow DanceSchedule::findFootSwing(std::size_t index,
         return window;
     }
     const SwingSamples& swing = useIncoming ? in : out;
+    const ScheduleSegment& source = useIncoming ? incoming : outgoing;
     window.begin = start + swing.begin * kHandOverStep;
     window.end = start + swing.end * kHandOverStep;
+    window.beginBeat = segmentClipBeat(source, window.begin, timeline.grid());
+    window.endBeat = segmentClipBeat(source, window.end, timeline.grid());
+    window.fromOutgoing = !useIncoming;
     return window;
 }
 
@@ -579,16 +583,20 @@ std::array<DanceSchedule::FootHandOver, 2> DanceSchedule::footHandOver(
             hand.active = linear < 1.0;
             continue;
         }
-        const double tA = window.begin;
-        const double tB = window.end;
-        if (mediaTime <= tA) {
-            hand.progress = 0.0f;
-            hand.active = true;
-        } else if (mediaTime >= tB) {
+        // Progress runs in the swing's own clip beats (the pose's feet read the same linear
+        // beat), so it stays on the swing when a rebase changes the tempo.
+        const ScheduleSegment& source = window.fromOutgoing ? segments_[index - 1] : incoming;
+        const double bA = window.beginBeat;
+        const double bB = window.endBeat;
+        const double beat = segmentClipBeat(source, mediaTime, timeline.grid());
+        if (bB <= bA || beat <= bA) {
+            hand.progress = bB <= bA && mediaTime >= window.end ? 1.0f : 0.0f;
+            hand.active = hand.progress < 1.0f;
+        } else if (beat >= bB) {
             hand.progress = 1.0f;
             hand.active = false;
         } else {
-            hand.progress = smootherstep(static_cast<float>((mediaTime - tA) / (tB - tA)));
+            hand.progress = smootherstep(static_cast<float>((beat - bA) / (bB - bA)));
             hand.active = true;
         }
     }

@@ -710,3 +710,22 @@ TEST_CASE(alive.blend_to_idle_lift_is_continuous_in_the_dance_contact) {
     CHECK(worst < 2.0e-4f);  // 0.001 of contact per step: no jump
     CHECK(previous > 0.02f);  // fully planted: the full step arch
 }
+
+TEST_CASE(alive.blend_to_idle_anchor_keeps_the_idle_stance_fixed_on_resume) {
+    // Resuming a travelled dance: the dance root moves on while the mix falls. With the
+    // stop pose latched as the anchor, the Idle end of each foot stays where it was.
+    const ClipPose idle = idleStance();
+    const ClipPose stopped = travelledDance();
+    ClipPose resumed = stopped;
+    resumed.rootX += 0.15f;
+    resumed.rootYaw += 0.1f;
+    const auto anchored = motion::idleFeetAtDanceRoot(stopped, idle);
+    // Mix 0.75 with the left foot first: the left foot is fully at its Idle end.
+    const ClipPose a = motion::blendToIdleKeepingFeet(stopped, idle, 0.75f, 0, &stopped);
+    const ClipPose b = motion::blendToIdleKeepingFeet(resumed, idle, 0.75f, 0, &stopped);
+    CHECK(vecIdentical(a.foot[0].position, anchored[0].position));
+    CHECK(vecIdentical(b.foot[0].position, anchored[0].position));
+    // Without the anchor the Idle end would follow the moving root.
+    const ClipPose c = motion::blendToIdleKeepingFeet(resumed, idle, 0.75f, 0);
+    CHECK(footDistanceXZ(c.foot[0].position, anchored[0].position) > 0.05f);
+}

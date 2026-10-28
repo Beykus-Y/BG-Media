@@ -258,7 +258,7 @@ int airborneFootFirst(const ClipPose& dance) {
 }
 
 ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, float mix,
-                                int firstFoot) {
+                                int firstFoot, const ClipPose* anchor) {
     const float m = std::isfinite(mix) ? std::clamp(mix, 0.0f, 1.0f) : 0.0f;
     if (m <= 0.0f) {
         return dance;
@@ -274,7 +274,10 @@ ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle, flo
 
     // Idle's own targets sit around Idle's root; move them to the kept dance root so the
     // stance does not lean back to the origin or twist against the body's heading.
-    const std::array<ClipPose::Foot, 2> idleFeet = idleFeetAtDanceRoot(dance, idle);
+    // `anchor` (the pose the dancer stopped in, latched by the caller) keeps the Idle
+    // stance fixed while a resumed dance root moves on.
+    const std::array<ClipPose::Foot, 2> idleFeet =
+        idleFeetAtDanceRoot(anchor ? *anchor : dance, idle);
 
     // Feet: one at a time. The foot with less contact in the dance pose (the airborne one)
     // lands first, over mix 0..0.5; the supporting foot moves over 0.5..1, once the other

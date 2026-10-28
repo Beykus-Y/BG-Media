@@ -1179,3 +1179,58 @@ TEST_CASE(dance.plan_blend_never_pushes_a_landed_foot_below_the_floor) {
     // HipHop itself dips to about -0.0025 (heel roll); the old carry reached -0.061.
     CHECK(lowest > -0.005);
 }
+
+TEST_CASE(dance.rebased_handover_follows_the_swing_on_the_new_tempo) {
+    // A tempo rebase during a hand-over changes when the clip's swing happens. The hand-over
+    // follows the swing's clip beats, so a planted foot is not dragged to its new place while
+    // the clip still holds it down (HipHop 100 BPM -> Energetic, then 80 BPM mid-fade). The
+    // planted slide after the rebase is compared with the same transition without a tempo
+    // change, so slides a pair has anyway (no swing in the window) do not count.
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Idle, motion::DanceStyle::Groove,
+                                         motion::DanceStyle::HipHop, motion::DanceStyle::SideStep,
+                                         motion::DanceStyle::Energetic};
+    constexpr double kMetresPerHeight = 1.7;
+    constexpr double kStep = 1.0 / 120.0;
+    const auto plantedSlide = [&](motion::DanceStyle from, motion::DanceStyle to, double u,
+                                  double bpmAfter) {
+        motion::DanceDirector director(&library());
+        director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+        director.select(from, 0.0, false, true);
+        director.select(to, 5.37);
+        const motion::ScheduleSegment& incoming = director.schedule().segments().back();
+        const double now = incoming.startTime + u * incoming.fadeSeconds;
+        director.rebase(now, motion::BeatClock::constant(bpmAfter, 0.0));
+        // Horizontal travel of a foot over a run of frames where it is planted.
+        motion::ClipPose previous = director.sample(now).pose;
+        std::array<double, 2> run{0.0, 0.0};
+        double worst = 0.0;
+        for (double t = now + kStep; t < now + 5.0; t += kStep) {
+            const motion::ClipPose pose = director.sample(t).pose;
+            for (std::size_t f = 0; f < 2; ++f) {
+                if (previous.foot[f].contact <= 0.95f || pose.foot[f].contact <= 0.95f) {
+                    run[f] = 0.0;
+                    continue;
+                }
+                const motion::Vec3 d = pose.foot[f].position - previous.foot[f].position;
+                run[f] += std::sqrt(d.x * d.x + d.z * d.z) * kMetresPerHeight;
+                worst = std::max(worst, run[f]);
+            }
+            previous = pose;
+        }
+        return worst;
+    };
+    double worstExcess = 0.0;
+    for (motion::DanceStyle from : styles) {
+        for (motion::DanceStyle to : styles) {
+            if (from == to) continue;
+            for (double u : {0.2, 0.5, 0.8}) {
+                const double steady = plantedSlide(from, to, u, 100.0);
+                for (double bpmAfter : {80.0, 125.0}) {
+                    worstExcess =
+                        std::max(worstExcess, plantedSlide(from, to, u, bpmAfter) - steady);
+                }
+            }
+        }
+    }
+    CHECK(worstExcess < 0.01);   // a rebase adds under 1 cm of planted slide
+}

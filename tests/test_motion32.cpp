@@ -1147,3 +1147,35 @@ TEST_CASE(motion32.gated_cue_yields_arbitration_with_its_gate) {
     // 0.0005 of contact per sample: the hips move continuously, no 0.01 jump.
     CHECK(worstStep < 0.001);
 }
+
+TEST_CASE(motion32.foot_lift_fades_with_the_support_gate) {
+    // A step needs a supporting foot. As that support goes, the swinging foot's lift must
+    // fade with it, not stay at full height until the cue is rejected.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    double previous = 0.0;
+    double worstStep = 0.0;
+    for (int i = 0; i <= 2000; ++i) {
+        const float support = static_cast<float>(i) / 2000.0f;
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = motion::FootPhase::Swing;
+        base.foot[0].contact = 0.0f;
+        base.foot[1].phase = motion::FootPhase::Plant;
+        base.foot[1].contact = support;
+        const motion::ComposedPose composed = motion::composeMotion(base, cues, 0.25, 4.0, true);
+        const double y = composed.pose.foot[0].position.y;
+        CHECK(std::isfinite(y));
+        if (i > 0) {
+            worstStep = std::max(worstStep, std::abs(y - previous));
+        }
+        previous = y;
+    }
+    CHECK(worstStep < 0.001);  // no 0.039 jump at the rejection threshold
+    CHECK(previous > 0.01);    // full support: the step lifts the foot
+}

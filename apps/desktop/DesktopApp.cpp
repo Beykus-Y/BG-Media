@@ -1257,10 +1257,13 @@ struct DesktopApp::Impl {
             // The foot order of the pause hand-over is chosen once, from the pose the
             // dancer stopped in, and kept until the blend is fully back to the dance.
             const float idleMix = danceIdle.mix(animationTime);
+            // The Idle stance is anchored at the same pose's root, so on resume the
+            // advancing dance root does not drag the planted Idle feet along.
             if (idleMix <= 0.0f) {
                 danceIdleFirstFoot = -1;
             } else if (danceIdleFirstFoot < 0) {
                 danceIdleFirstFoot = motion::airborneFootFirst(danceFrame.pose);
+                danceIdleAnchor = danceFrame.pose;
             }
             const motion::ClipPose pose =
                 composeDancePose(danceFrame.pose, animationTime, idleMix,
@@ -1293,6 +1296,7 @@ struct DesktopApp::Impl {
     // Dance <-> Idle crossfade for a stopped transport (wall-clock driven).
     motion::IdleCrossfade danceIdle;
     int danceIdleFirstFoot = -1;  // latched foot order of the pause hand-over
+    motion::ClipPose danceIdleAnchor;  // latched pose whose root places the Idle stance
     bool useClips = true;
     double danceLabTime = 0.0;
     bool danceLabRunning = true;
@@ -1351,7 +1355,8 @@ struct DesktopApp::Impl {
             }
             // The dancer keeps the dance root and the feet are handed over one at a
             // time, so a travelled dancer does not glide back to the Idle origin.
-            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix, firstFoot);
+            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix, firstFoot,
+                                                  firstFoot >= 0 ? &danceIdleAnchor : nullptr);
             // Idle already breathes and shifts its weight, so the alive layer's
             // breathing and weight shift fade out as it takes over. The head look stays.
             bodyWeight *= 1.0f - std::clamp(idleMix, 0.0f, 1.0f);

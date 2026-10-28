@@ -51,9 +51,12 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
 // above either end, and it drops while the foot moves. Yaw and toe roll follow the
 // same p. Bones, hips and hands use the plain crossfade with `mix`.
 // `firstFoot` (0 or 1) fixes which foot moves first; any other value picks it from
-// `dance` with airborneFootFirst. Latch it once per transition when `dance` keeps moving.
+// `dance` with airborneFootFirst. `anchor`, when given, is the pose whose root places the
+// Idle stance (instead of `dance`'s). Latch both once per transition when `dance` keeps
+// moving (a resume), so the Idle end of a planted foot does not travel with the dance.
 [[nodiscard]] ClipPose blendToIdleKeepingFeet(const ClipPose& dance, const ClipPose& idle,
-                                              float mix, int firstFoot = -1);
+                                              float mix, int firstFoot = -1,
+                                              const ClipPose* anchor = nullptr);
 
 // The foot that lands first in blendToIdleKeepingFeet: the one with less contact
 // (airborne), ties left (0).
