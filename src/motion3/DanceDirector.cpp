@@ -269,9 +269,35 @@ double DanceSchedule::segmentClipBeat(const ScheduleSegment& segment, double med
     return mapping.beat;
 }
 
-ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
-                               const MusicalTimeline& timeline,
-                               const WarpProfile& warp, float* transition) const {
+namespace {
+
+// Bones carried by the inertial transition: spine, head and both arms with hands.
+// Hips, legs and feet keep the smootherstep blend (planted contacts must not drift).
+bool isInertialBone(std::size_t bone) {
+    using B = vrm::HumanoidBone;
+    const auto at = [](B b) { return static_cast<std::size_t>(b); };
+    return (bone >= at(B::Spine) && bone <= at(B::Head)) ||
+           (bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+           (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
+}
+
+// Critically damped decay of an offset, rescaled so it is exactly 1 at the transition
+// start and exactly 0 at the fade's end (no jump when the blend hands over to the
+// incoming clip). The slope at the start is non-zero, so the outgoing motion is carried
+// forward rather than eased to rest.
+float inertialDecay(double elapsed, double fadeSeconds) {
+    constexpr double kLambdaFades = 5.0;
+    const auto raw = [](double x) { return (1.0 + x) * std::exp(-x); };
+    const double atEnd = raw(kLambdaFades);
+    const double x = std::max(elapsed, 0.0) / fadeSeconds * kLambdaFades;
+    return static_cast<float>(std::max(0.0, (raw(x) - atEnd) / (1.0 - atEnd)));
+}
+
+} // namespace
+
+ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
+                                const MusicalTimeline& timeline,
+                                const WarpProfile& warp) const {
     const ScheduleSegment& segment = segments_[index];
     const Mapping stable = mapSegment(segment, mediaTime, timeline.grid(), &timeline,
                                       WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f},
@@ -292,20 +318,62 @@ ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
     if (decorator_) {
         decorator_(own, segment, mapped.beat);
     }
+    return own;
+}
+
+ClipPose DanceSchedule::poseOf(std::size_t index, double mediaTime,
+                               const MusicalTimeline& timeline,
+                               const WarpProfile& warp, float* transition,
+                               PoseMemo& memo) const {
+    const auto key = std::make_pair(index, mediaTime);
+    if (const auto found = memo.find(key); found != memo.end()) {
+        return found->second;
+    }
+    const ScheduleSegment& segment = segments_[index];
+    ClipPose result;
     if (index > 0 && segment.fadeSeconds > 1e-4) {
         const double u = (mediaTime - segment.startTime) / segment.fadeSeconds;
         if (u < 1.0) {
             if (transition) {
                 *transition = static_cast<float>(std::clamp(u, 0.0, 1.0));
             }
+            // The incoming pose is evaluated first, as before: decorator consumers rely on
+            // its call being the first one of a sample.
+            const ClipPose own = ownPose(index, mediaTime, timeline, warp);
             if (u <= 0.0) {
-                return poseOf(index - 1, mediaTime, timeline, warp, nullptr);
+                result = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
+                memo.emplace(key, result);
+                return result;
             }
-            const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr);
-            return blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            const ClipPose previous = poseOf(index - 1, mediaTime, timeline, warp, nullptr, memo);
+            result = blendPoses(previous, own, smootherstep(static_cast<float>(u)));
+            if (inertialTransitions_) {
+                // Inertialization: the offset between the outgoing and incoming upper body
+                // is fixed at the transition start, so it depends only on the segment and
+                // not on how the time was reached (seek and playback stay identical).
+                const double startTime = segment.startTime;
+                const ClipPose outgoingAtStart =
+                    poseOf(index - 1, startTime, timeline, warp, nullptr, memo);
+                const ClipPose incomingAtStart = ownPose(index, startTime, timeline, warp);
+                const float decay = inertialDecay(mediaTime - startTime, segment.fadeSeconds);
+                for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+                    if (!isInertialBone(bone)) {
+                        continue;
+                    }
+                    const Quat offset =
+                        (outgoingAtStart.bone[bone] * conjugate(incomingAtStart.bone[bone]))
+                            .normalized();
+                    result.bone[bone] =
+                        (math::slerp(Quat::identity(), offset, decay) * own.bone[bone]).normalized();
+                }
+            }
+            memo.emplace(key, result);
+            return result;
         }
     }
-    return own;
+    result = ownPose(index, mediaTime, timeline, warp);
+    memo.emplace(key, result);
+    return result;
 }
 
 DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock) const {
@@ -339,7 +407,8 @@ DanceFrame DanceSchedule::sample(double mediaTime, const BeatClock& clock,
         }
     }
     float transition = -1.0f;
-    frame.pose = poseOf(k, mediaTime, timeline, warp, &transition);
+    PoseMemo memo;
+    frame.pose = poseOf(k, mediaTime, timeline, warp, &transition, memo);
     frame.transitionProgress = transition;
 
     const ScheduleSegment& current = segments_[k];

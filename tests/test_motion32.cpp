@@ -768,3 +768,59 @@ TEST_CASE(motion32.seek_and_rebase_keep_generated_dance_finite) {
         }
     }
 }
+
+// BG Motion 3.2 suite (registered in CTest), #8: the opt-in inertial transition keeps upper-body poses continuous
+// at both ends of a segment fade, is a pure function of media time (seek equals playback),
+// and leaves the default blend untouched.
+TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+
+    const auto makeSchedule = [&](bool inertial) {
+        motion::DanceSchedule schedule;
+        schedule.setInertialTransitions(inertial);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const auto poseAt = [&](const motion::DanceSchedule& schedule, double t) {
+        return schedule.sample(t, clock, timeline, off).pose;
+    };
+
+    const motion::DanceSchedule inertial = makeSchedule(true);
+    const motion::DanceSchedule blend = makeSchedule(false);
+
+    // Start of the fade: the outgoing pose is held exactly, as in the blend.
+    const motion::ClipPose outgoingAtStart = poseAt(inertial, t0 - 1.0e-4);
+    const motion::ClipPose atStart = poseAt(inertial, t0);
+    CHECK_NEAR(poseDistance(outgoingAtStart, atStart), 0.0, 1e-2);
+
+    // Fade end: the inertial pose must hand over to the incoming clip without a step.
+    const double edge = 1.0e-4;
+    const motion::ClipPose beforeEnd = poseAt(inertial, t0 + fade - edge);
+    const motion::ClipPose afterEnd = poseAt(inertial, t0 + fade + edge);
+    CHECK_NEAR(poseDistance(beforeEnd, afterEnd), 0.0, 1e-2);
+
+    // Seek equals playback: a schedule sampled only at one time gives the same pose.
+    const motion::DanceSchedule fresh = makeSchedule(true);
+    CHECK_NEAR(poseDistance(poseAt(inertial, t0 + 0.3), poseAt(fresh, t0 + 0.3)), 0.0, 1e-6);
+
+    // Default off: the blend path is what existed before the flag.
+    CHECK(!motion::DanceSchedule{}.inertialTransitions());
+    CHECK(!blend.inertialTransitions());
+    CHECK(inertial.inertialTransitions());
+}
