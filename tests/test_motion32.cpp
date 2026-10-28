@@ -271,6 +271,45 @@ TEST_CASE(motion32.composition_never_moves_a_planted_foot) {
     CHECK_NEAR(composed.pose.foot[0].position.y, 0.0, 1e-6);
 }
 
+TEST_CASE(motion32.foot_overlay_fades_with_contact_instead_of_popping) {
+    // The foot lift follows the foot's contact continuously (BG Motion 3.3, A6). A hard
+    // planted/swing threshold switched the full lift on in one step.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    double previous = 0.0;
+    double worstStep = 0.0;
+    double liftAtSwing = 0.0;
+    for (int i = 0; i <= 100; ++i) {
+        const float contact = static_cast<float>(i) / 100.0f;
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = contact >= 0.5f ? motion::FootPhase::Stance : motion::FootPhase::Swing;
+        base.foot[0].contact = contact;
+        base.foot[0].position = {0.0f, 0.0f, 0.0f};
+        base.foot[1].phase = motion::FootPhase::Stance;
+        base.foot[1].contact = 1.0f;
+        base.foot[1].position = {0.0f, 0.0f, 0.0f};
+        const motion::ComposedPose composed =
+            motion::composeMotion(base, cues, 0.25, 4.0, true);
+        const double y = composed.pose.foot[0].position.y;
+        CHECK(std::isfinite(y));
+        if (i == 0) {
+            liftAtSwing = y;
+        } else {
+            worstStep = std::max(worstStep, std::abs(y - previous));
+        }
+        previous = y;
+    }
+    CHECK(std::abs(liftAtSwing) > 1e-3);   // a swinging foot is lifted
+    CHECK(worstStep < 0.005);              // no step over a 0.01 change of contact
+    CHECK_NEAR(previous, 0.0, 1e-6);       // a planted foot is never lifted
+}
+
 TEST_CASE(motion32.arm_and_hand_layers_compose_without_conflict) {
     motion::ClipPose base = motion::neutralClipPose();
     base.foot[0].phase = motion::FootPhase::Stance;
