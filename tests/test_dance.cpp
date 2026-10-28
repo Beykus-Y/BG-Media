@@ -1762,6 +1762,32 @@ TEST_CASE(dance.full_pipeline_is_seamless_across_loops) {
     CHECK(seam <= 1.5 * interior + 0.5);
 }
 
+TEST_CASE(dance.overlays_are_active_across_the_seams) {
+    // The seam checks above are only meaningful if overlays play through the seams: the cue sets
+    // change there, and their tails carry over. Frames around both seams must show overlays.
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setOverlayMode(motion::OverlayMode::Full);
+    const motion::HumanoidClip& groove = *player.library().find("groove");
+    player.setGrid(motion::BeatClock::constant(groove.bpm, 0.0), 0.0);
+    player.select(motion::DanceStyle::Groove, 0.0, true);
+
+    const double beatSeconds = 60.0 / groove.bpm;
+    int nearSeam = 0;
+    int frames = 0;
+    for (int i = 0; i <= static_cast<int>(33.0 * beatSeconds * 120.0); ++i) {
+        const double t = i / 120.0;
+        const motion::DanceFrame frame = player.update(t);
+        const double beat = t / beatSeconds;
+        if ((beat >= 15.0 && beat < 17.0) || (beat >= 31.0 && beat < 33.0)) {
+            ++frames;
+            if (frame.overlayActive > 0) ++nearSeam;
+        }
+    }
+    CHECK(frames > 0);
+    CHECK(nearSeam > frames / 2);
+}
+
 TEST_CASE(dance.loop_cues_carry_tails_and_start_at_full_weight) {
     // The per-loop composition: a cue on the downbeat ramps in from zero and reaches its full
     // weight, a tail that spills past the seam finishes in the next loop, and a cue that ends
@@ -1789,6 +1815,8 @@ TEST_CASE(dance.loop_cues_carry_tails_and_start_at_full_weight) {
     // Downbeat: the envelope starts at zero, so the pose is the base on the downbeat, and at the
     // peak it is exactly the single composition of the cue at full weight.
     CHECK(maxComponentDiff(motion::composeLoopCues(base, downbeatSet, {}, 0.0, beats).pose, base) < 1e-9);
+    // The fade-in before beat 0 is loop 0 with no cue started yet: the pose is the base, exactly.
+    CHECK(maxComponentDiff(motion::composeLoopCues(base, downbeatSet, {}, -0.25, beats).pose, base) == 0.0);
     const motion::ComposedPose peak = motion::composeLoopCues(base, downbeatSet, {}, 0.5, beats);
     const motion::ComposedPose alone = motion::composeMotion(base, downbeatSet, 0.5, beats, false);
     CHECK(maxComponentDiff(peak.pose, alone.pose) == 0.0);
