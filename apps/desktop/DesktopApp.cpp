@@ -1334,9 +1334,10 @@ struct DesktopApp::Impl {
         return track ? currentPosition() : danceLabTime;
     }
     // Dance time for the character's pose on this frame: the media clock plus the
-    // render latency lead. Scheduling and the transport keep using danceTime().
+    // render latency lead. Scheduling and the transport keep using danceTime(). A capture
+    // (still or offline render) shows the exact media time, so it takes no lead.
     [[nodiscard]] double danceVisualTime() const {
-        return track ? danceTime() + kDanceVisualLeadSeconds : danceTime();
+        return track && !captureMode ? danceTime() + kDanceVisualLeadSeconds : danceTime();
     }
 
     // Whether the dance transport is moving. Scrubbing and capture drive the dance
