@@ -246,6 +246,10 @@ public:
                                            bool* limited = nullptr);
 
 private:
+    // BG Motion 3.3 (A5). Re-anchors the schedule after the grid changed from `before` to
+    // clock_/timeline_ at `now`: active segments keep their blend and their clip beat at
+    // `now`, pending segments keep their musical alignment beat. Used by rebase().
+    void reanchorSchedule(double now, const BeatClock& before);
     [[nodiscard]] double fadeFor(double atTime) const;
     [[nodiscard]] const HumanoidClip* clipFor(DanceStyle style) const;
     [[nodiscard]] double entryTimeFor(const HumanoidClip& clip, double now,

@@ -960,3 +960,32 @@ TEST_CASE(dance.plan_and_grid_changes_fade_from_the_current_pose) {
     const motion::DanceFrame next = player.update(9.02);
     CHECK(worstBoneAngle(after.pose, next.pose) < 15.0);   // only natural motion in 20 ms
 }
+
+TEST_CASE(dance.rebase_keeps_crossfade_and_pending_one_shot_return) {
+    // A grid change in the middle of a crossfade must keep the fade running from the same
+    // pose, not collapse it to the incoming clip. A one-shot's return to idle is queued
+    // after the clip, so a grid change must not drop it.
+    motion::DanceDirector director(&library());
+    director.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    director.select(motion::DanceStyle::Groove, 0.0, false, true);
+    director.select(motion::DanceStyle::HipHop, 2.0);
+    double mid = 2.0;
+    for (double t = 2.0; t < 4.0; t += 1.0 / 240.0) {
+        if (director.sample(t).transitionProgress >= 0.5f) {
+            mid = t;
+            break;
+        }
+    }
+    const motion::DanceFrame before = director.sample(mid);
+    CHECK(before.transitionProgress > 0.0f && before.transitionProgress < 1.0f);
+    director.rebase(mid, motion::BeatClock::constant(140.0, 0.0));
+    const motion::DanceFrame after = director.sample(mid);
+    CHECK(after.transitionProgress > 0.0f && after.transitionProgress < 1.0f);
+    CHECK(worstBoneAngle(before.pose, after.pose) < 1e-3);
+
+    motion::DanceDirector oneShot(&library());
+    oneShot.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    oneShot.select(motion::DanceStyle::Energetic, 0.0, true, true);
+    oneShot.rebase(1.0, motion::BeatClock::constant(120.0, 0.0));
+    CHECK(oneShot.sample(60.0).style == motion::DanceStyle::Idle);
+}

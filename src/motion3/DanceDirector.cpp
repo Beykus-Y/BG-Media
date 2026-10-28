@@ -903,26 +903,9 @@ void DanceDirector::rebase(double now, BeatClock newClock) {
         setBeatClock(std::move(newClock));
         return;
     }
-    const auto& segments = schedule_.segments();
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < segments.size(); ++i) {
-        if (segments[i].startTime <= now) {
-            k = i;
-        }
-    }
-    ScheduleSegment segment = segments[k];
-    segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
+    const BeatClock before = clock_;
     setBeatClock(std::move(newClock));
-    segment.alignTime = now;
-    segment.startTime = now - 1.0e6;
-    segment.fadeSeconds = 0.0;
-    if (segment.clip->tempoSync) {
-        segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
-    }
-    segment.meter = timeline_.beatsPerBar();
-    segment.barPhaseTrusted = timeline_.downbeatTrusted();
-    schedule_.clear();
-    schedule_.append(segment);
+    reanchorSchedule(now, before);
 }
 
 void DanceDirector::rebase(double now, MusicalTimeline newTimeline) {
@@ -930,28 +913,61 @@ void DanceDirector::rebase(double now, MusicalTimeline newTimeline) {
         setMusicalTimeline(std::move(newTimeline));
         return;
     }
-    const auto& segments = schedule_.segments();
-    std::size_t k = 0;
-    for (std::size_t i = 0; i < segments.size(); ++i) {
-        if (segments[i].startTime <= now) {
-            k = i;
+    const BeatClock before = clock_;
+    setMusicalTimeline(std::move(newTimeline));
+    reanchorSchedule(now, before);
+}
+
+void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
+    // Segments are kept, not collapsed: the schedule holds the outgoing and incoming
+    // clips of a crossfade in progress and any queued one-shot return.
+    const std::vector<ScheduleSegment> old = schedule_.segments();
+    std::size_t first = old.size();
+    for (std::size_t i = 0; i < old.size(); ++i) {
+        if (old[i].startTime + old[i].fadeSeconds > now) {
+            first = i;
+            break;
         }
     }
-    ScheduleSegment segment = segments[k];
-    segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, clock_);
-    const double previousBeat = segment.entryClipBeat;
-    setMusicalTimeline(std::move(newTimeline));
-    segment.alignTime = now;
-    segment.startTime = now - 1.0e6;
-    segment.fadeSeconds = 0.0;
-    if (segment.clip->tempoSync) {
-        segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
+    // The segment before `first` is the base at `now`, or the outgoing side of the fade in
+    // progress. Segments before it have finished blending and no longer affect the pose.
+    const std::size_t keepFrom = first == 0 ? 0 : first - 1;
+    std::vector<ScheduleSegment> kept;
+    for (std::size_t i = keepFrom; i < old.size(); ++i) {
+        ScheduleSegment segment = old[i];
+        if (!segment.clip) {
+            continue;
+        }
+        if (segment.startTime <= now) {
+            // Active or blending: the clip beat at `now` is preserved, and the mapping
+            // restarts from `now` on the new grid. startTime and fadeSeconds are kept, so an
+            // in-progress crossfade keeps its progress.
+            segment.entryClipBeat = DanceSchedule::segmentClipBeat(segment, now, before);
+            segment.alignTime = now;
+            if (segment.clip->tempoSync) {
+                segment.rate = chooseRate(*segment.clip, clock_.bpmAt(now));
+            }
+            segment.meter = timeline_.beatsPerBar();
+            segment.barPhaseTrusted = timeline_.downbeatTrusted();
+        } else {
+            // Pending: keep the musical beat it was aligned to, placed on the new grid.
+            const double alignTime = clock_.timeAtBeat(before.beatAt(segment.alignTime));
+            const double fade = segment.fadeSeconds;
+            const bool loop = segment.loop;
+            const std::string reason = segment.reason;
+            const double alignmentError = segment.alignmentErrorSeconds;
+            segment = makeSegment(*segment.clip, std::max(now, alignTime - fade * 0.5),
+                                  alignTime, fade);
+            segment.loop = loop;
+            segment.reason = reason;
+            segment.alignmentErrorSeconds = alignmentError;
+        }
+        kept.push_back(std::move(segment));
     }
-    segment.entryClipBeat = previousBeat;
-    segment.meter = timeline_.beatsPerBar();
-    segment.barPhaseTrusted = timeline_.downbeatTrusted();
     schedule_.clear();
-    schedule_.append(segment);
+    for (auto& segment : kept) {
+        schedule_.append(std::move(segment));
+    }
 }
 
 void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool immediate) {
