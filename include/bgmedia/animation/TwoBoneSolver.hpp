@@ -44,6 +44,9 @@ struct TwoBoneLimits {
     float flexMax = 3.14159265f;
     // false: the window is measured and reported (flexBound) but not applied.
     bool flexEnforced = true;
+    // How far an enforced window narrows the hard range, 0..1 (the arm collision
+    // re-solve fades it in with collision depth, like the soft band).
+    float flexWeight = 1.0f;
     // Squared length of the pole's projection (perpendicular to the reach line) below
     // which the pole is treated as absent and the fallback axes are used. Legs use 1e-8;
     // the arm collision re-solve uses 1e-10, its BG Motion 3.2 threshold.

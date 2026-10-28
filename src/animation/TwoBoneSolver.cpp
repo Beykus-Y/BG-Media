@@ -131,8 +131,9 @@ TwoBoneSolution solveTwoBone(math::Vec3 root, math::Vec3 target, math::Vec3 pole
             out.flexBound = (distance < windowLo && windowLo > minReach) ||
                             (distance > windowHi && windowHi < maxReach);
             if (limits.flexEnforced) {
-                lo = windowLo;
-                hi = windowHi;
+                const float w = std::clamp(limits.flexWeight, 0.0f, 1.0f);
+                lo = minReach + (windowLo - minReach) * w;
+                hi = maxReach + (windowHi - maxReach) * w;
             }
         }
     }

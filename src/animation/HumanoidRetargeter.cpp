@@ -870,9 +870,11 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
             const float depthT = std::clamp(-armRaw / (0.01f * height), 0.0f, 1.0f);
             const float fade = depthT * depthT * (3.0f - 2.0f * depthT);
             armLimits.softReach *= fade;
-            // The stable bend fades in the same way: the authored arm (FK) uses the pole
-            // rule, so a full blend on the first collision solve snaps the elbow.
+            // The stable bend and the elbow flexion window fade in the same way: the
+            // authored arm (FK) has neither, so applying them in full on the first
+            // collision solve would snap the elbow.
             armLimits.stableBendWeight = fade;
+            armLimits.flexWeight = fade;
         }
 
         // A few bounded iterations: moving the elbow changes the forearm sample.
