@@ -78,7 +78,10 @@ reach line, in model space. A straight bind falls back to `forward` for knees an
 (0 = straight), in radians. The law of cosines converts them to a window on the
 reach distance: `d(f) = sqrt(l1^2 + l2^2 + 2 l1 l2 cos f)`. So the limit depends
 only on the bone lengths, not on the rig's axes. The window is combined with the
-hard reach, and the soft band (if any) is applied inside it.
+hard reach, and the soft band (if any) is applied inside it. A window that lies
+outside the hard reach (for example an almost-straight `flexMax` that would need
+more than `L1 + L2 - 2 mm`) saturates at the nearest hard limit instead of being
+dropped. A misordered window (`flexMin > flexMax`) is ignored.
 
 Where the limit is applied:
 

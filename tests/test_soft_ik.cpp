@@ -298,6 +298,25 @@ TEST_CASE(soft_ik.flexion_window_bounds_a_folded_chain) {
     CHECK_NEAR(reported.solvedDistance, 0.05f, 1e-6);
 }
 
+TEST_CASE(soft_ik.flexion_window_outside_hard_reach_saturates) {
+    // An almost-straight flexMax asks for more length than the 2 mm hard margin
+    // allows; the window saturates at max reach instead of switching off.
+    const TwoBoneChain chain = chainOf(0.3f, 0.3f);
+    TwoBoneLimits limits;
+    limits.flexWindow = true;
+    limits.flexMin = 0.0f;
+    limits.flexMax = 0.1f;
+    const Vec3 root{};
+    const Vec3 pole{0.0f, 0.0f, 1.0f};
+    const Vec3 target{0.0f, -0.3f, 0.0f};
+
+    const TwoBoneSolution held = animation::solveTwoBone(root, target, pole, chain, limits);
+    CHECK(held.flexBound);
+    CHECK_NEAR(held.solvedDistance, 0.598f, 1e-5);
+    CHECK(flexionOf(held, root) < 0.2f);
+    checkBoneLengths(held, root, chain);
+}
+
 TEST_CASE(soft_ik.near_straight_knee_keeps_its_bend_side_across_a_sweep) {
     // The reach is almost the full chain and the pole swings through the reach line
     // (the pole is parallel to the target direction at theta = pi / 2). The bend side must

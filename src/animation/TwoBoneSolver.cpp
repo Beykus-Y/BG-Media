@@ -116,9 +116,13 @@ TwoBoneSolution solveTwoBone(math::Vec3 root, math::Vec3 target, math::Vec3 pole
     float lo = minReach;
     float hi = maxReach;
     if (limits.flexWindow) {
-        const float windowLo = std::max(minReach, distanceAtFlexion(l1, l2, limits.flexMax));
-        const float windowHi = std::min(maxReach, distanceAtFlexion(l1, l2, limits.flexMin));
-        if (windowLo <= windowHi) {
+        // Clamp into the hard range rather than dropping a window that misses it:
+        // an almost-straight flexMax saturates at maxReach, a deep flexMin at minReach.
+        const float windowLo =
+            std::clamp(distanceAtFlexion(l1, l2, limits.flexMax), minReach, maxReach);
+        const float windowHi =
+            std::clamp(distanceAtFlexion(l1, l2, limits.flexMin), minReach, maxReach);
+        if (limits.flexMin <= limits.flexMax) {
             out.flexBound = (distance < windowLo && windowLo > minReach) ||
                             (distance > windowHi && windowHi < maxReach);
             if (limits.flexEnforced) {
