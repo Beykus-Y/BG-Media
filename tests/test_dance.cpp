@@ -3,6 +3,7 @@
 #include "motion_metrics.hpp"
 
 #include "bgmedia/analysis/Analyzer.hpp"
+#include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "support/SyntheticSignals.hpp"
 
@@ -2179,4 +2180,54 @@ TEST_CASE(dance.musical_gestures_are_deterministic_per_seed) {
         differs = a[i].mediaTime != c[i].mediaTime || a[i].kind != c[i].kind;
     }
     CHECK(differs);
+}
+
+TEST_CASE(dance.head_world_yaw_is_stabilised_during_the_spin) {
+    // Energetic turns the whole body by its root yaw (about 180 deg in one bit). Calm
+    // (energy 0.2), the head keeps about half of that turn in world space. At the dance's
+    // own energy (0.6) there is no stabilisation, so the head goes round with the body.
+    const motion::HumanoidClip& energetic = *library().forStyle(motion::DanceStyle::Energetic);
+    constexpr double kPi = 3.14159265358979323846;
+    const auto headYawRange = [&](float energy) {
+        const int steps = 480;
+        double previous = 0.0;
+        double unwrapped = 0.0;
+        double lo = 0.0;
+        double hi = 0.0;
+        for (int i = 0; i <= steps; ++i) {
+            const double beat = energetic.beats * static_cast<double>(i) / steps;
+            motion::ClipPose pose = motion::sampleClip(energetic, beat);
+            motion::applyAlive(pose, 0.1 * i, energy, 7u, 1.0f);
+            const math::Quat chain =
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Hips)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Spine)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Chest)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::UpperChest)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Neck)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Head)];
+            const math::Quat root =
+                math::fromAxisAngle({0.0f, 1.0f, 0.0f},
+                                    static_cast<float>(2.0 * kPi * pose.rootYaw));
+            const math::Vec3 forward = math::rotate(root * chain, {0.0f, 0.0f, 1.0f});
+            const double yaw =
+                std::atan2(static_cast<double>(forward.x), static_cast<double>(forward.z)) *
+                180.0 / kPi;
+            if (i == 0) {
+                unwrapped = yaw;
+            } else {
+                double step = yaw - previous;
+                step -= 360.0 * std::round(step / 360.0);  // shortest way round
+                unwrapped += step;
+            }
+            previous = yaw;
+            lo = std::min(lo, unwrapped);
+            hi = std::max(hi, unwrapped);
+        }
+        return hi - lo;
+    };
+    const double rangeCalm = headYawRange(0.2f);
+    const double rangeDancing = headYawRange(0.6f);
+    CHECK(rangeDancing > 150.0);      // the spin really turns the head with the body
+    CHECK(rangeCalm < 0.7 * rangeDancing);
+    CHECK(rangeCalm > 0.3 * rangeDancing);  // half is kept, not zero: it still reads as a turn
 }

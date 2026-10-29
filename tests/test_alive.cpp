@@ -375,8 +375,8 @@ TEST_CASE(alive.head_weight_zero_stops_the_look_but_keeps_breathing) {
 
 TEST_CASE(alive.body_weight_scales_the_breathing_linearly) {
     // Breathing and weight shift are linear in their amplitude, so half the body
-    // weight is exactly half the chest tilt, shoulder lift and hip sway. The head is
-    // untouched by the body weight.
+    // weight is exactly half the chest tilt, shoulder lift and hip sway. The head look is
+    // untouched by the body weight; the head's own stabilisation follows the torso.
     const ClipPose base = motion::neutralClipPose();
     for (double t = 0.0; t < 30.0; t += 0.05) {
         ClipPose full = base;
@@ -391,7 +391,28 @@ TEST_CASE(alive.body_weight_scales_the_breathing_linearly) {
                    1.0e-6);
         CHECK_NEAR(static_cast<double>(half.hips.x), 0.5 * static_cast<double>(full.hips.x),
                    1.0e-6);
-        CHECK(quatIdentical(half.bone[idx(HumanoidBone::Head)], full.bone[idx(HumanoidBone::Head)]));
+        // Changed with the stabilisation (WP-K): the head keeps half of the torso's world
+        // pitch, so the body weight reaches it only through that half of the breathing.
+        const auto torsoPitch = [](const ClipPose& p) {
+            const math::Quat torso = p.bone[idx(HumanoidBone::Hips)] *
+                                     p.bone[idx(HumanoidBone::Spine)] *
+                                     p.bone[idx(HumanoidBone::Chest)] *
+                                     p.bone[idx(HumanoidBone::UpperChest)];
+            const math::Vec3 f = math::rotate(torso, {0.0f, 0.0f, 1.0f});
+            return std::asin(std::clamp(-static_cast<double>(f.y), -1.0, 1.0)) * kRadToDeg;
+        };
+        const auto headPitch = [](const ClipPose& p) {
+            const math::Quat head = p.bone[idx(HumanoidBone::Hips)] *
+                                    p.bone[idx(HumanoidBone::Spine)] *
+                                    p.bone[idx(HumanoidBone::Chest)] *
+                                    p.bone[idx(HumanoidBone::UpperChest)] *
+                                    p.bone[idx(HumanoidBone::Neck)] *
+                                    p.bone[idx(HumanoidBone::Head)];
+            const math::Vec3 f = math::rotate(head, {0.0f, 0.0f, 1.0f});
+            return std::asin(std::clamp(-static_cast<double>(f.y), -1.0, 1.0)) * kRadToDeg;
+        };
+        CHECK_NEAR(headPitch(half) - headPitch(full),
+                   0.5 * (torsoPitch(half) - torsoPitch(full)), 0.02);
     }
 }
 
@@ -728,4 +749,210 @@ TEST_CASE(alive.blend_to_idle_anchor_keeps_the_idle_stance_fixed_on_resume) {
     // Without the anchor the Idle end would follow the moving root.
     const ClipPose c = motion::blendToIdleKeepingFeet(resumed, idle, 0.75f, 0);
     CHECK(footDistanceXZ(c.foot[0].position, anchored[0].position) > 0.05f);
+}
+
+// --- saccades, head stabilisation and the inertial pause (BG Motion 3.5, WP-K) ---
+
+namespace {
+
+// Head orientation in the body frame: the torso chain, the neck and the head.
+math::Quat bodyHead(const ClipPose& pose) {
+    return pose.bone[idx(HumanoidBone::Hips)] * pose.bone[idx(HumanoidBone::Spine)] *
+           pose.bone[idx(HumanoidBone::Chest)] * pose.bone[idx(HumanoidBone::UpperChest)] *
+           pose.bone[idx(HumanoidBone::Neck)] * pose.bone[idx(HumanoidBone::Head)];
+}
+
+// Yaw about +Y and pitch about +X (degrees) of a rotation, from its forward axis.
+void yawPitchDeg(const math::Quat& q, double& yaw, double& pitch) {
+    const math::Vec3 f = math::rotate(q, {0.0f, 0.0f, 1.0f});
+    yaw = std::atan2(static_cast<double>(f.x), static_cast<double>(f.z)) * kRadToDeg;
+    pitch = std::asin(std::clamp(-static_cast<double>(f.y), -1.0, 1.0)) * kRadToDeg;
+}
+
+// Angular speed (deg/s) of the body-frame head, sampled every dt seconds for a neutral
+// body in idle (energy 0).
+std::vector<double> idleHeadSpeeds(std::uint32_t seed, double dt, std::size_t steps) {
+    const ClipPose base = motion::neutralClipPose();
+    ClipPose first = base;
+    motion::applyAlive(first, 0.0, 0.0f, seed, 1.0f);
+    math::Quat previous = bodyHead(first);
+    std::vector<double> speeds;
+    speeds.reserve(steps);
+    for (std::size_t k = 1; k <= steps; ++k) {
+        ClipPose pose = base;
+        motion::applyAlive(pose, static_cast<double>(k) * dt, 0.0f, seed, 1.0f);
+        const math::Quat current = bodyHead(pose);
+        speeds.push_back(angleDeg(previous.conjugate() * current) / dt);
+        previous = current;
+    }
+    return speeds;
+}
+
+} // namespace
+
+TEST_CASE(alive.idle_head_speed_stays_low_with_saccades_between_fixations) {
+    // 5 minutes at 120 Hz per seed. A turn is a run of samples above 3 deg/s.
+    const double dt = 1.0 / 120.0;
+    const std::size_t steps = 36000;
+    for (const std::uint32_t seed : kSeeds) {
+        const std::vector<double> speeds = idleHeadSpeeds(seed, dt, steps);
+        std::size_t calm = 0;
+        double peak = 0.0;
+        std::size_t turnLength = 0;
+        std::size_t longestTurn = 0;
+        std::size_t fixationLength = 0;
+        std::size_t shortestFixation = steps;
+        bool sawTurn = false;
+        for (const double speed : speeds) {
+            calm += speed <= 2.0 ? 1 : 0;
+            peak = std::max(peak, speed);
+            if (speed > 3.0) {
+                if (turnLength == 0 && sawTurn) {
+                    shortestFixation = std::min(shortestFixation, fixationLength);
+                }
+                ++turnLength;
+                longestTurn = std::max(longestTurn, turnLength);
+                fixationLength = 0;
+                sawTurn = true;
+            } else {
+                turnLength = 0;
+                ++fixationLength;
+            }
+        }
+        CHECK(static_cast<double>(calm) >= 0.70 * static_cast<double>(steps));
+        CHECK(peak <= 120.0);
+        // Turns take 0.12..0.20 s; fixations last 1.5 s or more (the sampling adds a step).
+        CHECK(static_cast<double>(longestTurn) * dt <= 0.25);
+        CHECK(static_cast<double>(shortestFixation) * dt >= 1.5);
+        CHECK(sawTurn);
+    }
+}
+
+TEST_CASE(alive.head_keeps_half_of_the_torso_turn_when_calm) {
+    // Breathing is off, so the torso is exactly the input, and the look is the same in
+    // both calls of a pair. Calm: the head's world yaw and pitch take half of the torso's
+    // change. Dancing (energy 0.6): no stabilisation, so the head goes with the torso.
+    ClipPose turned = motion::neutralClipPose();
+    turned.bone[idx(HumanoidBone::Chest)] =
+        math::fromAxisAngle({0.0f, 1.0f, 0.0f}, static_cast<float>(30.0 / kRadToDeg));
+    ClipPose tilted = motion::neutralClipPose();
+    tilted.bone[idx(HumanoidBone::Chest)] =
+        math::fromAxisAngle({1.0f, 0.0f, 0.0f}, static_cast<float>(20.0 / kRadToDeg));
+    const ClipPose still = motion::neutralClipPose();
+    for (const std::uint32_t seed : kSeeds) {
+        for (double t = 0.0; t < 20.0; t += 0.37) {
+            ClipPose a = still;
+            ClipPose b = turned;
+            ClipPose c = tilted;
+            motion::applyAlive(a, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            motion::applyAlive(b, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            motion::applyAlive(c, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            double yawA = 0.0;
+            double pitchA = 0.0;
+            double yawB = 0.0;
+            double pitchB = 0.0;
+            double yawC = 0.0;
+            double pitchC = 0.0;
+            yawPitchDeg(bodyHead(a), yawA, pitchA);
+            yawPitchDeg(bodyHead(b), yawB, pitchB);
+            yawPitchDeg(bodyHead(c), yawC, pitchC);
+            CHECK_NEAR(yawB - yawA, 15.0, 0.5);
+            CHECK_NEAR(pitchC - pitchA, 10.0, 0.5);
+
+            ClipPose dancingA = still;
+            ClipPose dancingB = turned;
+            motion::applyAlive(dancingA, t, 0.6f, seed, 1.0f, 0.0f, 1.0f);
+            motion::applyAlive(dancingB, t, 0.6f, seed, 1.0f, 0.0f, 1.0f);
+            double yawDA = 0.0;
+            double pitchDA = 0.0;
+            double yawDB = 0.0;
+            double pitchDB = 0.0;
+            yawPitchDeg(bodyHead(dancingA), yawDA, pitchDA);
+            yawPitchDeg(bodyHead(dancingB), yawDB, pitchDB);
+            CHECK_NEAR(yawDB - yawDA, 30.0, 0.5);
+        }
+    }
+}
+
+TEST_CASE(alive.coast_time_decays_from_full_speed_to_a_stop) {
+    const double stop = 12.5;
+    const double tau = motion::kCoastTauSeconds;
+    CHECK_NEAR(motion::coastTime(stop, 0.0), stop, 1.0e-12);
+    CHECK_NEAR(motion::coastTime(stop, -1.0), stop, 1.0e-12);
+    CHECK_NEAR(motion::coastTime(stop, std::numeric_limits<double>::quiet_NaN()), stop,
+               1.0e-12);
+    // Full speed at the stop: v0 = 1 media second per second.
+    CHECK_NEAR((motion::coastTime(stop, 1.0e-6) - stop) / 1.0e-6, 1.0, 1.0e-4);
+    // Speed falls as exp(-t / tau): at one tau it is 1 / e.
+    const double h = 1.0e-5;
+    const double speedAtTau =
+        (motion::coastTime(stop, tau + h) - motion::coastTime(stop, tau - h)) / (2.0 * h);
+    CHECK_NEAR(speedAtTau, std::exp(-1.0), 1.0e-4);
+    // The whole coast is v0 * tau, and it is monotone on the way.
+    CHECK_NEAR(motion::coastTime(stop, 10.0) - stop, tau, 1.0e-9);
+    double previous = stop;
+    for (double t = 0.0; t <= 1.0; t += 0.01) {
+        const double shown = motion::coastTime(stop, t);
+        CHECK(shown >= previous);
+        previous = shown;
+    }
+    // Resume: the lag left over decays, and the shown speed starts at the coast speed.
+    const double lag = motion::coastTime(stop, 0.2) - stop;
+    CHECK_NEAR(motion::coastLagAfterResume(lag, 0.0), lag, 1.0e-12);
+    CHECK_NEAR(1.0 - lag / tau, std::exp(-0.2 / tau), 1.0e-9);
+    CHECK_NEAR(motion::coastLagAfterResume(lag, 10.0), 0.0, 1.0e-9);
+}
+
+TEST_CASE(alive.pause_coasts_the_dance_without_a_velocity_jump) {
+    // Dance: the chest turns at a constant 90 deg/s. Idle: the neutral stance. Frames at
+    // 60 Hz; the transport stops at media 2.0 s. The dance is sampled at coastTime (or,
+    // for the old behaviour, frozen) and blended with the IdleCrossfade mix.
+    const double rate = 90.0 / kRadToDeg;
+    const double stopAt = 2.0;
+    const double dt = 1.0 / 60.0;
+    const auto dancePose = [&](double media) {
+        ClipPose pose = motion::neutralClipPose();
+        pose.bone[idx(HumanoidBone::Chest)] =
+            math::fromAxisAngle({0.0f, 1.0f, 0.0f}, static_cast<float>(rate * media));
+        return pose;
+    };
+    // Angular speed (deg/s) of the chest between consecutive frames, from frame 1 on.
+    const auto chestSpeeds = [&](bool coast) {
+        motion::IdleCrossfade fade;
+        std::vector<double> speeds;
+        math::Quat previous = motion::neutralClipPose().bone[idx(HumanoidBone::Chest)];
+        for (int k = 1; k <= 150; ++k) {
+            const double wall = static_cast<double>(k) * dt;
+            const bool running = wall < stopAt;
+            fade.update(running, wall);
+            double media = wall;
+            if (!running) {
+                media = coast ? motion::coastTime(stopAt, wall - stopAt) : stopAt;
+            }
+            const ClipPose pose = motion::blendToIdleKeepingFeet(
+                dancePose(media), motion::neutralClipPose(), fade.mix(wall));
+            const math::Quat current = pose.bone[idx(HumanoidBone::Chest)];
+            speeds.push_back(angleDeg(previous.conjugate() * current) / dt);
+            previous = current;
+        }
+        return speeds;
+    };
+    // speeds[j] is the step ending at frame j + 1. Frame 120 (2.0 s) is the first stopped one:
+    // speeds[118] is a running step, speeds[119] still runs up to the stop, and speeds[120]
+    // is the first step after it.
+    const std::vector<double> coasting = chestSpeeds(true);
+    const std::vector<double> frozen = chestSpeeds(false);
+    CHECK_NEAR(coasting[118], 90.0, 0.01);
+    const double before = coasting[118];
+    CHECK(std::abs(coasting[120] - before) < 0.10 * before);
+    // The old freeze stops dead in the first step after the stop: the same check fails.
+    CHECK(std::abs(frozen[120] - before) > 0.9 * before);
+    // Deceleration is the exponential itself: each frame keeps exp(-dt / tau) of the last
+    // step (about 0.90 at 60 Hz). The ease into Idle starts at 2.25 s, after these steps.
+    const double perFrame = std::exp(-dt / motion::kCoastTauSeconds);
+    for (std::size_t j = 121; j < 134; ++j) {
+        CHECK_NEAR(coasting[j] / coasting[j - 1], perFrame, 0.005);
+    }
+    // The coast has settled: between 1 s and 1.5 s after the stop media time moves < 1 ms.
+    CHECK(motion::coastTime(stopAt, 1.5) - motion::coastTime(stopAt, 1.0) < 1.0e-3);
 }

@@ -27,8 +27,13 @@ namespace bgmedia::motion {
 //   bodyWeight 0..1 extra scale on breathing and the weight shift (chest,
 //             shoulders, hips). The host lowers it as the Idle clip takes over,
 //             because Idle already breathes and shifts its weight.
-//   headWeight 0..1 extra scale on the head and neck look-around.
+//   headWeight 0..1 extra scale on the head and neck look-around and on the head
+//             stabilisation.
 // The two extra weights multiply `weight`; the defaults keep the full layer.
+// The head look-around is a saccade pattern: a turn of 0.12..0.20 s, then a fixation of
+// 1.55..3.63 s on a seed-dependent target. While calm (energy below 0.5) the head is
+// also counter-rotated against the torso's world yaw and pitch by 50 %, so it does not
+// spin with the body; the correction fades out between energy 0.35 and 0.5.
 // Offsets are composed like the other overlays: bone = delta * bone, with the
 // delta authored about the clip-frame axes (+X left, +Y up, +Z forward).
 void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t seed,
@@ -70,8 +75,9 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
                                                                const ClipPose& idle);
 
 // Wall-clock crossfade between the dance and the Idle clip, used when the
-// transport has stopped (paused, ended or stopped). It holds the dance for a
-// short grace period, then eases to Idle; on resume it eases back to the dance.
+// transport has stopped (paused, ended or stopped). It waits a short grace period,
+// then eases to Idle; on resume it eases back to the dance. During the grace the host
+// keeps the dance coasting (coastTime) instead of freezing it.
 // Pure state machine: the host calls update() once per frame and reads mix().
 class IdleCrossfade {
 public:
@@ -93,5 +99,22 @@ private:
     double start_ = 0.0;
     double duration_ = 0.0;
 };
+
+// Inertial pause. When the transport stops, the dance's media time does not freeze: it
+// keeps running at a speed that falls off as kCoastStartSpeed * exp(-t / kCoastTauSeconds),
+// while IdleCrossfade eases the pose into Idle. The coast is the only visual motion: the
+// real transport position never moves with it.
+inline constexpr double kCoastStartSpeed = 1.0;      // media seconds per second at the stop
+inline constexpr double kCoastTauSeconds = 0.15;     // speed time constant
+
+// Media time shown `sinceStop` seconds after a stop at `stoppedMediaTime`:
+// stop + v0 * tau * (1 - exp(-t / tau)). Equal to the stop at t = 0 and never more than
+// v0 * tau past it. A non-positive or NaN `sinceStop` returns the stop.
+[[nodiscard]] double coastTime(double stoppedMediaTime, double sinceStop);
+
+// On resume the coast's lead over the real position (coastTime - stop) decays as
+// lag * exp(-t / tau), so the shown speed comes back up from the coast speed to the
+// normal speed with no jump. Visual speed at t = 0 equals the coast speed exactly.
+[[nodiscard]] double coastLagAfterResume(double lagAtResume, double sinceResume);
 
 } // namespace bgmedia::motion
