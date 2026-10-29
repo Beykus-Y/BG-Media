@@ -39,6 +39,9 @@ struct ScheduleSegment {
     bool loop = true;
     std::string reason;            // why the planner chose this segment
     bool alignedToDownbeat = false;  // the entry landed on a trusted bar start
+    // Auto plan: the phrase starts after a jump of energy, so its first beat gets a hit accent
+    // (overlay planner, analysed tracks only).
+    bool phraseHit = false;
     bool barPhaseTrusted = true;   // the musical bar phase was trusted at entry
     int meter = 4;                 // musical meter used for the entry
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|

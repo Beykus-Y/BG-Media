@@ -81,6 +81,13 @@ MusicalOverlayContext musicalContextFor(const ScheduleSegment& segment, const Hu
             context.silences.emplace_back(static_cast<float>(begin), static_cast<float>(end));
         }
     }
+    // The first beat of a phrase that starts after an energy jump (the entry of its segment).
+    if (segment.phraseHit) {
+        const double start = segment.entryClipBeat - base;
+        if (start >= 0.0 && start < beats) {
+            context.phraseStarts.push_back(static_cast<float>(start));
+        }
+    }
     return context;
 }
 
@@ -294,6 +301,7 @@ const std::vector<PrimitiveCue>& DancePlayer::segmentOverlays(const ScheduleSegm
     key.alignTime = segment.alignTime;
     key.entryClipBeat = segment.entryClipBeat;
     key.rate = segment.rate;
+    key.phraseHit = segment.phraseHit;
     if (const auto it = overlays_.find(key); it != overlays_.end()) {
         return it->second;
     }
