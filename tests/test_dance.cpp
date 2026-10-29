@@ -454,6 +454,54 @@ TEST_CASE(dance.turns_pivot_on_a_planted_foot) {
     CHECK(h.maxRootYawDeg > 30.0);
 }
 
+// The weight sits over the support foot. In single support (exactly one foot in contact) the
+// horizontal distance from the hips to the support ankle is the weight offset. Its median must
+// stay within 4 cm and its 90th percentile within 7 cm on the three dances that step. Clips are
+// authored in height units of a 1.6 m character; the bind ankles are 7 cm either side of the hips.
+// Same measure and limits as tools/dancegen/check_weight.py.
+TEST_CASE(dance.weight_sits_over_the_support_in_single_support) {
+    constexpr double kRefCm = 160.0;
+    constexpr double kAnkleHalfCm = 7.0;
+    const motion::DanceStyle styles[] = {motion::DanceStyle::Groove, motion::DanceStyle::HipHop,
+                                         motion::DanceStyle::SideStep};
+    for (motion::DanceStyle style : styles) {
+        const motion::HumanoidClip& clip = *library().forStyle(style);
+        const std::size_t keys = static_cast<std::size_t>(clip.keyCount);
+        CHECK(clip.hips.size() == keys);
+        CHECK(clip.feet[0].position.size() == keys && clip.feet[1].position.size() == keys);
+        const auto inContact = [&](int foot, double beat) {
+            for (const motion::ContactSegment& seg : clip.contacts) {
+                if (seg.foot == foot && seg.start <= beat && beat <= seg.end) return true;
+            }
+            return false;
+        };
+        std::vector<double> offsets;
+        for (std::size_t i = 0; i + 1 < keys; ++i) {
+            const double beat = static_cast<double>(i) / clip.keysPerBeat;
+            const bool left = inContact(0, beat);
+            if (left == inContact(1, beat)) {
+                continue;  // double support, or no foot planted
+            }
+            const std::size_t f = left ? 0 : 1;
+            const auto& ankle = clip.feet[f].position[i];
+            const double ankleX = (left ? kAnkleHalfCm : -kAnkleHalfCm) + ankle.x * kRefCm;
+            const double ankleZ = ankle.z * kRefCm;
+            const double dx = clip.hips[i].x * kRefCm - ankleX;
+            const double dz = clip.hips[i].z * kRefCm - ankleZ;
+            offsets.push_back(std::sqrt(dx * dx + dz * dz));
+        }
+        CHECK(!offsets.empty());
+        if (offsets.empty()) {
+            continue;
+        }
+        std::sort(offsets.begin(), offsets.end());
+        const double median = offsets[(offsets.size() - 1) / 2];
+        const double p90 = offsets[static_cast<std::size_t>(std::ceil(0.9 * offsets.size())) - 1];
+        CHECK(median <= 4.0);  // cm
+        CHECK(p90 <= 7.0);     // cm
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Retargeting, portability, left / right
 // ---------------------------------------------------------------------------

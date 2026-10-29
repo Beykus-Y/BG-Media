@@ -243,7 +243,9 @@ def build_energetic():
     d.pose(15.0, root_yaw=0.0, tension=1.4)
     d.turn_about(12.0, 13.0, pivot_b)
     d.turn_about(14.0, 15.0, pivot_b)
-    d.auto_balance(0.0, 0.0)
+    # no pelvis follow in single support: the wide lunges are out of reach if it did (reach drop
+    # 31 cm) and the hips step breaks the transition continuity limit at 80 BPM
+    d.auto_balance(0.0, 0.0, over_support=False)
     d.auto_roll(8.0, 0.7)
 
     # pelvis: deep squat, lunges shift sideways, otherwise recover tall

@@ -119,6 +119,11 @@ def smootherstep(t):
     return t * t * t * (t * (t * 6 - 15) + 10)
 
 
+def _phi(x):
+    """Standard normal distribution function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 # ----------------------------------------------------------------------------
 # cyclic curve
 # ----------------------------------------------------------------------------
@@ -531,6 +536,17 @@ WRIST_MAX = 25.0        # soft clamp of the wrist flex, degrees
 WRIST_SMOOTH = 0.07     # beats: the wrist's inertia (low-pass of the drag)
 CURL_DRIFT = 0.035      # slow finger-curl drift, 3 cycles per loop
 CURL_RIPPLE = 0.10      # finger-curl ripple on each accent
+CURL_RIPPLE_ATTACK = 0.2  # beats the ripple takes to rise to full after an accent (no key step)
+CURL_RIPPLE_TAIL = 0.6    # beats after an accent at which the ripple has faded out completely
+BALANCE_FALL = 0.30     # beats: the weight shift away from a foot is centred this long before its lift-off
+BALANCE_RISE = 0.22     # beats: the weight shift onto a landing foot is centred this long after the landing
+COM_MIDDLE = 0.05       # weight (relative to a full foot) given to the middle of the feet in the centre of mass
+COMPRESS_DEPTH = 2.5    # cm: pelvis compression after each landing (the low end of -2..-4 cm)
+COMPRESS_DEEP = 4.0     # cm: after a lift above COMPRESS_LIFT_CM
+COMPRESS_LIFT_CM = 15.0
+COMPRESS_TROUGH = 0.075 # beats after the landing at which the pelvis is lowest
+COMPRESS_SIGMA_BEFORE = 0.20  # beats: width of the dip before its lowest point (the knees give)
+COMPRESS_SIGMA_AFTER = 0.30    # beats: width after it (the pelvis rises back slowly)
 FINE = 64               # samples per beat for the fine periodic helper tracks
 
 
@@ -704,7 +720,8 @@ class Dance:
         self.entry = [0.0]
         self.exit = [0.0]
         self.balance = (0.0, 0.0)
-        self.balance_sigma = 0.22
+        self.balance_sigma = 0.26  # beats: half-width of the weight shift (see _loads)
+        self.over_support = True
         self.roll = (0.0, 0.0)
         self.turns = []  # (t0, t1, (px, pz)): body yaw happens about a stage point
 
@@ -754,9 +771,13 @@ class Dance:
     def accent(self, beat, strength=1.0, kind="hit"):
         self.accents.append({"beat": beat, "strength": strength, "kind": kind})
 
-    def auto_balance(self, gain_x=0.85, gain_z=0.35, sigma=0.22):
+    def auto_balance(self, gain_x=0.85, gain_z=0.35, sigma=0.26, over_support=True):
+        """gain_x, gain_z: how far the pelvis follows the centre of mass in double support.
+        over_support: in single support the pelvis sits over the loaded foot (gain 1). A dance
+        whose lunges are wider than the legs reach keeps the balance gain in every phase."""
         self.balance = (gain_x, gain_z)
         self.balance_sigma = sigma
+        self.over_support = over_support
 
     def auto_roll(self, degrees=6.0, counter=0.8):
         """Pelvis roll follows the loaded leg (hip of the supporting leg rises);
@@ -821,24 +842,65 @@ class Dance:
 
     # --- baking ---
     def _loads(self, n):
-        """Per key load of each foot (0..1), derived from the swing phases."""
-        sig = self.balance_sigma
-        radius = int(sig * 3 * self.kpb) + 1
-        kernel = [math.exp(-0.5 * ((i / self.kpb) / sig) ** 2) for i in range(-radius, radius + 1)]
-        ks = sum(kernel)
-        kernel = [k / ks for k in kernel]
+        """Per key load of each foot (0..1), derived from the swing phases.
+
+        A foot carries load 1 on its stance and 0 in its swing. The window is asymmetric, so
+        the weight is on the standing foot when it matters:
+          * the weight leaves a foot BEFORE it lifts: the falling edge is centred BALANCE_FALL
+            beats before the lift-off (the window is shifted earlier, by -sigma), so the foot
+            has handed over most of its weight by lift-off;
+          * the landing foot takes its weight only AFTER it has touched down: the rising edge is
+            centred BALANCE_RISE beats after the landing.
+        Each edge is a Gaussian-CDF ramp of half-width balance_sigma. A planted foot never gives
+        up weight to a partner that is still in the air: its load is at least what the partner
+        does not carry, so in single support the planted foot carries all the weight. The gate is
+        the load itself, so the floor is continuous."""
+        half = self.balance_sigma  # beats: half-width of each edge of the weight shift
         cyc = n - 1
-        loads = {}
+        carried = {}
         for side, foot in self.feet.items():
-            swing = [1.0 if foot.at(i / self.kpb)[4] == "swing" else 0.0 for i in range(cyc)]
-            sm = []
+            swings = [(seg[1], seg[2]) for seg in foot.segs if seg[0] in ("arc", "orbit")]
+            out = []
             for i in range(cyc):
-                acc = 0.0
-                for j, k in enumerate(kernel):
-                    acc += k * swing[(i + j - radius) % cyc]
-                sm.append(acc)
-            loads[side] = [1.0 - v for v in sm]
+                t = i / self.kpb
+                c = 0.0
+                for t0, t1 in swings:
+                    for shift in (-self.beats, 0.0, self.beats):
+                        a = t0 - BALANCE_FALL + shift
+                        b = t1 + BALANCE_RISE + shift
+                        c += _phi((t - a) / half) - _phi((t - b) / half)
+                out.append(min(1.0, max(0.0, c)))  # 1 in the swing, 0 on the stance
+            carried[side] = out
+        loads = {"left": [], "right": []}
+        for i in range(cyc):
+            lo0 = 1.0 - carried["left"][i]
+            ro0 = 1.0 - carried["right"][i]
+            # the planted share of each foot is its own load; the floor applies to that share only
+            loads["left"].append(lo0 + lo0 * max(0.0, (1.0 - ro0) - lo0))
+            loads["right"].append(ro0 + ro0 * max(0.0, (1.0 - lo0) - ro0))
         return loads
+
+    def _landings(self):
+        """(landing beat, lift in cm) of every swing of either foot."""
+        out = []
+        for foot in self.feet.values():
+            for seg in foot.segs:
+                if seg[0] in ("arc", "orbit"):
+                    out.append((seg[2], seg[5]))
+        return out
+
+    def _compression(self, t, landings):
+        """Pelvis compression after each landing, cm (zero or below). A soft dip whose lowest
+        point is COMPRESS_TROUGH beats after the foot touches down, deeper after a high step.
+        It is a Gaussian in time, so the hips feel it as a settle, not a jerk."""
+        out = 0.0
+        for land, lift in landings:
+            depth = COMPRESS_DEEP if lift > COMPRESS_LIFT_CM else COMPRESS_DEPTH
+            for shift in (-self.beats, 0.0, self.beats):
+                d = t - land - shift
+                width = COMPRESS_SIGMA_BEFORE if d < COMPRESS_TROUGH else COMPRESS_SIGMA_AFTER
+                out -= depth * math.exp(-0.5 * ((d - COMPRESS_TROUGH) / width) ** 2)
+        return out
 
     def _controls(self, t):
         return {k: cur.at(t) for k, cur in self.curves.items()}
@@ -863,8 +925,12 @@ class Dance:
         v = base + CURL_DRIFT * math.sin(2.0 * math.pi * 3.0 * t / self.beats + (0.0 if side == "l" else 1.3))
         for a in self.accents:
             d = (t - a["beat"]) % self.beats
-            if d < 0.6:
-                v += CURL_RIPPLE * a["strength"] * math.exp(-d / 0.12)
+            if d < CURL_RIPPLE_TAIL:
+                # rises from zero with zero slope over CURL_RIPPLE_ATTACK, then decays; the
+                # tail fades to zero at CURL_RIPPLE_TAIL, so there is no step on any key
+                rise = smoothstep(d / CURL_RIPPLE_ATTACK)
+                fade = smoothstep((CURL_RIPPLE_TAIL - d) / (CURL_RIPPLE_TAIL - 0.3))
+                v += CURL_RIPPLE * a["strength"] * rise * fade * math.exp(-d / 0.12)
         return min(1.0, max(0.0, v))
 
     def bake(self):
@@ -872,6 +938,7 @@ class Dance:
             f.close()
         n = int(round(self.beats * self.kpb)) + 1
         loads = self._loads(n)
+        landings = self._landings()
         bone_tracks = {}
         hips_track, root_track, foot_tracks = [], [], {"left": [], "right": []}
         hand_tracks = {"left": [], "right": []}
@@ -938,15 +1005,26 @@ class Dance:
                 rootx = px + dx * math.cos(a) + dz * math.sin(a)
                 rootz = pz - dx * math.sin(a) + dz * math.cos(a)
             c["root_x"], c["root_z"] = rootx, rootz
-            if li + ri > 0.05:
-                com_x = (li * (FOOT_HALF_CM + fl[0]) + ri * (-FOOT_HALF_CM + fr[0])) / (li + ri)
-                com_z = (li * fl[2] + ri * fr[2]) / (li + ri)
-            else:
-                com_x = 0.5 * (fl[0] + fr[0])
-                com_z = 0.5 * (fl[2] + fr[2])
-            hx = c["hips_x"] + com_x * self.balance[0]
-            hz = c["hips_z"] + com_z * self.balance[1]
-            hips_track.append((hx / REF_HEIGHT_CM, c["hips_y"] / REF_HEIGHT_CM, hz / REF_HEIGHT_CM))
+            # weighted mean of the feet by their load, with a small weight at the middle of the feet
+            # (COM_MIDDLE): the centre of mass stays on the line between the feet during a weight
+            # transfer and has no step where both loads are near zero (both feet in the air)
+            total = li + ri
+            sum_x = li * (FOOT_HALF_CM + fl[0]) + ri * (-FOOT_HALF_CM + fr[0])
+            sum_z = li * fl[2] + ri * fr[2]
+            mid_x = 0.5 * (fl[0] + fr[0])
+            mid_z = 0.5 * (fl[2] + fr[2])
+            com_x = (sum_x + COM_MIDDLE * mid_x) / (total + COM_MIDDLE)
+            com_z = (sum_z + COM_MIDDLE * mid_z) / (total + COM_MIDDLE)
+            # the pelvis follows the centre of mass with the balance gain in double support and
+            # with gain 1 in single support, where the weight is on one foot and the pelvis sits
+            # over it (the gain falls to the balance gain as the second foot takes weight)
+            single = (1.0 - min(li, ri)) if self.over_support else 0.0
+            gain_x = self.balance[0] + (1.0 - self.balance[0]) * single
+            gain_z = self.balance[1] + (1.0 - self.balance[1]) * single
+            hx = c["hips_x"] + com_x * gain_x
+            hz = c["hips_z"] + com_z * gain_z
+            hips_y = c["hips_y"] + self._compression(t, landings)
+            hips_track.append((hx / REF_HEIGHT_CM, hips_y / REF_HEIGHT_CM, hz / REF_HEIGHT_CM))
             hand_tracks["left"].append((self._curl("left", t, c["hand_l"]),))
             hand_tracks["right"].append((self._curl("right", t, c["hand_r"]),))
             root_track.append((c["root_x"] / REF_HEIGHT_CM, c["root_z"] / REF_HEIGHT_CM, c["root_yaw"] / 360.0))
