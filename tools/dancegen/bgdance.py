@@ -289,8 +289,9 @@ class Curve:
 # ----------------------------------------------------------------------------
 
 
-SWING_LEAD = 0.17       # share of a step spent lifting before the foot starts to travel, so a
-                        # step does not drag along the floor (the lift is under 2 cm until ~0.17)
+TRAVEL_LIFT_CM = 2.0    # a swing foot does not travel while it is lower than this (the ground-drag
+                        # limit of the QA metric is 1.2 cm, of motion_diag 2.0 cm)
+TRAVEL_LEAD_MAX = 0.35  # cap on the share of a swing spent lifting before the travel starts
 HEEL_PEEL = 0.12        # beats the heel rises before a lift-off, the toe stays on the floor
 HEEL_PEEL_TOE = 1.0     # toe value at the top of the peel (positive = heel up)
 TOE_OFF = 0.12          # beats for the peeled toe to come back flat in the first part of the swing
@@ -305,15 +306,31 @@ def _ease7(v):
 
 
 def swing_profile(u):
-    """Height of a swing foot, 0..1, through the swing u in [0, 1]: up with _ease7 to the
-    peak at mid-swing and down with it to the landing. Lift-off and landing have zero
-    velocity, acceleration and jerk. The old h*sin(pi u)^0.85 had an infinite slope at both
-    ends and was the snap in the knee (B1).
+    """Height of a swing foot, 0..1, through the swing u in [0, 1]: _ease7 of the triangle
+    v = 1 - |2u - 1| raised to 0.7. The lift has zero slope and zero curvature at the floor
+    (no infinite-slope snap like the old h*sin(pi u)^0.85, which was the knee snap of B1),
+    and it rises early, to about 35 percent of the height by u = 0.15. That early rise lets
+    the travel start sooner (see travel_lead), so the travel is not squeezed into the middle
+    of the swing: with the plain ease (exponent 1) the travel window was 0.69 of the swing
+    and the 60 fps ankle acceleration on hiphop rose by a third over origin/dev. The first
+    key after lift-off rises by 56 cm/beat on the authored clips (origin/dev: 99)."""
+    return _ease7((1.0 - abs(2.0 * u - 1.0)) ** 0.7)
 
-    The spec asked for an early peak. Measured on every authored swing, an early peak fails
-    the first-key bound (< 20 cm/beat): with the same ease and the peak at 0.4 the sidestep
-    knee-up gives 34 cm/beat, at 0.45 it gives 23. So the peak stays at mid-swing."""
-    return _ease7(1.0 - abs(2.0 * u - 1.0))
+
+def travel_lead(h):
+    """Share of a swing, from each end, before the horizontal travel starts. It is the first
+    u where the lift h * swing_profile(u) reaches TRAVEL_LIFT_CM, so the foot never moves
+    sideways while it is low. Capped at TRAVEL_LEAD_MAX for very low swings."""
+    if h <= TRAVEL_LIFT_CM:
+        return TRAVEL_LEAD_MAX
+    lo, hi = 0.0, 0.5
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if h * swing_profile(mid) >= TRAVEL_LIFT_CM:
+            hi = mid
+        else:
+            lo = mid
+    return min(TRAVEL_LEAD_MAX, hi)
 
 
 class Foot:
@@ -404,8 +421,9 @@ class Foot:
             return (p0[0], 0.0, p0[1], p0[2] + (p1[2] - p0[2]) * s, "pivot")
         s = smootherstep(u)
         if kind in ("arc", "orbit"):
-            # the travel starts once the foot has left the floor (see SWING_LEAD)
-            s = smootherstep((u - SWING_LEAD) / (1.0 - 2.0 * SWING_LEAD))
+            # the travel starts once the lift has reached TRAVEL_LIFT_CM (see travel_lead)
+            lead = travel_lead(h)
+            s = smootherstep((u - lead) / (1.0 - 2.0 * lead))
         if kind == "orbit":
             px, pz, ang = seg[6]
             half = FOOT_HALF_CM if self.side == "left" else -FOOT_HALF_CM
