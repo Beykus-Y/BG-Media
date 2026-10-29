@@ -1333,11 +1333,13 @@ struct DesktopApp::Impl {
     [[nodiscard]] double danceTime() const {
         return track ? currentPosition() : danceLabTime;
     }
-    // Dance time for the character's pose on this frame: the media clock plus the
-    // render latency lead. Scheduling and the transport keep using danceTime(). A capture
-    // (still or offline render) shows the exact media time, so it takes no lead.
+    // Dance time for the character's pose on this frame: the shown media time (the
+    // coast of an inertial pause, see updateDanceCoast) plus the render latency lead.
+    // Scheduling and the transport keep using danceTime(). A capture (still or offline
+    // render) shows the exact media time, so it takes no lead.
     [[nodiscard]] double danceVisualTime() const {
-        return track && !captureMode ? danceTime() + kDanceVisualLeadSeconds : danceTime();
+        const double shown = danceShownMediaTime();
+        return track && !captureMode ? shown + kDanceVisualLeadSeconds : shown;
     }
 
     // Whether the dance transport is moving. Scrubbing and capture drive the dance
@@ -1351,8 +1353,45 @@ struct DesktopApp::Impl {
         return captureMode || scrubbing || playing();
     }
 
-    // The pose the 3D character shows this frame. The dance is frozen while the
-    // transport is stopped; once it has been stopped for a moment the pose eases
+    // Inertial pause (motion::coastTime). While the transport is stopped the dance is shown
+    // at a coasting media time, so its motion decelerates instead of freezing; on resume the
+    // coast's lead decays to zero. Visual only: the transport position never moves.
+    bool danceCoastStopped = false;
+    double danceCoastBase = 0.0;   // shown media time at the stop
+    double danceCoastMedia = 0.0;  // transport media time at the stop
+    double danceCoastWall = 0.0;   // wall time of the last stop or resume
+    double danceCoastLag = 0.0;    // lead over the transport that a resume leaves behind
+
+    [[nodiscard]] double danceShownMediaTime() const {
+        if (danceCoastStopped) {
+            return motion::coastTime(danceCoastBase, animationTime - danceCoastWall);
+        }
+        return danceTime() +
+               motion::coastLagAfterResume(danceCoastLag, animationTime - danceCoastWall);
+    }
+
+    // Once per frame, after animationTime is set, with this frame's transport state.
+    void updateDanceCoast(bool running) {
+        if (!running && !danceCoastStopped) {
+            danceCoastBase = danceShownMediaTime();
+            danceCoastMedia = danceTime();
+            danceCoastWall = animationTime;
+            danceCoastStopped = true;
+        } else if (running && danceCoastStopped) {
+            // The lead carries over so the shown time does not jump. A real move of the
+            // transport (a seek or scrub, more than 50 ms) is a jump the viewer should see,
+            // so it carries nothing. The lead is capped at one tau: that keeps the shown
+            // time moving forward while the lead decays.
+            const bool moved = std::abs(danceTime() - danceCoastMedia) > 0.05;
+            const double lead = danceShownMediaTime() - danceTime();
+            danceCoastLag = moved ? 0.0 : std::clamp(lead, 0.0, motion::kCoastTauSeconds);
+            danceCoastWall = animationTime;
+            danceCoastStopped = false;
+        }
+    }
+
+    // The pose the 3D character shows this frame. The dance coasts to a stop while the
+    // transport is stopped (danceShownMediaTime); after a short hold the pose eases
     // to the Idle clip, sampled on wall time. The alive layer (breathing, weight
     // shift, head look-around) comes last, with its energy taken from the blended
     // pose: full strength at idle, reduced while dancing.
@@ -5304,7 +5343,9 @@ int DesktopApp::Impl::run() {
             updateDemo(deltaSeconds);
             updatePlayback();
             animationTime = static_cast<double>(frameStart) / 1e9;
-            danceIdle.update(danceTransportRunning(), animationTime);
+            const bool danceRunning = danceTransportRunning();
+            danceIdle.update(danceRunning, animationTime);
+            updateDanceCoast(danceRunning);
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
