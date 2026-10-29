@@ -147,6 +147,9 @@ struct PrimitiveCue {
     BlendMode blend = BlendMode::Additive;
     int side = -1;  // -1 both, 0 left, 1 right
     float phaseOffset = 0.0f;
+    // Phase of the rise of a snap (head, shoulder and chest accents) or a hand flick. The
+    // planner sets it from the tempo so the rise lasts a fixed real time; 0 = the default.
+    float snapAttack = 0.0f;
     std::string reason;
 
     [[nodiscard]] const PrimitiveMetadata& metadata() const {
@@ -206,11 +209,15 @@ struct ComposedPose {
     CompositionDiagnostics diagnostics;
 };
 
+// Phase of the rise of a snap envelope when the cue does not set one (PrimitiveCue::snapAttack).
+inline constexpr float kDefaultSnapAttack = 0.08f;
+
 // Evaluates one primitive at a local phase (0..1) and intensity. This is a pure
 // function; the scheduler and the compositor are the only callers.
 [[nodiscard]] PrimitivePose samplePrimitive(PrimitiveKind kind, float phase,
                                             float intensity, int side,
-                                            float accent = 0.0f);
+                                            float accent = 0.0f,
+                                            float snapAttack = kDefaultSnapAttack);
 
 // Combines a base pose with active cues. Deterministic; cue order does not
 // affect the result because cues are sorted by priority and beat.
