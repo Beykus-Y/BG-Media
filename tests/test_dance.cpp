@@ -364,6 +364,68 @@ TEST_CASE(dance.foot_contacts_declared_and_planted_feet_do_not_slide) {
     }
 }
 
+// A foot leaves the floor with a gentle first key. The rise from the last stance key to the
+// first swing key is the foot's vertical speed on entering the swing. The old lift
+// h*sin(pi u)^0.85 entered at 104 cm/beat on the sidestep, and the knee snapped.
+TEST_CASE(dance.first_swing_key_is_gentle) {
+    constexpr double kRefCm = 160.0;  // authored heights are fractions of a 160 cm character
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        const int keys = clip.keyCount;
+        for (const motion::ContactSegment& seg : clip.contacts) {
+            if (seg.end >= clip.beats - 1e-4f) {
+                continue;  // the loop seam has no swing start
+            }
+            const auto& track = clip.feet[static_cast<std::size_t>(seg.foot)].position;
+            const int k = static_cast<int>(std::floor(seg.end * clip.keysPerBeat + 1e-4)) + 1;
+            if (track.size() != static_cast<std::size_t>(keys) || k < 1 || k >= keys) {
+                continue;
+            }
+            const double rise = std::abs(static_cast<double>(track[static_cast<std::size_t>(k)].y) -
+                                         track[static_cast<std::size_t>(k - 1)].y);
+            CHECK_NEAR(rise * kRefCm * clip.keysPerBeat, 0.0, 20.0);  // cm per beat
+        }
+    }
+}
+
+// A planted foot is never under the floor. The Catmull-Rom segment through a hold-to-swing
+// break used to undershoot by up to 6 mm inside a stance. Heights at the 1.6 m reference.
+TEST_CASE(dance.planted_feet_stay_on_the_floor) {
+    constexpr double kRefMm = 1600.0;  // one height unit in millimetres
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        double lowest = 0.0;
+        for (double beat = 0.0; beat < clip.beats; beat += 1.0 / 64.0) {
+            const motion::ClipPose pose = motion::sampleClip(clip, beat);
+            for (const motion::ClipPose::Foot& foot : pose.foot) {
+                if (foot.contact > 0.0f) {
+                    lowest = std::min(lowest, static_cast<double>(foot.position.y) * kRefMm);
+                }
+            }
+        }
+        CHECK_NEAR(lowest, 0.0, 0.5);  // mm
+    }
+}
+
+// The fifth foot component carries the heel roll: a heel peel before each lift-off in the
+// dances that step, and a heel strike after forward and side landings.
+TEST_CASE(dance.heel_roll_is_authored_around_the_steps) {
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        for (const motion::FootTrack& track : clip.feet) {
+            CHECK(track.toe.size() == static_cast<std::size_t>(clip.keyCount));
+        }
+    }
+    const motion::HumanoidClip& sidestep = *library().forStyle(motion::DanceStyle::SideStep);
+    float peak = 0.0f;
+    float strike = 0.0f;
+    for (const motion::FootTrack& track : sidestep.feet) {
+        for (float v : track.toe) {
+            peak = std::max(peak, v);
+            strike = std::min(strike, v);
+        }
+    }
+    CHECK(peak > 0.9f);     // a heel up, toe on the floor, before a lift-off
+    CHECK(strike < -0.3f);  // toes up on a heel strike after a landing
+}
+
 TEST_CASE(dance.footwork_moves_the_feet_not_just_the_knees) {
     const motion::HumanoidClip& side = *library().forStyle(motion::DanceStyle::SideStep);
     const qa::ClipReport r = qa::analyseClip(side, nullptr, nullptr, side.bpm);

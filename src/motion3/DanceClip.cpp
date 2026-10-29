@@ -436,6 +436,11 @@ void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out) {
             foot.toePitch = std::clamp(scalar(track.toe), -1.0f, 1.0f);
         }
         foot.phase = footPhaseAt(clip, f, clipBeat, foot.contact);
+        // The Catmull-Rom segment through a hold-to-swing break undershoots a few millimetres
+        // below the floor. A planted foot is never under the floor.
+        if (foot.contact > 0.0f) {
+            foot.position.y = std::max(0.0f, foot.position.y);
+        }
     }
     for (int h = 0; h < 2; ++h) {
         const auto& track = clip.hands[static_cast<std::size_t>(h)];
