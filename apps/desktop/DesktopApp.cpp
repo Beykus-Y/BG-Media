@@ -1361,10 +1361,13 @@ struct DesktopApp::Impl {
     double danceCoastMedia = 0.0;  // transport media time at the stop
     double danceCoastWall = 0.0;   // wall time of the last stop or resume
     double danceCoastLag = 0.0;    // lead over the transport that a resume leaves behind
+    bool danceCoastHeld = false;   // a seek while stopped: show the new position, no coast
 
     [[nodiscard]] double danceShownMediaTime() const {
         if (danceCoastStopped) {
-            return motion::coastTime(danceCoastBase, animationTime - danceCoastWall);
+            return danceCoastHeld
+                       ? danceCoastBase
+                       : motion::coastTime(danceCoastBase, animationTime - danceCoastWall);
         }
         return danceTime() +
                motion::coastLagAfterResume(danceCoastLag, animationTime - danceCoastWall);
@@ -1377,6 +1380,14 @@ struct DesktopApp::Impl {
             danceCoastMedia = danceTime();
             danceCoastWall = animationTime;
             danceCoastStopped = true;
+            danceCoastHeld = false;
+        } else if (!running && danceCoastStopped &&
+                   std::abs(danceTime() - danceCoastMedia) > 1.0e-4) {
+            // The stopped transport moved (a seek, or Stop rewinding to the start): the
+            // viewer asked for that position, so it is shown as is and the coast ends.
+            danceCoastBase = danceTime();
+            danceCoastMedia = danceTime();
+            danceCoastHeld = true;
         } else if (running && danceCoastStopped) {
             // The lead carries over so the shown time does not jump. A real move of the
             // transport (a seek or scrub, more than 50 ms) is a jump the viewer should see,

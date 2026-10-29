@@ -956,3 +956,38 @@ TEST_CASE(alive.pause_coasts_the_dance_without_a_velocity_jump) {
     // The coast has settled: between 1 s and 1.5 s after the stop media time moves < 1 ms.
     CHECK(motion::coastTime(stopAt, 1.5) - motion::coastTime(stopAt, 1.0) < 1.0e-3);
 }
+
+TEST_CASE(alive.head_stabilisation_is_continuous_across_the_yaw_seam) {
+    // The root yaw is taken as authored, never through atan2, so a turn through half a turn
+    // does not flip the neck and head bones. A torso twisted round to the atan2 seam gives
+    // the same bones on both sides of it.
+    const auto neckHead = [](const ClipPose& pose) {
+        return pose.bone[idx(HumanoidBone::Neck)] * pose.bone[idx(HumanoidBone::Head)];
+    };
+    ClipPose twisted = motion::neutralClipPose();
+    twisted.bone[idx(HumanoidBone::Chest)] =
+        math::fromAxisAngle({0.0f, 1.0f, 0.0f}, static_cast<float>(20.0 / kRadToDeg));
+    for (const std::uint32_t seed : kSeeds) {
+        for (double t = 0.0; t < 10.0; t += 0.53) {
+            for (const float turn : {0.5f, -0.5f, 0.4875f}) {
+                ClipPose before = twisted;
+                ClipPose after = twisted;
+                before.rootYaw = turn - 0.00002f;
+                after.rootYaw = turn + 0.00002f;
+                motion::applyAlive(before, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+                motion::applyAlive(after, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+                CHECK(angleDeg(neckHead(before).conjugate() * neckHead(after)) < 0.05);
+            }
+
+            ClipPose left = motion::neutralClipPose();
+            ClipPose right = motion::neutralClipPose();
+            left.bone[idx(HumanoidBone::Chest)] =
+                math::fromAxisAngle({0.0f, 1.0f, 0.0f}, static_cast<float>(179.99 / kRadToDeg));
+            right.bone[idx(HumanoidBone::Chest)] =
+                math::fromAxisAngle({0.0f, 1.0f, 0.0f}, static_cast<float>(180.01 / kRadToDeg));
+            motion::applyAlive(left, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            motion::applyAlive(right, t, 0.0f, seed, 1.0f, 0.0f, 1.0f);
+            CHECK(angleDeg(neckHead(left).conjugate() * neckHead(right)) < 0.1);
+        }
+    }
+}

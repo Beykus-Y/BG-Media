@@ -308,6 +308,23 @@ TEST_CASE(retarget.heel_roll_turns_the_foot_about_the_toe) {
     CHECK(heelRise > 0.01f);  // more than 1 cm on a 1.7 m character
     CHECK((toesB - toesA).length() < 0.001f);
     CHECK((ankleC - ankleA).length() < 1.0e-4f);
+
+    // The roll follows the turned foot: with the foot yawed by a quarter and half a turn the
+    // heel still rises and the toe joint still stays put.
+    for (const float turn : {0.25f, 0.5f}) {
+        bgmedia::motion::ClipPose turnedFlat = flat;
+        turnedFlat.foot[0].yaw = turn;
+        bgmedia::motion::ClipPose turnedHeel = turnedFlat;
+        turnedHeel.foot[0].toePitch = 1.0f;
+        const auto d = fixture->rig->applyClip(turnedFlat, 0.0);
+        const auto e = fixture->rig->applyClip(turnedHeel, 0.0);
+        const auto ankleD = bgmedia::animation::HumanoidRetargeter::stagePosition(d, ankle);
+        const auto ankleE = bgmedia::animation::HumanoidRetargeter::stagePosition(e, ankle);
+        const auto toesD = bgmedia::animation::HumanoidRetargeter::stagePosition(d, toes);
+        const auto toesE = bgmedia::animation::HumanoidRetargeter::stagePosition(e, toes);
+        CHECK(bgmedia::math::dot(ankleE - ankleD, model.up) > 0.01f);
+        CHECK((toesE - toesD).length() < 0.001f);
+    }
 }
 
 TEST_CASE(retarget.model1_if_available) {
