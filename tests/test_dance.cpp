@@ -2,7 +2,9 @@
 
 #include "motion_metrics.hpp"
 
+#include "bgmedia/analysis/Analyzer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "support/SyntheticSignals.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1910,4 +1912,110 @@ TEST_CASE(dance.overlay_pipeline_composes_each_loop_without_blending) {
     }
     CHECK(worst < 1e-5);
     CHECK(overlaid > frames / 4);
+}
+
+namespace {
+
+// BG Beat analysis of a synthetic track, as the desktop host gets it.
+AnalysisResult analyzeSynthetic(const test::SyntheticTrack& track) {
+    std::string error;
+    const PcmBuffer pcm = PcmBuffer::fromAudio(track.audio, &error);
+    if (!pcm.valid()) {
+        throw test::Failure("failed to create PCM: " + error);
+    }
+    const Analyzer analyzer(AnalysisConfig{});
+    AnalysisReport report = analyzer.analyze(pcm);
+    if (!report.ok()) {
+        throw test::Failure("analysis failed: " + report.message);
+    }
+    return std::move(report.result);
+}
+
+bool isHandOrHead(motion::PrimitiveKind kind) {
+    using K = motion::PrimitiveKind;
+    return kind == K::HandFlick || kind == K::FingerRipple || kind == K::WristRoll ||
+           kind == K::FingerSpread || kind == K::FistPulse || kind == K::HeadTilt ||
+           kind == K::LookDirection || kind == K::HeadAccent;
+}
+
+} // namespace
+
+TEST_CASE(dance.musical_gestures_land_on_bass_accents) {
+    // Auto plan over a track whose kick is the body's hit: at least 70 % of the hand and head
+    // cues sit within 0.12 beat of a bass accent. Snares and hats may get a gesture too, but
+    // rarely, so they stay a minority.
+    const AnalysisResult analysis = analyzeSynthetic(test::makeBassAccentTrack());
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const std::vector<motion::DancePlayer::PlannedOverlay> planned =
+        player.plannedOverlays(0.0, analysis.info.duration);
+    const motion::MusicalTimeline& timeline = player.timeline();
+    int handHead = 0;
+    int nearBass = 0;
+    for (const auto& cue : planned) {
+        if (!isHandOrHead(cue.kind)) continue;
+        ++handHead;
+        const double beat = timeline.beatAt(cue.mediaTime);
+        for (const BassAccent& accent : analysis.bassAccents) {
+            if (std::abs(beat - timeline.beatAt(accent.time)) <= 0.12) {
+                ++nearBass;
+                break;
+            }
+        }
+    }
+    CHECK(handHead >= 4);
+    CHECK(nearBass >= 0.7 * handHead);
+}
+
+TEST_CASE(dance.musical_gestures_stay_out_of_silence) {
+    // Nothing plays in the silent gap of the track: no overlay cue starts inside a silence.
+    const AnalysisResult analysis = analyzeSynthetic(test::makeSilenceTrack());
+    CHECK(!analysis.silences.empty());
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const std::vector<motion::DancePlayer::PlannedOverlay> planned =
+        player.plannedOverlays(0.0, analysis.info.duration);
+    CHECK(!planned.empty());
+    int inSilence = 0;
+    for (const auto& cue : planned) {
+        for (const SilenceRegion& silence : analysis.silences) {
+            if (cue.mediaTime >= silence.start && cue.mediaTime <= silence.end) {
+                ++inSilence;
+            }
+        }
+    }
+    CHECK(inSilence == 0);
+}
+
+TEST_CASE(dance.musical_gestures_are_deterministic_per_seed) {
+    const AnalysisResult analysis = analyzeSynthetic(test::makeBassAccentTrack());
+    const auto plan = [&](std::uint32_t seed) {
+        motion::DancePlayer player;
+        player.loadLibrary(dancesDir());
+        player.setOverlaySeed(seed);
+        player.setAnalysis(&analysis, 0.0);
+        player.setMode(motion::DanceMode::Auto, 0.0);
+        return player.plannedOverlays(0.0, analysis.info.duration);
+    };
+    const auto a = plan(3u);
+    const auto b = plan(3u);
+    const auto c = plan(77u);
+    CHECK(!a.empty());
+    CHECK(a.size() == b.size());
+    bool same = a.size() == b.size();
+    for (std::size_t i = 0; same && i < a.size(); ++i) {
+        same = a[i].mediaTime == b[i].mediaTime && a[i].kind == b[i].kind &&
+               a[i].clipId == b[i].clipId && a[i].reason == b[i].reason;
+    }
+    CHECK(same);
+    // Another host seed plans other gestures on the same track.
+    bool differs = a.size() != c.size();
+    for (std::size_t i = 0; !differs && i < a.size(); ++i) {
+        differs = a[i].mediaTime != c[i].mediaTime || a[i].kind != c[i].kind;
+    }
+    CHECK(differs);
 }

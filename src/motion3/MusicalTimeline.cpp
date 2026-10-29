@@ -125,6 +125,7 @@ void MusicalTimeline::buildBeatTable(const std::vector<double>& times,
 MusicalTimeline MusicalTimeline::fromAnalysis(const AnalysisResult& analysis,
                                               double fallbackBpm) {
     MusicalTimeline timeline;
+    timeline.analyzed_ = true;
     timeline.grid_ = BeatClock::fromAnalysis(analysis, fallbackBpm);
     timeline.valid_ = timeline.grid_.valid();
     timeline.duration_ = std::isfinite(analysis.info.duration) && analysis.info.duration > 0.0

@@ -67,8 +67,11 @@ struct ScheduleSegment {
 // to each segment's own pose *before* segments are crossfaded, so an outgoing
 // clip keeps its own overlays while it fades and an incoming clip fades its
 // overlays in, instead of the overlay set flipping mid-transition.
-using PoseDecorator =
-    std::function<void(ClipPose& pose, const ScheduleSegment& segment, double clipBeat)>;
+// `clipBeat` is the warped clip beat the pose was sampled at. `linearClipBeat` is the
+// stable-grid beat the segment's music maps to linearly: a cue placed on it lands on the media
+// time that DanceSchedule::mediaTimeAtClipBeat gives for it. The warp moves the upper body only.
+using PoseDecorator = std::function<void(ClipPose& pose, const ScheduleSegment& segment,
+                                         double clipBeat, double linearClipBeat)>;
 
 struct DanceFrame {
     ClipPose pose;
@@ -165,6 +168,11 @@ public:
                                                 double* rate = nullptr,
                                                 bool* warpActive = nullptr,
                                                 double* deviation = nullptr);
+    // Inverse of the stable (unwarped) mapping: the media time at which `segment` reaches
+    // linear clip beat `clipBeat`. segmentClipBeat with an off warp maps back to the same beat.
+    [[nodiscard]] static double mediaTimeAtClipBeat(const ScheduleSegment& segment,
+                                                    double clipBeat,
+                                                    const MusicalTimeline& timeline);
 
 private:
     // Pose of one segment at one time, memoized per sample() call: with overlapping
@@ -174,9 +182,11 @@ private:
                                   const MusicalTimeline& timeline,
                                   const WarpProfile& warp, float* transition,
                                   PoseMemo& memo) const;
+    // `clipBeat` gets the warped beat the pose is sampled at, `linearBeat` the stable-grid beat.
     [[nodiscard]] ClipPose basePose(std::size_t index, double mediaTime,
                                     const MusicalTimeline& timeline,
-                                    const WarpProfile& warp, double* clipBeat) const;
+                                    const WarpProfile& warp, double* clipBeat,
+                                    double* linearBeat = nullptr) const;
     [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
                                    const MusicalTimeline& timeline,
                                    const WarpProfile& warp) const;
