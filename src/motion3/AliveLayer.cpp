@@ -44,12 +44,28 @@ constexpr double kLookYawDeg = 4.0;
 constexpr double kLookPitchDeg = 2.0;
 constexpr double kNeckShare = 0.4;
 
-// Sum of three incommensurate sines per axis. The weights sum to 1, so the
-// sum never leaves [-1, 1] and the look angles stay within their limits.
-constexpr double kYawFrequencyHz[3] = {0.083, 0.147, 0.229};
-constexpr double kYawWeight[3] = {0.5, 0.3, 0.2};
-constexpr double kPitchFrequencyHz[3] = {0.113, 0.191, 0.263};
-constexpr double kPitchWeight[3] = {0.45, 0.35, 0.2};
+// Look-around as saccades: the gaze holds a target for 1.5..4 s, then turns to the next
+// one in 0.12..0.20 s. Saccade n starts at n * slot + offset(n), with offset(n) in
+// 0..1 s, so the start times are closed form and the layer stays a pure function of
+// wall time. Between two saccades the fixation is slot + offset(n+1) - offset(n) -
+// duration(n), that is 1.55..3.63 s. Past kMaxWallTime the gaze freezes, so the slot
+// index stays exact in an int64 (about 30 000 years).
+constexpr double kSaccadeSlotSeconds = 2.75;
+constexpr double kSaccadeOffsetSeconds = 1.0;
+constexpr double kSaccadeMinSeconds = 0.12;
+constexpr double kSaccadeSpanSeconds = 0.08;
+constexpr double kMaxWallTime = 1.0e12;
+
+// Head stabilisation: below the dancing level the head keeps (1 - share) of the torso's
+// world yaw and pitch. The share is 50 % up to energy 0.35 and fades to 0 at 0.5.
+constexpr double kStabiliseShare = 0.5;
+constexpr double kStabiliseFullEnergy = 0.35;
+constexpr double kStabiliseOffEnergy = 0.5;
+
+// Spotting (head turns ahead of the body after a turn over 90 deg) is not in this
+// layer: it is an event at the start of the turn, and the layer sees only the current
+// pose, so a stateless spot cannot be derived from root yaw. The stabilisation above
+// already holds half of a 180 deg spin in world space.
 
 std::size_t boneIndex(HumanoidBone bone) {
     return static_cast<std::size_t>(bone);
@@ -140,19 +156,103 @@ void composeBone(ClipPose& pose, HumanoidBone bone, const math::Quat& delta) {
     target = (delta * target).normalized();
 }
 
-// Head look-around for one axis: a weighted sum of three sines, in [-1, 1].
-double lookSum(const double (&frequencies)[3], const double (&weights)[3],
-               double wallTime, std::uint32_t seed, std::uint32_t salt) {
-    double sum = 0.0;
-    for (std::uint32_t i = 0; i < 3; ++i) {
-        // Seed-dependent jitter of +-8 % keeps every character's rhythm distinct
-        // while the frequencies stay inside 0.07..0.3 Hz.
-        const double jitter = 0.92 + 0.16 * unitHash(seed, salt + i);
-        const double frequency = frequencies[i] * jitter;
-        const double phase = unitHash(seed, salt + 8 + i);
-        sum += weights[i] * wave(wallTime * frequency, phase);
+// Hash in [0, 1) of a saccade index (an int64 slot number), a seed and a channel:
+// 0 yaw target, 1 pitch target, 2 start offset, 3 duration.
+double indexHash(std::uint32_t seed, std::int64_t index, std::uint32_t channel) {
+    const auto u = static_cast<std::uint64_t>(index);
+    const std::uint32_t folded =
+        hash32(static_cast<std::uint32_t>(u) ^
+               hash32(static_cast<std::uint32_t>(u >> 32) ^ 0x3c6ef372U));
+    return unitHash(seed ^ folded, channel);
+}
+
+// A gaze target in the unit square: -1..1 of the yaw and pitch limits.
+struct Gaze {
+    double yaw = 0.0;
+    double pitch = 0.0;
+};
+
+Gaze saccadeTarget(std::uint32_t seed, std::int64_t index) {
+    return {2.0 * indexHash(seed, index, 0) - 1.0, 2.0 * indexHash(seed, index, 1) - 1.0};
+}
+
+double saccadeStart(std::uint32_t seed, std::int64_t index) {
+    return static_cast<double>(index) * kSaccadeSlotSeconds +
+           kSaccadeOffsetSeconds * indexHash(seed, index, 2);
+}
+
+double saccadeSpan(std::uint32_t seed, std::int64_t index) {
+    return kSaccadeMinSeconds + kSaccadeSpanSeconds * indexHash(seed, index, 3);
+}
+
+// Gaze at a wall time. The latest saccade that has started is either the one of this
+// slot or, when its offset is still ahead, the one of the slot before (a saccade ends
+// before the next slot starts). The turn is a smoothstep from the previous target.
+Gaze gazeAt(double wallTime, std::uint32_t seed) {
+    const double t = std::clamp(wallTime, -kMaxWallTime, kMaxWallTime);
+    const auto slot = static_cast<std::int64_t>(std::floor(t / kSaccadeSlotSeconds));
+    const std::int64_t index = saccadeStart(seed, slot) > t ? slot - 1 : slot;
+    const Gaze target = saccadeTarget(seed, index);
+    const double progress =
+        std::clamp((t - saccadeStart(seed, index)) / saccadeSpan(seed, index), 0.0, 1.0);
+    if (progress >= 1.0) {
+        return target;
     }
-    return sum;
+    const Gaze from = saccadeTarget(seed, index - 1);
+    const double eased = progress * progress * (3.0 - 2.0 * progress);
+    return {from.yaw + (target.yaw - from.yaw) * eased,
+            from.pitch + (target.pitch - from.pitch) * eased};
+}
+
+// Yaw about +Y and pitch about +X (positive tilts the top forward) of a rotation, in
+// degrees, read from its forward axis. Exact for yaw * pitch.
+struct YawPitch {
+    double yaw = 0.0;
+    double pitch = 0.0;
+};
+
+YawPitch yawPitchOf(const math::Quat& q) {
+    const math::Vec3 forward = math::rotate(q, {0.0f, 0.0f, 1.0f});
+    return {std::atan2(static_cast<double>(forward.x), static_cast<double>(forward.z)) / kDegree,
+            std::asin(std::clamp(-static_cast<double>(forward.y), -1.0, 1.0)) / kDegree};
+}
+
+// The `share` power of a rotation: the part of it a bone takes when the head is split
+// between neck and head. Shortest arc, so the identity sits at 0.
+math::Quat shareOf(const math::Quat& q, double share) {
+    const math::Quat shortest = q.w < 0.0f ? math::Quat{-q.x, -q.y, -q.z, -q.w} : q;
+    return math::slerp(math::Quat::identity(), shortest, static_cast<float>(share));
+}
+
+// Torso world orientation: the body-frame chain Hips, Spine, Chest, UpperChest, turned by
+// the root yaw (the retargeter turns the whole model by rootYaw about up).
+math::Quat torsoBodyRotation(const ClipPose& pose) {
+    const math::Quat chain = pose.bone[boneIndex(HumanoidBone::Hips)] *
+                             pose.bone[boneIndex(HumanoidBone::Spine)] *
+                             pose.bone[boneIndex(HumanoidBone::Chest)] *
+                             pose.bone[boneIndex(HumanoidBone::UpperChest)];
+    return chain.normalized();
+}
+
+// Counter-rotates the head so it keeps (1 - amount) of the torso's world yaw and pitch.
+// The correction is worked out in the torso frame, where the bones live, and split
+// 40 % neck / 60 % head like the look, so the neck and head shares of the whole head
+// motion stay the same. Does nothing when the torso or the root yaw is not finite.
+void stabiliseHead(ClipPose& pose, double amount) {
+    const math::Quat torso = torsoBodyRotation(pose);
+    const double rootYaw = std::isfinite(pose.rootYaw) ? static_cast<double>(pose.rootYaw) : 0.0;
+    if (!finiteQuat(torso) || amount <= 0.0) {
+        return;
+    }
+    const math::Quat root = yawQuat(rootYaw * 360.0);
+    const YawPitch world = yawPitchOf(root * torso);
+    // Stage-frame counter-rotation, then conjugated into the torso frame:
+    // torso^-1 * root^-1 * W * root * torso.
+    const math::Quat stage = yawQuat(-amount * world.yaw) * pitchQuat(-amount * world.pitch);
+    const math::Quat correction =
+        (torso.conjugate() * (root.conjugate() * stage * root) * torso).normalized();
+    composeBone(pose, HumanoidBone::Neck, shareOf(correction, kNeckShare));
+    composeBone(pose, HumanoidBone::Head, shareOf(correction, 1.0 - kNeckShare));
 }
 
 } // namespace
@@ -214,18 +314,44 @@ void applyAlive(ClipPose& pose, double wallTime, float energy, std::uint32_t see
         }
     }
 
-    // --- head micro look-around ----------------------------------------------
+    // --- head look-around: saccades -------------------------------------------
     if (headAmplitude > 0.0) {
-        const double yaw =
-            kLookYawDeg * headAmplitude * lookSum(kYawFrequencyHz, kYawWeight, t, seed, 16);
-        const double pitch =
-            kLookPitchDeg * headAmplitude * lookSum(kPitchFrequencyHz, kPitchWeight, t, seed, 40);
+        const Gaze gaze = gazeAt(t, seed);
+        const double yaw = kLookYawDeg * headAmplitude * gaze.yaw;
+        const double pitch = kLookPitchDeg * headAmplitude * gaze.pitch;
         const math::Quat neck = yawQuat(kNeckShare * yaw) * pitchQuat(kNeckShare * pitch);
         const math::Quat head = yawQuat((1.0 - kNeckShare) * yaw) *
                                 pitchQuat((1.0 - kNeckShare) * pitch);
         composeBone(pose, HumanoidBone::Neck, neck);
         composeBone(pose, HumanoidBone::Head, head);
     }
+
+    // --- head stabilisation ---------------------------------------------------
+    // Only while calm (energy below 0.5): when dancing the head follows the body. It is
+    // part of the head, so the head weight scales it, not the energy amplitude.
+    const float calmEnergy = std::isfinite(energy) ? std::clamp(energy, 0.0f, 1.0f) : 0.0f;
+    const double calm = 1.0 - static_cast<double>(smoothstep01(
+                                  static_cast<float>(kStabiliseFullEnergy),
+                                  static_cast<float>(kStabiliseOffEnergy), calmEnergy));
+    const double stabiliseAmount =
+        kStabiliseShare * calm * static_cast<double>(strength) * static_cast<double>(headScale);
+    stabiliseHead(pose, stabiliseAmount);
+}
+
+double coastTime(double stoppedMediaTime, double sinceStop) {
+    // Not in the past: a time before the stop (or NaN) reads as the stop itself.
+    if (!(sinceStop > 0.0)) {
+        return stoppedMediaTime;
+    }
+    return stoppedMediaTime +
+           kCoastStartSpeed * kCoastTauSeconds * (1.0 - std::exp(-sinceStop / kCoastTauSeconds));
+}
+
+double coastLagAfterResume(double lagAtResume, double sinceResume) {
+    if (!(sinceResume > 0.0)) {
+        return lagAtResume;
+    }
+    return lagAtResume * std::exp(-sinceResume / kCoastTauSeconds);
 }
 
 std::array<ClipPose::Foot, 2> idleFeetAtDanceRoot(const ClipPose& dance, const ClipPose& idle) {
