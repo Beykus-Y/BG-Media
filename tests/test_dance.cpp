@@ -1931,6 +1931,38 @@ AnalysisResult analyzeSynthetic(const test::SyntheticTrack& track) {
     return std::move(report.result);
 }
 
+// A steady grid whose waveform has amplitude `before` until `switchAt` and `after` from then on.
+AnalysisResult gridWithDynamics(double bpm, double duration, double switchAt, float before,
+                                float after) {
+    AnalysisResult analysis;
+    analysis.info.duration = duration;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 0.95f;
+    analysis.beatPhaseConfidence = 0.95f;
+    analysis.meterConfidence = 0.9f;
+    analysis.downbeatConfidence = 0.9f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const int count = static_cast<int>(duration * bpm / 60.0);
+    for (int i = 0; i < count; ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / bpm;
+        beat.strength = i % 4 == 0 ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+    }
+    analysis.waveformPeaksPerSecond = 50.0f;
+    const int bins = static_cast<int>(duration * 50.0);
+    for (int k = 0; k < bins; ++k) {
+        const float amplitude = k / 50.0 < switchAt ? before : after;
+        analysis.waveform.push_back(WaveformPeak{-amplitude, amplitude});
+    }
+    return analysis;
+}
+
 bool isHandOrHead(motion::PrimitiveKind kind) {
     using K = motion::PrimitiveKind;
     return kind == K::HandFlick || kind == K::FingerRipple || kind == K::WristRoll ||
@@ -1989,6 +2021,56 @@ TEST_CASE(dance.musical_gestures_stay_out_of_silence) {
         }
     }
     CHECK(inSilence == 0);
+}
+
+TEST_CASE(dance.phrase_loudness_sets_the_upper_body_swing) {
+    // Two copies of one grid: one is quiet before 20 s and loud after, the other the reverse. At
+    // the same media time both play the same clip at the same beat, so the only difference is the
+    // phrase loudness: 0.75 in the quiet passage, 1.15 in the loud one. The chest's angular speed
+    // there scales with the swing, so it is about 0.65 times as fast in the quiet copy.
+    const AnalysisResult quietFirst = gridWithDynamics(92.0, 40.0, 20.0, 0.1f, 0.6f);
+    const AnalysisResult loudFirst = gridWithDynamics(92.0, 40.0, 20.0, 0.6f, 0.1f);
+    motion::DancePlayer quiet;
+    motion::DancePlayer loud;
+    for (motion::DancePlayer* player : {&quiet, &loud}) {
+        player->loadLibrary(dancesDir());
+        player->setOverlayMode(motion::OverlayMode::Off);
+    }
+    quiet.setAnalysis(&quietFirst, 0.0);
+    loud.setAnalysis(&loudFirst, 0.0);
+    for (motion::DancePlayer* player : {&quiet, &loud}) {
+        player->select(motion::DanceStyle::Groove, 0.0, true);
+    }
+    CHECK(quiet.timeline().phraseLoudnessAt(9.0) < 0.1f);
+    CHECK(loud.timeline().phraseLoudnessAt(9.0) > 0.9f);
+
+    const auto chestSpeed = [](motion::DancePlayer& player, double from, double to) {
+        double total = 0.0;
+        int steps = 0;
+        motion::ClipPose previous;
+        for (int i = 0; i <= static_cast<int>(to * 240.0); ++i) {
+            const motion::ClipPose pose = player.update(i / 240.0).pose;
+            if (i >= static_cast<int>(from * 240.0)) {
+                if (steps > 0) {
+                    const math::Quat& p =
+                        previous.bone[static_cast<std::size_t>(vrm::HumanoidBone::Chest)];
+                    const math::Quat& q = pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::Chest)];
+                    total += 2.0 * std::acos(std::min(1.0f, std::abs(math::dot(p, q))));
+                }
+                ++steps;
+            }
+            previous = pose;
+        }
+        return total / std::max(1, steps - 1);
+    };
+    const double quietSpeed = chestSpeed(quiet, 6.0, 12.0);
+    const double loudSpeed = chestSpeed(loud, 6.0, 12.0);
+    CHECK(loudSpeed > 0.0);
+    // The ratio is 1.00 with the phrase factor off; scaling the larger swing angles is not exactly
+    // linear, so the measured 0.59 sits a little under 0.65.
+    const double ratio = quietSpeed / loudSpeed;
+    CHECK(ratio > 0.5);
+    CHECK(ratio < 0.8);
 }
 
 TEST_CASE(dance.musical_gestures_are_deterministic_per_seed) {
