@@ -20,6 +20,12 @@ constexpr float kPi = 3.14159265358979323846f;
 // Matches the dance generator (TRAVEL_LIFT_CM, TRAVEL_LEAD_MAX in tools/dancegen/bgdance.py).
 constexpr float kTravelLiftCm = 2.0f;
 constexpr float kTravelLeadMax = 0.35f;
+// Pelvis shift that follows the planted feet: a share of the stance offsets, limited to
+// +-kPelvisLimitCm by a soft clamp (tanh, so it has no corner where it meets the limit), then
+// smoothed by a periodic Gaussian of kPelvisSmoothBeats (bgdance.py: weight over the support).
+constexpr float kPelvisGain = 0.35f;
+constexpr float kPelvisLimitCm = 6.0f;
+constexpr float kPelvisSmoothBeats = 0.25f;
 
 // One step of one foot: the swing that carries it, followed by the stance it lands in.
 // All key indices are cyclic positions in [0, M).
@@ -509,10 +515,39 @@ HumanoidClip Planner::run(FootworkPlanReport* report) {
                 ax += w * (d.x * c - d.z * s);
                 az += w * (d.x * s + d.z * c);
             }
-            ax = std::clamp(0.35f * ax, -6.0f, 6.0f);
-            az = std::clamp(0.35f * az, -6.0f, 6.0f);
+            // Soft limit: linear for small shifts, saturating at the limit. A hard clamp put a
+            // corner into the pelvis path where the shift met the limit (B4).
+            ax = kPelvisLimitCm * std::tanh(kPelvisGain * ax / kPelvisLimitCm);
+            az = kPelvisLimitCm * std::tanh(kPelvisGain * az / kPelvisLimitCm);
             adjust[static_cast<std::size_t>(i)] = {ax, 0.0f, az};
-            biggest = std::max(biggest, std::max(std::abs(ax), std::abs(az)));
+        }
+        // Smooth after the limit: a periodic Gaussian over the loop, so the seam stays closed.
+        {
+            const float sigmaKeys = kPelvisSmoothBeats * static_cast<float>(K);
+            const int radiusKeys = std::max(1, static_cast<int>(std::ceil(3.0f * sigmaKeys)));
+            std::vector<float> kernel(static_cast<std::size_t>(2 * radiusKeys + 1));
+            float kernelSum = 0.0f;
+            for (int d = -radiusKeys; d <= radiusKeys; ++d) {
+                const float w = std::exp(-0.5f * (static_cast<float>(d) / sigmaKeys) * (static_cast<float>(d) / sigmaKeys));
+                kernel[static_cast<std::size_t>(d + radiusKeys)] = w;
+                kernelSum += w;
+            }
+            std::vector<Vec3> smoothed(static_cast<std::size_t>(M_), Vec3{});
+            for (int i = 0; i < M_; ++i) {
+                float sx = 0.0f, sz = 0.0f;
+                for (int d = -radiusKeys; d <= radiusKeys; ++d) {
+                    const int j = ((i + d) % M_ + M_) % M_;
+                    const float w = kernel[static_cast<std::size_t>(d + radiusKeys)] / kernelSum;
+                    sx += w * adjust[static_cast<std::size_t>(j)].x;
+                    sz += w * adjust[static_cast<std::size_t>(j)].z;
+                }
+                smoothed[static_cast<std::size_t>(i)] = {sx, 0.0f, sz};
+            }
+            for (int i = 0; i < M_; ++i) {
+                adjust[static_cast<std::size_t>(i)] = smoothed[static_cast<std::size_t>(i)];
+                biggest = std::max(biggest, std::max(std::abs(smoothed[static_cast<std::size_t>(i)].x),
+                                                     std::abs(smoothed[static_cast<std::size_t>(i)].z)));
+            }
         }
         adjust[static_cast<std::size_t>(M_)] = adjust[0];
         if (biggest > 0.05f) {
