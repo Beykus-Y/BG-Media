@@ -156,15 +156,19 @@ bool isAncestorOf(const VrmModel& model, int ancestor, int node) {
 }
 
 // Appends spheres covering the segment head..tail (node-local), spaced at most
-// one radius apart so the union has no gap a joint of hitRadius >= 0 can pass.
-void appendCapsule(SpringColliderGroup& group, Vec3 head, Vec3 tail, float radius) {
+// one radius apart: the union then has no gap and its surface sags by at most
+// 13 % of the radius between centres. Returns false when the sphere budget ran
+// out first (a capsule more than ~127 radii long), which leaves gaps.
+bool appendCapsule(SpringColliderGroup& group, Vec3 head, Vec3 tail, float radius) {
+    constexpr int kMaxSpheres = 128;
     const float length = (tail - head).length();
-    const int count = std::clamp(
-        static_cast<int>(std::ceil(length / std::max(radius, 1.0e-4f))) + 1, 2, 16);
+    const float needed = std::ceil(length / std::max(radius, 1.0e-4f)) + 1.0f;
+    const int count = static_cast<int>(std::clamp(needed, 2.0f, static_cast<float>(kMaxSpheres)));
     for (int i = 0; i < count; ++i) {
         const float t = static_cast<float>(i) / static_cast<float>(count - 1);
         group.colliders.push_back({math::lerp(head, tail, t), radius});
     }
+    return needed <= static_cast<float>(kMaxSpheres);
 }
 
 } // namespace
@@ -264,8 +268,11 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
                     const Vec3 offset = vec3Field(capsule, "offset", {});
                     const Vec3 tail = vec3Field(capsule, "tail", {});
                     const float radius = floatField(capsule, "radius", 0.0f);
-                    if (math::finite(offset) && math::finite(tail) && radius > 0.0f) {
-                        appendCapsule(group, offset, tail, radius);
+                    if (math::finite(offset) && math::finite(tail) && radius > 0.0f &&
+                        !appendCapsule(group, offset, tail, radius)) {
+                        model.warnings.push_back(
+                            "VRMC_springBone: capsule collider too long for its radius; "
+                            "approximated with gaps");
                     }
                 }
             }
@@ -313,12 +320,12 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
                     model.warnings.push_back("VRMC_springBone: ignored invalid joint node");
                     break;
                 }
-                // Joints must form a parent -> child line; stop where it breaks.
-                if (!joints.empty() &&
-                    model.nodes[static_cast<std::size_t>(*node)].parent != joints.back()) {
+                // Each joint must descend from the previous one; the spec allows
+                // intermediate nodes to be skipped. Stop where that breaks.
+                if (!joints.empty() && !isAncestorOf(model, joints.back(), *node)) {
                     model.warnings.push_back(
-                        "VRMC_springBone: spring joints are not a parent/child chain; "
-                        "truncated");
+                        "VRMC_springBone: spring joints are not an ancestor/descendant "
+                        "chain; truncated");
                     break;
                 }
                 joints.push_back(*node);
@@ -391,6 +398,29 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
         chain.dragForce = group.dragForce;
         chain.hitRadius = group.hitRadius;
         chain.gravityDir = group.gravityDir;
+        // Skipped intermediate nodes join the chain as simulated points, so the
+        // runtime (which writes only chain nodes) carries them along instead of
+        // leaving them, and the skin on them, at the animated pose. A node at the
+        // previous point's position has no direction of its own and stays out.
+        std::vector<int> path{joints.front()};
+        for (std::size_t i = 1; i < joints.size(); ++i) {
+            std::vector<int> between;
+            for (int n = model.nodes[static_cast<std::size_t>(joints[i])].parent;
+                 n >= 0 && n != joints[i - 1];
+                 n = model.nodes[static_cast<std::size_t>(n)].parent) {
+                between.push_back(n);
+            }
+            for (auto it = between.rbegin(); it != between.rend(); ++it) {
+                const Vec3 a =
+                    model.bindGlobals[static_cast<std::size_t>(path.back())].translationPart();
+                const Vec3 b = model.bindGlobals[static_cast<std::size_t>(*it)].translationPart();
+                if ((b - a).length() >= 1.0e-4f) {
+                    path.push_back(*it);
+                }
+            }
+            path.push_back(joints[i]);
+        }
+
         std::size_t first = 0;
         // A spring that starts on a joint another spring already simulates is a
         // branch: that joint becomes its anchor, written only by the parent.
@@ -400,13 +430,13 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
             chain.nodes.push_back(joints.front());
             first = 1;
         }
-        for (std::size_t i = first; i < joints.size(); ++i) {
-            if (owner.count(joints[i]) != 0) {
+        for (std::size_t i = first; i < path.size(); ++i) {
+            if (owner.count(path[i]) != 0) {
                 model.warnings.push_back(
                     "VRMC_springBone: joint shared by two springs; later spring truncated");
                 break;
             }
-            chain.nodes.push_back(joints[i]);
+            chain.nodes.push_back(path[i]);
         }
         if (chain.nodes.size() < 2) {
             continue;
@@ -658,12 +688,17 @@ void readFirstPersonV1(const JsonValue* vrmc, VrmModel& model) {
         out.type = stringField(lookAt, "type") == "expression" ? LookAtType::Expression
                                                                : LookAtType::Bone;
         const float scale = out.type == LookAtType::Bone ? 10.0f : 1.0f;
-        // The offset is in the (normalized) head frame, whose axes are the
-        // file's model axes; rotate it into the engine frame like the scene.
+        // The offset is in the head bone's local space. The head's bind global
+        // rotation carries both its authored rest orientation and the scene
+        // turn, so it lands the offset in the engine's model axes.
+        const int head = model.nodeFor(HumanoidBone::Head);
+        const Quat headRest =
+            head >= 0 && static_cast<std::size_t>(head) < model.bindGlobalRotations.size()
+                ? model.bindGlobalRotations[static_cast<std::size_t>(head)]
+                : model.sourceToModel;
         const Vec3 offset = vec3Field(lookAt, "offsetFromHeadBone", {0.0f, 0.06f, 0.0f});
-        out.offsetFromHeadBone = math::finite(offset)
-                                     ? math::rotate(model.sourceToModel, offset)
-                                     : Vec3{0.0f, 0.06f, 0.0f};
+        out.offsetFromHeadBone = math::rotate(
+            headRest, math::finite(offset) ? offset : Vec3{0.0f, 0.06f, 0.0f});
         out.horizontalInner = rangeMapV1(objectField(lookAt, "rangeMapHorizontalInner"), scale);
         out.horizontalOuter = rangeMapV1(objectField(lookAt, "rangeMapHorizontalOuter"), scale);
         out.verticalDown = rangeMapV1(objectField(lookAt, "rangeMapVerticalDown"), scale);

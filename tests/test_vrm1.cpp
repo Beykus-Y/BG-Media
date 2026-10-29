@@ -723,3 +723,50 @@ TEST_CASE(vrm1.rejects_and_survives_bad_input) {
     std::cout << "\n            1.0 mutation corpus: " << accepted << " accepted";
 }
 
+
+TEST_CASE(vrm1.spring_joints_may_skip_nodes) {
+    // Neck -> LeftEye skips the head; the spec allows it. The head joins the
+    // chain so it is carried along instead of staying at the animated pose.
+    V1Options options;
+    options.extraExtensions =
+        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[{"node":3},{"node":19}]}]})";
+    auto v1 = loadV1(options);
+    REQUIRE(v1 != nullptr);
+    REQUIRE(v1->springChains.size() == 1);
+    CHECK((v1->springChains[0].nodes == std::vector<int>{3, 4, 19}));
+    // Not a descendant: truncated to nothing.
+    options.extraExtensions =
+        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[{"node":19},{"node":3}]}]})";
+    auto bad = loadV1(options);
+    REQUIRE(bad != nullptr);
+    CHECK(bad->springChains.empty());
+}
+
+TEST_CASE(vrm1.long_capsule_keeps_coverage) {
+    V1Options options;
+    options.extraExtensions =
+        R"(,"VRMC_springBone":{"specVersion":"1.0","colliders":[)"
+        R"({"node":2,"shape":{"capsule":{"offset":[0,0,0],"radius":0.01,"tail":[0,0.5,0]}}}]})";
+    auto v1 = loadV1(options);
+    REQUIRE(v1 != nullptr);
+    REQUIRE(v1->springColliderGroups.size() == 1);
+    const auto& spheres = v1->springColliderGroups[0].colliders;
+    REQUIRE(spheres.size() >= 2);
+    for (std::size_t i = 1; i < spheres.size(); ++i) {
+        CHECK((spheres[i].offset - spheres[i - 1].offset).length() <= 0.01f + 1e-6f);
+    }
+    CHECK_NEAR(spheres.back().offset.y, 0.5, 1e-6);
+}
+
+TEST_CASE(vrm1.lookat_offset_follows_head_rest) {
+    V1Options options;
+    options.restRotations = true;
+    options.vrmcExtra = R"(,"lookAt":{"offsetFromHeadBone":[0,0.06,0.02]})";
+    auto v1 = loadV1(options);
+    REQUIRE(v1 != nullptr);
+    // Same rest formula as vrm1Json for node 4 (the head).
+    const Quat headRest =
+        math::fromAxisAngle({std::sin(4.0f), std::cos(1.3f * 4.0f), 0.5f}, 0.4f + 0.13f * 4.0f);
+    const Vec3 expected = math::rotate(v1->sourceToModel * headRest, {0.0f, 0.06f, 0.02f});
+    CHECK((v1->lookAt.offsetFromHeadBone - expected).length() < 1e-5f);
+}
