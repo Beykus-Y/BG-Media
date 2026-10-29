@@ -659,6 +659,43 @@ TEST_CASE(vrm1.node_constraints) {
     CHECK(math::dot(aim, hand) > 0.9999f);
 }
 
+TEST_CASE(vrm1.roll_from_scene_root_keeps_its_direction) {
+    // The loader turns the scene roots half way about Y; a roll read off a
+    // root (the hips here) must still see the twist the file authored.
+    for (const char* axis : {"X", "Z"}) {
+        V1Options options;
+        options.constraints[0] = std::string(R"("roll":{"source":0,"rollAxis":")") + axis +
+                                 R"(","weight":1})";
+        auto v1 = loadV1(options);
+        REQUIRE(v1 != nullptr);
+        REQUIRE(v1->nodeConstraints.size() == 1);
+        animation::NodeConstraintSolver solver(*v1);
+        const Vec3 unit = axis[0] == 'X' ? Vec3{1.0f, 0.0f, 0.0f} : Vec3{0.0f, 0.0f, 1.0f};
+        const Quat twist = math::fromAxisAngle(unit, 0.5f);
+
+        std::vector<math::Mat4> globals(v1->nodes.size());
+        std::vector<int> stack(v1->sceneRoots.rbegin(), v1->sceneRoots.rend());
+        while (!stack.empty()) {
+            const int n = stack.back();
+            stack.pop_back();
+            const vrm::Node& node = v1->nodes[static_cast<std::size_t>(n)];
+            // The hips' authored local rotation is `twist`; in the model it
+            // carries the scene turn in front.
+            const math::Mat4 local =
+                n == 0 ? math::Mat4::fromTRS(node.translation, v1->sourceToModel * twist, node.scale)
+                       : node.local;
+            globals[static_cast<std::size_t>(n)] =
+                node.parent >= 0 ? globals[static_cast<std::size_t>(node.parent)] * local : local;
+            for (int c : node.children) {
+                stack.push_back(c);
+            }
+        }
+        CHECK(solver.apply(globals) == 1);
+        const Quat roll = (globals[5].inverseAffine() * globals[25]).rotationQuat();
+        CHECK(std::abs(math::dot(roll, twist)) > 0.99999f);
+    }
+}
+
 TEST_CASE(vrm1.constraint_cycles_are_skipped) {
     V1Options options;
     // 25 copies 27 and 27 copies 25: no order satisfies both.

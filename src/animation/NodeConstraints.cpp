@@ -32,6 +32,15 @@ Quat localRotation(const vrm::VrmModel& model, const std::vector<Mat4>& globals,
         .rotationQuat();
 }
 
+bool isSceneRoot(const vrm::VrmModel& model, int node) {
+    for (int root : model.sceneRoots) {
+        if (root == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rewrites `node`'s local rotation and carries its whole subtree along.
 void setLocalRotation(const vrm::VrmModel& model, std::vector<Mat4>& globals, int node,
                       Quat rotation) {
@@ -122,21 +131,32 @@ int NodeConstraintSolver::apply(std::vector<Mat4>& globals) const {
         if (c.weight <= 0.0f) {
             continue;
         }
-        const Quat dstRest = model.nodes[static_cast<std::size_t>(c.destination)].rotation;
-        const Quat srcRest = model.nodes[static_cast<std::size_t>(c.source)].rotation;
+        // Constraints are authored against the file's local frames. The loader
+        // turned the scene roots by sourceToModel, so take that turn back off
+        // a root's local rotation here and put it back on when writing.
+        const Quat srcTurn = isSceneRoot(model, c.source) ? model.sourceToModel : Quat::identity();
+        const Quat dstTurn =
+            isSceneRoot(model, c.destination) ? model.sourceToModel : Quat::identity();
+        const auto authoredLocal = [&](int node, Quat turn) {
+            return turn.conjugate() * localRotation(model, globals, node);
+        };
+        const Quat dstRest =
+            dstTurn.conjugate() * model.nodes[static_cast<std::size_t>(c.destination)].rotation;
+        const Quat srcRest =
+            srcTurn.conjugate() * model.nodes[static_cast<std::size_t>(c.source)].rotation;
         Quat target = dstRest;
         switch (c.type) {
         case vrm::NodeConstraintType::Rotation: {
             // The source's rotation away from its rest, applied on top of the
             // destination's rest.
-            const Quat delta = srcRest.conjugate() * localRotation(model, globals, c.source);
+            const Quat delta = srcRest.conjugate() * authoredLocal(c.source, srcTurn);
             target = dstRest * delta;
             break;
         }
         case vrm::NodeConstraintType::Roll: {
             // Only the twist of the source's delta about the roll axis, after
             // moving the delta into the destination's rest frame.
-            const Quat src = localRotation(model, globals, c.source);
+            const Quat src = authoredLocal(c.source, srcTurn);
             const Quat deltaInParent = src * srcRest.conjugate();
             const Quat deltaInDst = dstRest.conjugate() * deltaInParent * dstRest;
             const Vec3 to = math::rotate(deltaInDst, c.axis);
@@ -146,7 +166,8 @@ int NodeConstraintSolver::apply(std::vector<Mat4>& globals) const {
         }
         case vrm::NodeConstraintType::Aim: {
             // Turn the destination's aim axis toward the source.
-            const Quat parentRot = parentGlobal(model, globals, c.destination).rotationQuat();
+            const Quat parentRot =
+                parentGlobal(model, globals, c.destination).rotationQuat() * dstTurn;
             const Vec3 from = math::rotate(parentRot * dstRest, c.axis);
             const Vec3 to = globals[static_cast<std::size_t>(c.source)].translationPart() -
                             globals[static_cast<std::size_t>(c.destination)].translationPart();
@@ -158,7 +179,8 @@ int NodeConstraintSolver::apply(std::vector<Mat4>& globals) const {
             break;
         }
         }
-        setLocalRotation(model, globals, c.destination, math::slerp(dstRest, target, c.weight));
+        setLocalRotation(model, globals, c.destination,
+                         dstTurn * math::slerp(dstRest, target, c.weight));
         ++applied;
     }
     return applied;
