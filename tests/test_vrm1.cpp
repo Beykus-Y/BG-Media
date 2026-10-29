@@ -724,22 +724,85 @@ TEST_CASE(vrm1.rejects_and_survives_bad_input) {
 }
 
 
+namespace {
+
+// Runs a spring rig for 90 frames of chest sway and returns the worst error of
+// `child`'s translation under `parent` against its bind local translation.
+float worstLocalDrift(const vrm::VrmModel& model, int parent, int child, float* childMoved) {
+    animation::HumanoidRetargeter rig(model);
+    animation::SecondaryDynamics springs(model);
+    motion::ClipPose pose = motion::neutralClipPose();
+    animation::RetargetedPose out = rig.applyClip(pose, 0.0);
+    springs.reset(out);
+    float worst = 0.0f;
+    float moved = 0.0f;
+    for (int frame = 1; frame <= 90; ++frame) {
+        pose.bone[static_cast<std::size_t>(HumanoidBone::Chest)] =
+            math::fromAxisAngle({0.0f, 0.0f, 1.0f}, 0.4f * std::sin(frame * 0.15f));
+        out = rig.applyClip(pose, frame / 60.0);
+        const Vec3 animated = out.nodeGlobals[static_cast<std::size_t>(child)].translationPart();
+        springs.update(out, 1.0 / 60.0, animation::SecondarySettings{});
+        moved = std::max(moved, (out.nodeGlobals[static_cast<std::size_t>(child)].translationPart() -
+                                 animated).length());
+        const Vec3 local = (out.nodeGlobals[static_cast<std::size_t>(parent)].inverseAffine() *
+                            out.nodeGlobals[static_cast<std::size_t>(child)])
+                               .translationPart();
+        worst = std::max(worst, (local - model.nodes[static_cast<std::size_t>(child)].translation).length());
+    }
+    if (childMoved) {
+        *childMoved = moved;
+    }
+    return worst;
+}
+
+}  // namespace
+
 TEST_CASE(vrm1.spring_joints_may_skip_nodes) {
-    // Neck -> LeftEye skips the head; the spec allows it. The head joins the
-    // chain so it is carried along instead of staying at the animated pose.
+    // Neck -> LeftEye skips the head; the spec allows it and ignores the head,
+    // which must then ride rigidly on the neck rather than swing on its own.
     V1Options options;
     options.extraExtensions =
-        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[{"node":3},{"node":19}]}]})";
+        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[)"
+        R"({"node":3,"stiffness":0.1,"gravityPower":2,"gravityDir":[1,0,0]},{"node":19}]}]})";
     auto v1 = loadV1(options);
     REQUIRE(v1 != nullptr);
     REQUIRE(v1->springChains.size() == 1);
-    CHECK((v1->springChains[0].nodes == std::vector<int>{3, 4, 19}));
+    CHECK((v1->springChains[0].nodes == std::vector<int>{3, 19}));
+    float headMoved = 0.0f;
+    const float headDrift = worstLocalDrift(*v1, 3, 4, &headMoved);
+    CHECK(headMoved > 0.005f);  // the spring really moves the head
+    CHECK(headDrift < 1e-4f);   // which rides rigidly on the neck
     // Not a descendant: truncated to nothing.
     options.extraExtensions =
         R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[{"node":19},{"node":3}]}]})";
     auto bad = loadV1(options);
     REQUIRE(bad != nullptr);
     CHECK(bad->springChains.empty());
+}
+
+TEST_CASE(vrm1.spring_below_another_spring_rides_on_it) {
+    // Chest -> Neck -> Head -> LeftEye with springs [Chest, Neck] and
+    // [Head, LeftEye], the deeper one listed first. The head is the second
+    // spring's root and must stay attached to the simulated neck.
+    V1Options options;
+    options.extraExtensions =
+        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[)"
+        R"({"joints":[{"node":4},{"node":19}]},)"
+        R"({"joints":[{"node":2,"stiffness":0.1,"gravityPower":2,"gravityDir":[1,0,0]},{"node":3}]}]})";
+    auto v1 = loadV1(options);
+    REQUIRE(v1 != nullptr);
+    REQUIRE(v1->springChains.size() == 2);
+    CHECK((v1->springChains[0].nodes == std::vector<int>{2, 3}));
+    const vrm::SpringBoneChain& upper = v1->springChains[1];
+    CHECK((upper.nodes == std::vector<int>{4, 19}));
+    CHECK(upper.attached);
+    CHECK(upper.parentChain == 0);
+    CHECK(upper.parentIndex == 1);
+    CHECK(v1->springBoneCount() == 4);
+    float headMoved = 0.0f;
+    const float headDrift = worstLocalDrift(*v1, 3, 4, &headMoved);
+    CHECK(headMoved > 0.005f);   // the lower spring really moves the head
+    CHECK(headDrift < 1e-4f);    // which stays attached to the neck
 }
 
 TEST_CASE(vrm1.long_capsule_keeps_coverage) {

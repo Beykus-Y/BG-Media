@@ -310,7 +310,28 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
         finishSpringDiagnostics(model);
         return;
     }
+    // Shallowest root first, so a spring below another is linked to it whatever
+    // the file order.
+    const auto depthOf = [&](const JsonValue& spring) {
+        const JsonValue* list = objectField(&spring, "joints");
+        const auto node = list && list->isArray() && !list->items.empty()
+                              ? indexField(&list->items.front(), "node", nodeCount)
+                              : std::nullopt;
+        int depth = 0;
+        for (int n = node ? *node : -1; n >= 0 && depth <= static_cast<int>(nodeCount);
+             n = model.nodes[static_cast<std::size_t>(n)].parent) {
+            ++depth;
+        }
+        return depth;
+    };
+    std::vector<const JsonValue*> ordered;
     for (const JsonValue& spring : springs->items) {
+        ordered.push_back(&spring);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [&](const JsonValue* a, const JsonValue* b) { return depthOf(*a) < depthOf(*b); });
+    for (const JsonValue* springPtr : ordered) {
+        const JsonValue& spring = *springPtr;
         std::vector<int> joints;
         std::vector<const JsonValue*> jointJson;
         if (const JsonValue* list = objectField(&spring, "joints"); list && list->isArray()) {
@@ -398,29 +419,8 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
         chain.dragForce = group.dragForce;
         chain.hitRadius = group.hitRadius;
         chain.gravityDir = group.gravityDir;
-        // Skipped intermediate nodes join the chain as simulated points, so the
-        // runtime (which writes only chain nodes) carries them along instead of
-        // leaving them, and the skin on them, at the animated pose. A node at the
-        // previous point's position has no direction of its own and stays out.
-        std::vector<int> path{joints.front()};
-        for (std::size_t i = 1; i < joints.size(); ++i) {
-            std::vector<int> between;
-            for (int n = model.nodes[static_cast<std::size_t>(joints[i])].parent;
-                 n >= 0 && n != joints[i - 1];
-                 n = model.nodes[static_cast<std::size_t>(n)].parent) {
-                between.push_back(n);
-            }
-            for (auto it = between.rbegin(); it != between.rend(); ++it) {
-                const Vec3 a =
-                    model.bindGlobals[static_cast<std::size_t>(path.back())].translationPart();
-                const Vec3 b = model.bindGlobals[static_cast<std::size_t>(*it)].translationPart();
-                if ((b - a).length() >= 1.0e-4f) {
-                    path.push_back(*it);
-                }
-            }
-            path.push_back(joints[i]);
-        }
-
+        // Skipped intermediate nodes are not simulated (the spec ignores them);
+        // the runtime carries them rigidly with their simulated ancestor.
         std::size_t first = 0;
         // A spring that starts on a joint another spring already simulates is a
         // branch: that joint becomes its anchor, written only by the parent.
@@ -429,14 +429,25 @@ void readSpringBoneV1(const JsonValue* springBone, VrmModel& model) {
             chain.parentIndex = found->second.second;
             chain.nodes.push_back(joints.front());
             first = 1;
+        } else {
+            // A spring rooted below another spring's joint rides on that joint.
+            for (int n = model.nodes[static_cast<std::size_t>(joints.front())].parent; n >= 0;
+                 n = model.nodes[static_cast<std::size_t>(n)].parent) {
+                if (const auto above = owner.find(n); above != owner.end()) {
+                    chain.parentChain = above->second.first;
+                    chain.parentIndex = above->second.second;
+                    chain.attached = true;
+                    break;
+                }
+            }
         }
-        for (std::size_t i = first; i < path.size(); ++i) {
-            if (owner.count(path[i]) != 0) {
+        for (std::size_t i = first; i < joints.size(); ++i) {
+            if (owner.count(joints[i]) != 0) {
                 model.warnings.push_back(
                     "VRMC_springBone: joint shared by two springs; later spring truncated");
                 break;
             }
-            chain.nodes.push_back(path[i]);
+            chain.nodes.push_back(joints[i]);
         }
         if (chain.nodes.size() < 2) {
             continue;

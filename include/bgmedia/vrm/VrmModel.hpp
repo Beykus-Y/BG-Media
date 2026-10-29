@@ -133,6 +133,11 @@ struct SpringBoneChain {
     std::vector<int> nodes;
     int parentChain = -1;               // index into springChains, -1 = root chain
     int parentIndex = 0;                // index of the anchor inside the parent chain
+    // VRM 1.0: a spring rooted below another chain's node (not on it). Then
+    // nodes[0] is this chain's own root, written by this chain, and it rides
+    // rigidly on the simulated ancestor parentChain/parentIndex instead of
+    // being an anchor shared with it.
+    bool attached = false;
     std::vector<int> colliderGroups;
     float stiffness = 0.5f;
     float gravityPower = 0.0f;

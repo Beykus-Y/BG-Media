@@ -61,6 +61,7 @@ struct SecondaryDynamics::Impl {
         bool virtualTail = false;
         int parentChain = -1;   // index into `chains` (not springChains), -1 = root chain
         int parentIndex = 0;
+        bool attached = false;  // see vrm::SpringBoneChain::attached
         std::vector<Vec3> animated;
         // Animated target of the previous frame. Each fixed step samples the target at
         // its own time between the two frames (stepTarget), so the spring never sees a
@@ -167,6 +168,7 @@ void SecondaryDynamics::Impl::build() {
             sourceToChain[static_cast<std::size_t>(source.parentChain)] >= 0) {
             chain.parentChain = sourceToChain[static_cast<std::size_t>(source.parentChain)];
             chain.parentIndex = source.parentIndex;
+            chain.attached = source.attached;
         }
         chain.virtualTail = chain.nodes.size() == 1;
         bool valid = true;
@@ -233,7 +235,8 @@ void SecondaryDynamics::Impl::build() {
     stats.chains = static_cast<int>(chains.size());
     stats.bones = 0;
     for (const Chain& chain : chains) {
-        stats.bones += static_cast<int>(chain.nodes.size()) - (chain.parentChain >= 0 ? 1 : 0);
+        stats.bones += static_cast<int>(chain.nodes.size()) -
+                       (chain.parentChain >= 0 && !chain.attached ? 1 : 0);
     }
     stats.colliders = static_cast<int>(colliderCenters.size());
     stats.height = model->height;
@@ -351,7 +354,20 @@ Vec3 SecondaryDynamics::Impl::anchorOf(const Chain& chain, const std::vector<Vec
         const Chain& parent = chains[static_cast<std::size_t>(chain.parentChain)];
         const std::size_t index = static_cast<std::size_t>(std::max(0, chain.parentIndex));
         if (index < parent.current.size()) {
-            return parent.current[index];
+            if (!chain.attached || target.empty() || parent.stepTarget.size() != parent.current.size()) {
+                return parent.current[index];
+            }
+            // Attached root: keep its animated offset from the ancestor, turned
+            // by the ancestor's simulated segment rotation.
+            const Vec3 base = parent.stepTarget[index];
+            // The ancestor's outgoing segment, or its incoming one at a tip.
+            const std::size_t a = index + 1 < parent.current.size() ? index : index - 1;
+            Quat turn = Quat::identity();
+            if (index > 0 || index + 1 < parent.current.size()) {
+                turn = math::fromTo(parent.stepTarget[a + 1] - parent.stepTarget[a],
+                                    parent.current[a + 1] - parent.current[a]);
+            }
+            return parent.current[index] + math::rotate(turn, target[0] - base);
         }
     }
     return target.empty() ? Vec3{} : target[0];
@@ -529,15 +545,45 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
             std::min(std::max(0.005f, settings.maxDisplacement),
                      std::max(0.006f, chain.totalRest * 0.45f)) *
             std::max(1.0f, intensity) * (1.0f - 1.0e-4f);
-        for (std::size_t i = 0; i < points; ++i) {
-            Vec3 offset = rendered[i] - chain.animated[i];
+        // An attached chain's root rides rigidly on its ancestor exactly as the
+        // ancestor was just written (parents are written first), so the
+        // attachment holds even where the ancestor's displacement was limited.
+        // The rest of the chain shifts with it and keeps its simulated shape.
+        if (chain.attached && points > 0 && chain.parentChain >= 0 &&
+            static_cast<std::size_t>(chain.parentChain) < chains.size()) {
+            const Chain& parent = chains[static_cast<std::size_t>(chain.parentChain)];
+            const std::size_t k = static_cast<std::size_t>(std::max(0, chain.parentIndex));
+            if (k < parent.nodes.size() && k < parent.animated.size() &&
+                k < parent.animatedRotations.size()) {
+                const int parentNode = parent.nodes[k];
+                const Mat4 animatedParent =
+                    Mat4::fromTRS(toCharacter(parent.animated[k]), parent.animatedRotations[k],
+                                  parent.scales[k]);
+                const Mat4 delta = pose.nodeGlobals[static_cast<std::size_t>(parentNode)] *
+                                   animatedParent.inverseAffine();
+                const Vec3 root = toStage(delta.transformPoint(toCharacter(chain.animated[0])));
+                if (finiteVec(root)) {
+                    const Vec3 shift = root - rendered[0];
+                    for (Vec3& point : rendered) {
+                        point += shift;
+                    }
+                }
+            }
+        }
+        // An attached chain's root moves with its ancestor, not with this chain's
+        // spring, so the limit is measured from the pose shifted with the root.
+        const Vec3 carriedShift =
+            chain.attached && points > 0 ? rendered[0] - chain.animated[0] : Vec3{};
+        for (std::size_t i = chain.attached ? 1 : 0; i < points; ++i) {
+            const Vec3 base = chain.animated[i] + carriedShift;
+            Vec3 offset = rendered[i] - base;
             const float distance = offset.length();
             if (distance > maxDisplacement) {
-                rendered[i] = chain.animated[i] + offset / distance * maxDisplacement;
+                rendered[i] = base + offset / distance * maxDisplacement;
             }
         }
         // A branch chain's anchor is written by its parent chain.
-        const std::size_t first = chain.parentChain >= 0 ? 1 : 0;
+        const std::size_t first = chain.parentChain >= 0 && !chain.attached ? 1 : 0;
         // Rotate each segment so the skinned vertices follow the simulated
         // direction. The tip inherits its parent's delta.
         Quat inherited = Quat::identity();
@@ -637,8 +683,8 @@ void SecondaryDynamics::update(RetargetedPose& pose, double deltaSeconds,
     impl_->stats.chains = static_cast<int>(impl_->chains.size());
     impl_->stats.bones = 0;
     for (const auto& chain : impl_->chains) {
-        impl_->stats.bones +=
-            static_cast<int>(chain.nodes.size()) - (chain.parentChain >= 0 ? 1 : 0);
+        impl_->stats.bones += static_cast<int>(chain.nodes.size()) -
+                              (chain.parentChain >= 0 && !chain.attached ? 1 : 0);
     }
     impl_->stats.colliders = static_cast<int>(impl_->colliderCenters.size());
     impl_->stats.height = impl_->model ? impl_->model->height : 0.0f;
