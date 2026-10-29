@@ -235,22 +235,30 @@ math::Quat torsoBodyRotation(const ClipPose& pose) {
 }
 
 // Counter-rotates the head so it keeps (1 - amount) of the torso's world yaw and pitch.
-// The correction is worked out in the torso frame, where the bones live, and split
-// 40 % neck / 60 % head like the look, so the neck and head shares of the whole head
-// motion stay the same. Does nothing when the torso or the root yaw is not finite.
+// The world yaw is not read back through atan2, which wraps at 180 degrees and would flip
+// the correction there: it is the authored root yaw, which is never wrapped and so moves
+// continuously through a spin, plus the torso's yaw relative to the root. The root share is
+// capped at half a turn either way, so a long spin does not wind the neck up. The torso
+// share is folded before its own seam: past 90 degrees it tapers to 0 at 180, so it stays
+// continuous even for a body twisted all the way round. The correction is worked out in
+// the torso frame, where the bones live, and split 40 % neck / 60 % head like the look, so
+// the neck and head shares of the whole head motion stay the same. A root yaw that is not
+// finite counts as 0; a torso that is not finite leaves the head alone.
 void stabiliseHead(ClipPose& pose, double amount) {
     const math::Quat torso = torsoBodyRotation(pose);
     const double rootYaw = std::isfinite(pose.rootYaw) ? static_cast<double>(pose.rootYaw) : 0.0;
     if (!finiteQuat(torso) || amount <= 0.0) {
         return;
     }
-    const math::Quat root = yawQuat(rootYaw * 360.0);
-    const YawPitch world = yawPitchOf(root * torso);
-    // Stage-frame counter-rotation, then conjugated into the torso frame:
-    // torso^-1 * root^-1 * W * root * torso.
-    const math::Quat stage = yawQuat(-amount * world.yaw) * pitchQuat(-amount * world.pitch);
-    const math::Quat correction =
-        (torso.conjugate() * (root.conjugate() * stage * root) * torso).normalized();
+    const YawPitch body = yawPitchOf(torso);
+    const double bodyYaw = std::abs(body.yaw) <= 90.0
+                               ? body.yaw
+                               : std::copysign(180.0 - std::abs(body.yaw), body.yaw);
+    const double worldYaw = std::clamp(rootYaw * 360.0, -180.0, 180.0) + bodyYaw;
+    // Root-frame counter-rotation (the yaw about up is the same in the stage frame),
+    // conjugated into the torso frame: torso^-1 * W * torso.
+    const math::Quat stage = yawQuat(-amount * worldYaw) * pitchQuat(-amount * body.pitch);
+    const math::Quat correction = (torso.conjugate() * stage * torso).normalized();
     composeBone(pose, HumanoidBone::Neck, shareOf(correction, kNeckShare));
     composeBone(pose, HumanoidBone::Head, shareOf(correction, 1.0 - kNeckShare));
 }

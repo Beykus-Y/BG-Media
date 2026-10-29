@@ -1694,6 +1694,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
 
     Vec3 targets[2];
     Quat footDelta[2];
+    Quat footYawQuat[2];
     Vec3 poles[2];
     for (int f = 0; f < 2; ++f) {
         const motion::ClipPose::Foot& foot = pose.foot[static_cast<std::size_t>(f)];
@@ -1705,6 +1706,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         const float pointed = (1.0f - foot.contact) *
                               std::clamp(lift / 0.05f, 0.0f, 1.0f) * 0.42f;
         const Quat yawQuat = math::fromAxisAngle(up, footYaw);
+        footYawQuat[f] = yawQuat;
         footDelta[f] = (yawQuat * math::fromAxisAngle(left, pointed)).normalized();
         // The knee points where the toes point (half-way, so it stays natural).
         poles[f] = math::normalize(forward * 0.6f + math::rotate(yawQuat, forward) * 0.4f);
@@ -1729,8 +1731,11 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
             if (heel <= 1.0e-4f) {
                 continue;
             }
-            // Positive rotation about `left` tips the toe down, so the heel goes up.
-            const Quat roll = math::fromAxisAngle(left, heel * heelRollRadians);
+            // Positive rotation about the foot's own lateral axis tips the toe down, so the
+            // heel goes up. The axis turns with the foot yaw: a foot turned half a turn has
+            // its toe behind the ankle, and the fixed model axis would drop that heel.
+            const Vec3 lateral = math::rotate(footYawQuat[f], left);
+            const Quat roll = math::fromAxisAngle(lateral, heel * heelRollRadians);
             const Quat turned = footDelta[f];
             const Vec3 toeOffset =
                 math::rotate(turned, impl_->bindPosition(leg.toes) - leg.bindAnkle);
