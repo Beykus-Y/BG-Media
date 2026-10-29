@@ -207,10 +207,11 @@ private:
         double alignTime = 0.0;
         double entryClipBeat = 0.0;
         double rate = 0.0;
+        bool phraseHit = false;
         bool operator<(const OverlayPlanKey& other) const {
-            return std::tie(clipId, loop, musical, alignTime, entryClipBeat, rate) <
+            return std::tie(clipId, loop, musical, alignTime, entryClipBeat, rate, phraseHit) <
                    std::tie(other.clipId, other.loop, other.musical, other.alignTime,
-                            other.entryClipBeat, other.rate);
+                            other.entryClipBeat, other.rate, other.phraseHit);
         }
     };
     std::map<OverlayPlanKey, std::vector<PrimitiveCue>> overlays_;

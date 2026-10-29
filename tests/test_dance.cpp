@@ -1963,6 +1963,47 @@ AnalysisResult gridWithDynamics(double bpm, double duration, double switchAt, fl
     return analysis;
 }
 
+// Three 8-second phrases at 120 BPM: calm, loud, calm. The sections and the onset strengths say
+// so, which gives the auto plan Groove, Energetic, Groove, with an energy jump at each seam.
+AnalysisResult threePhrases() {
+    AnalysisResult analysis;
+    const double bpm = 120.0;
+    const double duration = 24.0;
+    analysis.info.duration = duration;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 0.95f;
+    analysis.beatPhaseConfidence = 0.95f;
+    analysis.meterConfidence = 0.9f;
+    analysis.downbeatConfidence = 0.9f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const auto energyAt = [](double t) { return t >= 8.0 && t < 16.0 ? 0.95f : 0.1f; };
+    for (int i = 0; i < static_cast<int>(duration * bpm / 60.0); ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / bpm;
+        beat.strength = i % 4 == 0 ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+        Onset onset;
+        onset.time = beat.time;
+        onset.strength = energyAt(beat.time);
+        analysis.onsets.push_back(onset);
+    }
+    for (int k = 0; k < 3; ++k) {
+        Section section;
+        section.start = 8.0 * k;
+        section.end = 8.0 * (k + 1);
+        section.kind = SectionKind::Main;
+        section.energy = energyAt(section.start + 4.0);
+        section.confidence = 0.9f;
+        analysis.sections.push_back(section);
+    }
+    return analysis;
+}
+
 bool isHandOrHead(motion::PrimitiveKind kind) {
     using K = motion::PrimitiveKind;
     return kind == K::HandFlick || kind == K::FingerRipple || kind == K::WristRoll ||
@@ -2071,6 +2112,44 @@ TEST_CASE(dance.phrase_loudness_sets_the_upper_body_swing) {
     const double ratio = quietSpeed / loudSpeed;
     CHECK(ratio > 0.5);
     CHECK(ratio < 0.8);
+}
+
+TEST_CASE(dance.auto_phrases_join_from_different_entries) {
+    // Two calm phrases of one style, with a loud phrase between them: the second Groove starts
+    // from another entry point of the clip, since the poses allow it.
+    const AnalysisResult analysis = threePhrases();
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    std::vector<double> grooveEntries;
+    for (const motion::ScheduleSegment& segment : player.director().schedule().segments()) {
+        if (segment.clip && segment.clip->style == motion::DanceStyle::Groove) {
+            grooveEntries.push_back(segment.entryClipBeat);
+        }
+    }
+    CHECK(grooveEntries.size() == 2);
+    if (grooveEntries.size() == 2) {
+        CHECK(grooveEntries[0] != grooveEntries[1]);
+    }
+}
+
+TEST_CASE(dance.auto_phrase_after_an_energy_jump_starts_with_a_hit) {
+    const AnalysisResult analysis = threePhrases();
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const auto planned = player.plannedOverlays(0.0, analysis.info.duration);
+    for (double seam : {8.0, 16.0}) {
+        bool hit = false;
+        for (const auto& cue : planned) {
+            if (cue.reason == "phrase hit" && std::abs(cue.mediaTime - seam) < 0.05) {
+                hit = true;
+            }
+        }
+        CHECK(hit);
+    }
 }
 
 TEST_CASE(dance.musical_gestures_are_deterministic_per_seed) {
