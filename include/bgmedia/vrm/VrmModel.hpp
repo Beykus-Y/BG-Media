@@ -1,6 +1,14 @@
 #pragma once
 
-// VRM 0.x (glTF 2.0 + extensions.VRM) import data model.
+// VRM import data model for both schema generations:
+//   VRM 0.x  glTF 2.0 + extensions.VRM            (UniVRM 0.x, faces -Z)
+//   VRM 1.0  glTF 2.0 + extensions.VRMC_vrm and   (faces +Z)
+//            VRMC_springBone / VRMC_node_constraint / VRMC_materials_mtoon
+//
+// The loader detects the generation and adapts a 1.0 file into the same
+// conventions the rest of the engine was built on (see VrmModel::version and
+// VrmModel::sourceToModel), so animation, springs and the renderer never branch
+// on the version.
 //
 // This header is deliberately graphics-API agnostic. It contains no SDL types
 // and no renderer objects, so the importer can be tested headlessly and reused
@@ -91,6 +99,14 @@ struct SpringCollider {
     Vec3 offset{};
     float radius = 0.0f;
 };
+
+// Which schema generation the file was authored in.
+enum class VrmVersion : std::uint8_t {
+    V0,  // extensions.VRM
+    V1   // extensions.VRMC_vrm
+};
+
+[[nodiscard]] std::string_view vrmVersionName(VrmVersion version);
 
 struct SpringColliderGroup {
     int node = -1;
@@ -238,21 +254,181 @@ struct Skin {
 };
 
 struct HumanoidEntry {
+    // VRM 0.x bone name. A 1.0 file's names are normalised to it: the 1.0
+    // thumb chain (Metacarpal, Proximal, Distal) becomes the 0.x chain
+    // (Proximal, Intermediate, Distal), the same bones under older names.
     std::string name;
+    std::string sourceName;  // as written in the file
     int node = -1;
     std::optional<HumanoidBone> core;
 };
 
+// The VRM 0.x fields keep their 0.x spelling and values. A VRM 1.0 file fills
+// them with the nearest 0.x equivalent (title <- name, author <- authors,
+// allowedUserName <- avatarPermission, ...) so existing UI keeps working, and
+// also fills the 1.0-only fields below.
 struct Metadata {
     std::string title;
     std::string author;
     std::string licenseName;
-    std::string allowedUserName;
-    std::string commercialUsage;
+    std::string allowedUserName;   // "OnlyAuthor", "ExplicitlyLicensedPerson", "Everyone"
+    std::string commercialUsage;   // "Allow" / "Disallow"
     std::string sexualUsage;
     std::string violentUsage;
     std::string otherPermission;
     int thumbnailTexture = -1;
+
+    std::string version;                 // model version (both generations)
+    std::vector<std::string> authors;    // 1.0 authors; 0.x: {author}
+    std::string contactInformation;
+    std::string reference;
+    std::string copyrightInformation;    // 1.0
+    std::string licenseUrl;              // 1.0
+    std::string thirdPartyLicenses;      // 1.0
+    std::string otherLicenseUrl;         // both
+    std::string avatarPermission;        // 1.0 raw value
+    std::string commercialUsageV1;       // 1.0 raw value (personalNonProfit, ...)
+    std::string creditNotation;          // 1.0 ("required" / "unnecessary")
+    std::string modification;            // 1.0 ("prohibited", ...)
+    std::optional<bool> allowRedistribution;           // 1.0 only
+    std::optional<bool> allowPoliticalOrReligiousUsage;  // 1.0 only
+    std::optional<bool> allowAntisocialOrHateUsage;    // 1.0 only
+    int thumbnailImage = -1;             // glTF image index (1.0 thumbnailImage)
+
+    // True when the licence keeps the avatar to its author or forbids
+    // redistribution. Same answer as the 0.x-only check the desktop used before.
+    [[nodiscard]] bool restrictsRedistribution() const;
+};
+
+// ---------------------------------------------------------------------------
+// Expressions (VRM 1.0 expressions, VRM 0.x blendShapeMaster)
+// ---------------------------------------------------------------------------
+// The preset set is VRM 1.0's; 0.x presets are mapped onto it (joy -> Happy,
+// sorrow -> Sad, fun -> Relaxed, a -> Aa, blink_l -> BlinkLeft, ...).
+enum class ExpressionPreset : std::uint8_t {
+    Custom,
+    Neutral,
+    Happy,
+    Angry,
+    Sad,
+    Relaxed,
+    Surprised,
+    Aa,
+    Ih,
+    Ou,
+    Ee,
+    Oh,
+    Blink,
+    BlinkLeft,
+    BlinkRight,
+    LookUp,
+    LookDown,
+    LookLeft,
+    LookRight
+};
+
+[[nodiscard]] std::string_view expressionPresetName(ExpressionPreset preset);
+[[nodiscard]] std::optional<ExpressionPreset> expressionPresetFromVrm1Name(
+    std::string_view name);
+// Case-insensitive, as UniVRM 0.x wrote both "Joy" and "joy".
+[[nodiscard]] std::optional<ExpressionPreset> expressionPresetFromVrm0Name(
+    std::string_view name);
+
+enum class ExpressionOverride : std::uint8_t { None, Block, Blend };
+
+struct MorphTargetBind {
+    int mesh = -1;      // index into VrmModel::meshes
+    int node = -1;      // 1.0: the node that instances the mesh; 0.x: -1
+    int index = -1;     // morph target index inside the mesh
+    float weight = 0.0f;  // 0..1 (0.x weights are 0..100 and are rescaled)
+};
+
+enum class MaterialColorType : std::uint8_t {
+    Color,
+    EmissionColor,
+    ShadeColor,
+    MatcapColor,
+    RimColor,
+    OutlineColor
+};
+
+struct MaterialColorBind {
+    int material = -1;
+    MaterialColorType type = MaterialColorType::Color;
+    Vec4 targetValue{1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+struct TextureTransformBind {
+    int material = -1;
+    Vec2 scale{1.0f, 1.0f};
+    Vec2 offset{0.0f, 0.0f};
+};
+
+struct Expression {
+    std::string name;
+    ExpressionPreset preset = ExpressionPreset::Custom;
+    bool isBinary = false;
+    ExpressionOverride overrideBlink = ExpressionOverride::None;
+    ExpressionOverride overrideLookAt = ExpressionOverride::None;
+    ExpressionOverride overrideMouth = ExpressionOverride::None;
+    std::vector<MorphTargetBind> morphTargetBinds;
+    std::vector<MaterialColorBind> materialColorBinds;
+    std::vector<TextureTransformBind> textureTransformBinds;
+};
+
+// ---------------------------------------------------------------------------
+// Look-at (VRM 1.0 lookAt, VRM 0.x firstPerson.lookAt*)
+// ---------------------------------------------------------------------------
+enum class LookAtType : std::uint8_t { Bone, Expression };
+
+// Yaw/pitch in degrees up to inputMaxValue map linearly to outputScale
+// (degrees of eye bone rotation for Bone, expression weight for Expression).
+// 0.x curves are reduced to their end points (xRange -> inputMaxValue,
+// yRange -> outputScale), which is what UniVRM's default linear curve means.
+struct LookAtRangeMap {
+    float inputMaxValue = 90.0f;
+    float outputScale = 10.0f;
+};
+
+struct LookAt {
+    bool authored = false;
+    LookAtType type = LookAtType::Bone;
+    // Eye origin relative to the head bone, in model axes (already converted
+    // to the engine's -Z-forward frame for both generations).
+    Vec3 offsetFromHeadBone{0.0f, 0.06f, 0.0f};
+    LookAtRangeMap horizontalInner;
+    LookAtRangeMap horizontalOuter;
+    LookAtRangeMap verticalDown;
+    LookAtRangeMap verticalUp;
+};
+
+// First-person mesh visibility (1.0 meshAnnotations by node; 0.x by mesh,
+// expanded here to every node that instances that mesh).
+enum class FirstPersonType : std::uint8_t {
+    Auto,
+    Both,
+    ThirdPersonOnly,
+    FirstPersonOnly
+};
+
+struct FirstPersonAnnotation {
+    int node = -1;
+    FirstPersonType type = FirstPersonType::Auto;
+};
+
+// ---------------------------------------------------------------------------
+// Node constraints (VRMC_node_constraint, VRM 1.0 only)
+// ---------------------------------------------------------------------------
+enum class NodeConstraintType : std::uint8_t { Roll, Aim, Rotation };
+
+struct NodeConstraint {
+    int destination = -1;   // the node carrying the extension
+    int source = -1;
+    NodeConstraintType type = NodeConstraintType::Rotation;
+    // Roll: the roll axis; Aim: the aim axis (signed). Unit vector in the
+    // destination's local space. Unused for Rotation.
+    Vec3 axis{1.0f, 0.0f, 0.0f};
+    float weight = 1.0f;
 };
 
 struct Diagnostics {
@@ -275,7 +451,9 @@ struct Diagnostics {
     int springChainCount = 0;
     int springColliderGroupCount = 0;
     int springColliderCount = 0;
-    int blendShapeCount = 0;
+    int blendShapeCount = 0;   // 0.x blend shape groups / 1.0 expressions
+    int expressionCount = 0;
+    int nodeConstraintCount = 0;
     int estimatedCpuTextureBytes = 0;
     double loadMilliseconds = 0.0;
 };
@@ -286,6 +464,12 @@ public:
     std::string name;
     std::string exporterVersion;
     std::string specVersion;
+    VrmVersion version = VrmVersion::V0;
+    // Rotation the loader applied to the file's scene roots so every model
+    // faces -Z like VRM 0.x (the frame the camera, clips and tools assume).
+    // Identity for 0.x; a half turn about +Y for 1.0, which faces +Z. Any data
+    // read later in the file's own model frame must be rotated by it.
+    Quat sourceToModel = Quat::identity();
     std::uint64_t fileSize = 0;
 
     std::vector<Node> nodes;
@@ -311,6 +495,13 @@ public:
     std::vector<SpringColliderGroup> springColliderGroups;
     std::vector<SpringBoneChain> springChains;
     std::string springSource;  // "VRM.secondaryAnimation", "VRMC_springBone" or empty
+
+    std::vector<Expression> expressions;
+    LookAt lookAt;
+    int firstPersonBone = -1;  // 0.x firstPersonBone; 1.0: the head
+    std::vector<FirstPersonAnnotation> firstPersonAnnotations;
+    // Evaluated by animation::applyNodeConstraints after retargeting.
+    std::vector<NodeConstraint> nodeConstraints;
 
     Metadata metadata;
     Diagnostics diagnostics;
@@ -344,6 +535,8 @@ public:
     [[nodiscard]] const Material* materialForPrimitive(int mesh, int primitive) const;
     [[nodiscard]] Vec3 boneBindPosition(HumanoidBone bone) const;
     [[nodiscard]] bool completeHumanoid() const;
+    [[nodiscard]] const Expression* findExpression(ExpressionPreset preset) const;
+    [[nodiscard]] const Expression* findExpression(std::string_view name) const;
     void releaseTexturePixels();
 };
 

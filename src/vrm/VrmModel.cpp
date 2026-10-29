@@ -41,7 +41,111 @@ constexpr BoneName kBoneNames[] = {
     {HumanoidBone::RightEye, "rightEye"},
 };
 
+struct PresetName {
+    ExpressionPreset preset;
+    std::string_view name;
+};
+
+// VRM 1.0 expressions.preset keys.
+constexpr PresetName kPresetNames[] = {
+    {ExpressionPreset::Neutral, "neutral"},
+    {ExpressionPreset::Happy, "happy"},
+    {ExpressionPreset::Angry, "angry"},
+    {ExpressionPreset::Sad, "sad"},
+    {ExpressionPreset::Relaxed, "relaxed"},
+    {ExpressionPreset::Surprised, "surprised"},
+    {ExpressionPreset::Aa, "aa"},
+    {ExpressionPreset::Ih, "ih"},
+    {ExpressionPreset::Ou, "ou"},
+    {ExpressionPreset::Ee, "ee"},
+    {ExpressionPreset::Oh, "oh"},
+    {ExpressionPreset::Blink, "blink"},
+    {ExpressionPreset::BlinkLeft, "blinkLeft"},
+    {ExpressionPreset::BlinkRight, "blinkRight"},
+    {ExpressionPreset::LookUp, "lookUp"},
+    {ExpressionPreset::LookDown, "lookDown"},
+    {ExpressionPreset::LookLeft, "lookLeft"},
+    {ExpressionPreset::LookRight, "lookRight"},
+};
+
+// VRM 0.x blendShapeGroups[].presetName values (lower case).
+constexpr PresetName kVrm0PresetNames[] = {
+    {ExpressionPreset::Neutral, "neutral"},
+    {ExpressionPreset::Happy, "joy"},
+    {ExpressionPreset::Angry, "angry"},
+    {ExpressionPreset::Sad, "sorrow"},
+    {ExpressionPreset::Relaxed, "fun"},
+    {ExpressionPreset::Aa, "a"},
+    {ExpressionPreset::Ih, "i"},
+    {ExpressionPreset::Ou, "u"},
+    {ExpressionPreset::Ee, "e"},
+    {ExpressionPreset::Oh, "o"},
+    {ExpressionPreset::Blink, "blink"},
+    {ExpressionPreset::BlinkLeft, "blink_l"},
+    {ExpressionPreset::BlinkRight, "blink_r"},
+    {ExpressionPreset::LookUp, "lookup"},
+    {ExpressionPreset::LookDown, "lookdown"},
+    {ExpressionPreset::LookLeft, "lookleft"},
+    {ExpressionPreset::LookRight, "lookright"},
+};
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto lower = [](char c) {
+            return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+        };
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
+
+std::string_view vrmVersionName(VrmVersion version) {
+    return version == VrmVersion::V1 ? "1.0" : "0.x";
+}
+
+std::string_view expressionPresetName(ExpressionPreset preset) {
+    for (const PresetName& entry : kPresetNames) {
+        if (entry.preset == preset) {
+            return entry.name;
+        }
+    }
+    return "custom";
+}
+
+std::optional<ExpressionPreset> expressionPresetFromVrm1Name(std::string_view name) {
+    for (const PresetName& entry : kPresetNames) {
+        if (entry.name == name) {
+            return entry.preset;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ExpressionPreset> expressionPresetFromVrm0Name(std::string_view name) {
+    for (const PresetName& entry : kVrm0PresetNames) {
+        if (equalsIgnoreCase(entry.name, name)) {
+            return entry.preset;
+        }
+    }
+    return std::nullopt;
+}
+
+bool Metadata::restrictsRedistribution() const {
+    if (!licenseName.empty() &&
+        (allowedUserName == "OnlyAuthor" ||
+         licenseName.find("Redistribution") != std::string::npos)) {
+        return true;
+    }
+    return avatarPermission == "onlyAuthor" ||
+           (allowRedistribution.has_value() && !*allowRedistribution);
+}
 
 std::string_view humanoidBoneName(HumanoidBone bone) {
     for (const BoneName& entry : kBoneNames) {
@@ -177,6 +281,27 @@ bool VrmModel::completeHumanoid() const {
         }
     }
     return true;
+}
+
+const Expression* VrmModel::findExpression(ExpressionPreset preset) const {
+    if (preset == ExpressionPreset::Custom) {
+        return nullptr;
+    }
+    for (const Expression& expression : expressions) {
+        if (expression.preset == preset) {
+            return &expression;
+        }
+    }
+    return nullptr;
+}
+
+const Expression* VrmModel::findExpression(std::string_view expressionName) const {
+    for (const Expression& expression : expressions) {
+        if (expression.name == expressionName) {
+            return &expression;
+        }
+    }
+    return nullptr;
 }
 
 void VrmModel::releaseTexturePixels() {

@@ -1,5 +1,8 @@
 #include "bgmedia/vrm/VrmModel.hpp"
 
+#include "VrmJson.hpp"
+#include "VrmSchema.hpp"
+
 #include "cgltf.h"
 #include "stb_image.h"
 
@@ -54,420 +57,7 @@ Vec3 vec3FromArray(const float* values) {
     return {values[0], values[1], values[2]};
 }
 
-// ---------------------------------------------------------------------------
-// Minimal JSON DOM, used only for the VRM extension block. The glTF core is
-// handled by cgltf. Keeping this parser small and bounded means a corrupted
-// VRM cannot recurse without limit or read outside the JSON chunk.
-// ---------------------------------------------------------------------------
-struct JsonValue {
-    enum class Type { Null, Bool, Number, String, Array, Object };
-
-    Type type = Type::Null;
-    bool boolean = false;
-    double number = 0.0;
-    std::string string;
-    std::vector<JsonValue> items;
-    std::vector<std::pair<std::string, JsonValue>> fields;
-
-    [[nodiscard]] const JsonValue* find(std::string_view key) const {
-        for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
-            if (it->first == key) {
-                return &it->second;
-            }
-        }
-        return nullptr;
-    }
-    [[nodiscard]] const JsonValue* at(std::size_t index) const {
-        return index < items.size() ? &items[index] : nullptr;
-    }
-    [[nodiscard]] bool isObject() const { return type == Type::Object; }
-    [[nodiscard]] bool isArray() const { return type == Type::Array; }
-    [[nodiscard]] bool isString() const { return type == Type::String; }
-    [[nodiscard]] bool isNumber() const { return type == Type::Number; }
-};
-
-class JsonParser {
-public:
-    explicit JsonParser(std::string_view text) : text_(text) {}
-
-    bool parse(JsonValue& out, std::string& error) {
-        skipWhitespace();
-        if (!parseValue(out, 0)) {
-            error = lastError_;
-            return false;
-        }
-        skipWhitespace();
-        if (position_ != text_.size()) {
-            error = "unexpected trailing JSON data at byte " +
-                    std::to_string(position_);
-            return false;
-        }
-        return true;
-    }
-
-private:
-    bool fail(std::string message, int depth) {
-        lastError_ = std::move(message) + " at byte " + std::to_string(position_);
-        if (depth > 0) {
-            lastError_ += " (depth " + std::to_string(depth) + ")";
-        }
-        return false;
-    }
-
-    void skipWhitespace() {
-        while (position_ < text_.size()) {
-            const char c = text_[position_];
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                ++position_;
-            } else {
-                break;
-            }
-        }
-    }
-
-    [[nodiscard]] char peek() const {
-        return position_ < text_.size() ? text_[position_] : '\0';
-    }
-
-    bool parseValue(JsonValue& out, int depth) {
-        if (depth > 128) {
-            lastError_ = "JSON nesting exceeds 128 levels";
-            return false;
-        }
-        skipWhitespace();
-        if (position_ >= text_.size()) {
-            return fail("unexpected end of JSON", depth);
-        }
-        const char c = text_[position_];
-        if (c == '{') {
-            return parseObject(out, depth);
-        }
-        if (c == '[') {
-            return parseArray(out, depth);
-        }
-        if (c == '"') {
-            out.type = JsonValue::Type::String;
-            return parseString(out.string, depth);
-        }
-        if (c == 't') {
-            return parseLiteral("true", out, true, depth);
-        }
-        if (c == 'f') {
-            return parseLiteral("false", out, false, depth);
-        }
-        if (c == 'n') {
-            return parseNull(out, depth);
-        }
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            return parseNumber(out, depth);
-        }
-        return fail("invalid JSON value", depth);
-    }
-
-    bool parseObject(JsonValue& out, int depth) {
-        out.type = JsonValue::Type::Object;
-        ++position_;
-        skipWhitespace();
-        if (peek() == '}') {
-            ++position_;
-            return true;
-        }
-        while (true) {
-            skipWhitespace();
-            if (peek() != '"') {
-                return fail("expected object key", depth);
-            }
-            std::string key;
-            if (!parseString(key, depth)) {
-                return false;
-            }
-            skipWhitespace();
-            if (peek() != ':') {
-                return fail("expected ':' after object key", depth);
-            }
-            ++position_;
-            JsonValue value;
-            if (!parseValue(value, depth + 1)) {
-                return false;
-            }
-            out.fields.emplace_back(std::move(key), std::move(value));
-            skipWhitespace();
-            if (peek() == ',') {
-                ++position_;
-                continue;
-            }
-            if (peek() == '}') {
-                ++position_;
-                return true;
-            }
-            return fail("expected ',' or '}' in object", depth);
-        }
-    }
-
-    bool parseArray(JsonValue& out, int depth) {
-        out.type = JsonValue::Type::Array;
-        ++position_;
-        skipWhitespace();
-        if (peek() == ']') {
-            ++position_;
-            return true;
-        }
-        while (true) {
-            JsonValue value;
-            if (!parseValue(value, depth + 1)) {
-                return false;
-            }
-            out.items.push_back(std::move(value));
-            skipWhitespace();
-            if (peek() == ',') {
-                ++position_;
-                continue;
-            }
-            if (peek() == ']') {
-                ++position_;
-                return true;
-            }
-            return fail("expected ',' or ']' in array", depth);
-        }
-    }
-
-    bool parseLiteral(std::string_view literal, JsonValue& out, bool value,
-                      int depth) {
-        if (text_.substr(position_, literal.size()) != literal) {
-            return fail("invalid literal", depth);
-        }
-        position_ += literal.size();
-        out.type = JsonValue::Type::Bool;
-        out.boolean = value;
-        return true;
-    }
-
-    bool parseNull(JsonValue& out, int depth) {
-        if (text_.substr(position_, 4) != "null") {
-            return fail("invalid literal", depth);
-        }
-        position_ += 4;
-        out.type = JsonValue::Type::Null;
-        return true;
-    }
-
-    bool parseNumber(JsonValue& out, int depth) {
-        const std::size_t start = position_;
-        if (peek() == '-') {
-            ++position_;
-        }
-        if (peek() == '0') {
-            ++position_;
-        } else if (peek() >= '1' && peek() <= '9') {
-            while (peek() >= '0' && peek() <= '9') {
-                ++position_;
-            }
-        } else {
-            return fail("invalid number", depth);
-        }
-        if (peek() == '.') {
-            ++position_;
-            if (!(peek() >= '0' && peek() <= '9')) {
-                return fail("invalid number fraction", depth);
-            }
-            while (peek() >= '0' && peek() <= '9') {
-                ++position_;
-            }
-        }
-        if (peek() == 'e' || peek() == 'E') {
-            ++position_;
-            if (peek() == '+' || peek() == '-') {
-                ++position_;
-            }
-            if (!(peek() >= '0' && peek() <= '9')) {
-                return fail("invalid number exponent", depth);
-            }
-            while (peek() >= '0' && peek() <= '9') {
-                ++position_;
-            }
-        }
-        const std::string token(text_.substr(start, position_ - start));
-        char* end = nullptr;
-        const double value = std::strtod(token.c_str(), &end);
-        if (!end || *end != '\0' || !std::isfinite(value)) {
-            return fail("number is not finite", depth);
-        }
-        out.type = JsonValue::Type::Number;
-        out.number = value;
-        return true;
-    }
-
-    bool parseString(std::string& out, int depth) {
-        if (peek() != '"') {
-            return fail("expected string", depth);
-        }
-        ++position_;
-        out.clear();
-        while (position_ < text_.size()) {
-            const unsigned char c = static_cast<unsigned char>(text_[position_++]);
-            if (c == '"') {
-                return true;
-            }
-            if (c < 0x20) {
-                return fail("control character in string", depth);
-            }
-            if (c != '\\') {
-                out.push_back(static_cast<char>(c));
-                continue;
-            }
-            if (position_ >= text_.size()) {
-                return fail("truncated escape", depth);
-            }
-            const char escape = text_[position_++];
-            switch (escape) {
-            case '"':
-                out.push_back('"');
-                break;
-            case '\\':
-                out.push_back('\\');
-                break;
-            case '/':
-                out.push_back('/');
-                break;
-            case 'b':
-                out.push_back('\b');
-                break;
-            case 'f':
-                out.push_back('\f');
-                break;
-            case 'n':
-                out.push_back('\n');
-                break;
-            case 'r':
-                out.push_back('\r');
-                break;
-            case 't':
-                out.push_back('\t');
-                break;
-            case 'u': {
-                std::uint32_t code = 0;
-                if (!readHex4(code, depth)) {
-                    return false;
-                }
-                if (code >= 0xD800 && code <= 0xDBFF) {
-                    if (position_ + 2 > text_.size() || text_[position_] != '\\' ||
-                        text_[position_ + 1] != 'u') {
-                        return fail("unpaired high surrogate", depth);
-                    }
-                    position_ += 2;
-                    std::uint32_t low = 0;
-                    if (!readHex4(low, depth)) {
-                        return false;
-                    }
-                    if (low < 0xDC00 || low > 0xDFFF) {
-                        return fail("invalid low surrogate", depth);
-                    }
-                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-                } else if (code >= 0xDC00 && code <= 0xDFFF) {
-                    return fail("unpaired low surrogate", depth);
-                }
-                appendUtf8(out, code);
-                break;
-            }
-            default:
-                return fail("unknown escape", depth);
-            }
-        }
-        return fail("unterminated string", depth);
-    }
-
-    bool readHex4(std::uint32_t& value, int depth) {
-        if (position_ + 4 > text_.size()) {
-            return fail("truncated unicode escape", depth);
-        }
-        value = 0;
-        for (int i = 0; i < 4; ++i) {
-            const char c = text_[position_++];
-            value <<= 4;
-            if (c >= '0' && c <= '9') {
-                value |= static_cast<std::uint32_t>(c - '0');
-            } else if (c >= 'a' && c <= 'f') {
-                value |= static_cast<std::uint32_t>(c - 'a' + 10);
-            } else if (c >= 'A' && c <= 'F') {
-                value |= static_cast<std::uint32_t>(c - 'A' + 10);
-            } else {
-                return fail("invalid unicode escape", depth);
-            }
-        }
-        return true;
-    }
-
-    static void appendUtf8(std::string& out, std::uint32_t code) {
-        if (code <= 0x7F) {
-            out.push_back(static_cast<char>(code));
-        } else if (code <= 0x7FF) {
-            out.push_back(static_cast<char>(0xC0 | (code >> 6)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        } else if (code <= 0xFFFF) {
-            out.push_back(static_cast<char>(0xE0 | (code >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xF0 | (code >> 18)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-        }
-    }
-
-    std::string_view text_;
-    std::size_t position_ = 0;
-    std::string lastError_;
-};
-
-const JsonValue* objectField(const JsonValue* object, std::string_view key) {
-    return object && object->isObject() ? object->find(key) : nullptr;
-}
-
-std::string stringField(const JsonValue* object, std::string_view key) {
-    const JsonValue* value = objectField(object, key);
-    return value && value->isString() ? value->string : std::string{};
-}
-
-double numberField(const JsonValue* object, std::string_view key,
-                   double fallback = 0.0) {
-    const JsonValue* value = objectField(object, key);
-    return value && value->isNumber() ? value->number : fallback;
-}
-
-Vec3 vec3Field(const JsonValue* object, std::string_view key, Vec3 fallback) {
-    const JsonValue* value = objectField(object, key);
-    if (!value) {
-        return fallback;
-    }
-    if (value->isObject()) {
-        return {static_cast<float>(numberField(value, "x", fallback.x)),
-                static_cast<float>(numberField(value, "y", fallback.y)),
-                static_cast<float>(numberField(value, "z", fallback.z))};
-    }
-    if (value->isArray() && value->items.size() >= 3 &&
-        value->items[0].isNumber() && value->items[1].isNumber() &&
-        value->items[2].isNumber()) {
-        return {static_cast<float>(value->items[0].number),
-                static_cast<float>(value->items[1].number),
-                static_cast<float>(value->items[2].number)};
-    }
-    return fallback;
-}
-
-Vec4 vec4Field(const JsonValue* object, std::string_view key, Vec4 fallback) {    const JsonValue* value = objectField(object, key);
-    if (!value || !value->isArray() || value->items.size() < 4) {
-        return fallback;
-    }
-    if (!value->items[0].isNumber() || !value->items[1].isNumber() ||
-        !value->items[2].isNumber() || !value->items[3].isNumber()) {
-        return fallback;
-    }
-    return {static_cast<float>(value->items[0].number),
-            static_cast<float>(value->items[1].number),
-            static_cast<float>(value->items[2].number),
-            static_cast<float>(value->items[3].number)};
-}
+using namespace json;
 
 bool parseGlbChunks(std::span<const std::uint8_t> bytes, std::string_view& json,
                     std::span<const std::uint8_t>& binary, std::string& error) {
@@ -817,22 +407,35 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         result.error = "VRM JSON: " + error;
         return result;
     }
+    // Version detection. A 1.0 file carries extensions.VRMC_vrm; a 0.x file
+    // extensions.VRM. `vrm` is the 0.x block and stays null for a 1.0 file, so
+    // every 0.x-only reader below is a no-op for it; `vrmc` is the 1.0 block.
     const JsonValue* extensions = objectField(&rootJson, "extensions");
     const JsonValue* vrm = objectField(extensions, "VRM");
-    if (!vrm) {
-        if (objectField(extensions, "VRMC_vrm")) {
-            result.error =
-                "this file uses VRM 1.0 (VRMC_vrm); this build implements the "
-                "VRM 0.x extensions.VRM schema used by Model1.vrm";
-        } else {
-            result.error = "not a VRM file: extensions.VRM is missing";
+    const JsonValue* vrmc = objectField(extensions, "VRMC_vrm");
+    if (vrmc) {
+        if (!vrmc->isObject()) {
+            result.error = "extensions.VRMC_vrm is not an object";
+            return result;
         }
+        model->version = VrmVersion::V1;
+        // A half turn about +Y, exact in float (see VrmModel::sourceToModel).
+        model->sourceToModel = Quat{0.0f, 1.0f, 0.0f, 0.0f};
+        if (vrm) {
+            model->warnings.push_back(
+                "file carries both VRMC_vrm (1.0) and VRM (0.x); using VRM 1.0");
+            vrm = nullptr;
+        }
+    } else if (!vrm) {
+        result.error =
+            "not a VRM file: neither extensions.VRMC_vrm (VRM 1.0) nor "
+            "extensions.VRM (VRM 0.x) is present";
         return result;
-    }
-    if (!vrm->isObject()) {
+    } else if (!vrm->isObject()) {
         result.error = "extensions.VRM is not an object";
         return result;
     }
+    const bool isV1 = model->version == VrmVersion::V1;
 
     cgltf_options options{};
     cgltf_data* rawData = nullptr;
@@ -871,33 +474,48 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
     }
 
     model->exporterVersion.clear();
-    const JsonValue* exporter = objectField(vrm, "exporterVersion");
+    const JsonValue* exporter =
+        isV1 ? objectField(objectField(&rootJson, "asset"), "generator")
+             : objectField(vrm, "exporterVersion");
     if (exporter && exporter->isString()) {
         model->exporterVersion = exporter->string;
     }
-    const JsonValue* spec = objectField(vrm, "specVersion");
+    const JsonValue* spec = objectField(isV1 ? vrmc : vrm, "specVersion");
     if (spec && spec->isString()) {
         model->specVersion = spec->string;
     }
     if (model->specVersion.empty()) {
-        model->specVersion = "0.x";
+        model->specVersion = isV1 ? "1.0" : "0.x";
     }
 
-    const JsonValue* meta = objectField(vrm, "meta");
-    model->metadata.title = stringField(meta, "title");
-    model->metadata.author = stringField(meta, "author");
-    model->metadata.licenseName = stringField(meta, "licenseName");
-    model->metadata.allowedUserName = stringField(meta, "allowedUserName");
-    model->metadata.commercialUsage =
-        stringField(meta, "commercialUssageName");
-    if (model->metadata.commercialUsage.empty()) {
-        model->metadata.commercialUsage = stringField(meta, "commercialUsageName");
+    if (isV1) {
+        schema::readMetaV1(objectField(vrmc, "meta"), *model);
+    } else {
+        const JsonValue* meta = objectField(vrm, "meta");
+        model->metadata.title = stringField(meta, "title");
+        model->metadata.author = stringField(meta, "author");
+        model->metadata.licenseName = stringField(meta, "licenseName");
+        model->metadata.allowedUserName = stringField(meta, "allowedUserName");
+        model->metadata.commercialUsage =
+            stringField(meta, "commercialUssageName");
+        if (model->metadata.commercialUsage.empty()) {
+            model->metadata.commercialUsage = stringField(meta, "commercialUsageName");
+        }
+        model->metadata.sexualUsage = stringField(meta, "sexualUssageName");
+        model->metadata.violentUsage = stringField(meta, "violentUssageName");
+        model->metadata.otherPermission = stringField(meta, "otherPermissionUrl");
+        model->metadata.thumbnailTexture =
+            static_cast<int>(numberField(meta, "texture", -1.0));
+        if (meta) {
+            model->metadata.version = stringField(meta, "version");
+            model->metadata.contactInformation = stringField(meta, "contactInformation");
+            model->metadata.reference = stringField(meta, "reference");
+            model->metadata.otherLicenseUrl = stringField(meta, "otherLicenseUrl");
+            if (!model->metadata.author.empty()) {
+                model->metadata.authors.push_back(model->metadata.author);
+            }
+        }
     }
-    model->metadata.sexualUsage = stringField(meta, "sexualUssageName");
-    model->metadata.violentUsage = stringField(meta, "violentUssageName");
-    model->metadata.otherPermission = stringField(meta, "otherPermissionUrl");
-    model->metadata.thumbnailTexture =
-        static_cast<int>(numberField(meta, "texture", -1.0));
     model->name = model->metadata.title;
     if (model->name.empty()) {
         const std::size_t slash = model->sourcePath.find_last_of("/\\");
@@ -1037,6 +655,21 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         return result;
     }
 
+    // VRM 1.0 faces +Z, 0.x faces -Z. Turning the scene roots half way about
+    // +Y makes a 1.0 file face -Z like 0.x everywhere downstream (camera,
+    // clips, tools). Only roots change: every child's local transform, every
+    // inverse bind matrix and every vertex stays as authored, and skinning
+    // (joint global * inverse bind) picks the turn up through the joints.
+    if (isV1) {
+        const Mat4 turn = Mat4::fromQuat(model->sourceToModel);
+        for (int root : model->sceneRoots) {
+            Node& node = model->nodes[static_cast<std::size_t>(root)];
+            node.local = turn * node.local;
+            node.translation = math::rotate(model->sourceToModel, node.translation);
+            node.rotation = (model->sourceToModel * node.rotation).normalized();
+        }
+    }
+
     model->bindGlobals.resize(model->nodes.size(), Mat4::identity());
     model->bindGlobalRotations.resize(model->nodes.size());
     std::vector<bool> visited(model->nodes.size(), false);
@@ -1079,26 +712,20 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
     }
 
     // ------------------------------------------------------------------
-    // Humanoid mapping from VRM 0.x
+    // Humanoid mapping (0.x: humanBones[] array; 1.0: humanBones{} map)
     // ------------------------------------------------------------------
-    const JsonValue* humanoid = objectField(vrm, "humanoid");
-    const JsonValue* humanBones = objectField(humanoid, "humanBones");
-    if (!humanBones || !humanBones->isArray()) {
-        result.error = "extensions.VRM.humanoid.humanBones is missing";
-        return result;
-    }
-    for (const JsonValue& entry : humanBones->items) {
-        const std::string name = stringField(&entry, "bone");
-        const double rawNode = numberField(&entry, "node", -1.0);
-        if (name.empty() || rawNode < 0.0 ||
+    const auto addHumanBone = [&](const std::string& fileBoneName, double rawNode) {
+        if (fileBoneName.empty() || rawNode < 0.0 ||
             rawNode > static_cast<double>(model->nodes.size() - 1) ||
             std::floor(rawNode) != rawNode) {
             model->warnings.push_back("ignored malformed humanoid bone entry");
-            continue;
+            return;
         }
+        const std::string name = isV1 ? schema::vrm0BoneName(fileBoneName) : fileBoneName;
         const int node = static_cast<int>(rawNode);
         HumanoidEntry parsed;
         parsed.name = name;
+        parsed.sourceName = fileBoneName;
         parsed.node = node;
         parsed.core = humanoidBoneFromVrmName(name);
         model->humanoidEntries.push_back(parsed);
@@ -1106,11 +733,32 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
             const std::size_t index = static_cast<std::size_t>(*parsed.core);
             if (model->humanoidNodes[index] >= 0 &&
                 model->humanoidNodes[index] != node) {
-                model->warnings.push_back("duplicate humanoid bone '" + name +
+                model->warnings.push_back("duplicate humanoid bone '" + fileBoneName +
                                           "'; keeping the first mapping");
             } else {
                 model->humanoidNodes[index] = node;
             }
+        }
+    };
+    if (isV1) {
+        const JsonValue* humanBones =
+            objectField(objectField(vrmc, "humanoid"), "humanBones");
+        if (!humanBones || !humanBones->isObject()) {
+            result.error = "extensions.VRMC_vrm.humanoid.humanBones is missing";
+            return result;
+        }
+        for (const auto& [boneName, bone] : humanBones->fields) {
+            addHumanBone(boneName, numberField(&bone, "node", -1.0));
+        }
+    } else {
+        const JsonValue* humanoid = objectField(vrm, "humanoid");
+        const JsonValue* humanBones = objectField(humanoid, "humanBones");
+        if (!humanBones || !humanBones->isArray()) {
+            result.error = "extensions.VRM.humanoid.humanBones is missing";
+            return result;
+        }
+        for (const JsonValue& entry : humanBones->items) {
+            addHumanBone(stringField(&entry, "bone"), numberField(&entry, "node", -1.0));
         }
     }
     model->diagnostics.humanoidCount =
@@ -1359,19 +1007,12 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
                     }
                 }
             }
-            model->diagnostics.springGroupCount =
-                static_cast<int>(model->springGroups.size());
-            model->diagnostics.springChainCount =
-                static_cast<int>(model->springChains.size());
-            model->diagnostics.springBoneCount = model->springBoneCount();
-            model->diagnostics.springColliderGroupCount =
-                static_cast<int>(model->springColliderGroups.size());
-            int colliderCount = 0;
-            for (const SpringColliderGroup& group : model->springColliderGroups) {
-                colliderCount += static_cast<int>(group.colliders.size());
-            }
-            model->diagnostics.springColliderCount = colliderCount;
+            schema::finishSpringDiagnostics(*model);
         }
+    }
+    // Secondary animation (VRM 1.0 extensions.VRMC_springBone)
+    if (isV1) {
+        schema::readSpringBoneV1(objectField(extensions, "VRMC_springBone"), *model);
     }
 
     // ------------------------------------------------------------------
@@ -1487,6 +1128,15 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         material.emissiveFactor = {source.emissive_factor[0],
                                   source.emissive_factor[1],
                                   source.emissive_factor[2], 1.0f};
+        // KHR_materials_emissive_strength (common in VRM 1.0 exports).
+        if (source.has_emissive_strength &&
+            std::isfinite(source.emissive_strength.emissive_strength) &&
+            source.emissive_strength.emissive_strength > 0.0f) {
+            const float strength = source.emissive_strength.emissive_strength;
+            material.emissiveFactor = {material.emissiveFactor.x * strength,
+                                       material.emissiveFactor.y * strength,
+                                       material.emissiveFactor.z * strength, 1.0f};
+        }
         material.doubleSided = source.double_sided != 0;
         material.unlit = source.unlit != 0;
         material.alphaCutoff = source.alpha_cutoff;
@@ -1504,7 +1154,12 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         }
     }
 
-    // VRM material properties are outside glTF materials and carry MToon's
+    // VRM 1.0 MToon lives on the glTF material itself.
+    if (isV1) {
+        schema::readMToonV1(&rootJson, *model);
+    }
+
+    // VRM 0.x material properties are outside glTF materials and carry MToon's
     // shade colour/cull mode. Missing entries are not fatal.
     const JsonValue* materialProperties =
         objectField(vrm, "materialProperties");
@@ -1570,6 +1225,15 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         if (source.has_basisu || source.has_webp) {
             model->warnings.push_back(
                 "texture uses a compressed container that is not decoded");
+        }
+    }
+    // VRM 1.0 names the thumbnail by image, 0.x by texture.
+    if (isV1 && model->metadata.thumbnailImage >= 0) {
+        for (const Texture& texture : model->textures) {
+            if (texture.imageIndex == model->metadata.thumbnailImage) {
+                model->metadata.thumbnailTexture = texture.sourceTexture;
+                break;
+            }
         }
     }
     std::unordered_set<int> referencedTextures;
@@ -1935,9 +1599,12 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
         for (const Primitive& primitive : mesh.primitives) {
             const bool appliesSkin = primitive.skinned && skin;
             for (const Vertex& vertex : primitive.vertices) {
-                const Vec3 position = appliesSkin
-                                          ? vertex.position
-                                          : nodeTransform.transformPoint(vertex.position);
+                // A skinned vertex is authored in the file's bind space; the
+                // joints carry sourceToModel (identity for 0.x).
+                const Vec3 position =
+                    appliesSkin ? (isV1 ? math::rotate(model->sourceToModel, vertex.position)
+                                        : vertex.position)
+                                : nodeTransform.transformPoint(vertex.position);
                 model->bounds.include(position);
             }
             if (appliesSkin) {
@@ -1961,6 +1628,10 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
     model->height = std::max(0.05f, model->bounds.size().y);
     model->up = {0.0f, 1.0f, 0.0f};
 
+    // Without usable eyes 0.x keeps its historical +Z default. A 1.0 file is
+    // known to face +Z by spec, which the root turn above made -Z.
+    const Vec3 fallbackForward =
+        isV1 ? Vec3{0.0f, 0.0f, -1.0f} : Vec3{0.0f, 0.0f, 1.0f};
     const int headNode = model->nodeFor(HumanoidBone::Head);
     const int leftEyeNode = model->nodeFor(HumanoidBone::LeftEye);
     const int rightEyeNode = model->nodeFor(HumanoidBone::RightEye);
@@ -1980,15 +1651,39 @@ LoadResult VrmLoader::loadFromMemory(std::span<const std::uint8_t> bytes,
             front.lengthSquared() > kMinEyeForwardLength * kMinEyeForwardLength) {
             model->forward = math::normalize(front);
         } else {
-            model->forward = {0.0f, 0.0f, 1.0f};
+            model->forward = fallbackForward;
         }
     } else {
-        model->forward = {0.0f, 0.0f, 1.0f};
+        model->forward = fallbackForward;
     }
     model->right = math::normalize(math::cross(model->forward, model->up));
     if (model->right.lengthSquared() < 0.1f) {
         model->right = {1.0f, 0.0f, 0.0f};
     }
+
+    // ------------------------------------------------------------------
+    // Expressions, look-at, first person and node constraints
+    // ------------------------------------------------------------------
+    {
+        std::vector<int> morphTargetCounts(data->meshes_count, 0);
+        for (std::size_t m = 0; m < data->meshes_count; ++m) {
+            for (std::size_t p = 0; p < data->meshes[m].primitives_count; ++p) {
+                morphTargetCounts[m] = std::max(
+                    morphTargetCounts[m],
+                    static_cast<int>(std::min<std::size_t>(
+                        data->meshes[m].primitives[p].targets_count, 4096)));
+            }
+        }
+        if (isV1) {
+            schema::readExpressionsV1(vrmc, morphTargetCounts, *model);
+            schema::readFirstPersonV1(vrmc, *model);
+            schema::readNodeConstraintsV1(&rootJson, *model);
+        } else {
+            schema::readExpressionsV0(vrm, morphTargetCounts, *model);
+            schema::readFirstPersonV0(vrm, *model);
+        }
+    }
+
     model->diagnostics.nodeCount = static_cast<int>(model->nodes.size());
     model->diagnostics.sceneRootCount = static_cast<int>(model->sceneRoots.size());
     model->diagnostics.meshCount = static_cast<int>(model->meshes.size());

@@ -10,7 +10,7 @@ BG Media — самостоятельный кроссплатформенный
 
 - `bgmedia_core` — независимая C++20-библиотека: анализ PCM, карта ударов,
   басовые акценты, тишина, кеш, модель времени, расчёт хореографии.
-- `bgmedia_vrm` — импорт VRM 0.x (GLB/glTF 2.0, cgltf, stb_image), bind pose и
+- `bgmedia_vrm` — импорт VRM 0.x и 1.0 (GLB/glTF 2.0, cgltf, stb_image), bind pose и
   humanoid mapping; без SDL.
 - `bgmedia_rig` — generic humanoid retargeter `CharacterPose → local transforms`
   с two-bone foot IK; без SDL.

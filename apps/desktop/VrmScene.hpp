@@ -55,7 +55,7 @@ public:
     // The loaded model's leg geometry (reference body when no model is loaded).
     [[nodiscard]] motion::LegGeometry legGeometry() const;
 
-    // BG Motion 3.2 secondary dynamics (VRM 0.x spring bones).
+    // BG Motion 3.2 secondary dynamics (VRM 0.x secondaryAnimation / 1.0 VRMC_springBone).
     [[nodiscard]] bool secondaryAvailable() const;
     [[nodiscard]] animation::SecondarySettings& secondarySettings();
     [[nodiscard]] const animation::SecondarySettings& secondarySettings() const;

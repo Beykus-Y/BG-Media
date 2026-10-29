@@ -174,9 +174,11 @@ int main(int argc, char** argv) {
         }
     }
     const bgmedia::vrm::VrmModel& model = *loaded.model;
-    std::printf("VRM %s: nodes=%d meshes=%d tris=%d materials=%d textures=%d "
+    std::printf("VRM %s (spec %s): nodes=%d meshes=%d tris=%d materials=%d textures=%d "
                 "decoded=%d humanoid=%d height=%.3f forward=(%.2f,%.2f,%.2f)\n",
-                toUtf8(modelPath).c_str(), model.diagnostics.nodeCount,
+                toUtf8(modelPath).c_str(),
+                std::string(bgmedia::vrm::vrmVersionName(model.version)).c_str(),
+                model.diagnostics.nodeCount,
                 model.diagnostics.meshCount, model.diagnostics.triangleCount,
                 model.diagnostics.materialCount, model.diagnostics.textureCount,
                 model.diagnostics.decodedTextureCount,

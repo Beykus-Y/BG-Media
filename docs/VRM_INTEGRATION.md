@@ -103,7 +103,10 @@ Desktop остаётся работоспособным в 2D-режиме и п
   baseColorTexture, KHR_texture_transform offset/scale;
 - VRM 0.x `extensions.VRM`: meta, humanoid.humanBones, materialProperties
   (`VRM/MToon`, `_ShadeColor`, `_Cutoff`, `_CullMode`);
-- humanoid-маппинг 54 костей; 24 из них входят в стабильное ядро retargeter.
+- humanoid-маппинг 54 костей; 24 из них входят в стабильное ядро retargeter;
+- VRM 1.0: `VRMC_vrm`, `VRMC_springBone`, `VRMC_node_constraint`,
+  `VRMC_materials_mtoon` — версия определяется автоматически
+  ([VRM_1_0.md](VRM_1_0.md)).
 
 Проверки безопасности:
 
@@ -125,7 +128,7 @@ GLB 18 539 292 bytes, 175 nodes, 3 meshes, 35 881 triangles,
 
 ### 3.1 Что не поддерживается в v1
 
-- VRM 1.0 (`VRMC_vrm`) — выдаётся понятная ошибка;
+- VRM 1.0 (`VRMC_vrm`) поддерживается рядом с 0.x: см. [VRM_1_0.md](VRM_1_0.md);
 - morph targets / blend shape groups (лицо берётся в базовой позе; blink,
   lip sync и expressions не анимируются);
 - secondary animation / spring bones (физика волос и юбки);

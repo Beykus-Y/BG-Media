@@ -83,12 +83,13 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# VRM 0.x importer and humanoid retargeter. Both are pure C++20: no SDL, no
+# VRM 0.x / 1.0 importer and humanoid retargeter. Both are pure C++20: no SDL, no
 # GPU API, no window. The desktop renderer is the only consumer of SDL_GPU.
 # ---------------------------------------------------------------------------
 add_library(bgmedia_vrm STATIC
     src/vrm/VrmModel.cpp
     src/vrm/VrmLoader.cpp
+    src/vrm/VrmSchema.cpp
     src/vrm/ThighColliders.cpp
     src/vrm/CgltfImpl.cpp
     src/vrm/StbImageImpl.cpp
@@ -112,6 +113,7 @@ add_library(bgmedia_rig STATIC
     src/animation/HumanoidRetargeter.cpp
     src/animation/TwoBoneSolver.cpp
     src/animation/SecondaryDynamics.cpp
+    src/animation/NodeConstraints.cpp
     src/motion3/BeatClock.cpp
     src/motion3/MusicalTimeline.cpp
     src/motion3/MusicalTimeWarp.cpp

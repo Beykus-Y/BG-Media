@@ -52,7 +52,7 @@ void printUsage() {
         << "  --capture <file.bmp>   render one frame and exit (UI screenshot)\n"
         << "  --capture-time <sec>   media time for the captured frame (default 2)\n"
         << "  --motion-lab <bpm>     synthetic beat grid for animation demos\n"
-        << "  --vrm <path>           load a VRM 0.x model and switch to 3D\n"
+        << "  --vrm <path>           load a VRM 0.x / 1.0 model and switch to 3D\n"
         << "  --3d                   start in the VRM 3D character view\n"
         << "  --vrm-demo             synthetic 123 BPM test dance (no music needed)\n"
         << "  --vrm-scale <value>    initial model scale (default 1.0)\n"

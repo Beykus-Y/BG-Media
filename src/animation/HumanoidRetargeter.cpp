@@ -1,4 +1,5 @@
 #include "bgmedia/animation/HumanoidRetargeter.hpp"
+#include "bgmedia/animation/NodeConstraints.hpp"
 #include "bgmedia/animation/TwoBoneSolver.hpp"
 
 #include <algorithm>
@@ -125,6 +126,8 @@ struct HumanoidRetargeter::Impl {
     std::vector<int> evaluationOrder;
     std::vector<Mat4> bindLocals;
     std::vector<Quat> bindLocalRotations;
+    // VRM 1.0 node constraints, evaluated on the finished pose (empty for 0.x).
+    NodeConstraintSolver constraints;
 
     LegRig legs[2];
     int hips = -1;
@@ -186,6 +189,7 @@ struct HumanoidRetargeter::Impl {
 
 bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
     model = &source;
+    constraints = NodeConstraintSolver(source);
     if (!source.completeHumanoid()) {
         error = "VRM humanoid is incomplete: the retargeter requires hips, head, "
                 "both arms and both legs";
@@ -1509,6 +1513,7 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
     const float turn = safeClamp(pose.rotation, -2.0f, 2.0f) * 2.0f * kPi;
     out.modelTransform = Mat4::fromQuat(math::fromAxisAngle(up, turn));
     out.nodeGlobals = std::move(globals);
+    impl_->constraints.apply(out.nodeGlobals);
     out.stats.valid = true;
     out.stats.height = height;
     out.stats.hipDrop = hipDrop;
@@ -1805,6 +1810,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     out.rootOffset = rootPos;
     out.rootPivot = pivot;
     out.nodeGlobals = std::move(globals);
+    impl_->constraints.apply(out.nodeGlobals);
     out.stats.valid = true;
     out.stats.clipDriven = true;
     out.stats.footIK = options.footIK;

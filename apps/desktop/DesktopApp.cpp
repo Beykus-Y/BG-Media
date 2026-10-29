@@ -646,7 +646,7 @@ struct DesktopApp::Impl {
             SDL_DialogFileFilter{"All files", "*.*"},
         };
         vrmFilters = {
-            SDL_DialogFileFilter{"VRM 0.x models", "*.vrm;*.glb"},
+            SDL_DialogFileFilter{"VRM 0.x / 1.0 models", "*.vrm;*.glb"},
             SDL_DialogFileFilter{"All files", "*.*"},
         };
 
@@ -4173,8 +4173,9 @@ void DesktopApp::Impl::draw3DStage() {
     const float left = stage.x + 22.0f;
     text->draw("BG MEDIA 3D", left, stage.y + 18.0f, 15,
                FontWeight::SemiBold, theme::accent);
-    label("VRM 0.x  ·  SDL_GPU", left + 138.0f, stage.y + 23.0f, 8, theme::dim,
-          1.2f);
+    label(std::string(loaded && loaded->version == vrm::VrmVersion::V1 ? "VRM 1.0" : "VRM 0.x") +
+              "  ·  SDL_GPU",
+          left + 138.0f, stage.y + 23.0f, 8, theme::dim, 1.2f);
     std::string modelTitle = "NO VRM MODEL";
     if (loaded) {
         modelTitle = loaded->name.empty() ? "VRM CHARACTER" : loaded->name;
@@ -4187,10 +4188,7 @@ void DesktopApp::Impl::draw3DStage() {
                     std::to_string(loaded->diagnostics.humanoidCount) +
                     " humanoid bones  ·  " +
                     std::to_string(loaded->diagnostics.triangleCount) + " tris";
-        if (!loaded->metadata.licenseName.empty() &&
-            (loaded->metadata.allowedUserName == "OnlyAuthor" ||
-             loaded->metadata.licenseName.find("Redistribution") !=
-                 std::string::npos)) {
+        if (loaded->metadata.restrictsRedistribution()) {
             modelLine += "  ·  PRIVATE / LOCAL";
         }
     } else {
