@@ -73,6 +73,9 @@ public:
                                                       double fallbackBpm = 100.0);
 
     [[nodiscard]] bool valid() const { return valid_; }
+    // True when the timeline was built from BG Beat analysis, so its accents and silences are
+    // evidence from the track. A grid-only timeline (Motion Lab, no track) is not analysed.
+    [[nodiscard]] bool analyzed() const { return analyzed_; }
     [[nodiscard]] const BeatClock& grid() const { return grid_; }
     [[nodiscard]] double nominalBpm() const { return grid_.nominalBpm(); }
     [[nodiscard]] double duration() const { return duration_; }
@@ -141,6 +144,7 @@ private:
     void inferSubdivision(const std::vector<Onset>& onsets);
 
     bool valid_ = false;
+    bool analyzed_ = false;
     BeatClock grid_;
     double duration_ = 1.0e9;
     int beatsPerBar_ = 4;

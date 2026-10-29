@@ -419,6 +419,14 @@ double DanceSchedule::segmentClipBeat(const ScheduleSegment& segment, double med
     return mapping.beat;
 }
 
+double DanceSchedule::mediaTimeAtClipBeat(const ScheduleSegment& segment, double clipBeat,
+                                          const MusicalTimeline& timeline) {
+    if (!segment.clip) {
+        return segment.alignTime;
+    }
+    return timeAtLinearClipBeat(segment, clipBeat, timeline.grid());
+}
+
 namespace {
 
 // Bones carried by the inertial transition: spine, head and both arms with hands.
@@ -658,7 +666,8 @@ void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double
 
 ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
                                  const MusicalTimeline& timeline,
-                                 const WarpProfile& warp, double* clipBeat) const {
+                                 const WarpProfile& warp, double* clipBeat,
+                                 double* linearBeat) const {
     const ScheduleSegment& segment = segments_[index];
     const Mapping stable = mapSegment(segment, mediaTime, timeline.grid(), &timeline,
                                       WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f},
@@ -679,6 +688,9 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
     applyLoopAmplitude(own, *segment.clip, mapped.beat);
     if (clipBeat) {
         *clipBeat = mapped.beat;
+    }
+    if (linearBeat) {
+        *linearBeat = stable.linearBeat;
     }
     return own;
 }
@@ -807,12 +819,13 @@ ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
                                 const MusicalTimeline& timeline,
                                 const WarpProfile& warp) const {
     double clipBeat = 0.0;
-    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat);
+    double linearBeat = 0.0;
+    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat, &linearBeat);
     if (followThrough_) {
         applyFollowThrough(own, index, mediaTime, timeline, warp);
     }
     if (decorator_) {
-        decorator_(own, segments_[index], clipBeat);
+        decorator_(own, segments_[index], clipBeat, linearBeat);
     }
     return own;
 }

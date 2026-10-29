@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -246,6 +247,29 @@ inline constexpr float kDefaultSnapAttack = 0.08f;
 [[nodiscard]] std::vector<PrimitiveCue> planPrimitiveOverlays(
     const HumanoidClip& clip, std::uint32_t seed, float density,
     bool includeHands = true);
+
+// What the track says about one loop of a clip, in local clip beats (0 .. clip.beats). It is
+// built from the analysed timeline by the host (DancePlayer maps media time to clip beats through
+// the schedule segment), so the planner itself never sees media time.
+struct MusicalOverlayContext {
+    struct Event {
+        float beat = 0.0f;      // local clip beat of an onset or a bass accent
+        float strength = 0.0f;  // 0..1 within the track
+        float offset = 0.0f;    // signed offset from the nearest musical beat, in music beats
+        bool bass = false;
+    };
+    std::vector<Event> events;                      // sorted by beat
+    std::vector<std::pair<float, float>> silences;  // [begin, end) local beats with no sound
+    std::vector<float> phraseStarts;                // local beats where a new phrase starts
+};
+
+// Overlay planner for an analysed track. Hand and head gestures land on onsets and bass accents
+// above a strength threshold, never in silence; one or two strong off-beat onsets per bar get a
+// syncopated hand gesture; a phrase start with a large energy jump gets a hit accent. Cues start
+// exactly on their event. Deterministic in (clip, seed, loop context).
+[[nodiscard]] std::vector<PrimitiveCue> planMusicalOverlays(
+    const HumanoidClip& clip, std::uint32_t seed, float density,
+    const MusicalOverlayContext& music, bool includeHands = true);
 
 // The body-mask bit that governs a humanoid bone (UpperChest -> Chest, Neck ->
 // Head, upper+lower arm -> arm). None for bones no mask can drive.
