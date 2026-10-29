@@ -120,6 +120,12 @@ public:
     [[nodiscard]] const std::vector<BassAccent>& bassEvents() const { return bass_; }
     [[nodiscard]] const std::vector<SilenceRegion>& silences() const { return silences_; }
 
+    // Loudness of the phrase around `mediaTime`, 0 (quiet passage of this track) .. 1 (loud
+    // passage). A smooth average over about two bars either side, so it changes over a bar or
+    // more and never jumps. -1 when the timeline has no loudness (no analysis, or a track with
+    // no dynamics).
+    [[nodiscard]] float phraseLoudnessAt(double mediaTime) const;
+
     [[nodiscard]] float accentAt(double mediaTime, double window = 0.12) const;
     [[nodiscard]] float accentConfidenceAt(double mediaTime, double window = 0.12) const;
     [[nodiscard]] float bassAt(double mediaTime, double window = 0.12) const;
@@ -156,6 +162,7 @@ private:
     float downbeatConfidence_ = 1.0f;
     bool downbeatTrusted_ = true;
     std::vector<TimelineBeat> beats_;
+    std::vector<float> beatLoudness_;  // per grid beat, 0..1; -1 unknown; empty = no loudness
     std::vector<AccentEvent> accents_;
     std::vector<BassAccent> bass_;
     std::vector<SilenceRegion> silences_;

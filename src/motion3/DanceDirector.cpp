@@ -314,25 +314,45 @@ Quat scaleSwing(const Quat& q, const Quat& mean, float scale) {
     return (mean * Quat{k * d.x, k * d.y, k * d.z, std::cos(scaledHalf)}).normalized();
 }
 
-void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat) {
-    if (!clip.loop || !(clip.beats > 0.0f)) {
-        return;
+// BG Motion WP-J. The upper body swings with the loudness of the phrase: 0.75 in the quietest
+// passages of the track, 1.15 in the loudest. Where the track has no loudness, the swing keeps
+// its authored size.
+constexpr float kPhraseAmplitudeMin = 0.75f;
+constexpr float kPhraseAmplitudeMax = 1.15f;
+
+float phraseAmplitude(const MusicalTimeline& timeline, double mediaTime) {
+    const float loudness = timeline.phraseLoudnessAt(mediaTime);
+    if (loudness < 0.0f) {
+        return 1.0f;
     }
-    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
-    const std::uint64_t hash = variationHash(clip.id);
+    return kPhraseAmplitudeMin + (kPhraseAmplitudeMax - kPhraseAmplitudeMin) * loudness;
+}
+
+// `phrase` scales the upper body on top of the per-loop variation. The hips and legs keep their
+// authored swing (planted contacts), and so does a clip with no loop and no phrase loudness.
+void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat, float phrase) {
     std::array<float, kAmplitudeGroups> scale{};
-    for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
-        const float from = loopAmplitude(hash, blend.from, group);
-        const float to = loopAmplitude(hash, blend.to, group);
-        scale[group] = from + (to - from) * blend.w;
+    scale.fill(1.0f);
+    if (clip.loop && clip.beats > 0.0f) {
+        const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
+        const std::uint64_t hash = variationHash(clip.id);
+        for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
+            const float from = loopAmplitude(hash, blend.from, group);
+            const float to = loopAmplitude(hash, blend.to, group);
+            scale[group] = from + (to - from) * blend.w;
+        }
     }
     for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
         const int group = amplitudeGroupOf(bone);
-        if (group < 0 || scale[static_cast<std::size_t>(group)] == 1.0f) {
+        if (group < 0) {
             continue;  // unscaled groups keep the authored rotation bit for bit
         }
+        const float amount = scale[static_cast<std::size_t>(group)] * phrase;
+        if (amount == 1.0f) {
+            continue;
+        }
         const Quat mean = trackMean(clip.bones[bone], clip.keyCount);
-        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, scale[static_cast<std::size_t>(group)]);
+        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, amount);
     }
 }
 
@@ -685,7 +705,9 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
     }
-    applyLoopAmplitude(own, *segment.clip, mapped.beat);
+    // Idle breathes on wall-clock time, not on the music: its amplitude is its own.
+    const float phrase = segment.clip->tempoSync ? phraseAmplitude(timeline, mediaTime) : 1.0f;
+    applyLoopAmplitude(own, *segment.clip, mapped.beat, phrase);
     if (clipBeat) {
         *clipBeat = mapped.beat;
     }
