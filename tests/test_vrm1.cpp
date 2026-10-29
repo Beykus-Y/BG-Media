@@ -770,3 +770,38 @@ TEST_CASE(vrm1.lookat_offset_follows_head_rest) {
     const Vec3 expected = math::rotate(v1->sourceToModel * headRest, {0.0f, 0.06f, 0.02f});
     CHECK((v1->lookAt.offsetFromHeadBone - expected).length() < 1e-5f);
 }
+
+TEST_CASE(vrm1.spring_carries_unsimulated_children) {
+    // The spring ends on the head, which still has the eyes below it. The eyes
+    // are not simulated but must ride along with the head.
+    V1Options options;
+    options.extraExtensions =
+        R"(,"VRMC_springBone":{"specVersion":"1.0","springs":[{"joints":[)"
+        R"({"node":3,"stiffness":0.1,"gravityPower":2,"gravityDir":[1,0,0]},{"node":4}]}]})";
+    auto v1 = loadV1(options);
+    REQUIRE(v1 != nullptr);
+    REQUIRE(v1->springChains.size() == 1);
+    animation::HumanoidRetargeter rig(*v1);
+    REQUIRE(rig.valid());
+    animation::SecondaryDynamics springs(*v1);
+    motion::ClipPose pose = motion::neutralClipPose();
+    animation::RetargetedPose out = rig.applyClip(pose, 0.0);
+    springs.reset(out);
+    float headMoved = 0.0f;
+    float worstEye = 0.0f;
+    for (int frame = 1; frame <= 90; ++frame) {
+        pose.bone[static_cast<std::size_t>(HumanoidBone::Chest)] =
+            math::fromAxisAngle({0.0f, 0.0f, 1.0f}, 0.4f * std::sin(frame * 0.15f));
+        out = rig.applyClip(pose, frame / 60.0);
+        const Vec3 animatedHead = out.nodeGlobals[4].translationPart();
+        springs.update(out, 1.0 / 60.0, animation::SecondarySettings{});
+        headMoved = std::max(headMoved, (out.nodeGlobals[4].translationPart() - animatedHead).length());
+        for (int eye : {19, 20}) {
+            const Vec3 local = (out.nodeGlobals[4].inverseAffine() * out.nodeGlobals[static_cast<std::size_t>(eye)])
+                                   .translationPart();
+            worstEye = std::max(worstEye, (local - v1->nodes[static_cast<std::size_t>(eye)].translation).length());
+        }
+    }
+    CHECK(headMoved > 0.005f);  // the spring really moves the head
+    CHECK(worstEye < 1e-4f);    // and the eyes keep their place on it
+}

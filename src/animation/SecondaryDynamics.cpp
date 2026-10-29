@@ -76,6 +76,11 @@ struct SecondaryDynamics::Impl {
         std::vector<Vec3> velocity;
         std::vector<Quat> animatedRotations;
         std::vector<Vec3> scales;
+        // Per node: descendants no chain simulates (a VRM 1.0 spring may end
+        // before the hierarchy's leaf), parent before child. They keep their
+        // local transform and follow the node. Empty for 0.x chains, which
+        // run to the leaves.
+        std::vector<std::vector<int>> carried;
         Vec3 lastAnimatedRoot{};
         bool haveLastRoot = false;
         float totalRest = 0.0f;
@@ -198,6 +203,31 @@ void SecondaryDynamics::Impl::build() {
         }
         sourceToChain[sourceIndex] = static_cast<int>(chains.size());
         chains.push_back(std::move(chain));
+    }
+    std::vector<char> simulated(model->nodes.size(), 0);
+    for (const Chain& chain : chains) {
+        for (int n : chain.nodes) {
+            simulated[static_cast<std::size_t>(n)] = 1;
+        }
+    }
+    for (Chain& chain : chains) {
+        chain.carried.assign(chain.nodes.size(), {});
+        for (std::size_t i = 0; i < chain.nodes.size(); ++i) {
+            auto& list = chain.carried[i];
+            std::vector<int> stack(model->nodes[static_cast<std::size_t>(chain.nodes[i])].children);
+            std::reverse(stack.begin(), stack.end());
+            while (!stack.empty()) {
+                const int n = stack.back();
+                stack.pop_back();
+                if (n < 0 || static_cast<std::size_t>(n) >= simulated.size() ||
+                    simulated[static_cast<std::size_t>(n)]) {
+                    continue;  // invalid, or written (with its subtree) by a chain
+                }
+                list.push_back(n);
+                const auto& children = model->nodes[static_cast<std::size_t>(n)].children;
+                stack.insert(stack.end(), children.rbegin(), children.rend());
+            }
+        }
     }
     stats.available = !chains.empty();
     stats.chains = static_cast<int>(chains.size());
@@ -536,8 +566,18 @@ void SecondaryDynamics::Impl::writePose(RetargetedPose& pose,
             if (!finiteVec(position) || !std::isfinite(rotation.w)) {
                 continue;
             }
-            pose.nodeGlobals[static_cast<std::size_t>(node)] =
-                Mat4::fromTRS(position, rotation, chain.scales[i]);
+            const Mat4 written = Mat4::fromTRS(position, rotation, chain.scales[i]);
+            if (i < chain.carried.size() && !chain.carried[i].empty()) {
+                const Mat4 delta =
+                    written * pose.nodeGlobals[static_cast<std::size_t>(node)].inverseAffine();
+                for (int carried : chain.carried[i]) {
+                    if (static_cast<std::size_t>(carried) < pose.nodeGlobals.size()) {
+                        pose.nodeGlobals[static_cast<std::size_t>(carried)] =
+                            delta * pose.nodeGlobals[static_cast<std::size_t>(carried)];
+                    }
+                }
+            }
+            pose.nodeGlobals[static_cast<std::size_t>(node)] = written;
         }
         // Stats.
         for (std::size_t i = 1; i < points; ++i) {
