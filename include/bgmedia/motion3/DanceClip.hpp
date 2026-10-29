@@ -83,8 +83,9 @@ struct FootTrack {
     // relative to the bind ankle position, in STAGE space (not root space).
     std::vector<Vec3> position;
     std::vector<float> yaw;  // turns, stage space
-    // Optional BG Motion 3.2 toe roll, -1..1. Positive lifts the toes (heel
-    // roll), negative presses the toes down (toe-off). Empty = 0.
+    // Optional toe roll, -1..1. Positive: the heel is up and the toe stays on the
+    // floor (heel peel and heel roll). Negative: the toes are up and the heel is on the
+    // floor (heel strike). Empty = 0.
     std::vector<float> toe;
 };
 
@@ -156,7 +157,7 @@ struct ClipPose {
     struct Foot {
         Vec3 position{};  // stage space offset from bind ankle
         float yaw = 0.0f; // turns, stage space
-        float toePitch = 0.0f;  // -1..1; positive = toes up (heel roll)
+        float toePitch = 0.0f;  // -1..1; positive = heel up, toe on the floor; negative = toes up
         float contact = 0.0f;  // 0 swing .. 1 fully planted
         FootPhase phase = FootPhase::Stance;
     };
