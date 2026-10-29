@@ -175,7 +175,7 @@ struct PrimitivePose {
     std::array<Quat, vrm::kHumanoidBoneCount> bone;
     Vec3 hips{};                 // additive offset, height units
     std::array<float, 2> footLift{};  // additive vertical lift, height units
-    std::array<float, 2> toePitch{};  // additive -1..1
+    std::array<float, 2> toePitch{};  // additive -1..1, positive = heel roll (ClipPose::Foot)
     std::array<HandPose, 2> hand;
     BodyMask mask = body::None;
     bool touchesFeet = false;

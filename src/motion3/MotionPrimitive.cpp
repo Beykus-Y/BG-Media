@@ -598,7 +598,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
                       axisAngle(kZ, (sd == 0 ? -4.0f : 4.0f) * lift * amp));
         if (pose.footLift[static_cast<std::size_t>(sd)] < 1.0e-5f) {
             pose.footLift[static_cast<std::size_t>(sd)] = 0.055f * lift * amp;
-            pose.toePitch[static_cast<std::size_t>(sd)] = 0.35f * lift * amp;
+            pose.toePitch[static_cast<std::size_t>(sd)] = -0.35f * lift * amp;
         }
         pose.touchesFeet = true;
         pose.mask = body::Pelvis | body::Legs | body::Feet;
@@ -612,7 +612,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         addBoneParent(pose, HumanoidBone::Hips,
                       axisAngle(kY, (sd == 0 ? 6.0f : -6.0f) * lift * amp));
         pose.footLift[static_cast<std::size_t>(sd)] = 0.040f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(other)] = -0.18f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(other)] = 0.18f * lift * amp;
         pose.touchesFeet = true;
         pose.mask = body::Pelvis | body::Legs | body::Feet;
         break;
@@ -621,7 +621,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         const float lift = std::sin(phase * 3.14159265f);
         const int sd = side >= 0 ? side : first;
         pose.footLift[static_cast<std::size_t>(sd)] = 0.018f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(sd)] = 0.75f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(sd)] = -0.75f * lift * amp;
         addBoneParent(pose, sd == 0 ? HumanoidBone::LeftUpperLeg : HumanoidBone::RightUpperLeg,
                       axisAngle(kX, 2.0f * lift * amp));
         pose.touchesFeet = true;
@@ -632,7 +632,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         const float lift = std::sin(phase * 3.14159265f);
         const int sd = side >= 0 ? side : first;
         pose.footLift[static_cast<std::size_t>(sd)] = 0.030f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(sd)] = -0.55f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(sd)] = 0.55f * lift * amp;
         pose.touchesFeet = true;
         pose.mask = body::LeftFoot | body::RightFoot | body::LeftLeg | body::RightLeg;
         break;
