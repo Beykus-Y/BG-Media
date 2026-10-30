@@ -112,7 +112,10 @@ private:
         std::atomic<double> requestedRate{1.0};
 
         std::atomic<std::uint64_t> seekSerial{0};
-        double seekSeconds = 0.0;      // guarded by seekSerial release/acquire
+        // Seek request. The payload is atomic because a later seek() may
+        // overwrite it while the callback is still reading the previous one;
+        // seekSerial only tells the callback that a new value is available.
+        std::atomic<double> seekSeconds{0.0};
         std::uint64_t seekApplied = 0;
 
         // Audio-thread reset request. loadDeck()/clearDeck() must not touch

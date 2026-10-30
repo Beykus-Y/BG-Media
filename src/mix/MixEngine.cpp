@@ -66,7 +66,7 @@ bool MixEngine::loadDeck(DeckId deck, std::shared_ptr<const PcmTrack> track,
     runtime.analysedBpm.store(std::max(0.0, analysedBpm),
                               std::memory_order_release);
     runtime.targetPlay.store(false, std::memory_order_release);
-    runtime.seekSeconds = 0.0;
+    runtime.seekSeconds.store(0.0, std::memory_order_release);
     runtime.seekSerial.fetch_add(1, std::memory_order_acq_rel);
     // The callback owns position/playing/fade/gain. Ask it to reset them; the
     // control thread must not write those fields concurrently.
@@ -153,7 +153,7 @@ void MixEngine::pause(DeckId deck) {
 
 void MixEngine::seek(DeckId deck, double seconds) {
     DeckRuntime& runtime = decks_[deckIndex(deck)];
-    runtime.seekSeconds = std::max(0.0, seconds);
+    runtime.seekSeconds.store(std::max(0.0, seconds), std::memory_order_release);
     runtime.seekSerial.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -385,8 +385,10 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         if (serial != deck.seekApplied) {
             deck.seekApplied = serial;
             if (const PcmTrack* source = deck.audio.load(std::memory_order_acquire)) {
+                const double seconds =
+                    deck.seekSeconds.load(std::memory_order_acquire);
                 deck.positionFrames =
-                    std::clamp(deck.seekSeconds, 0.0, source->duration()) *
+                    std::clamp(seconds, 0.0, source->duration()) *
                     source->sampleRate;
             }
             deck.ended = false;
