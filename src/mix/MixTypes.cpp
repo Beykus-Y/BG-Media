@@ -10,11 +10,10 @@ ImplementationStatus transitionStatus(TransitionType type) noexcept {
     case TransitionType::Crossfade:
     case TransitionType::SmartCrossfade:
     case TransitionType::Beatmatched:
+    case TransitionType::TempoRamp:
+    case TransitionType::PhraseAware:
     case TransitionType::DirectCut:
         return ImplementationStatus::Working;
-    case TransitionType::TempoRamp:
-        return ImplementationStatus::Experimental;
-    case TransitionType::PhraseAware:
     case TransitionType::DualTempoMatch:
     case TransitionType::BreakdownBridge:
         return ImplementationStatus::NotImplemented;
@@ -68,6 +67,7 @@ std::vector<TransitionType> selectableTransitionTypes() {
         TransitionType::SmartCrossfade,
         TransitionType::Beatmatched,
         TransitionType::TempoRamp,
+        TransitionType::PhraseAware,
         TransitionType::DirectCut,
     };
 }
@@ -77,6 +77,14 @@ PlannerConfig PlannerConfig::forTransition(TransitionType type) {
     switch (type) {
     case TransitionType::TempoRamp:
         config.allowTempoRamp = true;
+        config.tempoRampMode = TempoRampMode::Manual;
+        break;
+    case TransitionType::Beatmatched:
+        config.allowTempoRamp = true;
+        config.tempoRampMode = TempoRampMode::Auto;
+        break;
+    case TransitionType::PhraseAware:
+        config.phraseAlignment = true;
         break;
     case TransitionType::DirectCut:
         config.defaultCrossfadeSeconds = 0.0;

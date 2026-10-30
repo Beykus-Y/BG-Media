@@ -43,6 +43,40 @@ enum class ImplementationStatus : std::uint8_t {
     NotImplemented
 };
 
+// How the planner may use a pre-transition tempo ramp. Manual still requires
+// the caller to request TempoRamp/Beatmatched; Auto lets the adaptive planner
+// choose it when the material supports it.
+enum class TempoRampMode : std::uint8_t {
+    Off = 0,
+    Auto,
+    Manual
+};
+
+enum class TempoCurveKind : std::uint8_t {
+    Linear = 0,
+    Smooth,
+    SCurve
+};
+
+enum class Aggressiveness : std::uint8_t {
+    Gentle = 0,
+    Balanced,
+    Energetic
+};
+
+// Time-stretch quality mode. Quality uses WSOLA and preserves pitch; the
+// performance mode is plain linear resampling, where pitch follows tempo.
+enum class StretchQuality : std::uint8_t {
+    Quality = 0,
+    Performance
+};
+
+enum class MixMode : std::uint8_t {
+    Auto = 0,   // automatic scheduling + adaptive choice
+    Manual,     // explicit type, manual start
+    Preview     // plan/preview only, never auto-start
+};
+
 [[nodiscard]] ImplementationStatus transitionStatus(TransitionType type) noexcept;
 [[nodiscard]] const char* transitionTypeName(TransitionType type) noexcept;
 [[nodiscard]] const char* transitionTypeShortName(TransitionType type) noexcept;
@@ -51,7 +85,10 @@ enum class ImplementationStatus : std::uint8_t {
 [[nodiscard]] std::vector<TransitionType> selectableTransitionTypes();
 
 struct TempoPoint {
-    double time = 0.0;   // seconds from the start of the transition
+    // Seconds from the crossfade start. Negative points belong to the
+    // pre-transition tempo ramp, which is exactly the 0.2 behaviour: the
+    // outgoing deck reaches the incoming tempo before the overlay begins.
+    double time = 0.0;
     double rate = 1.0;   // playback speed of the outgoing deck
     double bpm = 0.0;    // resulting local BPM of the outgoing deck
 };
@@ -59,6 +96,16 @@ struct TempoPoint {
 struct GainPoint {
     double time = 0.0;
     float gain = 0.0f;
+};
+
+// Independent three-band automation point. Time is relative to the crossfade
+// start; gains are linear (1.0 = unity). The engine runs a phase-flat
+// complementary crossover, so equal gains are an exact bypass.
+struct EqGainPoint {
+    double time = 0.0;
+    float low = 1.0f;
+    float mid = 1.0f;
+    float high = 1.0f;
 };
 
 // A deterministic, explainable transition plan. The planner never hides a
@@ -71,9 +118,11 @@ struct MixPlan {
     DeckId from = DeckId::A;
     DeckId to = DeckId::B;
 
-    double duration = 0.0;          // seconds
-    double transitionStartA = 0.0;  // outgoing media time when the mix starts
-    double transitionEndA = 0.0;    // outgoing media time when the mix ends
+    double duration = 0.0;          // crossfade seconds (excludes pre-roll)
+    double preTransitionSeconds = 0.0;  // tempo-ramp seconds before the overlay
+    double transitionStartA = 0.0;  // outgoing media time when the crossfade starts
+    double transitionEndA = 0.0;    // outgoing media time when the crossfade ends
+    double tempoRampStartA = -1.0;  // outgoing media time where the ramp starts
     double startB = 0.0;            // incoming media time at mix start
     double endB = 0.0;              // incoming media time at mix end
 
@@ -82,15 +131,28 @@ struct MixPlan {
     double targetBpm = 0.0;
     double localBpmA = 0.0;
     double tempoRampPercent = 0.0;
+    double tempoRatioAStart = 1.0;
+    double tempoRatioAEnd = 1.0;
+    double tempoRatioB = 1.0;
 
     bool beatAligned = false;
     bool downbeatAligned = false;
-    double alignmentErrorMs = 0.0;
+    double alignmentErrorMs = 0.0;      // grid snap error at the cue
+    double beatPhaseErrorMs = 0.0;      // residual B-vs-A phase after matching
     double handoverProgress = 0.5;  // where the musical master moves to B
+
+    bool tempoRampActive = false;
+    bool pitchLock = true;
+    bool bassSwap = false;
+    int phraseBars = 0;
+    bool phraseBoundary = false;
+    float phraseConfidence = 0.0f;
 
     std::vector<TempoPoint> tempoCurve;
     std::vector<GainPoint> gainCurveOut;
     std::vector<GainPoint> gainCurveIn;
+    std::vector<EqGainPoint> eqCurveOut;
+    std::vector<EqGainPoint> eqCurveIn;
 
     float confidence = 0.0f;
     bool experimental = false;
@@ -102,11 +164,24 @@ struct MixPlan {
         return type != TransitionType::DirectCut &&
                type != TransitionType::Off;
     }
+
+    [[nodiscard]] double totalDuration() const noexcept {
+        return preTransitionSeconds + duration;
+    }
+
+    // Media time where the overall transition (ramp + crossfade) begins.
+    [[nodiscard]] double overallStartA() const noexcept {
+        return tempoRampStartA >= 0.0 ? tempoRampStartA : transitionStartA;
+    }
 };
 
 struct PlannerConfig {
     bool adaptive = true;
-    bool allowTempoRamp = false;      // experimental, off by default
+    // Kept for 0.1 API compatibility. true enables the ramp unless
+    // tempoRampMode is explicitly Off.
+    bool allowTempoRamp = true;
+    TempoRampMode tempoRampMode = TempoRampMode::Auto;
+    TempoCurveKind tempoCurveKind = TempoCurveKind::SCurve;
     double maxTempoDeltaPercent = 6.0;
     double tempoRampBars = 8.0;
     double defaultCrossfadeSeconds = 8.0;
@@ -115,6 +190,16 @@ struct PlannerConfig {
     double minConfidence = 0.45;
     bool trustDownbeats = true;
     bool preferPhraseBoundaries = true;
+    bool phraseAlignment = true;
+    bool bassSwap = true;
+    bool pitchLock = true;
+    Aggressiveness aggressiveness = Aggressiveness::Balanced;
+    int phraseBars = 4;  // musical phrase length in bars (4 or 8 typical)
+
+    // Effective ramp enable: Off wins over the legacy allowTempoRamp flag.
+    [[nodiscard]] bool rampEnabled() const noexcept {
+        return tempoRampMode != TempoRampMode::Off && allowTempoRamp;
+    }
 
     static PlannerConfig forTransition(TransitionType type);
 };
@@ -144,14 +229,40 @@ enum class TransitionPhase : std::uint8_t {
     Completed
 };
 
+// Musical stage inside a running transition. The engine deliberately keeps
+// only three transport phases (Idle/Running/Cancelling) and publishes the
+// finer stage for the UI and BG Sync.
+enum class TransitionStage : std::uint8_t {
+    Idle = 0,
+    Preparing,
+    TempoRamp,
+    BeatAlign,
+    Mixing,
+    Handover,
+    Complete,
+    Cancelled
+};
+
 struct MixSnapshot {
     DeckStatus decks[2];
     DeckId master = DeckId::A;
     TransitionPhase phase = TransitionPhase::Idle;
+    TransitionStage stage = TransitionStage::Idle;
     TransitionType transitionType = TransitionType::Off;
     double transitionProgress = 0.0;
     double transitionDuration = 0.0;
     double transitionElapsed = 0.0;
+    double crossfadeDuration = 0.0;
+    double crossfadeElapsed = 0.0;
+    double preTransitionSeconds = 0.0;
+    double tempoRatioA = 1.0;
+    double tempoRatioB = 1.0;
+    double beatPhaseErrorMs = 0.0;
+    bool pitchLock = false;
+    bool bassSwap = false;
+    float eqLow[2] = {1.0f, 1.0f};
+    float eqMid[2] = {1.0f, 1.0f};
+    float eqHigh[2] = {1.0f, 1.0f};
     std::uint64_t completedTransitions = 0;
     std::uint64_t outputFrames = 0;
     double sampleRate = 48000.0;
