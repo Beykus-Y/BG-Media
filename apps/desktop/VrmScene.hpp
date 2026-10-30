@@ -29,6 +29,10 @@ public:
     void unload();
     void shutdown();
 
+    // Dynamic offscreen resolution. Safe to call every frame: the underlying
+    // renderer only reallocates when the size actually changes.
+    void setRenderSize(int width, int height);
+
     [[nodiscard]] bool render(const CharacterPose& pose, double mediaTime,
                               const sdlgpu::Camera& camera,
                               const sdlgpu::RenderSettings& settings,

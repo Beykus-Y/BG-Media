@@ -1,4 +1,4 @@
-#include "TextRenderer.hpp"
+﻿#include "TextRenderer.hpp"
 
 #include "stb_truetype.h"
 
@@ -128,10 +128,12 @@ struct TextRenderer::Impl {
         float ascent = 0.0f;
         float descent = 0.0f;
         float lineHeight = 0.0f;
+        float inverseScale = 1.0f;
         std::unordered_map<std::uint32_t, Glyph> glyphs;
     };
 
     SDL_Renderer* renderer = nullptr;
+    float scale = 1.0f;
     std::vector<std::uint8_t> regularData;
     std::vector<std::uint8_t> semiboldData;
     stbtt_fontinfo regular{};
@@ -158,7 +160,10 @@ struct TextRenderer::Impl {
 
     [[nodiscard]] Face* face(int size, FontWeight weight) {
         size = std::clamp(size, 8, 96);
-        const int key = size * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
+        const int bakedSize = std::clamp(
+            static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
+            192);
+        const int key = bakedSize * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
         auto it = faces.find(key);
         if (it != faces.end()) {
             return &it->second;
@@ -170,18 +175,19 @@ struct TextRenderer::Impl {
         }
 
         Face baked;
-        baked.ascent = static_cast<float>(size) * 0.80f;
-        const float scale = stbtt_ScaleForPixelHeight(info, static_cast<float>(size));
+        baked.inverseScale = 1.0f / std::max(0.01f, scale);
+        baked.ascent = static_cast<float>(bakedSize) * 0.80f;
+        const float fontScale = stbtt_ScaleForPixelHeight(info, static_cast<float>(bakedSize));
         int ascent = 0;
         int descent = 0;
         int lineGap = 0;
         stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
-        baked.ascent = static_cast<float>(ascent) * scale;
-        baked.descent = static_cast<float>(descent) * scale;
-        baked.lineHeight = static_cast<float>(ascent - descent + lineGap) * scale;
+        baked.ascent = static_cast<float>(ascent) * fontScale;
+        baked.descent = static_cast<float>(descent) * fontScale;
+        baked.lineHeight = static_cast<float>(ascent - descent + lineGap) * fontScale;
 
-        const int atlasWidth = size >= 44 ? 2048 : 1024;
-        const int atlasHeight = 1024;
+        const int atlasWidth = bakedSize >= 64 ? 4096 : (bakedSize >= 44 ? 2048 : 1024);
+        const int atlasHeight = bakedSize >= 64 ? 4096 : (bakedSize >= 44 ? 2048 : 1024);
         std::vector<std::uint8_t> pixels(
             static_cast<std::size_t>(atlasWidth) * atlasHeight * 4, 0);
 
@@ -216,13 +222,13 @@ struct TextRenderer::Impl {
             int advanceRaw = 0;
             int bearing = 0;
             stbtt_GetCodepointHMetrics(info, static_cast<int>(useCp), &advanceRaw, &bearing);
-            const float advance = static_cast<float>(advanceRaw) * scale;
+            const float advance = static_cast<float>(advanceRaw) * fontScale;
 
             int x0 = 0;
             int y0 = 0;
             int x1 = 0;
             int y1 = 0;
-            stbtt_GetCodepointBitmapBox(info, static_cast<int>(useCp), scale, scale,
+            stbtt_GetCodepointBitmapBox(info, static_cast<int>(useCp), fontScale, fontScale,
                                         &x0, &y0, &x1, &y1);
             const int w = std::max(0, x1 - x0);
             const int h = std::max(0, y1 - y0);
@@ -245,7 +251,7 @@ struct TextRenderer::Impl {
             }
 
             std::vector<std::uint8_t> bitmap(static_cast<std::size_t>(w) * h);
-            stbtt_MakeCodepointBitmap(info, bitmap.data(), w, h, w, scale, scale,
+            stbtt_MakeCodepointBitmap(info, bitmap.data(), w, h, w, fontScale, fontScale,
                                       static_cast<int>(useCp));
             for (int gy = 0; gy < h; ++gy) {
                 for (int gx = 0; gx < w; ++gx) {
@@ -311,7 +317,10 @@ struct TextRenderer::Impl {
 
     [[nodiscard]] const Face* faceRead(int size, FontWeight weight) const {
         size = std::clamp(size, 8, 96);
-        const int key = size * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
+        const int bakedSize = std::clamp(
+            static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
+            192);
+        const int key = bakedSize * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
         auto it = faces.find(key);
         return it != faces.end() ? &it->second : nullptr;
     }
@@ -363,7 +372,7 @@ void TextRenderer::draw(std::string_view text, float x, float y, int size,
     SDL_SetTextureAlphaMod(face->texture, static_cast<Uint8>(
         std::clamp(alpha * static_cast<float>(color.a) / 255.0f, 0.0f, 1.0f) * 255.0f));
 
-    const float baseline = y + face->ascent;
+    const float baseline = y + face->ascent * face->inverseScale;
     std::size_t index = 0;
     while (index < text.size()) {
         const std::uint32_t cp = decodeUtf8(text, index);
@@ -375,12 +384,14 @@ void TextRenderer::draw(std::string_view text, float x, float y, int size,
             const SDL_FRect src{glyph->u0 * face->atlasWidth,
                                 glyph->v0 * face->atlasHeight,
                                 glyph->width, glyph->height};
-            const SDL_FRect dst{std::floor(x + glyph->bearingX),
-                                std::floor(baseline + glyph->bearingY),
-                                glyph->width, glyph->height};
+            const SDL_FRect dst{
+                x + glyph->bearingX * face->inverseScale,
+                baseline + glyph->bearingY * face->inverseScale,
+                glyph->width * face->inverseScale,
+                glyph->height * face->inverseScale};
             SDL_RenderTexture(impl_->renderer, face->texture, &src, &dst);
         }
-        x += glyph->advance + letterSpacing;
+        x += glyph->advance * face->inverseScale + letterSpacing;
     }
 }
 
@@ -413,19 +424,29 @@ float TextRenderer::measure(std::string_view text, int size, FontWeight weight,
         if (!glyph) {
             continue;
         }
-        width += glyph->advance + letterSpacing;
+        width += glyph->advance * face->inverseScale + letterSpacing;
     }
     return width;
 }
 
 float TextRenderer::lineHeight(int size, FontWeight weight) const {
-    const Impl::Face* face = impl_->face(size, weight);
-    return face ? face->lineHeight : static_cast<float>(size) * 1.2f;
+    const Impl::Face* face = impl_->faceRead(size, weight);
+    return face ? face->lineHeight * face->inverseScale
+                : static_cast<float>(size) * 1.2f;
 }
 
 float TextRenderer::ascent(int size, FontWeight weight) const {
-    const Impl::Face* face = impl_->face(size, weight);
-    return face ? face->ascent : static_cast<float>(size) * 0.8f;
+    const Impl::Face* face = impl_->faceRead(size, weight);
+    return face ? face->ascent * face->inverseScale
+                : static_cast<float>(size) * 0.8f;
 }
 
+void TextRenderer::setScale(float scale) {
+    impl_->scale = std::clamp(scale, 0.75f, 3.0f);
+}
+
+float TextRenderer::scale() const { return impl_->scale; }
+
 } // namespace bgmedia::desktop
+
+

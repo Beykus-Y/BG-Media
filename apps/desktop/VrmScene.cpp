@@ -92,6 +92,10 @@ void VrmScene::shutdown() {
     impl_->destroyTexture();
 }
 
+void VrmScene::setRenderSize(int width, int height) {
+    impl_->renderer.setRenderSize(width, height);
+}
+
 bool VrmScene::initializeRenderer(std::string* error) {
     if (impl_->rendererInitialized) {
         return true;
