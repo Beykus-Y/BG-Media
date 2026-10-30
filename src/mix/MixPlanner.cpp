@@ -381,7 +381,13 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     } else if (request.type == TransitionType::DirectCut) {
         plan.type = TransitionType::DirectCut;
         plan.duration = 0.0;
-        plan.transitionEndA = startA;
+        // A cut has no fade window. An executed cut happens at the current
+        // position; a preview reports the end of the planned musical window,
+        // so automatic scheduling cuts there (before trailing silence) rather
+        // than at the physical file end.
+        const double cutPoint = request.currentPositionA >= 0.0 ? startA : endA;
+        plan.transitionStartA = cutPoint;
+        plan.transitionEndA = cutPoint;
         plan.reasons.push_back("Direct cut: no crossfade, incoming deck starts on its marker");
     } else if (request.type == TransitionType::SmartCrossfade) {
         if (lowConfidence) {

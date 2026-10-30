@@ -619,9 +619,16 @@ void MixSession::update() {
     // against the physical file end. The planner deliberately ends the window
     // before detected trailing silence, so waiting for `duration - fade` would
     // start the incoming deck after the outgoing track has already gone silent.
+    // A Direct Cut is a valid zero-duration plan; it must be submitted too,
+    // otherwise automatic handover falls back to EOF promotion and loses the
+    // planned incoming marker.
     constexpr double kLeadSeconds = 0.35;
-    if (preview.valid && preview.from == from && preview.duration > 0.0 &&
-        deck.positionSeconds >= preview.transitionStartA - kLeadSeconds) {
+    constexpr double kCutLeadSeconds = 0.02;
+    const bool directCut = preview.type == TransitionType::DirectCut;
+    const bool schedulable = preview.duration > 0.0 || directCut;
+    const double lead = directCut ? kCutLeadSeconds : kLeadSeconds;
+    if (preview.valid && preview.from == from && schedulable &&
+        deck.positionSeconds >= preview.transitionStartA - lead) {
         startPlannedTransition(duration_);
     }
 }
