@@ -36,6 +36,16 @@ if(BGMEDIA_BUILD_MINIAUDIO)
     if(WIN32)
         target_link_libraries(bgmedia_mix_qa PRIVATE shell32)
     endif()
+
+    # Batch listening-test renderer: real BG Beat + planner + engine, WAV out.
+    add_executable(bgmedia_mix_listening
+        mix_listening/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_listening PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_listening PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_listening PRIVATE shell32)
+    endif()
 endif()
 
 add_executable(bgmedia_motion_qa
