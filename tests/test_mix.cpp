@@ -7,6 +7,7 @@
 #include "bgmedia/mix/PcmTrack.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -717,4 +718,423 @@ TEST_CASE("mix.session_queue_and_transport") {
     session.clearQueue();
     session.update();
     CHECK(session.snapshot().queue.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Regression coverage for the 10 Codex review findings and concurrency stress
+// ---------------------------------------------------------------------------
+namespace {
+
+double testTrackSeconds(const std::string& name) {
+    if (name.find("short") != std::string::npos) {
+        return 0.6;
+    }
+    if (name.find("long") != std::string::npos) {
+        return 30.0;
+    }
+    return 8.0;
+}
+
+bgmedia::mix::MixPrepareCallback makeTestPrepare() {
+    return [](const std::filesystem::path& path, PreparedMixTrack& out,
+              std::string& error,
+              std::function<void(float, std::string_view)> progress) {
+        const std::string name = path.filename().string();
+        if (name.empty()) {
+            error = "empty path";
+            return false;
+        }
+        const double duration = testTrackSeconds(name);
+        const double bpm = name.find("beta") != std::string::npos ? 128.0 : 123.0;
+        auto track = std::make_shared<PcmTrack>();
+        *track = *toneTrack(duration, 220.0);
+        out.audio = track;
+        out.analysis =
+            std::make_shared<AnalysisResult>(analysisFor(bpm, duration));
+        if (progress) {
+            progress(1.0f, "ready");
+        }
+        return true;
+    };
+}
+
+// Emulates the desktop host: one UI tick (session.update) followed by one audio
+// callback. Keeping both in the same loop reproduces the real hand-off order.
+struct SessionPump {
+    MixEngine& engine;
+    MixSession& session;
+    std::vector<float> block = std::vector<float>(480 * 2, 0.0f);
+
+    void once() {
+        session.update();
+        engine.render(block.data(), 480);
+    }
+
+    void forSeconds(double seconds) {
+        const int blocks =
+            std::max(1, static_cast<int>(std::ceil(seconds * kRate / 480.0)));
+        for (int i = 0; i < blocks; ++i) {
+            once();
+        }
+    }
+
+    bool waitForDecks(int count, int iterations = 800) {
+        for (int i = 0; i < iterations; ++i) {
+            once();
+            const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+            const int loaded = (snap.decks[0].loaded ? 1 : 0) +
+                               (snap.decks[1].loaded ? 1 : 0);
+            if (loaded >= count) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        return false;
+    }
+};
+
+} // namespace
+
+TEST_CASE("mix.engine_retired_track_lifetime") {
+    // Regression for the heap-use-after-free: replacing a deck buffer must not
+    // free the old PCM until a later render epoch proves the callback cannot
+    // still hold its raw pointer.
+    MixEngine engine(kRate);
+    auto first = std::make_shared<PcmTrack>(*dcTrack(1.0, 0.1f));
+    CHECK(engine.loadDeck(DeckId::A, first, 1, 120.0));
+    CHECK(first.use_count() >= 2);
+
+    CHECK(engine.loadDeck(DeckId::A, dcTrack(1.0, 0.2f), 2, 121.0));
+    // No callback has started since the swap, so the retired buffer stays alive.
+    CHECK(first.use_count() >= 2);
+    engine.reclaimRetired();
+    CHECK(first.use_count() >= 2);
+
+    std::vector<float> block(128 * 2, 0.0f);
+    engine.render(block.data(), 128);
+    engine.reclaimRetired();
+    CHECK(first.use_count() == 1);
+
+    // Time-stretch processors follow the same deferred protocol.
+    auto processor = std::make_shared<bgmedia::mix::LinearResampleStretcher>();
+    engine.setTimeStretch(processor);
+    CHECK(processor.use_count() >= 2);
+    engine.setTimeStretch(
+        std::make_shared<bgmedia::mix::LinearResampleStretcher>());
+    CHECK(processor.use_count() >= 2);
+    engine.render(block.data(), 128);
+    engine.reclaimRetired();
+    CHECK(processor.use_count() == 1);
+}
+
+TEST_CASE("mix.engine_load_seek_does_not_override_plan") {
+    // Regression for consuming the transition plan before the load-time seek:
+    // loading deck B in the same frame as a planned start used to reset the
+    // cue position selected by the plan back to zero.
+    MixEngine engine(kRate);
+    auto a = toneTrack(30.0, 180.0);
+    auto b = toneTrack(30.0, 240.0);
+    CHECK(engine.loadDeck(DeckId::A, a, 1, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.5, nullptr);
+
+    CHECK(engine.loadDeck(DeckId::B, b, 2, 124.0));
+    MixPlan plan = crossfadePlan(engine, 2.0, 1.5);
+    CHECK(engine.startTransition(plan));
+
+    std::vector<float> block(480 * 2, 0.0f);
+    engine.render(block.data(), 480);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Running);
+    CHECK_NEAR(snap.decks[1].positionSeconds, 1.5 + 480.0 / kRate, 0.02);
+}
+
+TEST_CASE("mix.engine_eof_declick_has_no_hard_edge") {
+    // Regression for fading the tail of the callback block instead of the last
+    // playable source sample: at a real EOF the output used to step from full
+    // amplitude straight to silence.
+    MixEngine engine(kRate);
+    auto track = dcTrack(0.20, 0.25f);
+    CHECK(engine.loadDeck(DeckId::A, track, 1, 120.0));
+    engine.play(DeckId::A);
+
+    std::vector<float> all;
+    std::vector<float> block(64 * 2, 0.0f);
+    for (int i = 0; i < 500 && !engine.snapshot().decks[0].ended; ++i) {
+        engine.render(block.data(), 64);
+        all.insert(all.end(), block.begin(), block.end());
+    }
+    CHECK(engine.snapshot().decks[0].ended);
+    CHECK(!all.empty());
+
+    std::size_t last = 0;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        if (std::abs(all[i]) > 1e-5f) {
+            last = i;
+        }
+    }
+    CHECK(last > 0);
+    CHECK(std::abs(all[last]) < 0.02f);
+    if (last + 1 < all.size()) {
+        CHECK(std::abs(all[last + 1] - all[last]) < 0.01f);
+    }
+}
+
+TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
+    // Regression for cancellation after the handover point: master_ pointed at
+    // the stopped incoming deck, so the next transition started from silence.
+    MixEngine engine(kRate);
+    auto a = toneTrack(30.0, 180.0);
+    auto b = toneTrack(30.0, 240.0);
+    CHECK(engine.loadDeck(DeckId::A, a, 1, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 2, 124.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.2, nullptr);
+
+    CHECK(engine.startTransition(crossfadePlan(engine, 1.0, 0.0)));
+    renderSeconds(engine, 0.7, nullptr);
+    CHECK(engine.snapshot().master == DeckId::B);
+
+    engine.cancelTransition();
+    renderSeconds(engine, 0.5, nullptr);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Idle);
+    CHECK(snap.master == DeckId::A);
+    CHECK(snap.decks[0].playing);
+    CHECK(!snap.decks[1].playing);
+}
+
+TEST_CASE("mix.session_refilled_deck_stays_stopped") {
+    // Finding #1: refilling the outgoing deck after a handover used to start it
+    // immediately at full independent gain alongside the playing master.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("alpha.wav");
+    session.addTrack("beta.wav");
+    session.addTrack("gamma.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAdaptive(true);
+    session.setTransitionType(TransitionType::DirectCut);
+    session.play();
+    pump.forSeconds(0.05);
+    CHECK(engine.snapshot().decks[0].playing);
+
+    const std::uint64_t completedBefore = engine.completedTransitions();
+    session.next();
+    bool refilled = false;
+    for (int i = 0; i < 500 && !refilled; ++i) {
+        pump.once();
+        const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+        refilled = snap.completedTransitions > completedBefore &&
+                   snap.decks[0].loaded && snap.decks[1].loaded;
+        if (!refilled) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+    }
+    CHECK(refilled);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.master == DeckId::B);
+    CHECK(snap.decks[1].playing);
+    CHECK(snap.decks[0].loaded);
+    CHECK(!snap.decks[0].playing);
+}
+
+TEST_CASE("mix.session_next_starts_at_current_position") {
+    // Finding #2: manual Next/Start Transition used to pass -1 as the outgoing
+    // position, so the planner selected the end-of-track window and the engine
+    // seeked the playing deck to the end.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAdaptive(true);
+    session.setTransitionDuration(0.0);
+    session.play();
+    pump.forSeconds(2.0);
+
+    const bgmedia::mix::MixSnapshot before = engine.snapshot();
+    const DeckId master = before.master;
+    CHECK(before.decks[deckIndex(master)].playing);
+    const double position = before.decks[deckIndex(master)].positionSeconds;
+    CHECK(position > 1.0);
+
+    session.next();
+    pump.once();
+    pump.once();
+    const bgmedia::mix::MixSnapshot after = engine.snapshot();
+    CHECK(after.phase == TransitionPhase::Running);
+    const double started = after.decks[deckIndex(master)].positionSeconds;
+    CHECK(started > 0.5);
+    CHECK(started > position - 0.75);
+    CHECK(started < position + 2.5);
+}
+
+TEST_CASE("mix.session_stop_and_clear_queue_recover") {
+    // Finding #3: Stop set paused before the callback settled the deck flags, so
+    // snapshots kept reporting "playing" and Clear Queue never released them.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("alpha.wav");
+    session.addTrack("beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.forSeconds(0.1);
+    CHECK(engine.snapshot().decks[0].playing);
+
+    session.stopAll();
+    pump.forSeconds(0.05);
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.paused);
+    CHECK(!snap.decks[0].playing);
+    CHECK(!snap.decks[1].playing);
+
+    session.clearQueue();
+    pump.forSeconds(0.05);
+    CHECK(session.snapshot().queue.empty());
+    snap = engine.snapshot();
+    CHECK(!snap.decks[0].loaded);
+    CHECK(!snap.decks[1].loaded);
+}
+
+TEST_CASE("mix.session_eof_promotes_prepared_deck") {
+    // Finding #6: when the master ends before the incoming deck starts, the
+    // prepared deck must be promoted instead of being ignored because it is not
+    // playing yet.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("short-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAutoQueue(false);
+    session.play();
+    pump.forSeconds(1.2);
+
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.decks[0].ended);
+    CHECK(!snap.decks[0].playing);
+    CHECK(snap.decks[1].loaded);
+    CHECK(!snap.decks[1].playing);
+
+    session.setAutoQueue(true);
+    pump.once();
+    pump.once();
+    pump.once();
+    snap = engine.snapshot();
+    CHECK(snap.master == DeckId::B);
+    CHECK(snap.decks[1].playing);
+    CHECK(!snap.decks[0].loaded);
+}
+
+TEST_CASE("mix.engine_concurrent_controls_stress") {
+    // Real two-thread stress: one thread is the audio callback (render), the
+    // other hammers play/pause/seek/load/clear/next/cancel/stop. Run this under
+    // ASan to make the deferred-reclamation protocol observable; a plain CTest
+    // pass is not by itself proof of memory safety.
+    MixEngine engine(kRate);
+    CHECK(engine.loadDeck(DeckId::A, dcTrack(2.0, 0.10f), 1, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, dcTrack(2.0, 0.12f), 2, 124.0));
+    engine.play(DeckId::A);
+    engine.setMaster(DeckId::A);
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> renders{0};
+    std::atomic<std::uint64_t> nonFinite{0};
+    std::atomic<float> peak{0.0f};
+
+    std::thread audio([&] {
+        std::vector<float> buffer(256 * 2, 0.0f);
+        while (!stop.load(std::memory_order_acquire)) {
+            engine.render(buffer.data(), 256);
+            float localPeak = 0.0f;
+            for (float value : buffer) {
+                if (!std::isfinite(value)) {
+                    nonFinite.fetch_add(1, std::memory_order_relaxed);
+                }
+                localPeak = std::max(localPeak, std::abs(value));
+            }
+            peak.store(std::max(peak.load(std::memory_order_relaxed), localPeak),
+                       std::memory_order_relaxed);
+            renders.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    std::thread control([&] {
+        for (int i = 0; i < 4000; ++i) {
+            switch (i % 12) {
+            case 0:
+                engine.setPaused(false);
+                engine.play(DeckId::A);
+                engine.setMaster(DeckId::A);
+                break;
+            case 1:
+                engine.setPaused(false);
+                engine.play(DeckId::B);
+                engine.setMaster(DeckId::B);
+                break;
+            case 2:
+                engine.pause(DeckId::A);
+                engine.pause(DeckId::B);
+                break;
+            case 3:
+                engine.setPaused(!engine.paused());
+                break;
+            case 4:
+                engine.seek(DeckId::A, (i % 40) * 0.05);
+                break;
+            case 5:
+                engine.seek(DeckId::B, (i % 40) * 0.05);
+                break;
+            case 6:
+                // Fresh buffers: the engine's retire list is the only owner of
+                // the replaced track, so a premature free is a real UAF.
+                (void)engine.loadDeck(DeckId::A, dcTrack(0.4, 0.08f),
+                                      1000 + i, 120.0);
+                break;
+            case 7:
+                (void)engine.loadDeck(DeckId::B, dcTrack(0.4, 0.09f),
+                                      2000 + i, 124.0);
+                break;
+            case 8:
+                engine.clearDeck(i & 1 ? DeckId::A : DeckId::B);
+                break;
+            case 9: {
+                const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+                if (snap.decks[0].loaded && snap.decks[1].loaded &&
+                    snap.phase == TransitionPhase::Idle) {
+                    (void)engine.startTransition(
+                        crossfadePlan(engine, 0.8, 0.0));
+                }
+                break;
+            }
+            case 10:
+                engine.cancelTransition();
+                break;
+            default:
+                engine.stop();
+                break;
+            }
+            std::this_thread::yield();
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    control.join();
+    audio.join();
+
+    CHECK(renders.load() > 0);
+    CHECK(nonFinite.load() == 0);
+    CHECK(peak.load() <= 1.02f);
+    std::printf("mix stress: renders=%llu peak=%.3f nonfinite=%llu\n",
+                static_cast<unsigned long long>(renders.load()),
+                static_cast<double>(peak.load()),
+                static_cast<unsigned long long>(nonFinite.load()));
 }

@@ -1,11 +1,3 @@
-add_library(bgmedia_test_signals STATIC
-    support/SyntheticSignals.cpp
-)
-target_link_libraries(bgmedia_test_signals PUBLIC bgmedia_core)
-target_include_directories(bgmedia_test_signals PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(bgmedia_test_signals PUBLIC cxx_std_20)
-target_compile_options(bgmedia_test_signals PRIVATE ${BGMEDIA_WARNING_FLAGS})
-
 add_executable(bgmedia_fixturegen
     fixturegen/main.cpp
 )

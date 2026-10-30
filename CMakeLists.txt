@@ -155,6 +155,23 @@ if(BGMEDIA_BUILD_MINIAUDIO)
 endif()
 
 # ---------------------------------------------------------------------------
+# Deterministic synthetic signals shared by the tools and the unit tests. This
+# target must exist whenever the tests are built too, otherwise an ASan or
+# core-only configuration (BGMEDIA_BUILD_TOOLS=OFF) cannot compile the tests
+# that include "support/SyntheticSignals.hpp".
+# ---------------------------------------------------------------------------
+if(BGMEDIA_BUILD_TOOLS OR (BGMEDIA_BUILD_TESTS AND BUILD_TESTING))
+    add_library(bgmedia_test_signals STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/support/SyntheticSignals.cpp
+    )
+    target_link_libraries(bgmedia_test_signals PUBLIC bgmedia_core)
+    target_include_directories(bgmedia_test_signals PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    target_compile_features(bgmedia_test_signals PUBLIC cxx_std_20)
+    target_compile_options(bgmedia_test_signals PRIVATE ${BGMEDIA_WARNING_FLAGS})
+endif()
+
+# ---------------------------------------------------------------------------
 # Tools and tests.
 # ---------------------------------------------------------------------------
 if(BGMEDIA_BUILD_TOOLS)
