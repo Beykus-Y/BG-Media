@@ -169,6 +169,9 @@ void MixSession::startTransitionNow() {
 void MixSession::cancelTransition() {
     engine_.cancelTransition();
     std::lock_guard lock(mutex_);
+    // A manual Next that is already running must not be re-armed after the
+    // reverse fade: the user asked to cancel it, so drop the pending request.
+    nextRequested_ = false;
     status_ = "Cancelling transition";
 }
 
@@ -536,6 +539,9 @@ void MixSession::startPlannedTransition(double durationOverride) {
         return;
     }
     std::lock_guard lock(mutex_);
+    // The request has been consumed. Leaving it set made a later Cancel start
+    // another transition as soon as the reverse fade finished.
+    nextRequested_ = false;
     status_ = std::string("Mixing: ") + transitionTypeName(plan.type);
 }
 
@@ -590,17 +596,15 @@ void MixSession::update() {
     }
     const DeckId from = snap.master;
     const DeckStatus& deck = snap.decks[deckIndex(from)];
-    const double remaining = deck.durationSeconds - deck.positionSeconds;
-    const bool ended = deck.ended ||
-                       (deck.durationSeconds > 0.0 && remaining <= 0.05);
-    if (!deck.playing && !ended) {
+    // Promote only on a real EOF. Treating the last 50 ms as "ended" promoted
+    // the prepared deck while the master was still playing; clearDeck() then
+    // failed (the deck was still the play target), so the played track stayed
+    // loaded and blocked the next queue item.
+    if (deck.ended) {
+        promoteEndedMaster(snap);
         return;
     }
-    // The master can reach EOF before the next track finished preparing. In
-    // that case there is no window left for a crossfade: promote the prepared
-    // deck directly instead of rejecting it because it is not playing yet.
-    if (ended) {
-        promoteEndedMaster(snap);
+    if (!deck.playing) {
         return;
     }
     if (!snap.decks[0].loaded || !snap.decks[1].loaded) {
@@ -611,8 +615,13 @@ void MixSession::update() {
         std::lock_guard lock(mutex_);
         preview = preview_;
     }
+    // Plan the fade against the outgoing window selected by the preview, not
+    // against the physical file end. The planner deliberately ends the window
+    // before detected trailing silence, so waiting for `duration - fade` would
+    // start the incoming deck after the outgoing track has already gone silent.
+    constexpr double kLeadSeconds = 0.35;
     if (preview.valid && preview.from == from && preview.duration > 0.0 &&
-        remaining > 0.0 && remaining <= preview.duration + 0.35) {
+        deck.positionSeconds >= preview.transitionStartA - kLeadSeconds) {
         startPlannedTransition(duration_);
     }
 }
