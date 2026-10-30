@@ -1,5 +1,10 @@
 # BG Mix 0.1
 
+> **Superseded by [BG Mix 0.2](BG_MIX_0_2.md).** The 0.1 engine is still the
+> baseline for the 0.2 branch, but the 0.2 document is the current behaviour,
+> including the pre-transition tempo ramp, WSOLA pitch lock, beat/phase and
+> phrase matching, bass swap and the two-stage engine.
+
 BG Mix is the first working dual-deck mixer in BG Media. It is deliberately a
 0.1: the mixing engine, queue, planning and UI are real and tested, while
 several DJ techniques are explicitly marked as not implemented.
