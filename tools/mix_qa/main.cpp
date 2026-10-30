@@ -582,8 +582,8 @@ bool deviceRun(const Options& options, const PreparedMixTrack& a,
         return false;
     }
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(
-                              static_cast<int>((plan.duration + 3.0) * 1000.0));
+                          std::chrono::milliseconds(static_cast<int>(
+                              (plan.totalDuration() + 3.0) * 1000.0));
     while (std::chrono::steady_clock::now() < deadline) {
         if (engine.completedTransitions() >= 1) {
             break;
