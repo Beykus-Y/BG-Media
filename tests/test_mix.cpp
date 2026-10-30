@@ -60,15 +60,16 @@ std::shared_ptr<PcmTrack> dcTrack(double seconds, float value,
 }
 
 std::shared_ptr<PcmTrack> toneTrack(double seconds, double frequency,
-                                    std::uint32_t channels = 2) {
+                                    std::uint32_t channels = 2,
+                                    std::uint32_t rate = kRate) {
     auto track = std::make_shared<PcmTrack>();
-    track->sampleRate = kRate;
+    track->sampleRate = rate;
     track->channels = channels;
-    const std::size_t frames = static_cast<std::size_t>(seconds * kRate);
+    const std::size_t frames = static_cast<std::size_t>(seconds * rate);
     track->samples.resize(frames * channels);
     for (std::size_t i = 0; i < frames; ++i) {
         const double phase = 2.0 * 3.14159265358979323846 * frequency *
-                             static_cast<double>(i) / kRate;
+                             static_cast<double>(i) / rate;
         const float value = static_cast<float>(0.4 * std::sin(phase));
         for (std::uint32_t c = 0; c < channels; ++c) {
             track->samples[i * channels + c] = value;
@@ -1810,7 +1811,11 @@ TEST_CASE("mix.live_tempo_follows_master") {
     CHECK_NEAR(live.bpm, 140.8, 1e-6);
     CHECK_NEAR(live.rate, 1.10, 1e-6);
     CHECK_NEAR(live.positionSeconds, 1.98, 1e-9);
-    CHECK_NEAR(live.beatPeriodSeconds, 60.0 / 140.8, 1e-9);
+    // Phase is in source-media time: the live BPM is 140.8, but the source
+    // grid is still 128 BPM. Using the live period would apply the rate twice.
+    CHECK_NEAR(live.sourceBpm, 128.0, 1e-9);
+    CHECK_NEAR(live.beatPeriodSeconds, 60.0 / 128.0, 1e-9);
+    CHECK_NEAR(live.beatPhase, 0.224, 1e-3);
     CHECK(live.beatPhase >= 0.0);
     CHECK(live.beatPhase < 1.0);
 
@@ -1835,4 +1840,73 @@ TEST_CASE("mix.live_tempo_follows_master") {
     CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
     std::printf("live tempo: master=%d bpm=%.1f phase=%.3f\n",
                 static_cast<int>(live.master), live.bpm, live.beatPhase);
+}
+
+TEST_CASE("mix.wsola_large_block_drains") {
+    const auto track = toneTrack(6.0, 440.0);
+    bgmedia::mix::WsolaStretcher processor;
+    const auto stream = processor.createStream(kRate);
+    CHECK(stream != nullptr);
+    stream->reset(0.0);
+    constexpr std::size_t kFrames = 16384;
+    std::vector<float> output(kFrames * 2, 0.0f);
+    double position = 0.0;
+    stream->render(*track, position, 1.0, 1.0, output.data(), kFrames);
+    CHECK(position > 16000.0);
+    std::size_t nonFinite = 0;
+    float peak = 0.0f;
+    for (float value : output) {
+        if (!std::isfinite(value)) {
+            ++nonFinite;
+        }
+        peak = std::max(peak, std::abs(value));
+    }
+    CHECK(nonFinite == 0);
+    CHECK(peak > 0.2f);
+}
+
+TEST_CASE("mix.engine_resamples_source_rate") {
+    // 44.1 kHz source into a 48 kHz engine: WSOLA must not play it 8.8% sharp.
+    MixEngine engine(kRate);
+    auto track = toneTrack(4.0, 440.0, 2, 44100);
+    CHECK(engine.loadDeck(DeckId::A, track, 41, 120.0));
+    engine.play(DeckId::A);
+    RenderStats stats;
+    renderSeconds(engine, 1.0, &stats, 0.2);
+    std::vector<float> block(480 * 2, 0.0f);
+    std::vector<float> collected;
+    collected.reserve(480 * 200 * 2);
+    for (int i = 0; i < 200; ++i) {
+        engine.render(block.data(), 480);
+        collected.insert(collected.end(), block.begin(), block.end());
+    }
+    const double hz = positiveZeroCrossingHz(collected, 2, kRate, 0.2);
+    CHECK(stats.nonFinite == 0);
+    CHECK_NEAR(hz, 440.0, 2.0);
+    std::printf("resample: 44.1k source -> %.1f Hz\n", hz);
+}
+
+TEST_CASE("mix.engine_transition_start_keeps_outgoing_continuity") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 51, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 52, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.5, nullptr);
+    const MixPlan plan = crossfadePlan(engine, 2.0, 0.0);
+    CHECK(engine.startTransition(plan));
+    std::vector<float> block(480 * 2, 0.0f);
+    engine.render(block.data(), 480);
+    // The cue is exactly the current position, so the outgoing WSOLA history
+    // must survive; resetting it would punch a ~21 ms fade-in hole.
+    float firstMinimum = 1.0f;
+    for (int i = 0; i < 100; ++i) {
+        firstMinimum = std::min(firstMinimum, std::abs(block[i * 2]));
+    }
+    // A reset stream starts at exactly zero; steady WSOLA on a constant signal
+    // has a small amplitude ripple, so assert "no hole", not unity.
+    CHECK(firstMinimum > 0.20f);
+    std::printf("transition start continuity: first-100 min=%.4f\n",
+                static_cast<double>(firstMinimum));
 }

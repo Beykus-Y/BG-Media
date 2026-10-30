@@ -398,6 +398,14 @@ CaseResult renderCase(const PreparedMixTrack& a, const PreparedMixTrack& b,
         return result;
     }
     MixEngine engine(kRate);
+    // The planner flag must select the real renderer, otherwise --no-pitch-lock
+    // would only change metadata and both A/B files would be identical.
+    engine.setTimeStretch(
+        plan.pitchLock
+            ? std::shared_ptr<const bgmedia::mix::ITimeStretchProcessor>(
+                  std::make_shared<bgmedia::mix::WsolaStretcher>())
+            : std::shared_ptr<const bgmedia::mix::ITimeStretchProcessor>(
+                  std::make_shared<bgmedia::mix::LinearResampleStretcher>()));
     if (!engine.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm) ||
         !engine.loadDeck(DeckId::B, b.audio, 2, b.analysis->bpm)) {
         return result;
@@ -540,6 +548,12 @@ bool offlineRun(const Options& options, const PreparedMixTrack& a,
 bool deviceRun(const Options& options, const PreparedMixTrack& a,
                const PreparedMixTrack& b) {
     MixEngine engine(kRate);
+    engine.setTimeStretch(
+        options.pitchLock
+            ? std::shared_ptr<const bgmedia::mix::ITimeStretchProcessor>(
+                  std::make_shared<bgmedia::mix::WsolaStretcher>())
+            : std::shared_ptr<const bgmedia::mix::ITimeStretchProcessor>(
+                  std::make_shared<bgmedia::mix::LinearResampleStretcher>()));
     const bool loadedA =
         engine.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm);
     const bool loadedB =

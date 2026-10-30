@@ -223,8 +223,11 @@ deferred to the next `update()`.
 
 `MixSync.hpp` is the adapter. `liveMixTempo(snapshot)` returns the master deck,
 its audible position (latency-compensated), live BPM (`analysedBpm * rate`),
-beat period and fractional phase. During a transition `master` moves at the
-handover, so a consumer automatically follows the audible reference.
+the source-time BPM/beat period and the fractional phase. The phase is computed
+in the **source-media** domain of `positionSeconds`; using the live BPM there
+would apply the playback rate twice during a ramp. During a transition `master`
+moves at the handover, so a consumer automatically follows the audible
+reference.
 
 The desktop app uses it when no video track is playing: it installs a
 `BeatClock` through the existing `DancePlayer::setGrid()` API. At natural speed
@@ -266,7 +269,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` — 25/25 pass. `bgmedia.mix` contains 39 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 42 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -303,10 +306,11 @@ without the ramp, bass swap or adaptive choice). Generated WAVs live under
 Representative run (real fixtures, 123.2 → 162.8 BPM, octave candidate at
 130.4 BPM, 5.9% delta):
 
-* plan: Tempo Ramp, 7 bars of pre-roll (13.25 s) + 7.94 s fade;
-* peak 0.786, 0 clipped samples, 0 non-finite samples;
-* 21.2 s of audio rendered in ≈0.08 s (≈0.4% of one core);
-* baseline peak 0.787, so the planned mix is not louder;
+* plan: Tempo Ramp, 7 bars of pre-roll (13.25 s) + 8.00 s fade;
+* peak 0.822, 0 clipped samples, 0 non-finite samples;
+* 21.25 s of audio rendered in ≈0.08 s (≈0.4% of one core);
+* baseline peak 0.797: the planned mix is ≈0.3 dB louder, and the limiter
+  never engages;
 * the same window with `--type phrase` selects the bar-aligned incoming cue at
   0.448 s and reports `phrase=1 (1.00)`;
 * an incompatible pair (92 → 123 BPM, 33.8%) falls back to Smart Crossfade with
