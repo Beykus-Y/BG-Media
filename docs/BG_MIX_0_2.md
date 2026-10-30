@@ -122,9 +122,16 @@ just to keep a ramp.
 `matchTempo()` compares the incoming BPM with the outgoing local BPM. It accepts
 the direct ratio when it is inside `maxTempoDeltaPercent`. When the incoming
 analysis is octave/metric-ambiguous it also considers `bpmCandidates`, but only
-with an incoming ratio in `[0.75, 1.33]`, so a candidate cannot turn into a
-2× chipmunk or half-speed drop. `tempoRatioB` is reported and the engine applies
-it to the incoming deck.
+with an incoming ratio in `[0.75, 1.33]` and inside the same per-deck delta cap,
+so a candidate cannot turn into a 2× chipmunk or half-speed drop. `tempoRatioB`
+is reported and the engine applies it to the incoming deck.
+
+If neither deck alone can meet the other inside the cap but the two allowed
+windows overlap, the planner chooses a **compromise target** inside the overlap,
+keeping A as close to its original tempo as possible and giving the rest of the
+movement to B. This is a normal dual-deck tempo match, still bounded by
+`maxTempoDeltaPercent` on both sides; if the windows do not overlap, the plan
+falls back to a plain EQ bass-swap crossfade and says why.
 
 The outgoing cue is snapped to a beat, and to a downbeat when meter/downbeat
 confidence is high. The incoming cue is snapped the same way. Because the ramp
@@ -279,7 +286,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 48 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 49 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -294,7 +301,8 @@ including:
   cap/disabled/unstable/low-confidence fallbacks;
 * phrase-aware cue and the adaptive compatible/incompatible/unstable cases;
 * no tempo-sync leak into a plain crossfade (including ambiguous candidates),
-  and Manual mode not inventing an adaptive ramp;
+  compromise targets inside the overlap of both 10% windows, and Manual mode
+  not inventing an adaptive ramp;
 * source-rate normalization (44.1 kHz into a 48 kHz engine), large WSOLA block
   draining, one-shot state isolation, unity-rate reconstruction (relative error
   0.0000), EOF tail drain to silence at unity and at 0.25× (the stretched tail

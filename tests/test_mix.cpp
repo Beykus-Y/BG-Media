@@ -514,8 +514,9 @@ TEST_CASE("mix.planner_tempo_ramp_phase") {
     PlanRequest request;
     request.type = TransitionType::TempoRamp;
     request.requestedDuration = 8.0;
+    // 123 -> 140 cannot meet inside a 3% window on both decks.
     const MixPlan tooFar =
-        strictPlanner.plan(analysisFor(123.0), analysisFor(128.0), request);
+        strictPlanner.plan(analysisFor(123.0), analysisFor(140.0), request);
     CHECK(tooFar.type == TransitionType::Crossfade);
     CHECK(tooFar.fallbackReason.find("exceeds") != std::string::npos);
 
@@ -1824,13 +1825,40 @@ TEST_CASE("mix.planner_fits_incoming_rate") {
     request.currentPositionA = 10.0;
     const MixPlan plan = planner.plan(analysisFor(125.0), b, request);
     CHECK(plan.valid);
-    CHECK(plan.tempoRampActive);
+    // A already matches the compromise target, so only B needs the rate match;
+    // there is no outgoing ramp.
+    CHECK(!plan.tempoRampActive);
     CHECK_NEAR(plan.tempoRatioB, 1.25, 1e-3);
     // 8 s of source at a mean incoming rate of 1.1875 lasts 6.74 s.
     CHECK(plan.duration < 6.8);
     CHECK(plan.endB <= 8.0 + 1e-6);
     std::printf("incoming rate fit: duration=%.2f endB=%.3f ratioB=%.2f\n",
                 plan.duration, plan.endB, plan.tempoRatioB);
+}
+
+TEST_CASE("mix.planner_compromise_tempo") {
+    PlannerConfig config;
+    config.tempoRampMode = TempoRampMode::Auto;
+    config.maxTempoDeltaPercent = 10.0;
+    MixPlanner planner(config);
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(analysisFor(115.0, 120.0),
+                                      analysisFor(140.0), request);
+    CHECK(plan.valid);
+    CHECK(plan.tempoRampActive);
+    CHECK(plan.type == TransitionType::PhraseAware);
+    // 115 and 140 are 21.7% apart; the planner meets at 126.02 so each deck
+    // moves inside the 10% cap.
+    CHECK_NEAR(plan.targetBpm, 126.02, 0.2);
+    CHECK(std::abs(plan.tempoRatioAEnd - 1.0) <= 0.10 + 1e-6);
+    CHECK(std::abs(plan.tempoRatioB - 1.0) <= 0.10 + 1e-6);
+    CHECK(plan.fallbackReason.empty());
+    std::printf("compromise: target=%.2f rA=%.4f rB=%.4f pre=%.2f\n",
+                plan.targetBpm, plan.tempoRatioAEnd, plan.tempoRatioB,
+                plan.preTransitionSeconds);
 }
 
 TEST_CASE("mix.planner_no_sync_leak_into_crossfade") {

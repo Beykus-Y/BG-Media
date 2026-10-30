@@ -337,7 +337,8 @@ TempoMatch matchTempo(const AnalysisResult& b, double localBpmA,
             return;
         }
         const double delta = std::abs(ratioA - 1.0) * 100.0;
-        if (delta > limit) {
+        const double deltaB = std::abs(ratioB - 1.0) * 100.0;
+        if (delta > limit || deltaB > limit) {
             return;
         }
         if (!match.compatible || delta < match.deltaPercent) {
@@ -353,6 +354,30 @@ TempoMatch matchTempo(const AnalysisResult& b, double localBpmA,
     if (allowOctave && b.octaveAmbiguous) {
         for (double candidate : b.bpmCandidates) {
             consider(candidate);
+        }
+    }
+    if (!match.compatible) {
+        // Neither deck is inside the other's cap. If the two allowed windows
+        // overlap, meet in the middle: keep A as close to its original tempo
+        // as possible and let B take the rest of the movement. This is a
+        // standard dual-deck tempo match, still bounded by maxTempoDeltaPercent
+        // on both sides.
+        const double fraction = limit / 100.0;
+        const double low =
+            std::max(localBpmA * (1.0 - fraction), b.bpm * (1.0 - fraction));
+        const double high =
+            std::min(localBpmA * (1.0 + fraction), b.bpm * (1.0 + fraction));
+        if (low <= high + 1e-9) {
+            const double target = std::clamp(localBpmA, low, high);
+            match.targetBpm = target;
+            match.ratioA = target / localBpmA;
+            match.ratioB = target / b.bpm;
+            match.deltaPercent = std::abs(match.ratioA - 1.0) * 100.0;
+            match.compatible = true;
+            match.reason = format(
+                "compromise target %.2f BPM inside the %.1f%% cap on both "
+                "decks",
+                target, limit);
         }
     }
     match.matched = std::abs(match.ratioA - 1.0) > 1e-4 ||
@@ -537,23 +562,36 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 plan.fallbackReason =
                     "adaptive: " + match.reason + "; using EQ bass-swap crossfade";
                 plan.reasons.push_back(plan.fallbackReason);
-            } else if (match.matched) {
+            } else if (match.matched &&
+                       std::abs(match.ratioA - 1.0) > 1e-4) {
                 // Manual means "ramp only when the caller explicitly asks for
                 // a tempo-synced type"; an adaptive Smart Crossfade must not
                 // invent one.
                 if (config_.tempoRampMode == TempoRampMode::Auto &&
                     config_.rampEnabled()) {
-                    type = TransitionType::TempoRamp;
+                    type = config_.preferPhraseBoundaries
+                               ? TransitionType::PhraseAware
+                               : TransitionType::TempoRamp;
                     plan.reasons.push_back(format(
-                        "Adaptive: compatible tempo (%.1f%% delta) -> "
-                        "pre-transition tempo ramp",
-                        match.deltaPercent));
+                        "Adaptive: compatible tempo (%.1f%% outgoing delta, "
+                        "target %.1f BPM) -> phrase-aware pre-transition ramp",
+                        match.deltaPercent, match.targetBpm));
                 } else {
                     type = TransitionType::SmartCrossfade;
                     plan.fallbackReason =
                         "adaptive: tempo sync needs the tempo ramp in Auto "
                         "mode; using EQ bass-swap crossfade";
                 }
+            } else if (match.matched) {
+                // The outgoing deck is already at the target; only the
+                // incoming deck needs a rate match during the fade.
+                type = config_.preferPhraseBoundaries
+                           ? TransitionType::PhraseAware
+                           : TransitionType::Beatmatched;
+                plan.reasons.push_back(format(
+                    "Adaptive: incoming rate match to %.1f BPM; outgoing deck "
+                    "needs no ramp",
+                    match.targetBpm));
             } else if (config_.preferPhraseBoundaries) {
                 type = TransitionType::PhraseAware;
                 plan.reasons.push_back(
@@ -610,9 +648,9 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     double ratioA = 1.0;
 
     if (tempoRequested && tempo.compatible && tempo.matched &&
-        config_.rampEnabled() && duration >= 2.0 &&
-        plan.confidence >= config_.minConfidence && a.tempoStable &&
-        b.tempoStable && !a.hasTempoChange()) {
+        std::abs(tempo.ratioA - 1.0) > 1e-4 && config_.rampEnabled() &&
+        duration >= 2.0 && plan.confidence >= config_.minConfidence &&
+        a.tempoStable && b.tempoStable && !a.hasTempoChange()) {
         rampBars = rampBarsFor(config_, tempo.deltaPercent);
         rampMediaSeconds = static_cast<double>(rampBars * bpbA) * 60.0 /
                            localBpmA;
@@ -743,23 +781,32 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     // Type-specific fallbacks that depend on the musical window.
     // ------------------------------------------------------------------
     if (type == TransitionType::TempoRamp && !ramp) {
-        std::string reason;
-        if (!config_.rampEnabled()) {
-            reason = "Tempo Ramp is disabled in preferences";
-        } else if (lowConfidence) {
-            reason = format("tempo confidence %.2f is too low for a tempo ramp",
-                            plan.confidence);
-        } else if (!a.tempoStable || a.hasTempoChange()) {
-            reason = "outgoing tempo is not stable enough for a tempo ramp";
-        } else if (!tempo.compatible) {
-            reason = tempo.reason;
-        } else if (!tempo.matched) {
-            reason = "tracks already share the same tempo";
+        if (tempo.compatible && tempo.matched &&
+            std::abs(tempo.ratioA - 1.0) <= 1e-4) {
+            // Only B needs the rate match; there is nothing to ramp on A.
+            type = TransitionType::Beatmatched;
+            plan.reasons.push_back(
+                "Incoming rate match; the outgoing deck needs no tempo ramp");
         } else {
-            reason = "transition is too short for a musical tempo ramp";
+            std::string reason;
+            if (!config_.rampEnabled()) {
+                reason = "Tempo Ramp is disabled in preferences";
+            } else if (lowConfidence) {
+                reason =
+                    format("tempo confidence %.2f is too low for a tempo ramp",
+                           plan.confidence);
+            } else if (!a.tempoStable || a.hasTempoChange()) {
+                reason = "outgoing tempo is not stable enough for a tempo ramp";
+            } else if (!tempo.compatible) {
+                reason = tempo.reason;
+            } else if (!tempo.matched) {
+                reason = "tracks already share the same tempo";
+            } else {
+                reason = "transition is too short for a musical tempo ramp";
+            }
+            type = TransitionType::Crossfade;
+            plan.fallbackReason = reason;
         }
-        type = TransitionType::Crossfade;
-        plan.fallbackReason = reason;
     }
     if (type == TransitionType::Beatmatched &&
         (!tempo.compatible || lowConfidence || !grids)) {
@@ -771,7 +818,8 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 : "tempo is not compatible for beatmatching; using a plain "
                   "crossfade";
     }
-    if (type == TransitionType::Beatmatched && tempo.matched && !ramp) {
+    if (type == TransitionType::Beatmatched && tempo.matched && !ramp &&
+        std::abs(tempo.ratioA - 1.0) > 1e-4) {
         type = TransitionType::Crossfade;
         plan.fallbackReason =
             "beatmatching needs tempo sync but the tempo ramp cannot run here; "
@@ -799,7 +847,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     if (grids && plan.confidence >= config_.minConfidence) {
         const double barSecondsB = static_cast<double>(bpbB) * 60.0 /
                                    std::max(1.0, b.bpm);
-        if (type == TransitionType::PhraseAware) {
+        if (config_.preferPhraseBoundaries) {
             const PhraseCue phraseCue =
                 findPhraseCue(b, cue, phraseBars, std::max(1.0, barSecondsB * 2.0));
             if (phraseCue.found) {
@@ -899,7 +947,12 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     // The incoming deck may play at a matched rate during the fade and then
     // return to 1.0 after the handover. Fit the fade against the source it
     // actually consumes, not against wall-clock duration.
-    const double incomingRate = ramp ? tempo.ratioB : 1.0;
+    const bool syncB =
+        tempo.compatible && tempo.matched &&
+        (type == TransitionType::TempoRamp ||
+         type == TransitionType::Beatmatched ||
+         type == TransitionType::PhraseAware);
+    const double incomingRate = syncB ? tempo.ratioB : 1.0;
     const double handover = 0.5;
     const double meanRateB =
         incomingRate * handover +
@@ -956,14 +1009,16 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     plan.tempoRampActive = ramp;
     // A plain crossfade is not tempo-synced. Do not leak an octave-candidate
     // incoming ratio into a fallback: the engine applies tempoRatioB for the
-    // whole fade, which would slow the incoming track without any ramp.
+    // whole fade, which would slow the incoming track without any sync.
+    // Beatmatched/PhraseAware may still sync B when A already matches.
+    const bool tempoSync = syncB;
     plan.tempoRampPercent = ramp ? tempo.deltaPercent : 0.0;
     plan.tempoRatioAStart = 1.0;
     plan.tempoRatioAEnd = ramp ? ratioA : 1.0;
-    plan.tempoRatioB = ramp ? tempo.ratioB : 1.0;
+    plan.tempoRatioB = tempoSync ? tempo.ratioB : 1.0;
     plan.preTransitionSeconds = ramp ? rampSeconds : 0.0;
     plan.tempoRampStartA = ramp ? overallStartA : crossfadeStartA;
-    plan.targetBpm = ramp ? tempo.targetBpm : b.bpm;
+    plan.targetBpm = tempoSync ? tempo.targetBpm : b.bpm;
 
     // ------------------------------------------------------------------
     // Tempo automation: ramp before the overlay, then hold the matched rate.
@@ -1011,6 +1066,14 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         if (plan.duration > 0.0) {
             plan.tempoCurve.push_back({plan.duration, 1.0, localBpmA});
         }
+    }
+    if (tempo.compatible && !tempo.reason.empty()) {
+        plan.reasons.push_back(tempo.reason);
+    }
+    if (!ramp && tempoSync && std::abs(tempo.ratioB - 1.0) > 1e-4) {
+        plan.reasons.push_back(format(
+            "Incoming deck rate match: %.3f to reach %.1f BPM",
+            tempo.ratioB, tempo.targetBpm, 0.0));
     }
     if (plan.pitchLock) {
         plan.reasons.push_back(
