@@ -68,6 +68,7 @@ add_library(bgmedia_core STATIC
     src/mix/MixTypes.cpp
     src/mix/PcmTrack.cpp
     src/mix/TimeStretch.cpp
+    src/mix/SpectralEq.cpp
     src/mix/MixPlanner.cpp
     src/mix/MixEngine.cpp
     src/mix/MixSession.cpp
