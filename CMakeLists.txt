@@ -72,6 +72,7 @@ add_library(bgmedia_core STATIC
     src/mix/MixPlanner.cpp
     src/mix/MixEngine.cpp
     src/mix/MixSession.cpp
+    src/mix/MixSync.cpp
 )
 add_library(BGMedia::Core ALIAS bgmedia_core)
 target_include_directories(bgmedia_core
