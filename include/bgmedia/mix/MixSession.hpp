@@ -116,10 +116,11 @@ private:
     [[nodiscard]] double deckDuration(DeckId deck) const;
     [[nodiscard]] std::uint64_t loadedId(DeckId deck) const;
     void installDeck(DeckId deck, const Item& item);
-    void startPlannedTransition(double durationOverride, bool automatic);
+    void startPlannedTransition(double durationOverride);
     [[nodiscard]] MixPlan buildPlan(DeckId from, DeckId to,
                                     const MixSnapshot& snap,
-                                    double durationOverride, bool automatic);
+                                    double durationOverride, bool execution);
+    void promoteEndedMaster(const MixSnapshot& snap);
 
     MixEngine& engine_;
     MixPrepareCallback prepare_;

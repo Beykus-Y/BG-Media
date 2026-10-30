@@ -145,9 +145,10 @@ void MixSession::pause() {
 }
 
 void MixSession::stopAll() {
-    engine_.setPaused(true);
-    engine_.pause(DeckId::A);
-    engine_.pause(DeckId::B);
+    // Engine-side stop settles the decks and any active transition before the
+    // paused early-out; pausing here and only clearing targetPlay left the
+    // snapshots stuck on "playing" and blocked Clear Queue.
+    engine_.stop();
     autoPlay_ = false;
     nextRequested_ = false;
     std::lock_guard lock(mutex_);
@@ -157,12 +158,12 @@ void MixSession::stopAll() {
 void MixSession::next() {
     nextRequested_ = true;
     engine_.setPaused(false);
-    startPlannedTransition(duration_, false);
+    startPlannedTransition(duration_);
 }
 
 void MixSession::startTransitionNow() {
     engine_.setPaused(false);
-    startPlannedTransition(duration_, false);
+    startPlannedTransition(duration_);
 }
 
 void MixSession::cancelTransition() {
@@ -433,7 +434,12 @@ void MixSession::serviceDecks() {
             if (deck == DeckId::A) {
                 currentId_ = item->id;
             }
-            if (autoPlay_ && deck == DeckId::A) {
+            // Only the very first usable track may auto-start. Refilling the
+            // outgoing deck after a handover must stay stopped: the incoming
+            // track is still playing and owns the master role.
+            const bool anyPlaying = snap.decks[0].playing ||
+                                    snap.decks[1].playing;
+            if (autoPlay_ && deck == DeckId::A && !anyPlaying && !snap.paused) {
                 engine_.play(DeckId::A);
                 engine_.setMaster(DeckId::A);
             }
@@ -445,13 +451,13 @@ void MixSession::serviceDecks() {
         const MixSnapshot after = engine_.snapshot();
         if (after.decks[0].loaded && after.decks[1].loaded) {
             nextRequested_ = false;
-            startPlannedTransition(duration_, false);
+            startPlannedTransition(duration_);
         }
     }
 }
 
 MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
-                              double durationOverride, bool automatic) {
+                              double durationOverride, bool execution) {
     const Item* a = findItem(snap.decks[deckIndex(from)].trackId);
     const Item* b = findItem(snap.decks[deckIndex(to)].trackId);
     if (!a || !b || !a->analysis || !b->analysis) {
@@ -470,9 +476,12 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
     PlanRequest request;
     request.type = adaptive_ ? type_ : TransitionType::Crossfade;
     request.requestedDuration = override;
+    // A preview deliberately plans the end-of-track window. Executing a
+    // transition (automatic or manual Next) must start where the outgoing
+    // deck is actually playing, otherwise the engine seeks it to the end.
     request.currentPositionA =
-        automatic ? snap.decks[deckIndex(from)].positionSeconds : -1.0;
-    request.autoStart = automatic;
+        execution ? snap.decks[deckIndex(from)].positionSeconds : -1.0;
+    request.autoStart = execution;
     request.trackNameB = b->name;
     MixPlan plan = planner.plan(*a->analysis, *b->analysis, request);
     plan.from = from;
@@ -489,8 +498,7 @@ void MixSession::refreshPlan() {
     preview_ = buildPlan(from, to, snap, duration_, false);
 }
 
-void MixSession::startPlannedTransition(double durationOverride,
-                                        bool automatic) {
+void MixSession::startPlannedTransition(double durationOverride) {
     const MixSnapshot snap = engine_.snapshot();
     if (snap.phase != TransitionPhase::Idle) {
         return;
@@ -508,7 +516,7 @@ void MixSession::startPlannedTransition(double durationOverride,
     MixPlan plan;
     {
         std::lock_guard lock(mutex_);
-        plan = buildPlan(from, to, snap, durationOverride, automatic);
+        plan = buildPlan(from, to, snap, durationOverride, true);
     }
     if (!plan.valid) {
         std::lock_guard lock(mutex_);
@@ -531,7 +539,34 @@ void MixSession::startPlannedTransition(double durationOverride,
     status_ = std::string("Mixing: ") + transitionTypeName(plan.type);
 }
 
+void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
+    const DeckId from = snap.master;
+    const DeckId to = otherDeck(from);
+    const DeckStatus& next = snap.decks[deckIndex(to)];
+    if (!next.loaded) {
+        return;
+    }
+    if (snap.paused) {
+        return;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        Item* oldItem = findItem(snap.decks[deckIndex(from)].trackId);
+        if (oldItem) {
+            oldItem->state = QueueState::Played;
+        }
+        currentId_ = next.trackId;
+        status_ = "Track ended: starting the prepared track";
+    }
+    engine_.setMaster(to);
+    engine_.play(to);
+    // Release the finished deck so serviceDecks() can refill it with the next
+    // prepared queue item.
+    engine_.clearDeck(from);
+}
+
 void MixSession::update() {
+    engine_.reclaimRetired();
     collectCompleted();
     startWorkerIfNeeded();
     handleTransitionCompletion();
@@ -553,15 +588,24 @@ void MixSession::update() {
     if (snap.phase != TransitionPhase::Idle || !autoQueue_ || !autoPlay_) {
         return;
     }
+    const DeckId from = snap.master;
+    const DeckStatus& deck = snap.decks[deckIndex(from)];
+    const double remaining = deck.durationSeconds - deck.positionSeconds;
+    const bool ended = deck.ended ||
+                       (deck.durationSeconds > 0.0 && remaining <= 0.05);
+    if (!deck.playing && !ended) {
+        return;
+    }
+    // The master can reach EOF before the next track finished preparing. In
+    // that case there is no window left for a crossfade: promote the prepared
+    // deck directly instead of rejecting it because it is not playing yet.
+    if (ended) {
+        promoteEndedMaster(snap);
+        return;
+    }
     if (!snap.decks[0].loaded || !snap.decks[1].loaded) {
         return;
     }
-    const DeckId from = snap.master;
-    const DeckStatus& deck = snap.decks[deckIndex(from)];
-    if (!deck.playing) {
-        return;
-    }
-    const double remaining = deck.durationSeconds - deck.positionSeconds;
     MixPlan preview;
     {
         std::lock_guard lock(mutex_);
@@ -569,11 +613,7 @@ void MixSession::update() {
     }
     if (preview.valid && preview.from == from && preview.duration > 0.0 &&
         remaining > 0.0 && remaining <= preview.duration + 0.35) {
-        startPlannedTransition(duration_, true);
-    } else if (deck.ended || remaining <= 0.05) {
-        // Hard safety net: never let the master deck run dry while another
-        // track is prepared.
-        startPlannedTransition(duration_, true);
+        startPlannedTransition(duration_);
     }
 }
 
