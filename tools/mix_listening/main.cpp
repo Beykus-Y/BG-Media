@@ -52,10 +52,14 @@ struct Options {
     std::filesystem::path cacheDir = "artifacts/bg_mix_listening_test/cache";
     std::vector<TrackSpec> tracks;
     std::vector<std::string> abPairs;
+    std::vector<std::string> onlyPairs;
+    std::filesystem::path diagnosticsDir;
+    bool diagnosticsOnly = false;
     int abTop = 0;
     double maxDelta = 10.0;
     double leadSeconds = 2.0;
     double tailSeconds = 2.0;
+    float deckGain = 0.75f;
     bool noCache = false;
 };
 
@@ -79,6 +83,10 @@ struct RenderResult {
     bgmedia::mix::MixSnapshot after;
     std::string processor;
     bool pitchPreserving = false;
+    float limiterMin = 1.0f;
+    double limiterSum = 0.0;
+    std::uint64_t limiterBlocks = 0;
+    std::uint64_t limiterHits = 0;
     double wallSeconds = 0.0;
     bool ok = false;
 };
@@ -97,8 +105,12 @@ void printUsage() {
         "  --max-delta <percent>   max tempo delta on each deck (default 10)\n"
         "  --lead <s>              source audio before the ramp (default 2)\n"
         "  --tail <s>              source audio after the fade (default 2)\n"
+        "  --deck-gain <0.1-1.5>   pre-limiter deck gain (default 0.75)\n"
         "  --ab <nameA_to_nameB>   also write _adaptive/_baseline WAVs\n"
-        "  --ab-top <n>            auto-pick the n most interesting pairs\n");
+        "  --ab-top <n>            auto-pick the n most interesting pairs\n"
+        "  --only <nameA_to_nameB> render only this pair (repeatable)\n"
+        "  --diagnostics <dir>     write 32-bit float diagnostic stems\n"
+        "  --diagnostics-only      skip the normal WAV/A-B output\n");
 }
 
 bool parseOptions(int argc, char** argv, Options& options) {
@@ -135,10 +147,25 @@ bool parseOptions(int argc, char** argv, Options& options) {
             const char* value = next("--tail");
             if (!value) return false;
             options.tailSeconds = std::atof(value);
+        } else if (arg == "--deck-gain") {
+            const char* value = next("--deck-gain");
+            if (!value) return false;
+            options.deckGain = static_cast<float>(std::clamp(std::atof(value), 0.1, 1.5));
         } else if (arg == "--ab") {
             const char* value = next("--ab");
             if (!value) return false;
             options.abPairs.emplace_back(value);
+        } else if (arg == "--only") {
+            const char* value = next("--only");
+            if (!value) return false;
+            options.onlyPairs.emplace_back(value);
+        } else if (arg == "--diagnostics") {
+            const char* value = next("--diagnostics");
+            if (!value) return false;
+            options.diagnosticsDir = std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t*>(value)));
+        } else if (arg == "--diagnostics-only") {
+            options.diagnosticsOnly = true;
         } else if (arg == "--ab-top") {
             const char* value = next("--ab-top");
             if (!value) return false;
@@ -377,7 +404,7 @@ void measure(const float* samples, std::size_t frames, Metrics& metrics) {
 
 RenderResult renderPlan(const PreparedMixTrack& a, const PreparedMixTrack& b,
                         const MixPlan& plan, double leadSeconds,
-                        double tailSeconds) {
+                        double tailSeconds, float deckGain) {
     RenderResult result;
     if (!plan.valid) {
         return result;
@@ -392,6 +419,12 @@ RenderResult renderPlan(const PreparedMixTrack& a, const PreparedMixTrack& b,
         std::fprintf(stderr, "render: failed to load decks\n");
         return result;
     }
+    // Leave headroom before the safety limiter. The source masters already
+    // peak near 0.99; a 1.0 deck gain makes the limiter work on almost every
+    // loud block, which is audible as pumping. This is a transparent bus trim,
+    // applied equally to both decks and to the A/B baseline.
+    engine.setDeckGain(DeckId::A, deckGain);
+    engine.setDeckGain(DeckId::B, deckGain);
     const double leadStart = plan.overallStartA() - leadSeconds;
     if (leadStart < -1e-6) {
         std::fprintf(stderr, "render: lead start is negative\n");
@@ -418,6 +451,13 @@ RenderResult renderPlan(const PreparedMixTrack& a, const PreparedMixTrack& b,
                 static_cast<std::size_t>(std::min<std::uint64_t>(kBlock, frames - done));
             engine.render(block.data(), chunk);
             measure(block.data(), chunk, result.metrics);
+            const float limiter = engine.snapshot().limiterGain;
+            result.limiterMin = std::min(result.limiterMin, limiter);
+            result.limiterSum += limiter;
+            ++result.limiterBlocks;
+            if (limiter < 0.999f) {
+                ++result.limiterHits;
+            }
             result.pcm.insert(result.pcm.end(), block.begin(),
                               block.begin() + static_cast<std::ptrdiff_t>(chunk * 2));
             done += chunk;
@@ -514,6 +554,215 @@ bool writeWav(const std::filesystem::path& path,
     return true;
 }
 
+bool writeFloatWav(const std::filesystem::path& path,
+                   const std::vector<float>& interleaved) {
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        std::fprintf(stderr, "cannot write %s\n", utf8(path).c_str());
+        return false;
+    }
+    const std::uint32_t dataBytes =
+        static_cast<std::uint32_t>(interleaved.size() * sizeof(float));
+    const std::uint32_t channels = 2;
+    const std::uint32_t rate = kRate;
+    const std::uint32_t byteRate = rate * channels * 4;
+    const std::uint16_t blockAlign = static_cast<std::uint16_t>(channels * 4);
+    auto u32 = [&](std::uint32_t v) {
+        file.write(reinterpret_cast<const char*>(&v), 4);
+    };
+    auto u16 = [&](std::uint16_t v) {
+        file.write(reinterpret_cast<const char*>(&v), 2);
+    };
+    file.write("RIFF", 4);
+    u32(36 + dataBytes);
+    file.write("WAVEfmt ", 8);
+    u32(16);
+    u16(3);  // IEEE float
+    u16(static_cast<std::uint16_t>(channels));
+    u32(rate);
+    u32(byteRate);
+    u16(blockAlign);
+    u16(32);
+    file.write("data", 4);
+    u32(dataBytes);
+    file.write(reinterpret_cast<const char*>(interleaved.data()),
+               static_cast<std::streamsize>(dataBytes));
+    return true;
+}
+
+double planRateAt(const MixPlan& plan, double time) {
+    if (plan.tempoCurve.empty()) {
+        return 1.0;
+    }
+    if (time <= plan.tempoCurve.front().time) {
+        return plan.tempoCurve.front().rate;
+    }
+    for (std::size_t i = 1; i < plan.tempoCurve.size(); ++i) {
+        if (time <= plan.tempoCurve[i].time) {
+            const auto& a = plan.tempoCurve[i - 1];
+            const auto& b = plan.tempoCurve[i];
+            const double span = std::max(1e-9, b.time - a.time);
+            const double t = std::clamp((time - a.time) / span, 0.0, 1.0);
+            return a.rate + (b.rate - a.rate) * t;
+        }
+    }
+    return plan.tempoCurve.back().rate;
+}
+
+bgmedia::mix::EqGains eqAt(const std::vector<bgmedia::mix::EqGainPoint>& curve,
+                           double time) {
+    bgmedia::mix::EqGains gains;
+    if (curve.empty()) {
+        return gains;
+    }
+    if (time <= curve.front().time) {
+        gains.low = curve.front().low;
+        gains.mid = curve.front().mid;
+        gains.high = curve.front().high;
+        return gains;
+    }
+    for (std::size_t i = 1; i < curve.size(); ++i) {
+        if (time <= curve[i].time) {
+            const auto& a = curve[i - 1];
+            const auto& b = curve[i];
+            const double span = std::max(1e-9, b.time - a.time);
+            const float t = static_cast<float>(
+                std::clamp((time - a.time) / span, 0.0, 1.0));
+            gains.low = a.low + (b.low - a.low) * t;
+            gains.mid = a.mid + (b.mid - a.mid) * t;
+            gains.high = a.high + (b.high - a.high) * t;
+            return gains;
+        }
+    }
+    gains.low = curve.back().low;
+    gains.mid = curve.back().mid;
+    gains.high = curve.back().high;
+    return gains;
+}
+
+std::vector<float> dryWindow(const bgmedia::mix::PcmTrack& track,
+                             double startSeconds, double seconds) {
+    const std::uint64_t frames =
+        static_cast<std::uint64_t>(std::llround(seconds * kRate));
+    std::vector<float> out(static_cast<std::size_t>(frames) * 2, 0.0f);
+    const double startFrame = startSeconds * track.sampleRate;
+    for (std::uint64_t i = 0; i < frames; ++i) {
+        const double source = startFrame +
+                              static_cast<double>(i) * track.sampleRate / kRate;
+        const auto index = static_cast<std::size_t>(
+            std::max(0.0, std::floor(source)));
+        if (index >= track.frameCount()) {
+            break;
+        }
+        const float left = track.channels == 1
+                               ? track.samples[index]
+                               : track.samples[index * 2];
+        const float right = track.channels == 1
+                                ? track.samples[index]
+                                : track.samples[index * 2 + 1];
+        out[i * 2] = left;
+        out[i * 2 + 1] = right;
+    }
+    return out;
+}
+
+std::vector<float> wsolaWindow(const bgmedia::mix::PcmTrack& track,
+                               double startSeconds, double seconds,
+                               const MixPlan* rampPlan,
+                               double relativeStart,
+                               bool applyEq) {
+    const std::uint64_t frames =
+        static_cast<std::uint64_t>(std::llround(seconds * kRate));
+    std::vector<float> out(static_cast<std::size_t>(frames) * 2, 0.0f);
+    bgmedia::mix::WsolaStretcher processor;
+    const auto stream = processor.createStream(kRate);
+    double position = startSeconds * track.sampleRate;
+    stream->reset(position);
+    std::vector<float> block(kBlock * 2, 0.0f);
+    std::uint64_t done = 0;
+    while (done < frames) {
+        const std::size_t chunk =
+            static_cast<std::size_t>(std::min<std::uint64_t>(kBlock, frames - done));
+        const double t0 = relativeStart + static_cast<double>(done) / kRate;
+        const double t1 = t0 + static_cast<double>(chunk) / kRate;
+        const double ratio0 = rampPlan ? planRateAt(*rampPlan, t0) : 1.0;
+        const double ratio1 = rampPlan ? planRateAt(*rampPlan, t1) : 1.0;
+        stream->render(track, position, ratio0, ratio1, block.data(), chunk);
+        std::copy_n(block.begin(), chunk * 2,
+                    out.begin() + static_cast<std::ptrdiff_t>(done * 2));
+        done += chunk;
+    }
+    if (applyEq && rampPlan) {
+        bgmedia::mix::ThreeBandEq eq;
+        eq.configure(kRate);
+        done = 0;
+        while (done < frames) {
+            const std::size_t chunk =
+                static_cast<std::size_t>(std::min<std::uint64_t>(kBlock, frames - done));
+            const double t0 = relativeStart + static_cast<double>(done) / kRate;
+            const double t1 = t0 + static_cast<double>(chunk) / kRate;
+            eq.process(out.data() + static_cast<std::ptrdiff_t>(done * 2), chunk,
+                       eqAt(rampPlan->eqCurveOut, t0),
+                       eqAt(rampPlan->eqCurveOut, t1));
+            done += chunk;
+        }
+    }
+    return out;
+}
+
+std::vector<float> sliceWindow(const std::vector<float>& pcm, double startSeconds,
+                               double seconds) {
+    const std::uint64_t frames =
+        static_cast<std::uint64_t>(std::llround(seconds * kRate));
+    std::vector<float> out(static_cast<std::size_t>(frames) * 2, 0.0f);
+    const std::uint64_t start =
+        static_cast<std::uint64_t>(std::max(0.0, startSeconds * kRate));
+    const std::uint64_t available =
+        pcm.size() / 2 > start ? pcm.size() / 2 - start : 0;
+    const std::uint64_t take = std::min(frames, available);
+    if (take > 0) {
+        std::copy_n(pcm.begin() + static_cast<std::ptrdiff_t>(start * 2),
+                    take * 2, out.begin());
+    }
+    return out;
+}
+
+struct StemMetrics {
+    double rms = 0.0;
+    float peak = 0.0f;
+    float maxStep = 0.0f;
+    std::uint64_t zeroRun = 0;
+};
+
+StemMetrics stemMetrics(const std::vector<float>& pcm) {
+    StemMetrics metrics;
+    double sum = 0.0;
+    std::uint64_t run = 0;
+    for (std::size_t i = 0; i < pcm.size(); ++i) {
+        const float value = pcm[i];
+        metrics.peak = std::max(metrics.peak, std::abs(value));
+        sum += static_cast<double>(value) * value;
+        if (value == 0.0f) {
+            ++run;
+            metrics.zeroRun = std::max(metrics.zeroRun, run);
+        } else {
+            run = 0;
+        }
+        if (i >= 2) {
+            metrics.maxStep = std::max(metrics.maxStep,
+                                       std::abs(value - pcm[i - 2]));
+        }
+    }
+    metrics.rms = pcm.empty()
+                      ? 0.0
+                      : std::sqrt(sum / static_cast<double>(pcm.size()));
+    return metrics;
+}
+
 MixPlan baselinePlan(const MixPlan& plan, double bpmA, double bpmB) {
     MixPlan baseline = plan;
     baseline.type = TransitionType::Crossfade;
@@ -568,6 +817,108 @@ std::string pairName(const TrackSpec& from, const TrackSpec& to) {
     return from.name + "_to_" + to.name;
 }
 
+void writeDiagnosticStems(const Options& options, const TrackSpec& from,
+                          const TrackSpec& to, const MixPlan& plan,
+                          const RenderResult& adaptive,
+                          const RenderResult& baseline, std::ofstream& csv) {
+    if (options.diagnosticsDir.empty()) {
+        return;
+    }
+    constexpr double kWindow = 4.0;  // 2 s before + 2 s after the event
+    const std::string pair = pairName(from, to);
+    const std::filesystem::path dir = options.diagnosticsDir / pair;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    auto emit = [&](const char* event, const char* variant,
+                    const std::vector<float>& pcm, float limiterMin = 1.0f,
+                    double limiterMean = 1.0, double limiterHits = 0.0) {
+        const std::filesystem::path path =
+            dir / (std::string(variant) + "_" + event + ".wav");
+        if (!writeFloatWav(path, pcm)) {
+            return;
+        }
+        const StemMetrics metrics = stemMetrics(pcm);
+        csv << pair << ',' << event << ',' << variant << ',' << metrics.rms
+            << ',' << metrics.peak << ',' << metrics.maxStep << ','
+            << metrics.zeroRun << ',' << limiterMin << ',' << limiterMean << ','
+            << limiterHits << '\n';
+    };
+
+    const double preEvent = options.leadSeconds;
+    const double crossEvent = options.leadSeconds + plan.preTransitionSeconds;
+    const double preStart = std::max(0.0, preEvent - 2.0);
+    const double crossStart = std::max(0.0, crossEvent - 2.0);
+
+    // ---- around the start of the pre-ramp ----
+    const double dryPreStart = std::max(0.0, plan.overallStartA() - 2.0);
+    emit("pre_ramp", "dry_A",
+         dryWindow(*from.prepared.audio, dryPreStart, kWindow));
+    emit("pre_ramp", "wsola_only",
+         wsolaWindow(*from.prepared.audio, dryPreStart, kWindow, nullptr, 0.0,
+                     false));
+    emit("pre_ramp", "wsola_ramp",
+         wsolaWindow(*from.prepared.audio, dryPreStart, kWindow, &plan,
+                     -(plan.preTransitionSeconds + 2.0), false));
+    emit("pre_ramp", "ramp_eq",
+         wsolaWindow(*from.prepared.audio, dryPreStart, kWindow, &plan,
+                     -(plan.preTransitionSeconds + 2.0), true));
+    emit("pre_ramp", "full_adaptive", sliceWindow(adaptive.pcm, preStart, kWindow),
+         adaptive.limiterMin,
+         adaptive.limiterBlocks > 0
+             ? adaptive.limiterSum / static_cast<double>(adaptive.limiterBlocks)
+             : 1.0,
+         adaptive.limiterBlocks > 0
+             ? static_cast<double>(adaptive.limiterHits) /
+                   static_cast<double>(adaptive.limiterBlocks)
+             : 0.0);
+    emit("pre_ramp", "plain_crossfade", sliceWindow(baseline.pcm, 0.0, kWindow),
+         baseline.limiterMin,
+         baseline.limiterBlocks > 0
+             ? baseline.limiterSum / static_cast<double>(baseline.limiterBlocks)
+             : 1.0,
+         baseline.limiterBlocks > 0
+             ? static_cast<double>(baseline.limiterHits) /
+                   static_cast<double>(baseline.limiterBlocks)
+             : 0.0);
+
+    // ---- around the start of the crossfade ----
+    const double dryCrossStart = std::max(0.0, plan.transitionStartA - 2.0);
+    emit("crossfade", "dry_A",
+         dryWindow(*from.prepared.audio, dryCrossStart, kWindow));
+    emit("crossfade", "dry_B",
+         dryWindow(*to.prepared.audio, std::max(0.0, plan.startB - 2.0), kWindow));
+    emit("crossfade", "wsola_only",
+         wsolaWindow(*from.prepared.audio, dryCrossStart, kWindow, nullptr, 0.0,
+                     false));
+    emit("crossfade", "wsola_ramp",
+         wsolaWindow(*from.prepared.audio, dryCrossStart, kWindow, &plan, -2.0,
+                     false));
+    emit("crossfade", "ramp_eq",
+         wsolaWindow(*from.prepared.audio, dryCrossStart, kWindow, &plan, -2.0,
+                     true));
+    emit("crossfade", "full_adaptive",
+         sliceWindow(adaptive.pcm, crossStart, kWindow), adaptive.limiterMin,
+         adaptive.limiterBlocks > 0
+             ? adaptive.limiterSum / static_cast<double>(adaptive.limiterBlocks)
+             : 1.0,
+         adaptive.limiterBlocks > 0
+             ? static_cast<double>(adaptive.limiterHits) /
+                   static_cast<double>(adaptive.limiterBlocks)
+             : 0.0);
+    emit("crossfade", "plain_crossfade",
+         sliceWindow(baseline.pcm, std::max(0.0, options.leadSeconds - 2.0),
+                     kWindow),
+         baseline.limiterMin,
+         baseline.limiterBlocks > 0
+             ? baseline.limiterSum / static_cast<double>(baseline.limiterBlocks)
+             : 1.0,
+         baseline.limiterBlocks > 0
+             ? static_cast<double>(baseline.limiterHits) /
+                   static_cast<double>(baseline.limiterBlocks)
+             : 0.0);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -595,11 +946,24 @@ int main(int argc, char** argv) {
     };
     std::vector<Entry> entries;
     entries.reserve(options.tracks.size() * (options.tracks.size() - 1));
+    std::ofstream diagnosticsCsv;
+    if (!options.diagnosticsDir.empty()) {
+        std::filesystem::create_directories(options.diagnosticsDir, ec);
+        diagnosticsCsv.open(options.diagnosticsDir / "diagnostics.csv");
+        diagnosticsCsv << "pair,event,variant,rms,peak,max_step,zero_run,"
+                          "limiter_min,limiter_mean,limiter_hit_ratio\n";
+    }
 
     int index = 0;
     for (const TrackSpec& from : options.tracks) {
         for (const TrackSpec& to : options.tracks) {
             if (&from == &to) {
+                continue;
+            }
+            const std::string pair = pairName(from, to);
+            if (!options.onlyPairs.empty() &&
+                std::find(options.onlyPairs.begin(), options.onlyPairs.end(),
+                          pair) == options.onlyPairs.end()) {
                 continue;
             }
             ++index;
@@ -645,7 +1009,8 @@ int main(int argc, char** argv) {
             entry.plan = plan;
             entry.interest = interestScore(plan);
             entry.render = renderPlan(from.prepared, to.prepared, plan,
-                                      options.leadSeconds, options.tailSeconds);
+                                      options.leadSeconds, options.tailSeconds,
+                                      options.deckGain);
             if (!entry.render.ok) {
                 std::fprintf(stderr, "  render failed\n");
                 continue;
@@ -654,9 +1019,26 @@ int main(int argc, char** argv) {
             std::snprintf(filename, sizeof(filename), "%02d_%s.wav", index,
                           pairName(from, to).c_str());
             entry.file = filename;
-            const std::filesystem::path path = options.outDir / entry.file;
-            if (!writeWav(path, entry.render.pcm)) {
-                continue;
+            if (!options.diagnosticsOnly) {
+                const std::filesystem::path path = options.outDir / entry.file;
+                if (!writeWav(path, entry.render.pcm)) {
+                    continue;
+                }
+            }
+            if (!options.diagnosticsDir.empty()) {
+                const MixPlan baseline =
+                    baselinePlan(plan, from.prepared.analysis->bpm,
+                                 to.prepared.analysis->bpm);
+                const RenderResult baseRender =
+                    renderPlan(from.prepared, to.prepared, baseline,
+                               options.leadSeconds, options.tailSeconds,
+                               options.deckGain);
+                if (baseRender.ok) {
+                    writeDiagnosticStems(options, from, to, plan, entry.render,
+                                         baseRender, diagnosticsCsv);
+                } else {
+                    std::fprintf(stderr, "diagnostic baseline render failed\n");
+                }
             }
             const Metrics& metrics = entry.render.metrics;
             const double seconds =
@@ -696,7 +1078,10 @@ int main(int argc, char** argv) {
                 "%.2f, stage %d, phase %d\n",
                 bEnd.positionSeconds, expectedB, bEnd.rate, bEnd.bpm,
                 static_cast<int>(fade.stage), static_cast<int>(fade.phase));
-            std::printf("  wrote %s\n", utf8(path).c_str());
+            if (!options.diagnosticsOnly) {
+                std::printf("  wrote %s\n",
+                            utf8(options.outDir / entry.file).c_str());
+            }
             entries.push_back(std::move(entry));
         }
     }
@@ -733,7 +1118,8 @@ int main(int argc, char** argv) {
                          entry.to->prepared.analysis->bpm);
         const RenderResult baseRender =
             renderPlan(entry.from->prepared, entry.to->prepared, baseline,
-                       options.leadSeconds, options.tailSeconds);
+                       options.leadSeconds, options.tailSeconds,
+                       options.deckGain);
         if (!baseRender.ok) {
             std::fprintf(stderr, "baseline render failed for %s\n", pair.c_str());
             continue;
@@ -754,29 +1140,34 @@ int main(int argc, char** argv) {
     }
 
     // Manifest for the README / objective ranking.
-    const std::filesystem::path manifest = options.outDir / "manifest.csv";
-    std::ofstream csv(manifest);
-    csv << "index,from,to,from_bpm,to_bpm,target_bpm,type,pre_s,fade_s,total_s,"
-           "a_cue_s,b_cue_s,ratio_a,ratio_b,pitch_lock,bass_swap,phrase,"
-           "beat_aligned,downbeat,confidence,peak,clipped,nonfinite,file,fallback\n";
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        const Entry& entry = entries[i];
-        const MixPlan& plan = entry.plan;
-        csv << (i + 1) << ',' << entry.from->name << ',' << entry.to->name << ','
-            << plan.bpmA << ',' << plan.bpmB << ',' << plan.targetBpm << ','
-            << bgmedia::mix::transitionTypeName(plan.type) << ','
-            << plan.preTransitionSeconds << ',' << plan.duration << ','
-            << plan.totalDuration() << ',' << plan.transitionStartA << ','
-            << plan.startB << ',' << plan.tempoRatioAEnd << ','
-            << plan.tempoRatioB << ',' << (plan.pitchLock ? 1 : 0) << ','
-            << (plan.bassSwap ? 1 : 0) << ',' << (plan.phraseBoundary ? 1 : 0)
-            << ',' << (plan.beatAligned ? 1 : 0) << ','
-            << (plan.downbeatAligned ? 1 : 0) << ',' << plan.confidence << ','
-            << entry.render.metrics.peak << ',' << entry.render.metrics.clipped
-            << ',' << entry.render.metrics.nonFinite << ',' << entry.file << ','
-            << plan.fallbackReason << '\n';
+    if (!options.diagnosticsOnly) {
+        const std::filesystem::path manifest = options.outDir / "manifest.csv";
+        std::ofstream csv(manifest);
+        csv << "index,from,to,from_bpm,to_bpm,target_bpm,type,pre_s,fade_s,"
+               "total_s,a_cue_s,b_cue_s,ratio_a,ratio_b,pitch_lock,bass_swap,"
+               "phrase,beat_aligned,downbeat,confidence,peak,clipped,nonfinite,"
+               "file,fallback\n";
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const Entry& entry = entries[i];
+            const MixPlan& plan = entry.plan;
+            csv << (i + 1) << ',' << entry.from->name << ',' << entry.to->name
+                << ',' << plan.bpmA << ',' << plan.bpmB << ',' << plan.targetBpm
+                << ',' << bgmedia::mix::transitionTypeName(plan.type) << ','
+                << plan.preTransitionSeconds << ',' << plan.duration << ','
+                << plan.totalDuration() << ',' << plan.transitionStartA << ','
+                << plan.startB << ',' << plan.tempoRatioAEnd << ','
+                << plan.tempoRatioB << ',' << (plan.pitchLock ? 1 : 0) << ','
+                << (plan.bassSwap ? 1 : 0) << ','
+                << (plan.phraseBoundary ? 1 : 0) << ','
+                << (plan.beatAligned ? 1 : 0) << ','
+                << (plan.downbeatAligned ? 1 : 0) << ',' << plan.confidence << ','
+                << entry.render.metrics.peak << ','
+                << entry.render.metrics.clipped << ','
+                << entry.render.metrics.nonFinite << ',' << entry.file << ','
+                << plan.fallbackReason << '\n';
+        }
+        std::printf("\nmanifest: %s\n", utf8(manifest).c_str());
     }
-    std::printf("\nmanifest: %s\n", utf8(manifest).c_str());
     std::printf("done: %zu transitions\n", entries.size());
     return entries.empty() ? 1 : 0;
 }

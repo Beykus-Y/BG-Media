@@ -413,7 +413,12 @@ CaseResult renderCase(const PreparedMixTrack& a, const PreparedMixTrack& b,
     engine.play(DeckId::A);
     engine.setMaster(DeckId::A);
     std::vector<float> block(kBlock * 2, 0.0f);
-    engine.render(block.data(), kBlock);  // settle the load reset
+    // QA renders the planned window from its cue, so cue the deck to the
+    // overall start (the engine would otherwise wait for a future event).
+    const double cue = plan.overallStartA();
+    engine.seek(DeckId::A,
+                std::max(0.0, cue - static_cast<double>(kBlock) / kRate));
+    engine.render(block.data(), kBlock);  // settle load reset + seek
     if (!engine.startTransition(plan)) {
         return result;
     }
@@ -577,7 +582,15 @@ bool deviceRun(const Options& options, const PreparedMixTrack& a,
         std::chrono::milliseconds(static_cast<int>(options.warmupSeconds *
                                                    1000.0)));
     const MixPlan plan = planTransition(options, a, b, engine);
-    if (!plan.valid || !engine.startTransition(plan)) {
+    if (!plan.valid) {
+        std::fprintf(stderr, "device: engine rejected the plan\n");
+        return false;
+    }
+    // Cue the device run to the planned window (the engine otherwise waits
+    // for a future musical event).
+    engine.seek(DeckId::A, plan.overallStartA());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!engine.startTransition(plan)) {
         std::fprintf(stderr, "device: engine rejected the plan\n");
         return false;
     }
