@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -50,9 +51,16 @@ struct Options {
     TransitionType type = TransitionType::SmartCrossfade;
     double duration = 0.0;
     double rampPercent = 6.0;
+    double rampBars = 0.0;
+    std::string rampMode = "auto";  // off | auto | manual
+    std::string curve = "scurve";   // linear | smooth | scurve
+    bool pitchLock = true;
+    bool bassSwap = true;
     double warmupSeconds = 8.0;
     double tailSeconds = 1.5;
     double stressSeconds = 0.0;
+    std::filesystem::path exportDir;
+    std::string name = "mix";
     bool device = false;
     bool noCache = false;
 };
@@ -102,9 +110,16 @@ double rms(const Metrics& metrics) {
 void printUsage() {
     std::printf(
         "usage: bgmedia_mix_qa --a <track> --b <track> [options]\n"
-        "  --type smart|beat|tempo|cut   transition type (default smart)\n"
+        "  --type smart|beat|tempo|phrase|cut  transition type (default smart)\n"
         "  --duration <s>                manual crossfade length (0 = auto)\n"
-        "  --ramp <percent>              Tempo Ramp max delta (default 6)\n"
+        "  --ramp <percent>              tempo ramp max delta (default 6)\n"
+        "  --ramp-mode off|auto|manual   tempo ramp mode (default auto)\n"
+        "  --ramp-bars <n>               ramp length in bars (0 = auto)\n"
+        "  --curve linear|smooth|scurve  tempo curve shape (default scurve)\n"
+        "  --no-pitch-lock               use linear resampling (pitch follows)\n"
+        "  --no-bass-swap                disable the three-band bass swap\n"
+        "  --export <dir>                write <name>_mix.wav and <name>_baseline.wav\n"
+        "  --name <label>                artifact name (default mix)\n"
         "  --warmup <s>                  playback before the transition (8)\n"
         "  --stress <s>                  concurrent play/pause/seek/load/clear/\n"
         "                                next/stop stress for this many seconds\n"
@@ -143,6 +158,8 @@ bool parseOptions(int argc, char** argv, Options& options) {
                 options.type = TransitionType::Beatmatched;
             } else if (type == "tempo") {
                 options.type = TransitionType::TempoRamp;
+            } else if (type == "phrase") {
+                options.type = TransitionType::PhraseAware;
             } else if (type == "cut") {
                 options.type = TransitionType::DirectCut;
             } else {
@@ -157,6 +174,41 @@ bool parseOptions(int argc, char** argv, Options& options) {
             const char* value = next("--ramp");
             if (!value) return false;
             options.rampPercent = std::atof(value);
+        } else if (arg == "--ramp-mode") {
+            const char* value = next("--ramp-mode");
+            if (!value) return false;
+            options.rampMode = value;
+            if (options.rampMode != "off" && options.rampMode != "auto" &&
+                options.rampMode != "manual") {
+                std::fprintf(stderr, "unknown --ramp-mode %s\n", value);
+                return false;
+            }
+        } else if (arg == "--ramp-bars") {
+            const char* value = next("--ramp-bars");
+            if (!value) return false;
+            options.rampBars = std::atof(value);
+        } else if (arg == "--curve") {
+            const char* value = next("--curve");
+            if (!value) return false;
+            options.curve = value;
+            if (options.curve != "linear" && options.curve != "smooth" &&
+                options.curve != "scurve") {
+                std::fprintf(stderr, "unknown --curve %s\n", value);
+                return false;
+            }
+        } else if (arg == "--no-pitch-lock") {
+            options.pitchLock = false;
+        } else if (arg == "--no-bass-swap") {
+            options.bassSwap = false;
+        } else if (arg == "--export") {
+            const char* value = next("--export");
+            if (!value) return false;
+            options.exportDir = std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t*>(value)));
+        } else if (arg == "--name") {
+            const char* value = next("--name");
+            if (!value) return false;
+            options.name = value;
         } else if (arg == "--warmup") {
             const char* value = next("--warmup");
             if (!value) return false;
@@ -222,7 +274,23 @@ bool prepare(const Options& options, const std::filesystem::path& path,
 MixPlan planTransition(const Options& options, const PreparedMixTrack& a,
                        const PreparedMixTrack& b, const MixEngine& engine) {
     PlannerConfig config = PlannerConfig::forTransition(options.type);
-    config.allowTempoRamp = options.type == TransitionType::TempoRamp;
+    config.tempoRampMode =
+        options.rampMode == "off"
+            ? bgmedia::mix::TempoRampMode::Off
+            : (options.rampMode == "manual"
+                   ? bgmedia::mix::TempoRampMode::Manual
+                   : bgmedia::mix::TempoRampMode::Auto);
+    config.allowTempoRamp =
+        config.tempoRampMode != bgmedia::mix::TempoRampMode::Off;
+    config.tempoRampBars = options.rampBars;
+    config.tempoCurveKind =
+        options.curve == "linear"
+            ? bgmedia::mix::TempoCurveKind::Linear
+            : (options.curve == "smooth"
+                   ? bgmedia::mix::TempoCurveKind::Smooth
+                   : bgmedia::mix::TempoCurveKind::SCurve);
+    config.pitchLock = options.pitchLock;
+    config.bassSwap = options.bassSwap;
     config.maxTempoDeltaPercent = std::clamp(options.rampPercent, 1.0, 16.0);
     MixPlanner planner(config);
 
@@ -250,6 +318,19 @@ void printPlan(const MixPlan& plan) {
     if (!plan.fallbackReason.empty()) {
         std::printf("    ! fallback: %s\n", plan.fallbackReason.c_str());
     }
+    std::printf(
+        "    window: pre %.2f s + fade %.2f s, A cue %.3f -> %.3f, "
+        "B cue %.3f, ramp %.1f%%\n",
+        plan.preTransitionSeconds, plan.duration, plan.transitionStartA,
+        plan.transitionEndA, plan.startB, plan.tempoRampPercent);
+    std::printf(
+        "    align: beat=%d downbeat=%d snap=%.1f ms phase=%.1f ms, "
+        "phrase=%d (%.2f), bassSwap=%d pitchLock=%d\n",
+        plan.beatAligned ? 1 : 0, plan.downbeatAligned ? 1 : 0,
+        plan.alignmentErrorMs, plan.beatPhaseErrorMs,
+        plan.phraseBoundary ? 1 : 0,
+        static_cast<double>(plan.phraseConfidence), plan.bassSwap ? 1 : 0,
+        plan.pitchLock ? 1 : 0);
     if (!plan.tempoCurve.empty()) {
         std::printf("    tempo curve: %zu points, %.4f -> %.4f\n",
                     plan.tempoCurve.size(), plan.tempoCurve.front().rate,
@@ -257,92 +338,202 @@ void printPlan(const MixPlan& plan) {
     }
 }
 
-bool offlineRun(const Options& options, const PreparedMixTrack& a,
-                const PreparedMixTrack& b) {
-    MixEngine engine(kRate);
-    const bool loadedA =
-        engine.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm);
-    const bool loadedB =
-        engine.loadDeck(DeckId::B, b.audio, 2, b.analysis->bpm);
-    if (!loadedA || !loadedB) {
-        std::fprintf(stderr, "failed to load prepared decks\n");
+bool writeWav(const std::filesystem::path& path,
+              const std::vector<float>& interleaved) {
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        std::fprintf(stderr, "cannot write %s\n", path.string().c_str());
         return false;
+    }
+    const std::uint32_t dataBytes =
+        static_cast<std::uint32_t>(interleaved.size() * sizeof(std::int16_t));
+    const std::uint32_t channels = 2;
+    const std::uint32_t rate = kRate;
+    const std::uint32_t byteRate = rate * channels * 2;
+    const std::uint16_t blockAlign =
+        static_cast<std::uint16_t>(channels * 2);
+    auto u32 = [&](std::uint32_t v) {
+        file.write(reinterpret_cast<const char*>(&v), 4);
+    };
+    auto u16 = [&](std::uint16_t v) {
+        file.write(reinterpret_cast<const char*>(&v), 2);
+    };
+    file.write("RIFF", 4);
+    u32(36 + dataBytes);
+    file.write("WAVEfmt ", 8);
+    u32(16);
+    u16(1);
+    u16(static_cast<std::uint16_t>(channels));
+    u32(rate);
+    u32(byteRate);
+    u16(blockAlign);
+    u16(16);
+    file.write("data", 4);
+    u32(dataBytes);
+    for (float value : interleaved) {
+        const float clamped = std::clamp(value, -1.0f, 1.0f);
+        const auto sample = static_cast<std::int16_t>(
+            std::lround(clamped * 32767.0f));
+        file.write(reinterpret_cast<const char*>(&sample), 2);
+    }
+    return true;
+}
+
+struct CaseResult {
+    Metrics metrics;
+    std::vector<float> pcm;
+    bgmedia::mix::MixSnapshot after;
+    double wallSeconds = 0.0;
+    bool ok = false;
+};
+
+CaseResult renderCase(const PreparedMixTrack& a, const PreparedMixTrack& b,
+                      const MixPlan& plan, bool captureAudio) {
+    CaseResult result;
+    if (!plan.valid) {
+        return result;
+    }
+    MixEngine engine(kRate);
+    if (!engine.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm) ||
+        !engine.loadDeck(DeckId::B, b.audio, 2, b.analysis->bpm)) {
+        return result;
     }
     engine.play(DeckId::A);
     engine.setMaster(DeckId::A);
-
     std::vector<float> block(kBlock * 2, 0.0f);
-    Metrics warmup;
-    const auto wallStart = std::chrono::steady_clock::now();
+    engine.render(block.data(), kBlock);  // settle the load reset
+    if (!engine.startTransition(plan)) {
+        return result;
+    }
+    const std::uint64_t totalFrames = static_cast<std::uint64_t>(
+        std::llround(plan.totalDuration() * kRate));
+    constexpr double kTailSeconds = 0.25;
+    const std::uint64_t blocks = static_cast<std::uint64_t>(
+        std::ceil((plan.totalDuration() + kTailSeconds) * kRate / kBlock));
+    if (captureAudio) {
+        result.pcm.reserve(static_cast<std::size_t>(totalFrames) * 2);
+    }
+    std::uint64_t captured = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        engine.render(block.data(), kBlock);
+        const std::uint64_t take =
+            captureAudio ? std::min<std::uint64_t>(kBlock, totalFrames - captured)
+                         : 0;
+        if (take > 0) {
+            measure(block.data(), static_cast<std::size_t>(take),
+                    result.metrics);
+            result.pcm.insert(result.pcm.end(), block.begin(),
+                              block.begin() + static_cast<std::ptrdiff_t>(take * 2));
+            captured += take;
+        }
+    }
+    result.wallSeconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    result.after = engine.snapshot();
+    result.ok = result.after.phase == TransitionPhase::Idle;
+    return result;
+}
+
+bool offlineRun(const Options& options, const PreparedMixTrack& a,
+                const PreparedMixTrack& b) {
+    // Plan from the same warmup position the host would use, but render the
+    // planned window from the plan's own cue so pre-roll and crossfade are
+    // measured exactly.
+    MixEngine probe(kRate);
+    if (!probe.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm) ||
+        !probe.loadDeck(DeckId::B, b.audio, 2, b.analysis->bpm)) {
+        std::fprintf(stderr, "failed to load prepared decks\n");
+        return false;
+    }
+    probe.play(DeckId::A);
+    probe.setMaster(DeckId::A);
+    std::vector<float> block(kBlock * 2, 0.0f);
     const std::uint64_t warmupBlocks = static_cast<std::uint64_t>(
         std::ceil(options.warmupSeconds * kRate / kBlock));
     for (std::uint64_t i = 0; i < warmupBlocks; ++i) {
-        engine.render(block.data(), kBlock);
-        measure(block.data(), kBlock, warmup);
+        probe.render(block.data(), kBlock);
     }
 
-    const bgmedia::mix::MixSnapshot before = engine.snapshot();
-    const MixPlan plan = planTransition(options, a, b, engine);
+    const MixPlan plan = planTransition(options, a, b, probe);
     printPlan(plan);
     if (!plan.valid) {
         std::fprintf(stderr, "plan is not valid\n");
         return false;
     }
-    if (!engine.startTransition(plan)) {
-        std::fprintf(stderr, "engine rejected the plan\n");
-        return false;
-    }
 
-    Metrics mix;
-    const std::uint64_t mixBlocks = static_cast<std::uint64_t>(
-        std::ceil(plan.duration * kRate / kBlock));
-    for (std::uint64_t i = 0; i < mixBlocks; ++i) {
-        engine.render(block.data(), kBlock);
-        measure(block.data(), kBlock, mix);
-    }
-    const bgmedia::mix::MixSnapshot after = engine.snapshot();
-    // The tail is deliberately not measured: after a handover the incoming
-    // track may legitimately end, and that is content silence, not a gap.
-    const std::uint64_t tailBlocks = static_cast<std::uint64_t>(
-        std::ceil(options.tailSeconds * kRate / kBlock));
-    for (std::uint64_t i = 0; i < tailBlocks; ++i) {
-        engine.render(block.data(), kBlock);
-    }
-    const double wallSeconds =
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - wallStart)
-            .count();
-    const double audioSeconds =
-        static_cast<double>(warmup.frames + (mixBlocks + tailBlocks) * kBlock) /
-        kRate;
-    const bgmedia::mix::MixSnapshot tail = engine.snapshot();
-
-    std::printf(
-        "  offline: %.2f s audio in %.3f s wall (%.1f%% of one core), "
-        "peak %.3f, clipped %llu, nonfinite %llu\n",
-        audioSeconds, wallSeconds, wallSeconds / audioSeconds * 100.0,
-        static_cast<double>(mix.peak),
-        static_cast<unsigned long long>(mix.clipped),
-        static_cast<unsigned long long>(mix.nonFinite));
-    std::printf(
-        "  output: rms %.4f, longest zero run %.1f ms, limiter %.3f\n",
-        rms(mix),
-        static_cast<double>(mix.longestZeroRun) / kRate * 1000.0,
-        static_cast<double>(after.limiterGain));
-    std::printf(
-        "  transition: completed=%llu phase=%d, A %.3f -> %.3f, "
-        "B start %.3f -> %.3f (expected %.3f)\n",
-        static_cast<unsigned long long>(after.completedTransitions),
-        static_cast<int>(after.phase), before.decks[0].positionSeconds,
-        after.decks[0].positionSeconds, plan.startB,
-        after.decks[1].positionSeconds, plan.startB + plan.duration);
-    if (after.phase != TransitionPhase::Idle) {
+    const CaseResult planned = renderCase(a, b, plan, true);
+    if (!planned.ok) {
         std::fprintf(stderr, "transition did not finish\n");
         return false;
     }
-    std::printf("  tail: master=%c, B ended=%d, B position %.3f\n",
-                tail.master == DeckId::A ? 'A' : 'B',
-                tail.decks[1].ended ? 1 : 0, tail.decks[1].positionSeconds);
+    const double audioSeconds = plan.totalDuration();
+    std::printf(
+        "  offline: %.2f s audio in %.3f s wall (%.1f%% of one core), "
+        "peak %.3f, clipped %llu, nonfinite %llu\n",
+        audioSeconds, planned.wallSeconds,
+        planned.wallSeconds / std::max(1e-9, audioSeconds) * 100.0,
+        static_cast<double>(planned.metrics.peak),
+        static_cast<unsigned long long>(planned.metrics.clipped),
+        static_cast<unsigned long long>(planned.metrics.nonFinite));
+    std::printf(
+        "  output: rms %.4f, longest zero run %.1f ms, limiter %.3f\n",
+        rms(planned.metrics),
+        static_cast<double>(planned.metrics.longestZeroRun) / kRate * 1000.0,
+        static_cast<double>(planned.after.limiterGain));
+    std::printf(
+        "  transition: completed=%llu phase=%d, A -> %.3f, "
+        "B -> %.3f (expected %.3f)\n",
+        static_cast<unsigned long long>(
+            planned.after.completedTransitions),
+        static_cast<int>(planned.after.phase),
+        planned.after.decks[0].positionSeconds,
+        planned.after.decks[1].positionSeconds,
+        plan.startB + plan.duration);
+
+    // A/B artifact: the same window with no tempo ramp, no bass swap and a
+    // plain equal-power fade. This is what a listener can compare in a DAW.
+    MixPlan baseline = plan;
+    baseline.type = TransitionType::Crossfade;
+    baseline.requestedType = TransitionType::Crossfade;
+    baseline.tempoCurve = {{0.0, 1.0, plan.localBpmA},
+                           {std::max(0.001, plan.duration), 1.0,
+                            plan.localBpmA}};
+    baseline.tempoRampActive = false;
+    baseline.tempoRatioAStart = 1.0;
+    baseline.tempoRatioAEnd = 1.0;
+    baseline.tempoRatioB = 1.0;
+    baseline.tempoRampStartA = plan.transitionStartA -
+                               plan.preTransitionSeconds;
+    if (baseline.tempoRampStartA < 0.0) {
+        baseline.tempoRampStartA = 0.0;
+    }
+    baseline.preTransitionSeconds = plan.preTransitionSeconds;
+    baseline.eqCurveOut.clear();
+    baseline.eqCurveIn.clear();
+    baseline.bassSwap = false;
+    const CaseResult base = renderCase(a, b, baseline, true);
+    if (base.ok) {
+        std::printf("  baseline: rms %.4f, peak %.3f, wall %.3f s\n",
+                    rms(base.metrics),
+                    static_cast<double>(base.metrics.peak),
+                    base.wallSeconds);
+    }
+
+    if (!options.exportDir.empty()) {
+        const std::filesystem::path dir = options.exportDir;
+        const std::string name = options.name.empty() ? "mix" : options.name;
+        if (writeWav(dir / (name + "_mix.wav"), planned.pcm) &&
+            (!base.ok || writeWav(dir / (name + "_baseline.wav"), base.pcm))) {
+            std::printf("  exported %s_mix.wav (+ baseline) to %s\n",
+                        name.c_str(), dir.string().c_str());
+        }
+    }
     return true;
 }
 

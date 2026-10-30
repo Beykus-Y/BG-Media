@@ -4,7 +4,9 @@
 #include "bgmedia/mix/MixEngine.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 #include "bgmedia/mix/MixSession.hpp"
+#include "bgmedia/mix/MixSync.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
+#include "bgmedia/mix/SpectralEq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -36,7 +38,12 @@ using bgmedia::mix::PlanRequest;
 using bgmedia::mix::PlannerConfig;
 using bgmedia::mix::PreparedMixTrack;
 using bgmedia::mix::TransitionPhase;
+using bgmedia::mix::TransitionStage;
 using bgmedia::mix::TransitionType;
+using bgmedia::mix::EqGains;
+using bgmedia::mix::ThreeBandEq;
+using bgmedia::mix::TempoCurveKind;
+using bgmedia::mix::TempoRampMode;
 
 constexpr std::uint32_t kRate = 48000;
 
@@ -441,25 +448,40 @@ TEST_CASE("mix.planner_tempo_ramp_phase") {
         const MixPlan plan = planner.plan(a, b, request);
         CHECK(plan.valid);
         CHECK(plan.type == TransitionType::TempoRamp);
-        CHECK(plan.experimental);
-        CHECK(plan.pitchShiftWarning);
+        // 0.2 ramps before the crossfade with pitch lock, so it is no longer
+        // flagged experimental or pitch-shifting.
+        CHECK(!plan.experimental);
+        CHECK(!plan.pitchShiftWarning);
+        CHECK(plan.pitchLock);
+        CHECK(plan.tempoRampActive);
+        CHECK(plan.preTransitionSeconds > 0.0);
+        CHECK(plan.tempoRampStartA < plan.transitionStartA - 0.1);
         CHECK(plan.tempoCurve.size() > 20);
         CHECK_NEAR(plan.tempoCurve.front().rate, 1.0, 1e-4);
+        CHECK_NEAR(plan.tempoCurve.front().time, -plan.preTransitionSeconds, 1e-6);
         const double ratio = toBpm / fromBpm;
         CHECK_NEAR(plan.tempoCurve.back().rate, ratio, 1e-3);
 
-        double integral = 0.0;
+        // The pre-roll curve must be smooth and start at 1.0. Its integral is
+        // the outgoing media advanced, which is exactly the distance from the
+        // ramp start to the crossfade cue.
+        double media = 0.0;
         for (std::size_t i = 1; i < plan.tempoCurve.size(); ++i) {
             const auto& p0 = plan.tempoCurve[i - 1];
             const auto& p1 = plan.tempoCurve[i];
-            integral += (p0.rate + p1.rate) * 0.5 * (p1.time - p0.time);
+            if (p1.time > 1e-9) {
+                break;
+            }
+            media += (p0.rate + p1.rate) * 0.5 * (p1.time - p0.time);
         }
-        const double mean = integral / std::max(1e-9, plan.duration);
-        CHECK_NEAR(mean, ratio, 0.005);
+        const double mean = media / std::max(1e-9, plan.preTransitionSeconds);
+        CHECK_NEAR(mean, 0.5 * (1.0 + ratio), 0.01);
+        CHECK_NEAR(media, plan.transitionStartA - plan.tempoRampStartA, 0.05);
         CHECK_NEAR(plan.tempoCurve.back().bpm, toBpm, 0.5);
-        std::printf("mix ramp %.0f->%.0f: mean=%.5f target=%.5f pitchWarn=%d\n",
-                    fromBpm, toBpm, mean, ratio,
-                    plan.pitchShiftWarning ? 1 : 0);
+        std::printf(
+            "mix ramp %.0f->%.0f: rampMean=%.5f target=%.5f pre=%.2f s "
+            "media=%.2f s\n",
+            fromBpm, toBpm, mean, ratio, plan.preTransitionSeconds, media);
     };
     checkRamp(123.0, 128.0);
     checkRamp(128.0, 122.0);
@@ -476,7 +498,9 @@ TEST_CASE("mix.planner_tempo_ramp_phase") {
     CHECK(tooFar.type == TransitionType::Crossfade);
     CHECK(tooFar.fallbackReason.find("exceeds") != std::string::npos);
 
-    MixPlanner disabled;
+    PlannerConfig disabledConfig;
+    disabledConfig.tempoRampMode = bgmedia::mix::TempoRampMode::Off;
+    MixPlanner disabled(disabledConfig);
     const MixPlan off =
         disabled.plan(analysisFor(123.0), analysisFor(128.0), request);
     CHECK(off.type == TransitionType::Crossfade);
@@ -1355,4 +1379,460 @@ TEST_CASE("mix.engine_concurrent_controls_stress") {
                 static_cast<unsigned long long>(renders.load()),
                 static_cast<double>(peak.load()),
                 static_cast<unsigned long long>(nonFinite.load()));
+}
+
+// ---------------------------------------------------------------------------
+// BG Mix 0.2 DSP: pitch-preserving time-stretch
+// ---------------------------------------------------------------------------
+namespace {
+
+double positiveZeroCrossingHz(const std::vector<float>& samples, int channels,
+                              std::uint32_t rate, double skipSeconds) {
+    const std::size_t first =
+        static_cast<std::size_t>(skipSeconds * static_cast<double>(rate));
+    const std::size_t frames = samples.size() / static_cast<std::size_t>(channels);
+    if (frames <= first + 8) {
+        return 0.0;
+    }
+    std::size_t crossings = 0;
+    for (std::size_t i = first + 1; i < frames; ++i) {
+        const float previous = samples[(i - 1) * static_cast<std::size_t>(channels)];
+        const float current = samples[i * static_cast<std::size_t>(channels)];
+        if (previous <= 0.0f && current > 0.0f) {
+            ++crossings;
+        }
+    }
+    const double seconds =
+        static_cast<double>(frames - first) / static_cast<double>(rate);
+    return seconds > 0.0 ? static_cast<double>(crossings) / seconds : 0.0;
+}
+
+std::vector<float> renderStretch(const bgmedia::mix::PcmTrack& track,
+                                 double ratio, double seconds,
+                                 double startSeconds = 0.0) {
+    const bgmedia::mix::WsolaStretcher processor;
+    const auto stream = processor.createStream(track.sampleRate);
+    double position = startSeconds * track.sampleRate;
+    stream->reset(position);
+    const std::size_t frames = static_cast<std::size_t>(seconds * kRate);
+    std::vector<float> output(frames * 2, 0.0f);
+    std::vector<float> block(480 * 2, 0.0f);
+    std::size_t done = 0;
+    while (done < frames) {
+        const std::size_t chunk = std::min<std::size_t>(480, frames - done);
+        stream->render(track, position, ratio, ratio, block.data(), chunk);
+        std::copy_n(block.begin(), chunk * 2, output.begin() +
+                                                 static_cast<std::ptrdiff_t>(done * 2));
+        done += chunk;
+    }
+    return output;
+}
+
+} // namespace
+
+TEST_CASE("mix.wsola_preserves_pitch") {
+    const auto track = toneTrack(8.0, 440.0);
+    const double ratios[] = {0.90, 0.95, 1.05, 1.10};
+    for (double ratio : ratios) {
+        const std::vector<float> output = renderStretch(*track, ratio, 3.0, 1.0);
+        const double hz = positiveZeroCrossingHz(output, 2, kRate, 0.35);
+        CHECK_NEAR(hz, 440.0, 8.0);
+        float peak = 0.0f;
+        for (float value : output) {
+            peak = std::max(peak, std::abs(value));
+        }
+        CHECK(peak > 0.15f);
+        CHECK(peak < 0.60f);
+        std::printf("wsola pitch %.2fx: %.2f Hz (target 440), peak %.3f\n",
+                    ratio, hz, static_cast<double>(peak));
+    }
+}
+
+TEST_CASE("mix.wsola_has_no_sample_step_clicks") {
+    const auto track = toneTrack(6.0, 220.0);
+    const std::vector<float> output = renderStretch(*track, 1.10, 2.0, 0.5);
+    float largestStep = 0.0f;
+    for (std::size_t i = 2; i < output.size(); ++i) {
+        largestStep = std::max(largestStep, std::abs(output[i] - output[i - 2]));
+    }
+    // A 220 Hz sine at 0.4 amplitude changes by at most ~0.015 per 48 kHz
+    // sample. Anything near a full-scale jump would be a click.
+    CHECK(largestStep < 0.08f);
+    std::printf("wsola click check: largest sample step %.4f\n",
+                static_cast<double>(largestStep));
+}
+
+TEST_CASE("mix.wsola_preserves_transient_spacing") {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = kRate * 6;
+    track->samples.assign(frames * 2, 0.0f);
+    // 30 ms bursts every 250 ms.
+    for (int burst = 0; burst < 20; ++burst) {
+        const std::size_t start = static_cast<std::size_t>((0.25 * burst + 0.1) * kRate);
+        for (std::size_t i = 0; i < kRate / 33; ++i) {
+            const float value = static_cast<float>(
+                0.5 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 *
+                               static_cast<double>(i) / kRate));
+            if (start + i < frames) {
+                track->samples[(start + i) * 2] = value;
+                track->samples[(start + i) * 2 + 1] = value;
+            }
+        }
+    }
+    const std::vector<float> output = renderStretch(*track, 1.10, 4.0, 0.0);
+    // Count envelope bursts above 0.1 after a 30 ms release.
+    std::vector<double> peaks;
+    double envelope = 0.0;
+    double lastPeak = -1.0;
+    bool inBurst = false;
+    for (std::size_t i = 0; i < output.size() / 2; ++i) {
+        const float value = output[i * 2];
+        envelope = std::max(static_cast<double>(std::abs(value)),
+                            envelope * 0.999);
+        if (!inBurst && envelope > 0.2) {
+            inBurst = true;
+            const double time = static_cast<double>(i) / kRate;
+            if (lastPeak >= 0.0) {
+                peaks.push_back(time - lastPeak);
+            }
+            lastPeak = time;
+        } else if (inBurst && envelope < 0.05) {
+            inBurst = false;
+        }
+    }
+    CHECK(peaks.size() >= 8);
+    for (std::size_t i = 1; i + 1 < peaks.size(); ++i) {
+        CHECK_NEAR(peaks[i], 0.25, 0.03);
+    }
+    std::printf("wsola transients: %zu intervals, first %.4f s\n",
+                peaks.size(), peaks.empty() ? 0.0 : peaks[1]);
+}
+
+namespace {
+
+MixPlan rampedPlan(const MixEngine& engine, double rampSeconds, double media,
+                   double duration, double targetRatio) {
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    MixPlan plan;
+    plan.valid = true;
+    plan.type = TransitionType::TempoRamp;
+    plan.requestedType = TransitionType::TempoRamp;
+    plan.from = DeckId::A;
+    plan.to = DeckId::B;
+    plan.preTransitionSeconds = rampSeconds;
+    plan.duration = duration;
+    plan.tempoRampStartA = snap.decks[0].positionSeconds;
+    plan.transitionStartA = plan.tempoRampStartA + media;
+    plan.transitionEndA = plan.transitionStartA + duration;
+    plan.startB = 0.0;
+    plan.endB = duration;
+    plan.handoverProgress = 0.5;
+    plan.tempoRampActive = true;
+    plan.pitchLock = true;
+    plan.tempoRatioAStart = 1.0;
+    plan.tempoRatioAEnd = targetRatio;
+    constexpr int kPoints = 33;
+    for (int i = 0; i < kPoints; ++i) {
+        const double t = static_cast<double>(i) / (kPoints - 1);
+        const double rate = 1.0 + (targetRatio - 1.0) * t;
+        plan.tempoCurve.push_back(
+            {-rampSeconds + rampSeconds * t, rate, 123.0 * rate});
+    }
+    plan.tempoCurve.push_back({0.0, targetRatio, 123.0 * targetRatio});
+    plan.tempoCurve.push_back({duration, targetRatio, 123.0 * targetRatio});
+    return plan;
+}
+
+} // namespace
+
+TEST_CASE("mix.engine_preroll_before_crossfade") {
+    MixEngine engine(kRate);
+    auto a = toneTrack(40.0, 173.0);
+    auto b = toneTrack(40.0, 197.0);
+    CHECK(engine.loadDeck(DeckId::A, a, 31, 123.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 32, 128.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.2, nullptr);
+
+    const MixPlan plan = rampedPlan(engine, 2.0, 2.1, 2.0, 1.10);
+    CHECK(engine.startTransition(plan));
+
+    renderSeconds(engine, 1.0, nullptr);
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Running);
+    CHECK(snap.stage == TransitionStage::TempoRamp ||
+          snap.stage == TransitionStage::BeatAlign);
+    CHECK_NEAR(snap.crossfadeElapsed, 0.0, 1e-9);
+    CHECK_NEAR(snap.preTransitionSeconds, 2.0, 0.01);
+    CHECK(!snap.decks[1].playing);
+    CHECK_NEAR(snap.decks[1].positionSeconds, 0.0, 1e-3);
+    CHECK_NEAR(snap.tempoRatioA, 1.05, 0.02);
+
+    // The incoming deck must appear exactly at the crossfade boundary, on its
+    // planned start marker, not at the ramp start.
+    renderSeconds(engine, 1.2, nullptr);
+    snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Running);
+    CHECK(snap.stage == TransitionStage::Mixing ||
+          snap.stage == TransitionStage::Handover);
+    CHECK(snap.crossfadeElapsed > 0.1);
+    CHECK(snap.decks[1].playing);
+    CHECK_NEAR(snap.decks[1].positionSeconds, 0.2, 0.06);
+    CHECK_NEAR(snap.tempoRatioA, 1.10, 0.02);
+    // A advanced by the integral of the ramp: 2.0 s * 1.05 = 2.1 s of media.
+    CHECK_NEAR(snap.decks[0].positionSeconds,
+               plan.tempoRampStartA + 2.1 + 0.2 * 1.10, 0.06);
+    std::printf(
+        "preroll: stage=%d crossfadeElapsed=%.3f A=%.3f B=%.3f ratio=%.3f\n",
+        static_cast<int>(snap.stage), snap.crossfadeElapsed,
+        snap.decks[0].positionSeconds, snap.decks[1].positionSeconds,
+        snap.tempoRatioA);
+}
+
+TEST_CASE("mix.engine_cancel_during_preroll_restores_rate") {
+    MixEngine engine(kRate);
+    auto a = toneTrack(40.0, 173.0);
+    auto b = toneTrack(40.0, 197.0);
+    CHECK(engine.loadDeck(DeckId::A, a, 33, 123.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 34, 128.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.2, nullptr);
+    const MixPlan plan = rampedPlan(engine, 2.0, 2.1, 2.0, 1.10);
+    CHECK(engine.startTransition(plan));
+
+    renderSeconds(engine, 1.0, nullptr);
+    CHECK(engine.snapshot().decks[1].playing == false);
+    engine.cancelTransition();
+    RenderStats stats;
+    renderSeconds(engine, 0.5, &stats, 0.02);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(stats.nonFinite == 0);
+    CHECK(stats.peak <= 1.02f);
+    CHECK(snap.phase == TransitionPhase::Idle);
+    CHECK(snap.master == DeckId::A);
+    CHECK(snap.decks[0].playing);
+    CHECK(!snap.decks[1].playing);
+    CHECK_NEAR(snap.decks[0].rate, 1.0, 0.02);
+    std::printf("preroll cancel: A=%.3f rate=%.3f peak=%.3f\n",
+                snap.decks[0].positionSeconds, snap.decks[0].rate,
+                static_cast<double>(stats.peak));
+}
+
+TEST_CASE("mix.engine_bass_swap_monitor") {
+    MixEngine engine(kRate);
+    auto a = toneTrack(30.0, 100.0);
+    auto b = toneTrack(30.0, 100.0);
+    CHECK(engine.loadDeck(DeckId::A, a, 35, 123.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 36, 123.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.1, nullptr);
+
+    MixPlan plan = crossfadePlan(engine, 2.0, 0.0);
+    plan.bassSwap = true;
+    plan.eqCurveOut = {{0.0, 1.0f, 1.0f, 1.0f}, {2.0, 0.0f, 1.0f, 1.0f}};
+    plan.eqCurveIn = {{0.0, 0.0f, 1.0f, 1.0f}, {2.0, 1.0f, 1.0f, 1.0f}};
+    CHECK(engine.startTransition(plan));
+    renderSeconds(engine, 1.0, nullptr);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.bassSwap);
+    CHECK_NEAR(snap.eqLow[0], 0.5, 0.03);
+    CHECK_NEAR(snap.eqLow[1], 0.5, 0.03);
+    CHECK_NEAR(snap.eqMid[0], 1.0, 1e-4);
+    CHECK_NEAR(snap.eqHigh[0], 1.0, 1e-4);
+    std::printf("bass swap: outLow=%.3f inLow=%.3f\n",
+                static_cast<double>(snap.eqLow[0]),
+                static_cast<double>(snap.eqLow[1]));
+}
+
+TEST_CASE("mix.eq_unity_bypass_and_band_response") {
+    ThreeBandEq eq;
+    eq.configure(kRate);
+    const std::size_t frames = kRate;
+    std::vector<float> input(frames * 2);
+    for (std::size_t i = 0; i < frames; ++i) {
+        input[i * 2] = input[i * 2 + 1] =
+            static_cast<float>(0.4 * std::sin(2.0 * 3.14159265358979323846 *
+                                              100.0 * static_cast<double>(i) /
+                                              kRate));
+    }
+    std::vector<float> bypass = input;
+    eq.process(bypass.data(), frames, EqGains{}, EqGains{});
+    CHECK(bypass == input);
+
+    auto rms = [](const std::vector<float>& data) {
+        double sum = 0.0;
+        for (float value : data) {
+            sum += static_cast<double>(value) * value;
+        }
+        return std::sqrt(sum / static_cast<double>(data.size()));
+    };
+    std::vector<float> lowCut = input;
+    EqGains cut;
+    cut.low = 0.0f;
+    eq.process(lowCut.data(), frames, cut, cut);
+    CHECK(rms(lowCut) < rms(input) * 0.65);
+
+    // The high band must survive a low cut. 5 kHz is well above the 3.2 kHz
+    // crossover, so only the one-pole split's small mid leakage changes it.
+    std::vector<float> highs(frames * 2);
+    for (std::size_t i = 0; i < frames; ++i) {
+        highs[i * 2] = highs[i * 2 + 1] =
+            static_cast<float>(0.4 * std::sin(2.0 * 3.14159265358979323846 *
+                                              5000.0 * static_cast<double>(i) /
+                                              kRate));
+    }
+    std::vector<float> highCut = highs;
+    eq.process(highCut.data(), frames, cut, cut);
+    CHECK(rms(highCut) > rms(highs) * 0.85);
+
+    // A one-second automation ramp must not step the sample stream.
+    ThreeBandEq automating;
+    automating.configure(kRate);
+    std::vector<float> swept = input;
+    EqGains from;
+    EqGains to;
+    to.low = 0.0f;
+    automating.process(swept.data(), frames, from, to);
+    float largestStep = 0.0f;
+    for (std::size_t i = 2; i < swept.size(); i += 2) {
+        largestStep = std::max(largestStep, std::abs(swept[i] - swept[i - 2]));
+    }
+    CHECK(largestStep < 0.1f);
+    std::printf("eq: lowCutRms=%.3f highKept=%.3f step=%.4f\n", rms(lowCut),
+                rms(highCut) / std::max(1e-9, rms(highs)),
+                static_cast<double>(largestStep));
+}
+
+TEST_CASE("mix.planner_phrase_and_adaptive") {
+    MixPlanner planner;
+    PlanRequest phrase;
+    phrase.type = TransitionType::PhraseAware;
+    phrase.requestedDuration = 8.0;
+    const MixPlan plan =
+        planner.plan(analysisFor(123.0), analysisFor(128.0), phrase);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::PhraseAware);
+    CHECK(plan.phraseBoundary);
+    CHECK(plan.phraseConfidence > 0.0f);
+    CHECK(plan.downbeatAligned);
+    CHECK(plan.tempoRampActive);
+    CHECK(plan.preTransitionSeconds > 0.0);
+    CHECK(plan.startB >= 0.0);
+
+    // Adaptive with compatible tempo uses the musical machinery, not a
+    // generic fade.
+    PlanRequest adaptive;
+    adaptive.type = TransitionType::SmartCrossfade;
+    adaptive.requestedDuration = 8.0;
+    const MixPlan compatible =
+        planner.plan(analysisFor(123.0), analysisFor(125.0), adaptive);
+    CHECK(compatible.valid);
+    CHECK(compatible.type != TransitionType::Crossfade);
+    CHECK(compatible.fallbackReason.empty());
+
+    // Incompatible tempo: an explicit, explained fallback to Smart Crossfade.
+    const MixPlan incompatible =
+        planner.plan(analysisFor(123.0), analysisFor(180.0), adaptive);
+    CHECK(incompatible.valid);
+    CHECK(incompatible.type == TransitionType::SmartCrossfade);
+    CHECK(incompatible.fallbackReason.find("exceeds") != std::string::npos);
+    CHECK(incompatible.bassSwap);
+
+    // Unstable tempo and low confidence both fall back explicitly.
+    AnalysisResult unstable = analysisFor(123.0);
+    unstable.tempoStable = false;
+    const MixPlan unstablePlan =
+        planner.plan(unstable, analysisFor(125.0), adaptive);
+    CHECK(unstablePlan.type == TransitionType::Crossfade);
+    CHECK(unstablePlan.fallbackReason.find("stable") != std::string::npos);
+
+    const MixPlan low =
+        planner.plan(analysisFor(123.0, 30.0, false),
+                     analysisFor(125.0, 30.0, false), adaptive);
+    CHECK(low.type == TransitionType::Crossfade);
+    CHECK(!low.fallbackReason.empty());
+    std::printf("adaptive: compatible=%s incompatible='%s'\n",
+                bgmedia::mix::transitionTypeName(compatible.type),
+                incompatible.fallbackReason.c_str());
+}
+
+TEST_CASE("mix.planner_ramp_smoothness") {
+    PlannerConfig config;
+    config.tempoRampMode = TempoRampMode::Manual;
+    config.tempoRampBars = 8.0;
+    config.tempoCurveKind = TempoCurveKind::Smooth;
+    MixPlanner planner(config);
+    PlanRequest request;
+    request.type = TransitionType::TempoRamp;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 10.0;
+    const MixPlan plan =
+        planner.plan(analysisFor(123.0), analysisFor(128.0), request);
+    CHECK(plan.valid);
+    CHECK(plan.tempoRampActive);
+    CHECK_NEAR(plan.tempoCurve.front().rate, 1.0, 1e-6);
+    CHECK_NEAR(plan.tempoCurve.back().rate, 128.0 / 123.0, 1e-3);
+    float largest = 0.0f;
+    for (std::size_t i = 1; i < plan.tempoCurve.size(); ++i) {
+        largest = std::max(
+            largest, static_cast<float>(std::abs(plan.tempoCurve[i].rate -
+                                                 plan.tempoCurve[i - 1].rate)));
+        CHECK(plan.tempoCurve[i].time >= plan.tempoCurve[i - 1].time);
+    }
+    CHECK(largest < 0.01f);
+    CHECK(plan.tempoRampStartA >= 0.0);
+    CHECK(plan.tempoRampStartA < plan.transitionStartA);
+    std::printf("ramp smooth: maxStep=%.5f bars=%.0f pre=%.2f s\n",
+                static_cast<double>(largest), config.tempoRampBars,
+                plan.preTransitionSeconds);
+}
+
+TEST_CASE("mix.live_tempo_follows_master") {
+    bgmedia::mix::MixSnapshot snap;
+    snap.master = DeckId::B;
+    snap.outputLatencySeconds = 0.02;
+    bgmedia::mix::DeckStatus& deck = snap.decks[1];
+    deck.loaded = true;
+    deck.playing = true;
+    deck.trackId = 77;
+    deck.analysedBpm = 128.0;
+    deck.rate = 1.10;
+    deck.bpm = 140.8;
+    deck.positionSeconds = 2.0;
+
+    const bgmedia::mix::LiveMixTempo live = bgmedia::mix::liveMixTempo(snap);
+    CHECK(live.valid);
+    CHECK(live.playing);
+    CHECK(live.master == DeckId::B);
+    CHECK(live.trackId == 77);
+    CHECK_NEAR(live.bpm, 140.8, 1e-6);
+    CHECK_NEAR(live.rate, 1.10, 1e-6);
+    CHECK_NEAR(live.positionSeconds, 1.98, 1e-9);
+    CHECK_NEAR(live.beatPeriodSeconds, 60.0 / 140.8, 1e-9);
+    CHECK(live.beatPhase >= 0.0);
+    CHECK(live.beatPhase < 1.0);
+
+    // A handover moves the musical reference to the other deck without any
+    // motion3 change: the adapter simply reports the new master.
+    snap.master = DeckId::A;
+    snap.decks[0].loaded = true;
+    snap.decks[0].playing = true;
+    snap.decks[0].trackId = 78;
+    snap.decks[0].bpm = 126.0;
+    snap.decks[0].analysedBpm = 126.0;
+    snap.decks[0].rate = 1.0;
+    snap.decks[0].positionSeconds = 4.0;
+    const bgmedia::mix::LiveMixTempo after = bgmedia::mix::liveMixTempo(snap);
+    CHECK(after.master == DeckId::A);
+    CHECK(after.trackId == 78);
+    CHECK_NEAR(after.bpm, 126.0, 1e-6);
+
+    // Cancelling freezes the follow state so the dancer does not chase a
+    // reverse fade.
+    snap.phase = TransitionPhase::Cancelling;
+    CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
+    std::printf("live tempo: master=%d bpm=%.1f phase=%.3f\n",
+                static_cast<int>(live.master), live.bpm, live.beatPhase);
 }
