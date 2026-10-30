@@ -22,8 +22,9 @@ float sanitize(float value) {
 
 MixEngine::MixEngine(std::uint32_t outputSampleRate)
     : outputSampleRate_(outputSampleRate ? outputSampleRate : 48000),
-      stretchOwned_(std::make_shared<LinearResampleStretcher>()) {
+      stretchOwned_(std::make_shared<WsolaStretcher>()) {
     stretch_.store(stretchOwned_.get(), std::memory_order_release);
+    rebuildStretchStreams();
     MixSnapshot initial;
     initial.sampleRate = outputSampleRate_;
     snapshotBuffers_[0] = initial;
@@ -33,6 +34,7 @@ MixEngine::MixEngine(std::uint32_t outputSampleRate)
     for (int i = 0; i < 2; ++i) {
         decks_[i].owned.reset();
         decks_[i].audio.store(nullptr, std::memory_order_relaxed);
+        decks_[i].eq.configure(outputSampleRate_);
     }
 }
 
@@ -113,6 +115,38 @@ void MixEngine::retireProcessor(
     retiredProcessors_.push_back(RetiredProcessor{std::move(owner), epoch});
 }
 
+void MixEngine::retireStream(std::shared_ptr<ITimeStretchStream> owner) {
+    if (!owner) {
+        return;
+    }
+    const std::uint64_t epoch =
+        renderEpoch_.load(std::memory_order_acquire) + 1;
+    retiredStreams_.push_back(RetiredStream{std::move(owner), epoch});
+}
+
+void MixEngine::rebuildStretchStreams() {
+    for (int i = 0; i < 2; ++i) {
+        std::shared_ptr<ITimeStretchStream> previous =
+            std::move(streamOwned_[i]);
+        streamOwned_[i] = stretchOwned_->createStream(outputSampleRate_);
+        stream_[i].store(streamOwned_[i].get(), std::memory_order_release);
+        retireStream(std::move(previous));
+        if (streamOwned_[i]) {
+            streamOwned_[i]->reset(0.0);
+        }
+    }
+    reclaimRetired();
+}
+
+void MixEngine::resetStretchStream(DeckId deck,
+                                   double positionFrames) noexcept {
+    ITimeStretchStream* stream =
+        stream_[deckIndex(deck)].load(std::memory_order_acquire);
+    if (stream) {
+        stream->reset(positionFrames);
+    }
+}
+
 void MixEngine::reclaimRetired() {
     const std::uint64_t epoch = renderEpoch_.load(std::memory_order_acquire);
     for (auto& retired : retiredTracks_) {
@@ -129,6 +163,12 @@ void MixEngine::reclaimRetired() {
                            return entry.epoch <= epoch;
                        }),
         retiredProcessors_.end());
+    retiredStreams_.erase(
+        std::remove_if(retiredStreams_.begin(), retiredStreams_.end(),
+                       [epoch](const RetiredStream& entry) {
+                           return entry.epoch <= epoch;
+                       }),
+        retiredStreams_.end());
 }
 
 
@@ -227,8 +267,9 @@ void MixEngine::setTimeStretch(
     std::shared_ptr<const ITimeStretchProcessor> previous =
         std::move(stretchOwned_);
     stretchOwned_ = processor ? std::move(processor)
-                              : std::make_shared<LinearResampleStretcher>();
+                              : std::make_shared<WsolaStretcher>();
     stretch_.store(stretchOwned_.get(), std::memory_order_release);
+    rebuildStretchStreams();
     retireProcessor(std::move(previous));
     reclaimRetired();
 }
@@ -261,6 +302,78 @@ double MixEngine::planRate(double elapsed) const noexcept {
     return plan.tempo[plan.tempoCount - 1].rate;
 }
 
+EqGains MixEngine::planEq(const EqGainPoint* points, int count,
+                          double elapsed) const noexcept {
+    EqGains gains;
+    if (count <= 0) {
+        return gains;
+    }
+    if (elapsed <= points[0].time) {
+        gains.low = points[0].low;
+        gains.mid = points[0].mid;
+        gains.high = points[0].high;
+        return gains;
+    }
+    for (int i = 1; i < count; ++i) {
+        if (elapsed <= points[i].time) {
+            const EqGainPoint& a = points[i - 1];
+            const EqGainPoint& b = points[i];
+            const double span = std::max(1e-9, b.time - a.time);
+            const float t = static_cast<float>(
+                std::clamp((elapsed - a.time) / span, 0.0, 1.0));
+            gains.low = a.low + (b.low - a.low) * t;
+            gains.mid = a.mid + (b.mid - a.mid) * t;
+            gains.high = a.high + (b.high - a.high) * t;
+            return gains;
+        }
+    }
+    const EqGainPoint& last = points[count - 1];
+    gains.low = last.low;
+    gains.mid = last.mid;
+    gains.high = last.high;
+    return gains;
+}
+
+TransitionStage MixEngine::liveStage() const noexcept {
+    const int phase = phase_.load(std::memory_order_acquire);
+    if (phase == static_cast<int>(Phase::Cancelling)) {
+        return TransitionStage::Cancelled;
+    }
+    if (phase == static_cast<int>(Phase::Running)) {
+        if (framesRendered_ < runtime_.crossfadeStartFrame) {
+            const double remaining =
+                static_cast<double>(runtime_.crossfadeStartFrame - framesRendered_) /
+                outputSampleRate_;
+            if (!runtime_.tempoRamp) {
+                return TransitionStage::Preparing;
+            }
+            return remaining > 1.0 ? TransitionStage::TempoRamp
+                                   : TransitionStage::BeatAlign;
+        }
+        if (framesRendered_ >= runtime_.endFrame) {
+            return TransitionStage::Complete;
+        }
+        const double span = static_cast<double>(std::max<std::uint64_t>(
+            1, runtime_.endFrame - runtime_.crossfadeStartFrame));
+        const double progress = std::clamp(
+            static_cast<double>(framesRendered_ - runtime_.crossfadeStartFrame) /
+                span,
+            0.0, 1.0);
+        return progress < runtime_.handoverProgress ? TransitionStage::Mixing
+                                                    : TransitionStage::Handover;
+    }
+    const std::uint64_t recent = outputSampleRate_ / 2;
+    if (everCancelled_ &&
+        framesRendered_ - lastCancelFrame_ < recent) {
+        return TransitionStage::Cancelled;
+    }
+    if (everCompleted_ &&
+        framesRendered_ - lastCompletionFrame_ < outputSampleRate_) {
+        return TransitionStage::Complete;
+    }
+    return TransitionStage::Idle;
+}
+
 void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     if (!planReady_.load(std::memory_order_acquire)) {
         return;
@@ -274,14 +387,27 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     runtime_.startB = plan.startB;
     runtime_.handoverProgress = std::clamp(plan.handoverProgress, 0.0, 1.0);
     runtime_.directCut = plan.type == TransitionType::DirectCut;
+    runtime_.bassSwap = plan.bassSwap;
+    runtime_.pitchLock = plan.pitchLock;
+    runtime_.beatPhaseErrorMs = plan.beatPhaseErrorMs;
+    runtime_.tempoRatioB =
+        std::clamp(plan.tempoRatioB, 0.75, 1.33);
     runtime_.startFrame = frame;
+
+    const double sampleRate = static_cast<double>(outputSampleRate_);
     const double seconds = std::max(0.0, plan.duration);
-    runtime_.endFrame = frame + static_cast<std::uint64_t>(
-                                    std::llround(seconds * outputSampleRate_));
+    const double preSeconds =
+        runtime_.directCut ? 0.0 : std::max(0.0, plan.preTransitionSeconds);
+    runtime_.crossfadeStartFrame =
+        frame + static_cast<std::uint64_t>(std::llround(preSeconds * sampleRate));
+    runtime_.endFrame =
+        runtime_.crossfadeStartFrame +
+        static_cast<std::uint64_t>(std::llround(seconds * sampleRate));
+    runtime_.tempoRamp = preSeconds > 0.0 && plan.tempoRampActive;
     runtime_.rateStart = 1.0;
     runtime_.rateEnd = 1.0;
     runtime_.tempoCount = std::min<int>(
-        static_cast<int>(plan.tempoCurve.size()), 64);
+        static_cast<int>(plan.tempoCurve.size()), 128);
     for (int i = 0; i < runtime_.tempoCount; ++i) {
         runtime_.tempo[i] = plan.tempoCurve[static_cast<std::size_t>(i)];
     }
@@ -289,13 +415,27 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
         runtime_.rateStart = runtime_.tempo[0].rate;
         runtime_.rateEnd = runtime_.tempo[runtime_.tempoCount - 1].rate;
     }
+    runtime_.eqOutCount =
+        std::min<int>(static_cast<int>(plan.eqCurveOut.size()), 64);
+    for (int i = 0; i < runtime_.eqOutCount; ++i) {
+        runtime_.eqOut[i] = plan.eqCurveOut[static_cast<std::size_t>(i)];
+    }
+    runtime_.eqInCount =
+        std::min<int>(static_cast<int>(plan.eqCurveIn.size()), 64);
+    for (int i = 0; i < runtime_.eqInCount; ++i) {
+        runtime_.eqIn[i] = plan.eqCurveIn[static_cast<std::size_t>(i)];
+    }
 
     DeckRuntime& from = decks_[deckIndex(runtime_.from)];
     DeckRuntime& to = decks_[deckIndex(runtime_.to)];
     const bool fromWasPlaying = from.playing;
+    // The outgoing deck starts at the beginning of the pre-roll, which may be
+    // earlier than the crossfade cue. `overallStartA()` handles both 0.1 plans
+    // (no pre-roll) and 0.2 plans (ramp before the overlay).
+    const double cueA = runtime_.directCut ? plan.transitionStartA
+                                           : plan.overallStartA();
     if (const PcmTrack* source = from.audio.load(std::memory_order_acquire)) {
-        from.positionFrames = std::clamp(plan.transitionStartA, 0.0,
-                                         source->duration()) *
+        from.positionFrames = std::clamp(cueA, 0.0, source->duration()) *
                               source->sampleRate;
     }
     from.playing = true;
@@ -303,20 +443,27 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     from.fade = fromWasPlaying ? 1.0f : 0.0f;
     from.rate = 1.0;
     from.rampRate = 1.0;
+    from.eq.reset();
+    // The incoming deck is prepared but stays stopped until the crossfade
+    // boundary so its first beat lands exactly on the overlay start.
     to.positionFrames = plan.startB;
     if (const PcmTrack* source = to.audio.load(std::memory_order_acquire)) {
         to.positionFrames =
             std::clamp(plan.startB, 0.0, source->duration()) * source->sampleRate;
     }
-    to.playing = true;
+    to.playing = false;
     to.ended = false;
     to.fade = 0.0f;
     to.rate = 1.0;
     to.rampRate = 1.0;
-    to.targetPlay.store(true, std::memory_order_release);
+    to.eq.reset();
+    to.targetPlay.store(false, std::memory_order_release);
     from.targetPlay.store(true, std::memory_order_release);
+    resetStretchStream(runtime_.from, from.positionFrames);
+    resetStretchStream(runtime_.to, to.positionFrames);
+    incomingStarted_ = false;
 
-    transitionStartFrame_ = frame;
+    transitionStartFrame_ = runtime_.crossfadeStartFrame;
     transitionEndFrame_ = runtime_.endFrame;
     handoverDone_ = false;
     planReady_.store(false, std::memory_order_release);
@@ -325,10 +472,15 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
         from.targetPlay.store(false, std::memory_order_release);
         from.playing = false;
         from.gain = 0.0f;
+        to.playing = true;
+        to.ended = false;
+        to.targetPlay.store(true, std::memory_order_release);
         to.gain = 1.0f;
         to.fade = 1.0f;
         master_.store(deckIndex(runtime_.to), std::memory_order_release);
         runtimeStarted_ = false;
+        lastCompletionFrame_ = framesRendered_;
+        everCompleted_ = true;
         completed_.fetch_add(1, std::memory_order_acq_rel);
         return;
     }
@@ -363,7 +515,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     // loadDeck()/clearDeck() publish a reset serial instead of writing the
     // callback-owned transport fields. Apply it first so a newly installed
     // track can never inherit the previous track's position or playing state.
-    for (DeckRuntime& deck : decks_) {
+    for (int i = 0; i < 2; ++i) {
+        DeckRuntime& deck = decks_[i];
         const std::uint64_t serial = deck.resetSerial.load(std::memory_order_acquire);
         if (serial != deck.resetApplied) {
             deck.resetApplied = serial;
@@ -375,6 +528,7 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             deck.fade = 0.0f;
             deck.gain = 0.0f;
             deck.wasTargetPlaying = false;
+            resetStretchStream(i == 0 ? DeckId::A : DeckId::B, 0.0);
         }
     }
 
@@ -382,7 +536,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     // this same callback still has the zero seek published by loadDeck(); if
     // that loop ran after consumeStartRequest() it would overwrite the cue
     // positions selected by the plan.
-    for (DeckRuntime& deck : decks_) {
+    for (int i = 0; i < 2; ++i) {
+        DeckRuntime& deck = decks_[i];
         const std::uint64_t serial = deck.seekSerial.load(std::memory_order_acquire);
         if (serial != deck.seekApplied) {
             deck.seekApplied = serial;
@@ -396,6 +551,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             deck.ended = false;
             deck.fade = 0.0f;
             deck.playing = deck.targetPlay.load(std::memory_order_acquire);
+            resetStretchStream(i == 0 ? DeckId::A : DeckId::B,
+                               deck.positionFrames);
         }
     }
 
@@ -413,10 +570,22 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         const double span = std::max(1.0, static_cast<double>(
                                                   transitionEndFrame_ -
                                                   transitionStartFrame_));
-        cancelStartProgress_ =
-            std::clamp(static_cast<double>(framesRendered_ - transitionStartFrame_) /
-                           span,
-                       0.0, 1.0);
+        cancelStartProgress_ = std::clamp(
+            (static_cast<double>(framesRendered_) -
+             static_cast<double>(transitionStartFrame_)) /
+                span,
+            0.0, 1.0);
+        // A cancel can land during the tempo pre-roll, where the crossfade
+        // progress is still zero. Capture the live ramp rate so the outgoing
+        // deck glides back to 1.0 instead of jumping.
+        const double elapsed =
+            (static_cast<double>(framesRendered_) -
+             static_cast<double>(transitionStartFrame_)) /
+            outputSampleRate_;
+        cancelRateStart_ = std::clamp(planRate(elapsed), 0.25, 2.0);
+        cancelEqOutStart_ = planEq(runtime_.eqOut, runtime_.eqOutCount, elapsed);
+        cancelEqInStart_ = planEq(runtime_.eqIn, runtime_.eqInCount, elapsed);
+        cancelIncomingStarted_ = incomingStarted_;
     }
 
     // A play request on an empty deck is a no-op. Without this the deck would
@@ -470,23 +639,52 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
     std::size_t done = 0;
     while (done < frames) {
-        const std::size_t chunk = std::min(kChunkFrames, frames - done);
-        const int phase = phase_.load(std::memory_order_acquire);
-        const bool running = phase == static_cast<int>(Phase::Running);
-        const bool cancelling = phase == static_cast<int>(Phase::Cancelling);
+        std::size_t chunk = std::min(kChunkFrames, frames - done);
+        int phase = phase_.load(std::memory_order_acquire);
+        bool running = phase == static_cast<int>(Phase::Running);
+        bool cancelling = phase == static_cast<int>(Phase::Cancelling);
+
+        // Never let a chunk straddle the pre-roll/crossfade boundary: the
+        // incoming deck must become audible on exactly the planned frame.
+        if (running && framesRendered_ < transitionStartFrame_) {
+            chunk = std::min<std::size_t>(
+                chunk, static_cast<std::size_t>(transitionStartFrame_ -
+                                                framesRendered_));
+        }
+        // The crossfade boundary itself: start the incoming deck here.
+        if (running && !incomingStarted_ &&
+            framesRendered_ >= transitionStartFrame_) {
+            DeckRuntime& incoming = decks_[deckIndex(runtime_.to)];
+            incoming.playing = true;
+            incoming.ended = false;
+            incoming.fade = 0.0f;
+            incoming.rate = 1.0;
+            incoming.rampRate = 1.0;
+            if (const PcmTrack* source =
+                    incoming.audio.load(std::memory_order_acquire)) {
+                incoming.positionFrames =
+                    std::clamp(runtime_.startB, 0.0, source->duration()) *
+                    source->sampleRate;
+            }
+            incoming.targetPlay.store(true, std::memory_order_release);
+            resetStretchStream(runtime_.to, incoming.positionFrames);
+            incomingStarted_ = true;
+        }
 
         double progress0 = 1.0;
         double progress1 = 1.0;
         if (running || cancelling) {
             const double span = static_cast<double>(
                 std::max<std::uint64_t>(1, transitionEndFrame_ - transitionStartFrame_));
-            progress0 = std::clamp(
-                static_cast<double>(framesRendered_ - transitionStartFrame_) / span,
-                0.0, 1.0);
-            progress1 = std::clamp(
-                static_cast<double>(framesRendered_ + chunk - transitionStartFrame_) /
-                    span,
-                0.0, 1.0);
+            // Cast before subtracting: during the pre-roll framesRendered_ is
+            // smaller than transitionStartFrame_, and unsigned arithmetic would
+            // wrap to a huge positive value and complete the transition.
+            const double start = static_cast<double>(transitionStartFrame_);
+            const double now = static_cast<double>(framesRendered_);
+            progress0 = std::clamp((now - start) / span, 0.0, 1.0);
+            progress1 =
+                std::clamp((now + static_cast<double>(chunk) - start) / span,
+                           0.0, 1.0);
         }
 
         float gainFrom0 = 0.0f;
@@ -496,6 +694,10 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         double rateFrom0 = 1.0;
         double rateFrom1 = 1.0;
         double rateTo = 1.0;
+        EqGains eqFrom0{};
+        EqGains eqFrom1{};
+        EqGains eqTo0{};
+        EqGains eqTo1{};
         DeckId fromDeck = DeckId::A;
         DeckId toDeck = DeckId::B;
 
@@ -507,15 +709,35 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             gainTo0 = equalPowerIn(progress0);
             gainTo1 = equalPowerIn(progress1);
             const double elapsed0 =
-                static_cast<double>(framesRendered_ - transitionStartFrame_) /
+                (static_cast<double>(framesRendered_) -
+                 static_cast<double>(transitionStartFrame_)) /
                 outputSampleRate_;
             const double elapsed1 =
-                static_cast<double>(framesRendered_ + chunk - transitionStartFrame_) /
+                (static_cast<double>(framesRendered_) +
+                 static_cast<double>(chunk) -
+                 static_cast<double>(transitionStartFrame_)) /
                 outputSampleRate_;
             rateFrom0 = planRate(elapsed0);
             rateFrom1 = planRate(elapsed1);
+            // The incoming deck holds the matched tempo until the handover,
+            // then returns to natural speed across the tail of the fade so the
+            // end of the transition has no rate step.
+            double ratioB = runtime_.tempoRatioB;
+            if (progress0 >= runtime_.handoverProgress && progress0 < 1.0) {
+                const double span =
+                    std::max(1e-9, 1.0 - runtime_.handoverProgress);
+                const double t = std::clamp(
+                    (progress0 - runtime_.handoverProgress) / span, 0.0, 1.0);
+                ratioB = runtime_.tempoRatioB +
+                         (1.0 - runtime_.tempoRatioB) * t;
+            }
             rateTo = decks_[deckIndex(toDeck)].requestedRate.load(
-                std::memory_order_acquire);
+                         std::memory_order_acquire) *
+                     ratioB;
+            eqFrom0 = planEq(runtime_.eqOut, runtime_.eqOutCount, elapsed0);
+            eqFrom1 = planEq(runtime_.eqOut, runtime_.eqOutCount, elapsed1);
+            eqTo0 = planEq(runtime_.eqIn, runtime_.eqInCount, elapsed0);
+            eqTo1 = planEq(runtime_.eqIn, runtime_.eqInCount, elapsed1);
         } else if (cancelling) {
             fromDeck = runtime_.from;
             toDeck = runtime_.to;
@@ -532,9 +754,43 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             gainFrom1 = originalFrom + (1.0f - originalFrom) * static_cast<float>(t1);
             gainTo0 = originalTo * (1.0f - static_cast<float>(t0));
             gainTo1 = originalTo * (1.0f - static_cast<float>(t1));
-            rateFrom0 = 1.0;
-            rateFrom1 = 1.0;
+            if (!cancelIncomingStarted_) {
+                gainTo0 = 0.0f;
+                gainTo1 = 0.0f;
+            }
+            // Glide the outgoing deck back to its natural speed. Jumping
+            // straight to 1.0 after a ramp would audibly step the pitch.
+            rateFrom0 =
+                cancelRateStart_ + (1.0 - cancelRateStart_) * t0;
+            rateFrom1 =
+                cancelRateStart_ + (1.0 - cancelRateStart_) * t1;
             rateTo = 1.0;
+            // Return the EQ to unity over the reverse fade instead of
+            // releasing a bass cut in one sample.
+            eqFrom0 = {cancelEqOutStart_.low +
+                           (1.0f - cancelEqOutStart_.low) * static_cast<float>(t0),
+                       cancelEqOutStart_.mid +
+                           (1.0f - cancelEqOutStart_.mid) * static_cast<float>(t0),
+                       cancelEqOutStart_.high +
+                           (1.0f - cancelEqOutStart_.high) * static_cast<float>(t0)};
+            eqFrom1 = {cancelEqOutStart_.low +
+                           (1.0f - cancelEqOutStart_.low) * static_cast<float>(t1),
+                       cancelEqOutStart_.mid +
+                           (1.0f - cancelEqOutStart_.mid) * static_cast<float>(t1),
+                       cancelEqOutStart_.high +
+                           (1.0f - cancelEqOutStart_.high) * static_cast<float>(t1)};
+            eqTo0 = {cancelEqInStart_.low +
+                         (1.0f - cancelEqInStart_.low) * static_cast<float>(t0),
+                     cancelEqInStart_.mid +
+                         (1.0f - cancelEqInStart_.mid) * static_cast<float>(t0),
+                     cancelEqInStart_.high +
+                         (1.0f - cancelEqInStart_.high) * static_cast<float>(t0)};
+            eqTo1 = {cancelEqInStart_.low +
+                         (1.0f - cancelEqInStart_.low) * static_cast<float>(t1),
+                     cancelEqInStart_.mid +
+                         (1.0f - cancelEqInStart_.mid) * static_cast<float>(t1),
+                     cancelEqInStart_.high +
+                         (1.0f - cancelEqInStart_.high) * static_cast<float>(t1)};
         } else {
             gainFrom0 = gainFrom1 = 1.0f;
             gainTo0 = gainTo1 = 1.0f;
@@ -571,9 +827,9 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         }
 
         renderDeck(fromDeck, scratchA_.data(), chunk, gainFrom0, gainFrom1,
-                   rateFrom0, rateFrom1);
-        renderDeck(toDeck, scratchB_.data(), chunk, gainTo0, gainTo1,
-                   rateTo, rateTo);
+                   rateFrom0, rateFrom1, eqFrom0, eqFrom1);
+        renderDeck(toDeck, scratchB_.data(), chunk, gainTo0, gainTo1, rateTo,
+                   rateTo, eqTo0, eqTo1);
 
         // Correlation-aware headroom. Equal-power keeps uncorrelated material
         // at constant power; correlated material would peak near +6 dB.
@@ -659,6 +915,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             decks_[deckIndex(to)].gain = 0.0f;
             decks_[deckIndex(to)].fade = 0.0f;
             runtimeStarted_ = false;
+            lastCancelFrame_ = framesRendered_;
+            everCancelled_ = true;
             phase_.store(static_cast<int>(Phase::Idle),
                          std::memory_order_release);
             // If the cancel happened after the handover point, master_ points
@@ -697,13 +955,16 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
 void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
                            float gain0, float gain1, double rate0,
-                           double rate1) noexcept {
+                           double rate1, EqGains eq0, EqGains eq1) noexcept {
     DeckRuntime& runtime = decks_[deckIndex(deck)];
     runtime.blockPeak = 0.0f;
     const PcmTrack* source = runtime.audio.load(std::memory_order_acquire);
     if (!source || !runtime.playing) {
         std::memset(out, 0, frames * 2 * sizeof(float));
         runtime.gain = 0.0f;
+        // Do not carry filter state across a silent gap: a later start must
+        // not inherit an old crossover transient.
+        runtime.eq.reset();
         return;
     }
 
@@ -713,6 +974,7 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
         runtime.playing = false;
         runtime.targetPlay.store(false, std::memory_order_release);
         runtime.gain = 0.0f;
+        runtime.eq.reset();
         std::memset(out, 0, frames * 2 * sizeof(float));
         return;
     }
@@ -728,19 +990,41 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
     // Number of output frames that still land on real source samples. The
     // stretcher writes zeros after this point, so the de-click fade must be
     // anchored here rather than at the end of the requested callback block.
+    const double remainingSource = std::max(0.0, lastFrame - startPosition);
+    const double remainingOutput = step > 0.0 ? remainingSource / step : 0.0;
     const std::size_t playable =
         startPosition >= lastFrame || step <= 0.0
             ? 0
             : std::min(frames,
-                       static_cast<std::size_t>(
-                           std::ceil((lastFrame - startPosition) / step)));
-    const bool reachesEnd = playable < frames;
-    const ITimeStretchProcessor* stretch = stretch_.load(std::memory_order_acquire);
-    if (!stretch) {
-        std::memset(out, 0, frames * 2 * sizeof(float));
-        return;
+                       static_cast<std::size_t>(std::ceil(remainingOutput)));
+    // WSOLA has algorithmic look-ahead, so the source may end a few samples
+    // before or after the nominal last output frame. Treat a block that
+    // contains the end (or lands exactly on it) as the EOF block and fade the
+    // remaining region to zero instead of stepping from full level.
+    const bool reachesEnd = remainingOutput <= static_cast<double>(frames);
+    const double stepEnd =
+        std::clamp(rate1, 0.25, 2.0) *
+        (static_cast<double>(source->sampleRate) /
+         static_cast<double>(outputSampleRate_));
+    ITimeStretchStream* stream =
+        stream_[deckIndex(deck)].load(std::memory_order_acquire);
+    if (stream) {
+        stream->render(*source, runtime.positionFrames, step, stepEnd, out,
+                       frames);
+    } else {
+        const ITimeStretchProcessor* stretch =
+            stretch_.load(std::memory_order_acquire);
+        if (!stretch) {
+            std::memset(out, 0, frames * 2 * sizeof(float));
+            return;
+        }
+        stretch->render(*source, runtime.positionFrames, step, out, frames);
     }
-    stretch->render(*source, runtime.positionFrames, step, out, frames);
+
+    // Three-band automation runs on the deck signal after the stretcher and
+    // before the crossfade gain. Unity gains are an exact bypass.
+    runtime.eqGains = eq0;
+    runtime.eq.process(out, frames, eq0, eq1);
 
     const float fadeStep =
         1.0f / static_cast<float>(outputSampleRate_ * kDeclickSeconds);
@@ -765,12 +1049,14 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
                                         std::abs(out[i * 2 + 1])));
     }
     runtime.gain = std::max(0.0f, std::abs(gainEnd)) * runtime.fade;
-    if (reachesEnd && playable > 0) {
-        // De-click the physical end of the track with a short linear tail that
-        // ends on the last playable sample, never on trailing zeros.
+    if (reachesEnd) {
+        // De-click the physical end of the track over the samples that still
+        // map to source audio. The tail ends at silence, never on a full-scale
+        // step to the zeros of the next callback.
+        const std::size_t endIndex = playable;
         const std::size_t fadeFrames = std::min<std::size_t>(
-            playable, static_cast<std::size_t>(0.008 * outputSampleRate_));
-        const std::size_t first = playable - fadeFrames;
+            endIndex, static_cast<std::size_t>(0.008 * outputSampleRate_));
+        const std::size_t first = endIndex - fadeFrames;
         for (std::size_t i = 0; i < fadeFrames; ++i) {
             const float scale =
                 static_cast<float>(fadeFrames - 1 - i) /
@@ -779,8 +1065,10 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
             out[index * 2] *= scale;
             out[index * 2 + 1] *= scale;
         }
-    }
-    if (reachesEnd) {
+        for (std::size_t i = endIndex; i < frames; ++i) {
+            out[i * 2] = 0.0f;
+            out[i * 2 + 1] = 0.0f;
+        }
         runtime.ended = true;
         runtime.playing = false;
         runtime.targetPlay.store(false, std::memory_order_release);
@@ -790,6 +1078,8 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
 
 void MixEngine::finishTransition() noexcept {
     runtimeStarted_ = false;
+    lastCompletionFrame_ = framesRendered_;
+    everCompleted_ = true;
     phase_.store(static_cast<int>(Phase::Idle), std::memory_order_release);
     DeckRuntime& from = decks_[deckIndex(runtime_.from)];
     DeckRuntime& to = decks_[deckIndex(runtime_.to)];
@@ -817,19 +1107,55 @@ void MixEngine::publishSnapshot() noexcept {
                          : (phase == static_cast<int>(Phase::Cancelling)
                                 ? TransitionPhase::Cancelling
                                 : TransitionPhase::Idle);
+    snapshot.transitionType = runtime_.type;
+    snapshot.stage = liveStage();
     if (phase != static_cast<int>(Phase::Idle)) {
-        snapshot.transitionType = runtime_.type;
-        snapshot.transitionDuration = static_cast<double>(
-            runtime_.endFrame - runtime_.startFrame) / outputSampleRate_;
-        snapshot.transitionElapsed =
-            static_cast<double>(framesRendered_ - runtime_.startFrame) /
-            outputSampleRate_;
+        const double sampleRate = static_cast<double>(outputSampleRate_);
+        const double preSeconds = static_cast<double>(
+            runtime_.crossfadeStartFrame - runtime_.startFrame) / sampleRate;
+        const double fadeSeconds = static_cast<double>(
+            runtime_.endFrame - runtime_.crossfadeStartFrame) / sampleRate;
+        snapshot.preTransitionSeconds = std::max(0.0, preSeconds);
+        snapshot.crossfadeDuration = std::max(0.0, fadeSeconds);
+        snapshot.transitionDuration =
+            snapshot.preTransitionSeconds + snapshot.crossfadeDuration;
+        snapshot.transitionElapsed = std::clamp(
+            (static_cast<double>(framesRendered_) -
+             static_cast<double>(runtime_.startFrame)) /
+                sampleRate,
+            0.0, snapshot.transitionDuration);
         snapshot.transitionProgress =
             snapshot.transitionDuration > 0.0
                 ? std::clamp(snapshot.transitionElapsed /
                                  snapshot.transitionDuration,
                              0.0, 1.0)
                 : 1.0;
+        snapshot.crossfadeElapsed = std::clamp(
+            (static_cast<double>(framesRendered_) -
+             static_cast<double>(runtime_.crossfadeStartFrame)) /
+                sampleRate,
+            0.0, snapshot.crossfadeDuration);
+        const double elapsed =
+            (static_cast<double>(framesRendered_) -
+             static_cast<double>(runtime_.crossfadeStartFrame)) /
+            sampleRate;
+        snapshot.tempoRatioA = planRate(elapsed);
+        snapshot.tempoRatioB =
+            decks_[deckIndex(runtime_.to)].requestedRate.load(
+                std::memory_order_relaxed);
+        snapshot.beatPhaseErrorMs = runtime_.beatPhaseErrorMs;
+        snapshot.pitchLock = runtime_.pitchLock;
+        snapshot.bassSwap = runtime_.bassSwap;
+        const EqGains out = planEq(runtime_.eqOut, runtime_.eqOutCount, elapsed);
+        const EqGains in = planEq(runtime_.eqIn, runtime_.eqInCount, elapsed);
+        const int fromIndex = deckIndex(runtime_.from);
+        const int toIndex = deckIndex(runtime_.to);
+        snapshot.eqLow[fromIndex] = out.low;
+        snapshot.eqMid[fromIndex] = out.mid;
+        snapshot.eqHigh[fromIndex] = out.high;
+        snapshot.eqLow[toIndex] = in.low;
+        snapshot.eqMid[toIndex] = in.mid;
+        snapshot.eqHigh[toIndex] = in.high;
     }
     snapshot.completedTransitions = completed_.load(std::memory_order_acquire);
     snapshot.outputFrames = framesRendered_;

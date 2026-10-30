@@ -10,6 +10,7 @@
 #include "bgmedia/mix/ITimeStretchProcessor.hpp"
 #include "bgmedia/mix/MixTypes.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
+#include "bgmedia/mix/SpectralEq.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -85,15 +86,25 @@ private:
         TransitionType type = TransitionType::Off;
         DeckId from = DeckId::A;
         DeckId to = DeckId::B;
-        std::uint64_t startFrame = 0;
-        std::uint64_t endFrame = 0;
+        std::uint64_t startFrame = 0;          // ramp / overall start
+        std::uint64_t crossfadeStartFrame = 0; // overlay begins
+        std::uint64_t endFrame = 0;            // overlay ends
         double startB = 0.0;
         double handoverProgress = 0.5;
         double rateStart = 1.0;
         double rateEnd = 1.0;
+        double tempoRatioB = 1.0;
         int tempoCount = 0;
-        TempoPoint tempo[64]{};
+        TempoPoint tempo[128]{};
+        int eqOutCount = 0;
+        EqGainPoint eqOut[64]{};
+        int eqInCount = 0;
+        EqGainPoint eqIn[64]{};
         bool directCut = false;
+        bool tempoRamp = false;
+        bool bassSwap = false;
+        bool pitchLock = false;
+        double beatPhaseErrorMs = 0.0;
     };
 
     enum class Phase : int {
@@ -134,14 +145,20 @@ private:
         bool wasTargetPlaying = false;
         float blockPeak = 0.0f;
         float lastSample[2] = {0.0f, 0.0f};
+        ThreeBandEq eq;
+        EqGains eqGains{};
     };
 
     [[nodiscard]] bool loadAllowed(DeckId deck) const noexcept;
     void publishSnapshot() noexcept;
     void consumeStartRequest(std::uint64_t frame) noexcept;
     [[nodiscard]] double planRate(double elapsed) const noexcept;
+    [[nodiscard]] EqGains planEq(const EqGainPoint* points, int count,
+                                 double elapsed) const noexcept;
+    [[nodiscard]] TransitionStage liveStage() const noexcept;
     void renderDeck(DeckId deck, float* out, std::size_t frames, float gain0,
-                    float gain1, double rate0, double rate1) noexcept;
+                    float gain1, double rate0, double rate1, EqGains eq0,
+                    EqGains eq1) noexcept;
     void finishTransition() noexcept;
 
     struct RetiredTrack {
@@ -152,14 +169,23 @@ private:
         std::shared_ptr<const ITimeStretchProcessor> owner;
         std::uint64_t epoch = 0;
     };
+    struct RetiredStream {
+        std::shared_ptr<ITimeStretchStream> owner;
+        std::uint64_t epoch = 0;
+    };
     void retireTrack(DeckId deck, std::shared_ptr<const PcmTrack> owner);
     void retireProcessor(
         std::shared_ptr<const ITimeStretchProcessor> owner);
+    void retireStream(std::shared_ptr<ITimeStretchStream> owner);
+    void rebuildStretchStreams();
+    void resetStretchStream(DeckId deck, double positionFrames) noexcept;
 
     std::uint32_t outputSampleRate_ = 48000;
     DeckRuntime decks_[2];
     std::shared_ptr<const ITimeStretchProcessor> stretchOwned_;
     std::atomic<const ITimeStretchProcessor*> stretch_{nullptr};
+    std::shared_ptr<ITimeStretchStream> streamOwned_[2];
+    std::atomic<ITimeStretchStream*> stream_[2]{nullptr, nullptr};
 
     std::atomic<int> master_{0};
     std::atomic<int> phase_{static_cast<int>(Phase::Idle)};
@@ -175,6 +201,7 @@ private:
     std::atomic<std::uint64_t> renderEpoch_{0};
     std::vector<RetiredTrack> retiredTracks_[2];
     std::vector<RetiredProcessor> retiredProcessors_;
+    std::vector<RetiredStream> retiredStreams_;
 
     MixPlan pendingPlan_;
     RuntimePlan runtime_;
@@ -183,6 +210,17 @@ private:
     std::uint64_t transitionEndFrame_ = 0;
     std::uint64_t cancelStartFrame_ = 0;
     double cancelStartProgress_ = 0.0;
+    double cancelRateStart_ = 1.0;
+    EqGains cancelEqOutStart_{};
+    EqGains cancelEqInStart_{};
+    bool cancelIncomingStarted_ = false;
+    bool incomingStarted_ = false;
+    std::uint64_t lastCompletionFrame_ = 0;
+    std::uint64_t lastCancelFrame_ = 0;
+    bool everCompleted_ = false;
+    bool everCancelled_ = false;
+    double liveRateA_ = 1.0;
+    double liveRateB_ = 1.0;
     std::atomic<bool> cancelRequested_{false};
     float pauseFade_ = 0.0f;
     std::uint64_t framesRendered_ = 0;
