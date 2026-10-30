@@ -12,7 +12,7 @@ several DJ techniques are explicitly marked as not implemented.
 | `bgmedia::mix::MixEngine` | core, UI-free | Real-time render callback, two decks, equal-power crossfade, correlation headroom, limiter, tempo automation, atomic snapshots. No SDL, miniaudio, locks, allocation or file I/O in `render()`. |
 | `bgmedia::mix::MixPlanner` | core, UI-free | Deterministic transition plan from two BG Beat analyses, with reasons and explicit fallbacks. |
 | `bgmedia::mix::MixSession` | core, UI-free | Queue, background preparation, deck promotion, automatic/manual transitions. Hosts pump `update()` once per frame. |
-| `bgmedia::MixEngine` adapters | `adapters/miniaudio` | `MiniaudioMixLoader` decodes + analyses + converts; `MiniaudioMixDevice` opens the output and reports latency/load/overruns. |
+| `bgmedia::MixEngine` adapters | `adapters/miniaudio` | `MiniaudioMixLoader` decodes + analyses + converts; `MiniaudioMixDevice` opens the output, reports latency/load/overruns, and validates the samples its callback produced. |
 | BG Mix screen | `apps/desktop` | Adaptive canvas layout, queue, decks, waveforms, plan preview, controls, diagnostics. |
 
 The public mixer headers contain no SDL or miniaudio includes. The desktop app
@@ -25,6 +25,11 @@ is a host; the engine can run in another host or be tested headlessly.
 * One audio callback calls `MixEngine::render()`. The callback swaps no
   `shared_ptr`s: decks are loaded only while idle and not playing, and the
   engine publishes a double-buffered snapshot with an atomic try-lock.
+* A transition plan is control-thread-owned. `startTransition()` refuses to
+  overwrite `pendingPlan_` while `planReady_` is set; the callback reads the
+  payload under that release/acquire flag, clears the flag after its last read,
+  and never writes the payload (including on Stop). This is what lets Stop and
+  a subsequent `startTransition()` run concurrently with the callback.
 * Track and time-stretch buffers replaced by `loadDeck()`, `clearDeck()` or
   `setTimeStretch()` are not freed on the control thread. They go to a retire
   list and are reclaimed by the control thread only after a render epoch shows
@@ -58,9 +63,17 @@ is a host; the engine can run in another host or be tested headlessly.
   it because it was not playing yet, and clears the finished deck.
 * **Cancel after handover** restores `master` to the outgoing deck and resumes
   it, so the next transition does not start from silence.
+* **Pause** ramps an 8 ms envelope per output sample and freezes the transport
+  only after the ramp has been rendered. A callback block is typically longer
+  than 8 ms (480 frames at 48 kHz), so the ramp cannot be applied per block
+  without stepping from full level to silence.
 * **EOF** applies its de-click fade over the last playable source sample, not
   over the rest of the callback block, so the final sample approaches silence
   instead of stepping from full amplitude to zero.
+* **Direct Cut** is a valid zero-duration plan. An executed cut happens at the
+  current position; a preview reports the end of the planned musical window, so
+  automatic scheduling cuts before trailing silence. The incoming deck starts
+  on its planned entry marker rather than at zero.
 
 ## Master deck and musical handover
 
@@ -187,31 +200,41 @@ The second review found five more issues, fixed in the same way:
 | Automatic fade scheduled from the file end | Start at `preview.transitionStartA - 0.35 s` | `mix.session_auto_transition_uses_planned_window` |
 | Atlas cache grew with every UI scale | Bounded key + per-frame inverse scale | `ui.font_cache_key_is_bounded_across_scales` |
 
+The third review found four more issues:
+
+| Finding | Fix | Regression test |
+| --- | --- | --- |
+| Pause muted a whole 480-frame block instead of ramping (P2) | Per-sample 8 ms envelope, freeze after the ramp | `mix.engine_pause_fade_is_per_sample` |
+| Zero-duration Direct Cut never scheduled automatically (P2) | Preview cut point is the window end; zero-duration plans are submitted | `mix.session_auto_direct_cut_uses_marker` |
+| Stop and startTransition raced on `pendingPlan_` (P1) | Payload stays control-thread-owned; the callback only clears `planReady_` | `mix.engine_concurrent_controls_stress` (ASan) |
+| Real-device stress never measured its samples (P2) | Device callback counts non-finite samples and peak | `bgmedia_mix_qa --stress --device` now reports `samples measured` |
+
 `mix.engine_concurrent_controls_stress` runs a real render thread against a
 control thread hammering play/pause/seek/load/clear/next/cancel/stop, and is
 meant to be run under AddressSanitizer.
 
 ## Verification (2026-10-30)
 
-* `bgmedia_tests mix.`: 27 tests, including equal-power curves, gapless
+* `bgmedia_tests mix.`: 29 tests, including equal-power curves, gapless
   transition, EOF/empty decks, pause/resume/cancel, seek during a transition,
-  conflicting commands, Direct Cut, underrun-sized blocks, 44.1/48 kHz,
-  mono/stereo/6-channel downmix, 92/123/163/180 BPM alignment, low-confidence
-  and unstable-tempo fallbacks, short incoming track, Tempo Ramp phase/mean/
-  slowdown/cap/disabled, render budget, session queue/transport, the eleven
-  regressions above, and the concurrent stress test.
+  conflicting commands, Direct Cut and automatic direct-cut markers, underrun-
+  sized blocks, 44.1/48 kHz, mono/stereo/6-channel downmix, 92/123/163/180 BPM
+  alignment, low-confidence and unstable-tempo fallbacks, short incoming track,
+  Tempo Ramp phase/mean/slowdown/cap/disabled, render budget, session
+  queue/transport, the regressions above, and the concurrent stress test.
 * `bgmedia_tests ui.`: 3 tests for scale clamping, column overflow and the
   bounded font cache.
-* Full CTest: 25/25 suites. Windows Release test binary: 356 passed, 0 failed.
+* Full CTest: 25/25 suites. Windows Release test binary: 358 passed, 0 failed.
 * AddressSanitizer (MSVC `/fsanitize=address`, RelWithDebInfo): full test
-  binary 355 passed, 0 failed, no ASan report, including the concurrent stress
+  binary 357 passed, 0 failed, no ASan report, including the concurrent stress
   test and the deferred-reclamation lifetime test.
 * Stress, emulated callback thread, real prepared tracks, 2 s: 344 control
   operations (68 loads, 34 transitions, 34 cancels), 573,687 render blocks,
   peak 0.749, 0 non-finite.
-* Stress, real WASAPI device (`Наушники (fifine SC9)`), 3 s: 1,679 control
-  operations (222 loads, 162 transitions, 168 cancels), 32.0 ms latency, 0.12%
-  callback load, 0 overruns, 0 non-finite.
+* Stress, real WASAPI device (`Наушники (fifine SC9)`), 3 s: 1,600 control
+  operations (207 loads, 159 transitions, 160 cancels), 316,416 samples
+  validated by the device callback, 32.0 ms latency, 0.03% callback load,
+  0 overruns, 0 non-finite.
 * Real tracks (BG Beat + decoder, 48 kHz): Smart 123 -> 123, 8 s requested,
   shortened to 3.55 s because the incoming edit is 4 s. Peak 0.443, 0 clipped,
   0 non-finite, 0.1% of one core offline.
