@@ -34,6 +34,16 @@ if(BGMEDIA_BUILD_MINIAUDIO)
     if(WIN32)
         target_link_libraries(bgmedia_analyze PRIVATE shell32)
     endif()
+
+    # Real-track BG Mix transition measurement (offline + optional device).
+    add_executable(bgmedia_mix_qa
+        mix_qa/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_qa PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_qa PRIVATE shell32)
+    endif()
 endif()
 
 add_executable(bgmedia_motion_qa
