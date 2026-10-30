@@ -749,8 +749,19 @@ bgmedia::mix::MixPrepareCallback makeTestPrepare() {
         auto track = std::make_shared<PcmTrack>();
         *track = *toneTrack(duration, 220.0);
         out.audio = track;
-        out.analysis =
-            std::make_shared<AnalysisResult>(analysisFor(bpm, duration));
+        auto analysis = std::make_shared<AnalysisResult>(
+            analysisFor(bpm, duration));
+        // "silence" fixtures end with six seconds of trailing silence. The
+        // planner must close the transition window before it, which is only
+        // observable if the analysis reports the region.
+        if (name.find("silence") != std::string::npos && duration > 8.0) {
+            SilenceRegion region;
+            region.start = duration - 6.0;
+            region.end = duration;
+            region.confidence = 0.9f;
+            analysis->silences.push_back(region);
+        }
+        out.analysis = analysis;
         if (progress) {
             progress(1.0f, "ready");
         }
@@ -1032,6 +1043,135 @@ TEST_CASE("mix.session_eof_promotes_prepared_deck") {
     CHECK(snap.master == DeckId::B);
     CHECK(snap.decks[1].playing);
     CHECK(!snap.decks[0].loaded);
+}
+
+TEST_CASE("mix.session_cancel_does_not_restart_next") {
+    // Finding: nextRequested_ stayed set while a manual Next was running, so
+    // cancelling it re-armed the request and a second transition started as
+    // soon as the reverse fade finished.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAdaptive(false);
+    session.setTransitionType(TransitionType::Crossfade);
+    session.setTransitionDuration(6.0);
+    session.setAutoQueue(false);
+    session.play();
+    pump.forSeconds(0.5);
+
+    const std::uint64_t completedBefore = engine.completedTransitions();
+    session.next();
+    pump.forSeconds(0.2);
+    CHECK(engine.snapshot().phase == TransitionPhase::Running);
+
+    session.cancelTransition();
+    pump.forSeconds(1.0);
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.completedTransitions() == completedBefore);
+
+    // Stay idle for longer than the cancelled transition would have lasted.
+    pump.forSeconds(7.0);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Idle);
+    CHECK(engine.completedTransitions() == completedBefore);
+    CHECK(snap.master == DeckId::A);
+    CHECK(snap.decks[0].playing);
+    CHECK(!snap.decks[1].playing);
+}
+
+TEST_CASE("mix.session_promotes_only_at_actual_eof") {
+    // Finding: the last 50 ms were treated as an EOF, so the prepared deck was
+    // promoted while the master was still playing. clearDeck() then failed on
+    // the live play target and the finished item stayed loaded.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("short-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    // Automatic mixing off keeps this near-end window reachable: the old code
+    // promoted there even though the track was still producing audio.
+    session.setTransitionType(TransitionType::Off);
+    session.play();
+
+    bool inWindow = false;
+    for (int i = 0; i < 4000 && !inWindow; ++i) {
+        pump.once();
+        const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+        const bgmedia::mix::DeckStatus& deck = snap.decks[0];
+        inWindow = deck.loaded && deck.playing && !deck.ended &&
+                   deck.durationSeconds > 0.0 &&
+                   deck.durationSeconds - deck.positionSeconds <= 0.04;
+        if (!inWindow) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    CHECK(inWindow);
+
+    // Several UI ticks at that position must not promote anything.
+    for (int i = 0; i < 5; ++i) {
+        session.update();
+    }
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.master == DeckId::A);
+    CHECK(snap.decks[0].loaded);
+    CHECK(snap.decks[0].playing);
+    CHECK(!snap.decks[1].playing);
+
+    // The real EOF does promote, and the finished deck is released.
+    pump.forSeconds(0.2);
+    snap = engine.snapshot();
+    CHECK(snap.master == DeckId::B);
+    CHECK(snap.decks[1].playing);
+    CHECK(!snap.decks[0].loaded);
+    CHECK(!snap.decks[0].playing);
+}
+
+TEST_CASE("mix.session_auto_transition_uses_planned_window") {
+    // Finding: automatic scheduling waited for `duration - fade`, i.e. the
+    // physical file end, instead of the window the preview selected before
+    // trailing silence. The fade then began after the track had gone quiet.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-silence-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAdaptive(false);
+    session.setTransitionType(TransitionType::Crossfade);
+    session.setTransitionDuration(4.0);
+    session.play();
+    pump.once();
+
+    const bgmedia::mix::MixPlan preview = session.snapshot().preview;
+    CHECK(preview.valid);
+    // The fixture is 30 s long with silence from 24 s, so the planned window
+    // must sit before 24 s: 24.2 - 4.0 = 20.2 s.
+    CHECK(preview.transitionStartA < 23.0);
+    CHECK(preview.transitionStartA > 17.0);
+
+    bool started = false;
+    for (int i = 0; i < 8000 && !started; ++i) {
+        pump.once();
+        started = engine.snapshot().phase == TransitionPhase::Running;
+        if (!started) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    CHECK(started);
+
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    const double startedAt = snap.decks[0].positionSeconds;
+    // The old rule would not have fired before 25.65 s.
+    CHECK(startedAt > 17.0);
+    CHECK(startedAt < 23.0);
+    CHECK_NEAR(snap.transitionDuration, 4.0, 0.35);
 }
 
 TEST_CASE("mix.engine_concurrent_controls_stress") {

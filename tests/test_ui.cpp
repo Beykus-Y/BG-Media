@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <set>
 
 namespace {
 
 using bgmedia::desktop::computeMixColumns;
 using bgmedia::desktop::effectiveUiScale;
 using bgmedia::desktop::fontFaceCacheKey;
+using bgmedia::desktop::fontInverseScale;
 using bgmedia::desktop::kMinCanvasHeight;
 using bgmedia::desktop::kMinCanvasWidth;
 using bgmedia::desktop::kUiScaleMin;
@@ -94,17 +96,27 @@ TEST_CASE("ui.mix_columns_never_overflow") {
     }
 }
 
-TEST_CASE("ui.font_cache_key_includes_scale") {
-    // Regression for reusing a 10 px face at both 100% and 125%: the atlas is
-    // the same but inverseScale, and therefore every logical metric, differs.
-    const std::uint64_t at100 = fontFaceCacheKey(10, 1.0f, false);
-    const std::uint64_t at125 = fontFaceCacheKey(10, 1.25f, false);
-    CHECK(at100 != at125);
-    CHECK(fontFaceCacheKey(10, 1.0f, false) == at100);
-    CHECK(fontFaceCacheKey(10, 1.0f, true) != at100);
-    // 8 px at 125% also bakes 10 px, so the baked size alone cannot be the key.
-    CHECK(fontFaceCacheKey(10, 1.25f, false) == at125);
-    CHECK(fontFaceCacheKey(8, 1.25f, false) != at125);
-    CHECK(fontFaceCacheKey(10, 1.5f, false) != at100);
-    CHECK(fontFaceCacheKey(10, 2.0f, false) != at100);
+TEST_CASE("ui.font_cache_key_is_bounded_across_scales") {
+    // Regression for two opposite failures. The original cache collapsed 10 px
+    // at 100% and 8 px at 125% into one face with wrong logical metrics; then
+    // keying by scale made continuous resizing retain a texture per scale step.
+    // Now the atlas is keyed by baked pixels only and metrics use the current
+    // inverse scale, so both cases are correct and the cache stays bounded.
+    const std::uint64_t tenPx = fontFaceCacheKey(10, false);
+    CHECK(tenPx == fontFaceCacheKey(10, false));
+    CHECK(fontFaceCacheKey(11, false) != tenPx);
+    CHECK(fontFaceCacheKey(10, true) != tenPx);
+    CHECK_NEAR(10.0f * fontInverseScale(1.0f), 10.0, 1e-5);
+    CHECK_NEAR(10.0f * fontInverseScale(1.25f), 8.0, 1e-5);
+
+    // A resize sweeping 1.00 -> 1.50 in 0.25% steps asks for 201 different
+    // scales, but a 10-point face bakes into only six pixel sizes.
+    std::set<std::uint64_t> keys;
+    for (int i = 0; i <= 200; ++i) {
+        const float scale = 1.0f + 0.0025f * static_cast<float>(i);
+        const int baked = static_cast<int>(
+            std::lround(10.0f * scale));
+        keys.insert(fontFaceCacheKey(baked, false));
+    }
+    CHECK(keys.size() <= 6);
 }
