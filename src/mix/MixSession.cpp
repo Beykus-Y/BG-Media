@@ -22,6 +22,7 @@ MixSession::MixSession(MixEngine& engine, MixPrepareCallback prepare,
                        MixPlanner planner)
     : engine_(engine), prepare_(std::move(prepare)), planner_(std::move(planner)) {
     worker_ = std::thread([this] { workerLoop(); });
+    applyStretchQuality();
 }
 
 MixSession::~MixSession() {
@@ -178,7 +179,7 @@ void MixSession::cancelTransition() {
 void MixSession::setTransitionType(TransitionType type) {
     type_ = type;
     if (type == TransitionType::TempoRamp) {
-        tempoRamp_ = true;
+        tempoRampMode_ = TempoRampMode::Manual;
     }
     refreshPlan();
 }
@@ -194,7 +195,12 @@ void MixSession::setAdaptive(bool enabled) {
 }
 
 void MixSession::setTempoRampEnabled(bool enabled) {
-    tempoRamp_ = enabled;
+    tempoRampMode_ = enabled ? TempoRampMode::Auto : TempoRampMode::Off;
+    refreshPlan();
+}
+
+void MixSession::setTempoRampMode(TempoRampMode mode) {
+    tempoRampMode_ = mode;
     refreshPlan();
 }
 
@@ -203,8 +209,79 @@ void MixSession::setTempoRampMaxPercent(double percent) {
     refreshPlan();
 }
 
+void MixSession::setTempoRampBars(double bars) {
+    rampBars_ = bars >= 1.0 ? std::min(32.0, bars) : 0.0;
+    refreshPlan();
+}
+
+void MixSession::setTempoCurve(TempoCurveKind curve) {
+    curve_ = curve;
+    refreshPlan();
+}
+
+void MixSession::setPitchLock(bool enabled) {
+    pitchLock_ = enabled;
+    stretchDirty_ = true;
+    applyStretchQuality();
+    refreshPlan();
+}
+
+void MixSession::setQuality(StretchQuality quality) {
+    quality_ = quality;
+    stretchDirty_ = true;
+    applyStretchQuality();
+    refreshPlan();
+}
+
+void MixSession::setMixMode(MixMode mode) {
+    mode_ = mode;
+    if (mode == MixMode::Auto) {
+        adaptive_ = true;
+    } else if (mode == MixMode::Manual) {
+        adaptive_ = false;
+    }
+    refreshPlan();
+}
+
+void MixSession::setAggressiveness(Aggressiveness aggressiveness) {
+    aggressiveness_ = aggressiveness;
+    refreshPlan();
+}
+
+void MixSession::setBassSwap(bool enabled) {
+    bassSwap_ = enabled;
+    refreshPlan();
+}
+
+void MixSession::setPhraseBars(int bars) {
+    phraseBars_ = std::clamp(bars, 2, 16);
+    refreshPlan();
+}
+
 void MixSession::setAutoQueue(bool enabled) {
     autoQueue_ = enabled;
+}
+
+void MixSession::applyStretchQuality() {
+    const bool pitchPreserving = pitchLock_ && quality_ == StretchQuality::Quality;
+    if (pitchPreserving == appliedPitchPreserving_) {
+        stretchDirty_ = false;
+        return;
+    }
+    // Rebuilding the stretch stream is safe only when no transition is being
+    // rendered: the callback may still hold the old stream. Defer otherwise
+    // and apply it from update() once the engine is idle again.
+    if (engine_.snapshot().phase != TransitionPhase::Idle) {
+        stretchDirty_ = true;
+        return;
+    }
+    engine_.setTimeStretch(
+        pitchPreserving ? std::shared_ptr<const ITimeStretchProcessor>(
+                              std::make_shared<WsolaStretcher>())
+                        : std::shared_ptr<const ITimeStretchProcessor>(
+                              std::make_shared<LinearResampleStretcher>()));
+    appliedPitchPreserving_ = pitchPreserving;
+    stretchDirty_ = false;
 }
 
 std::uint64_t MixSession::loadedId(DeckId deck) const {
@@ -467,8 +544,19 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
         return {};
     }
     PlannerConfig config = planner_.config();
-    config.allowTempoRamp = tempoRamp_;
+    config.adaptive = adaptive_;
+    config.tempoRampMode = tempoRampMode_;
+    config.allowTempoRamp = tempoRampMode_ != TempoRampMode::Off;
+    config.tempoRampBars = rampBars_;
+    config.tempoCurveKind = curve_;
     config.maxTempoDeltaPercent = rampMaxPercent_;
+    // Pitch lock is only real in the quality mode; the performance mode uses
+    // linear resampling, so the planner must warn about pitch shift.
+    config.pitchLock =
+        pitchLock_ && quality_ == StretchQuality::Quality;
+    config.aggressiveness = aggressiveness_;
+    config.bassSwap = bassSwap_;
+    config.phraseBars = phraseBars_;
     const double override = std::max(0.0, durationOverride);
     if (override > 0.0) {
         config.defaultCrossfadeSeconds = override;
@@ -477,7 +565,7 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
     }
     MixPlanner planner(config);
     PlanRequest request;
-    request.type = adaptive_ ? type_ : TransitionType::Crossfade;
+    request.type = type_;
     request.requestedDuration = override;
     // A preview deliberately plans the end-of-track window. Executing a
     // transition (automatic or manual Next) must start where the outgoing
@@ -573,6 +661,9 @@ void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
 
 void MixSession::update() {
     engine_.reclaimRetired();
+    if (stretchDirty_) {
+        applyStretchQuality();
+    }
     collectCompleted();
     startWorkerIfNeeded();
     handleTransitionCompletion();
@@ -591,7 +682,11 @@ void MixSession::update() {
     refreshPlan();
 
     const MixSnapshot snap = engine_.snapshot();
-    if (snap.phase != TransitionPhase::Idle || !autoQueue_ || !autoPlay_) {
+    // Auto scheduling only runs in Auto mode. Manual and Preview still allow
+    // the user to start a transition explicitly, and EOF promotion below keeps
+    // playback continuous if nobody does.
+    if (snap.phase != TransitionPhase::Idle || !autoQueue_ || !autoPlay_ ||
+        mode_ != MixMode::Auto) {
         return;
     }
     const DeckId from = snap.master;
@@ -627,8 +722,11 @@ void MixSession::update() {
     const bool directCut = preview.type == TransitionType::DirectCut;
     const bool schedulable = preview.duration > 0.0 || directCut;
     const double lead = directCut ? kCutLeadSeconds : kLeadSeconds;
+    // The ramp starts before the crossfade, so schedule from the overall start
+    // rather than from transitionStartA.
+    const double scheduleAt = preview.overallStartA();
     if (preview.valid && preview.from == from && schedulable &&
-        deck.positionSeconds >= preview.transitionStartA - lead) {
+        deck.positionSeconds >= scheduleAt - lead) {
         startPlannedTransition(duration_);
     }
 }

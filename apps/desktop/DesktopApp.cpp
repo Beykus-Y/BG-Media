@@ -14,6 +14,7 @@
 #include "bgmedia/choreography/Choreography.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
 #include "bgmedia/mix/MixSession.hpp"
+#include "bgmedia/mix/MixSync.hpp"
 #include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/version.hpp"
@@ -328,8 +329,23 @@ struct MixLayout {
     Rect typeNext{};
     Rect durationMinus{};
     Rect durationPlus{};
+    Rect modePrev{};
+    Rect modeNext{};
+    Rect rampModePrev{};
+    Rect rampModeNext{};
+    Rect rampBarsPrev{};
+    Rect rampBarsNext{};
+    Rect curvePrev{};
+    Rect curveNext{};
+    Rect maxDeltaPrev{};
+    Rect maxDeltaNext{};
     Rect rampMinus{};
     Rect rampPlus{};
+    Rect pitchChip{};
+    Rect bassChip{};
+    Rect qualityStretchChip{};
+    Rect timeline{};
+    Rect monitor{};
     Rect uiScaleChip{};
     Rect qualityChip{};
     Rect fullscreenChip{};
@@ -1754,10 +1770,38 @@ struct DesktopApp::Impl {
     };
     std::deque<TrailPoint> footTrail[2];
     std::deque<std::pair<float, float>> rootTrail;
+    // Live-mix follow: the master deck id and tempo last installed into the
+    // dance grid, so a handover or a tempo ramp re-anchors exactly once.
+    std::uint64_t mixDanceTrackId = 0;
+    double mixDanceBpm = 0.0;
+    // DancePlayer keeps a raw analysis pointer, so the mix follow adapter must
+    // own the analysis for as long as it is installed.
+    std::shared_ptr<const AnalysisResult> mixDanceAnalysis;
 
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
+    [[nodiscard]] mix::LiveMixTempo liveMixTempoNow() const {
+        return mixSession ? mix::liveMixTempo(mixSession->engine().snapshot())
+                          : mix::LiveMixTempo{};
+    }
+    [[nodiscard]] bool mixDrivesDance() const {
+        if (track) {
+            return false;
+        }
+        const mix::LiveMixTempo live = liveMixTempoNow();
+        return live.valid && live.playing;
+    }
     [[nodiscard]] double danceTime() const {
-        return track ? currentPosition() : danceLabTime;
+        if (track) {
+            return currentPosition();
+        }
+        if (mixSession) {
+            const mix::LiveMixTempo live = liveMixTempoNow();
+            if (live.valid && live.playing) {
+                // Follow the audible master position, not the raw deck cursor.
+                return live.positionSeconds;
+            }
+        }
+        return danceLabTime;
     }
     // Dance time for the character's pose on this frame: the media clock plus the
     // render latency lead. Scheduling and the transport keep using danceTime(). A capture
@@ -1770,8 +1814,11 @@ struct DesktopApp::Impl {
     // from the position, so they never count as stopped.
     [[nodiscard]] bool danceTransportRunning() const {
         if (!track) {
-            // Without a track the dance clock is danceLabTime, which only advances while
-            // Motion Lab runs (the synthetic demo's own play state does not move it).
+            // A live BG Mix drives the dance clock; otherwise the Motion Lab
+            // clock only advances while Motion Lab runs.
+            if (mixDrivesDance()) {
+                return true;
+            }
             return captureMode || danceLabRunning;
         }
         return captureMode || scrubbing || playing();
@@ -1816,6 +1863,25 @@ struct DesktopApp::Impl {
                 return motion::BeatClock::constant(motionLabBpm, 0.45, 4);
             }
             return motion::BeatClock::fromAnalysis(track->analysis);
+        }
+        // With no video track, a live BG Mix is the musical source. Build a
+        // constant grid from the master deck's audible tempo and phase; BG
+        // Motion 3.x itself is unchanged, it only receives a different clock.
+        if (mixSession) {
+            const mix::LiveMixTempo live = liveMixTempoNow();
+            if (live.valid && live.playing && live.bpm > 0.0) {
+                // At natural speed the analysed grid carries the real
+                // downbeats and accents. A tempo-ramped master needs a
+                // constant grid at the live tempo, anchored on its phase.
+                if (mixDanceAnalysis && live.trackId == mixDanceTrackId &&
+                    std::abs(live.rate - 1.0) < 0.005) {
+                    return motion::BeatClock::fromAnalysis(*mixDanceAnalysis);
+                }
+                const double period = 60.0 / live.bpm;
+                const double firstBeat =
+                    live.positionSeconds - live.beatPhase * period;
+                return motion::BeatClock::constant(live.bpm, firstBeat, 4);
+            }
         }
         return motion::BeatClock::constant(danceLabBpm, 0.0, 4);
     }
@@ -2123,7 +2189,32 @@ struct DesktopApp::Impl {
         }
     }
 
+    void refreshMixDanceIfNeeded() {
+        if (track || !mixSession) {
+            return;
+        }
+        const mix::LiveMixTempo live = liveMixTempoNow();
+        if (!live.valid || !live.playing) {
+            return;
+        }
+        // Re-anchor only when the musical master or its tempo actually changes,
+        // not every frame: re-installing the grid each tick would reset the
+        // beat phase and make the dancer stutter.
+        if (live.trackId == mixDanceTrackId &&
+            std::abs(live.bpm - mixDanceBpm) < 0.01) {
+            return;
+        }
+        mixDanceTrackId = live.trackId;
+        mixDanceBpm = live.bpm;
+        mixDanceAnalysis = mixSession->deckAnalysis(live.master);
+        if (mixDanceAnalysis) {
+            dance.setAnalysis(mixDanceAnalysis.get(), danceTime());
+        }
+        dance.setGrid(danceGrid(), danceTime());
+    }
+
     void updateDance() {
+        refreshMixDanceIfNeeded();
         danceFrame = dance.update(danceVisualTime());
     }
 
@@ -5353,9 +5444,11 @@ void DesktopApp::Impl::computeMixLayout() {
 
     const float innerX = control.x + 16.0f;
     const float innerW = control.w - 32.0f;
-    const float available = control.h - 38.0f - 46.0f;
-    const float rowGap = std::clamp((available - 166.0f) / 5.0f, 4.0f, 14.0f);
-    float y = control.y + 38.0f;
+    const float available = control.h - 56.0f - 46.0f;
+    // Eleven rows: transport, seven value rows, two chip rows, preview.
+    const float rowGap = std::clamp((available - 298.0f) / 10.0f, 2.0f, 9.0f);
+    mixLayout.monitor = { innerX, control.y + 32.0f, innerW, 16.0f };
+    float y = control.y + 54.0f;
     const float bw = (innerW - 18.0f) / 4.0f;
     mixLayout.playButton = { innerX, y, bw, 30.0f };
     mixLayout.nextButton = { innerX + bw + 6.0f, y, bw, 30.0f };
@@ -5363,25 +5456,34 @@ void DesktopApp::Impl::computeMixLayout() {
     mixLayout.cancelButton = { innerX + (bw + 6.0f) * 3.0f, y, bw, 30.0f };
     y += 30.0f + rowGap;
 
-    mixLayout.typePrev = { innerX + innerW - 58.0f, y, 26.0f, 26.0f };
-    mixLayout.typeNext = { innerX + innerW - 26.0f, y, 26.0f, 26.0f };
-    y += 26.0f + rowGap;
-
-    mixLayout.durationMinus = { innerX + innerW - 58.0f, y, 26.0f, 26.0f };
-    mixLayout.durationPlus = { innerX + innerW - 26.0f, y, 26.0f, 26.0f };
-    y += 26.0f + rowGap;
-
-    mixLayout.rampMinus = { innerX + innerW - 58.0f, y, 26.0f, 26.0f };
-    mixLayout.rampPlus = { innerX + innerW - 26.0f, y, 26.0f, 26.0f };
-    y += 26.0f + rowGap;
+    auto valueRow = [&](Rect& prev, Rect& next) {
+        prev = { innerX + innerW - 58.0f, y, 26.0f, 26.0f };
+        next = { innerX + innerW - 26.0f, y, 26.0f, 26.0f };
+        y += 26.0f + rowGap;
+    };
+    valueRow(mixLayout.typePrev, mixLayout.typeNext);
+    valueRow(mixLayout.durationMinus, mixLayout.durationPlus);
+    valueRow(mixLayout.modePrev, mixLayout.modeNext);
+    valueRow(mixLayout.rampModePrev, mixLayout.rampModeNext);
+    valueRow(mixLayout.rampBarsPrev, mixLayout.rampBarsNext);
+    valueRow(mixLayout.curvePrev, mixLayout.curveNext);
+    valueRow(mixLayout.maxDeltaPrev, mixLayout.maxDeltaNext);
 
     const float chipW = (innerW - 12.0f) / 3.0f;
-    mixLayout.adaptiveChip = { innerX, y, chipW, 28.0f };
-    mixLayout.tempoRampChip = { innerX + chipW + 6.0f, y, chipW, 28.0f };
-    mixLayout.autoQueueChip = { innerX + (chipW + 6.0f) * 2.0f, y, chipW, 28.0f };
+    mixLayout.pitchChip = { innerX, y, chipW, 28.0f };
+    mixLayout.bassChip = { innerX + chipW + 6.0f, y, chipW, 28.0f };
+    mixLayout.adaptiveChip = { innerX + (chipW + 6.0f) * 2.0f, y, chipW, 28.0f };
+    y += 28.0f + rowGap;
+    mixLayout.tempoRampChip = { innerX, y, chipW, 28.0f };
+    mixLayout.autoQueueChip = { innerX + chipW + 6.0f, y, chipW, 28.0f };
+    mixLayout.qualityStretchChip = { innerX + (chipW + 6.0f) * 2.0f, y, chipW,
+                                     28.0f };
     y += 28.0f + rowGap;
 
     mixLayout.previewButton = { innerX, y, innerW, 30.0f };
+
+    mixLayout.timeline = { plan.x + 16.0f, plan.y + 90.0f, plan.w - 32.0f,
+                           std::clamp(plan.h * 0.16f, 40.0f, 58.0f) };
 
     const float displayY = control.bottom() - 42.0f;
     const float displayW = (innerW - 12.0f) / 3.0f;
@@ -5707,12 +5809,55 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
                    theme::amber, 0.8f);
     }
 
+    // Transition Timeline: pre-roll, crossfade, handover and live playhead.
+    const Rect timeline = mixLayout.timeline;
+    ui::fillRoundedRect(renderer, timeline, 7.0f, theme::backgroundSoft);
+    ui::strokeRoundedRect(renderer, timeline, 7.0f, theme::border, 1.0f);
+    const double total = std::max(0.001, plan.totalDuration());
+    const float preW = static_cast<float>(
+        std::clamp(plan.preTransitionSeconds / total, 0.0, 1.0)) * timeline.w;
+    const float fadeW = std::max(0.0f, timeline.w - preW);
+    if (preW > 0.5f) {
+        ui::fillRect(renderer, { timeline.x, timeline.y + 3.0f, preW,
+                                 timeline.h - 6.0f },
+                     theme::alpha(theme::amber, 0.16f));
+        label("PRE-ROLL", timeline.x + 5.0f, timeline.y + 4.0f, 7,
+              theme::amber, 0.6f);
+    }
+    ui::fillRect(renderer, { timeline.x + preW, timeline.y + 3.0f, fadeW,
+                             timeline.h - 6.0f },
+                 theme::alpha(theme::accent, 0.14f));
+    if (fadeW > 40.0f) {
+        label("CROSSFADE", timeline.x + preW + 5.0f, timeline.y + 4.0f, 7,
+              theme::accent, 0.6f);
+    }
+    const float handoverX = timeline.x + preW +
+                            fadeW * static_cast<float>(
+                                        std::clamp(plan.handoverProgress, 0.0, 1.0));
+    ui::thickLine(renderer, handoverX, timeline.y + 3.0f, handoverX,
+                  timeline.bottom() - 3.0f, 1.0f,
+                  theme::alpha(theme::white, 0.35f), false);
+    label("HANDOVER", std::min(handoverX + 3.0f, timeline.right() - 52.0f),
+          timeline.y + 4.0f, 6, theme::dim, 0.4f);
+    if (snap.engine.phase == mix::TransitionPhase::Running ||
+        snap.engine.phase == mix::TransitionPhase::Cancelling) {
+        const double elapsed = snap.engine.transitionElapsed;
+        const float playX = timeline.x + static_cast<float>(
+            std::clamp(elapsed / total, 0.0, 1.0)) * timeline.w;
+        ui::thickLine(renderer, playX, timeline.y + 1.0f, playX,
+                      timeline.bottom() - 1.0f, 2.0f, theme::text, false);
+    }
+    labelRight(formatNumber(plan.preTransitionSeconds, 1) + " + " +
+                   formatNumber(plan.duration, 1) + " s",
+               timeline.right() - 4.0f, timeline.bottom() - 13.0f, 7,
+               theme::muted, 0.5f);
+
     // Gain and tempo curves from the actual plan.
-    const Rect curve{ card.x + 16.0f, card.y + 88.0f, card.w - 32.0f,
-                      std::clamp(card.h * 0.22f, 44.0f, 64.0f) };
+    const Rect curve{ card.x + 16.0f, timeline.bottom() + 8.0f,
+                      card.w - 32.0f,
+                      std::clamp(card.h * 0.18f, 38.0f, 58.0f) };
     ui::fillRoundedRect(renderer, curve, 7.0f, theme::backgroundSoft);
     ui::strokeRoundedRect(renderer, curve, 7.0f, theme::border, 1.0f);
-    const double span = std::max(0.001, plan.duration);
     auto plot = [&](const std::vector<mix::GainPoint>& points, SDL_Color color) {
         if (points.size() < 2) {
             return;
@@ -5720,8 +5865,9 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
         SDL_FPoint previous{};
         bool first = true;
         for (const mix::GainPoint& point : points) {
-            const float x = curve.x + static_cast<float>(
-                std::clamp(point.time / span, 0.0, 1.0)) * curve.w;
+            const float x = curve.x + static_cast<float>(std::clamp(
+                (plan.preTransitionSeconds + point.time) / total, 0.0, 1.0)) *
+                                        curve.w;
             const float y = curve.bottom() - 4.0f -
                             std::clamp(point.gain, 0.0f, 1.2f) * (curve.h - 8.0f);
             if (!first) {
@@ -5738,8 +5884,9 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
         SDL_FPoint previous{};
         bool first = true;
         for (const mix::TempoPoint& point : plan.tempoCurve) {
-            const float x = curve.x + static_cast<float>(
-                std::clamp(point.time / span, 0.0, 1.0)) * curve.w;
+            const float x = curve.x + static_cast<float>(std::clamp(
+                (plan.preTransitionSeconds + point.time) / total, 0.0, 1.0)) *
+                                        curve.w;
             const double deviation = std::clamp((point.rate - 1.0) / 0.15, -1.0, 1.0);
             const float y = curve.centerY() -
                             static_cast<float>(deviation) * (curve.h * 0.5f - 4.0f);
@@ -5753,6 +5900,9 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
         if (plan.pitchShiftWarning) {
             label("TEMPO RAMP  ·  PITCH SHIFT BY DESIGN", curve.x + 6.0f,
                   curve.y + 4.0f, 7, theme::amber, 0.5f);
+        } else if (plan.tempoRampActive) {
+            label("TEMPO RAMP  ·  PITCH LOCKED", curve.x + 6.0f,
+                  curve.y + 4.0f, 7, theme::accent, 0.5f);
         }
     }
     label("OUT", curve.x + 6.0f, curve.bottom() - 13.0f, 7, theme::accent, 0.6f);
@@ -5777,10 +5927,10 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
                        FontWeight::Regular),
              card.x + 82.0f, card.bottom() - 36.0f, 8, theme::amber);
     } else if (plan.pitchShiftWarning) {
-        body("Linear time-stretch changes pitch. Disable Tempo Ramp if that",
+        body("Linear time-stretch changes pitch. Choose Quality + Pitch Lock",
              card.x + 16.0f, card.bottom() - 36.0f, 8, theme::amber);
     } else {
-        label("GAIN CURVES + BEAT GRID FROM BG BEAT", card.x + 16.0f,
+        label("TIMELINE + GAIN/TEMPO CURVES FROM BG BEAT", card.x + 16.0f,
               card.bottom() - 36.0f, 7, theme::dim, 0.6f);
     }
 
@@ -5810,48 +5960,122 @@ void DesktopApp::Impl::drawMixControls(const Rect& card,
     const bool transportRunning = !snap.engine.paused && anyPlaying;
     const bool mixing = snap.engine.phase == mix::TransitionPhase::Running ||
                         snap.engine.phase == mix::TransitionPhase::Cancelling;
+
+    auto stageName = [](mix::TransitionStage stage) -> const char* {
+        switch (stage) {
+        case mix::TransitionStage::Preparing: return "PREPARING";
+        case mix::TransitionStage::TempoRamp: return "TEMPO RAMP";
+        case mix::TransitionStage::BeatAlign: return "BEAT ALIGN";
+        case mix::TransitionStage::Mixing: return "MIXING";
+        case mix::TransitionStage::Handover: return "HANDOVER";
+        case mix::TransitionStage::Complete: return "COMPLETE";
+        case mix::TransitionStage::Cancelled: return "CANCELLED";
+        case mix::TransitionStage::Idle: break;
+        }
+        return "IDLE";
+    };
+    // Live Transition Monitor: stage, both live rates, EQ, phase and the two
+    // audio-integrity flags. This is the same state BG Sync consumes.
+    std::string monitor;
+    if (mixing) {
+        const mix::MixSnapshot& e = snap.engine;
+        monitor = std::string(stageName(e.stage)) + "  ·  A " +
+                  formatNumber(e.tempoRatioA, 3) + "x  ·  B " +
+                  formatNumber(e.tempoRatioB, 3) + "x  ·  LOW " +
+                  formatNumber(e.eqLow[0], 2) + "/" +
+                  formatNumber(e.eqLow[1], 2) + "  ·  PHASE " +
+                  formatNumber(e.beatPhaseErrorMs, 1) + " ms";
+        if (e.pitchLock) {
+            monitor += "  ·  LOCK";
+        }
+        if (e.bassSwap) {
+            monitor += "  ·  BASS SWAP";
+        }
+    } else if (snap.preview.valid) {
+        monitor = std::string("NEXT  ·  ") +
+                  mix::transitionTypeName(snap.preview.type) + "  ·  " +
+                  formatNumber(snap.preview.preTransitionSeconds, 1) + " + " +
+                  formatNumber(snap.preview.duration, 1) + " s  ·  " +
+                  formatNumber(snap.preview.confidence * 100.0, 0) + "%";
+    } else {
+        monitor = "IDLE  ·  load two tracks to arm a transition";
+    }
+    label(ellipsize(*text, monitor, card.w - 32.0f, 8, FontWeight::Regular),
+          card.x + 16.0f, mixLayout.monitor.y, 8,
+          mixing ? theme::accent : theme::dim, 0.4f);
+
     drawMixButton(mixLayout.playButton, transportRunning ? "PAUSE" : "PLAY",
                   transportRunning, theme::accent, transportRunning ? 2 : 1);
     drawMixButton(mixLayout.nextButton, "NEXT", mixing, theme::violet);
     drawMixButton(mixLayout.stopButton, "STOP", false, theme::muted, 3);
     drawMixButton(mixLayout.cancelButton, "CANCEL", mixing, theme::red);
 
-    const std::vector<mix::TransitionType> types =
-        mix::selectableTransitionTypes();
-    const std::string typeName = mix::transitionTypeName(mixSession->transitionType());
-    label("TYPE", card.x + 16.0f, mixLayout.typePrev.y + 8.0f, 8, theme::dim, 1.2f);
-    text->drawRight(ellipsize(*text, typeName, 190.0f, 10, FontWeight::SemiBold),
-                    mixLayout.typePrev.x - 8.0f, mixLayout.typePrev.y + 4.0f, 10,
-                    FontWeight::SemiBold, theme::text);
-    drawMixButton(mixLayout.typePrev, "<", false, theme::muted);
-    drawMixButton(mixLayout.typeNext, ">", false, theme::muted);
-    (void)types;
+    auto valueRow = [&](const Rect& prev, const Rect& next, const char* caption,
+                        const std::string& value) {
+        label(caption, card.x + 16.0f, prev.y + 8.0f, 8, theme::dim, 1.2f);
+        text->drawRight(ellipsize(*text, value, 200.0f, 10, FontWeight::SemiBold),
+                        prev.x - 8.0f, prev.y + 4.0f, 10, FontWeight::SemiBold,
+                        theme::text);
+        drawMixButton(prev, "<", false, theme::muted);
+        drawMixButton(next, ">", false, theme::muted);
+    };
+
+    const std::string typeName =
+        mix::transitionTypeName(mixSession->transitionType());
+    valueRow(mixLayout.typePrev, mixLayout.typeNext, "TYPE", typeName);
 
     const double duration = mixSession->transitionDuration();
-    const std::string durationText =
-        duration <= 0.0 ? "AUTO" : formatNumber(duration, 1) + " s";
-    label("DURATION", card.x + 16.0f, mixLayout.durationMinus.y + 8.0f, 8,
-          theme::dim, 1.2f);
-    text->drawRight(durationText, mixLayout.durationMinus.x - 8.0f,
-                    mixLayout.durationMinus.y + 4.0f, 10, FontWeight::SemiBold,
-                    theme::text);
-    drawMixButton(mixLayout.durationMinus, "-", false, theme::muted);
-    drawMixButton(mixLayout.durationPlus, "+", false, theme::muted);
+    valueRow(mixLayout.durationMinus, mixLayout.durationPlus, "DURATION",
+             duration <= 0.0 ? "AUTO" : formatNumber(duration, 1) + " s");
 
-    label("TEMPO RAMP CAP", card.x + 16.0f, mixLayout.rampMinus.y + 8.0f, 8,
-          theme::dim, 1.2f);
-    text->drawRight(formatNumber(mixSession->tempoRampMaxPercent(), 0) + " %",
-                    mixLayout.rampMinus.x - 8.0f, mixLayout.rampMinus.y + 4.0f,
-                    10, FontWeight::SemiBold, theme::text);
-    drawMixButton(mixLayout.rampMinus, "-", false, theme::muted);
-    drawMixButton(mixLayout.rampPlus, "+", false, theme::muted);
+    const mix::MixMode mode = mixSession->mixMode();
+    const char* modeName = mode == mix::MixMode::Auto
+                               ? "AUTO"
+                               : (mode == mix::MixMode::Manual ? "MANUAL"
+                                                               : "PREVIEW");
+    valueRow(mixLayout.modePrev, mixLayout.modeNext, "MODE", modeName);
 
+    const mix::TempoRampMode rampMode = mixSession->tempoRampMode();
+    const char* rampModeName = rampMode == mix::TempoRampMode::Off
+                                   ? "OFF"
+                                   : (rampMode == mix::TempoRampMode::Auto
+                                          ? "AUTO"
+                                          : "MANUAL");
+    valueRow(mixLayout.rampModePrev, mixLayout.rampModeNext, "RAMP",
+             rampModeName);
+
+    const double bars = mixSession->tempoRampBars();
+    valueRow(mixLayout.rampBarsPrev, mixLayout.rampBarsNext, "RAMP BARS",
+             bars < 1.0 ? "AUTO" : formatNumber(bars, 0) + " bars");
+
+    const mix::TempoCurveKind curve = mixSession->tempoCurve();
+    valueRow(mixLayout.curvePrev, mixLayout.curveNext, "CURVE",
+             curve == mix::TempoCurveKind::Linear
+                 ? "LINEAR"
+                 : (curve == mix::TempoCurveKind::Smooth ? "SMOOTH"
+                                                        : "S-CURVE"));
+
+    valueRow(mixLayout.maxDeltaPrev, mixLayout.maxDeltaNext, "MAX DELTA",
+             formatNumber(mixSession->tempoRampMaxPercent(), 0) + " %");
+
+    drawMixButton(mixLayout.pitchChip, "PITCH LOCK",
+                  mixSession->pitchLock(), theme::accent);
+    drawMixButton(mixLayout.bassChip, "BASS SWAP", mixSession->bassSwap(),
+                  theme::violet);
     drawMixButton(mixLayout.adaptiveChip, "ADAPTIVE",
                   mixSession->adaptive(), theme::accent);
-    drawMixButton(mixLayout.tempoRampChip, "TEMPO RAMP",
+
+    drawMixButton(mixLayout.tempoRampChip, "RAMP " +
+                      std::string(mixSession->tempoRampEnabled() ? "ON" : "OFF"),
                   mixSession->tempoRampEnabled(), theme::amber);
     drawMixButton(mixLayout.autoQueueChip, "AUTO QUEUE",
                   mixSession->autoQueue(), theme::violet);
+    drawMixButton(mixLayout.qualityStretchChip,
+                  mixSession->quality() == mix::StretchQuality::Quality
+                      ? "STRETCH Q"
+                      : "STRETCH F",
+                  mixSession->quality() == mix::StretchQuality::Quality,
+                  theme::pink);
 
     drawMixButton(mixLayout.previewButton, "PREVIEW PLAN", mixPlanDetail,
                   theme::accent);
@@ -6082,8 +6306,8 @@ void DesktopApp::Impl::handleMixClick(float x, float y, int clicks) {
     if (hit(mixLayout.tempoRampChip)) {
         mixSession->setTempoRampEnabled(!mixSession->tempoRampEnabled());
         showToast(mixSession->tempoRampEnabled()
-                      ? "Tempo Ramp armed (experimental)"
-                      : "Tempo Ramp disarmed");
+                      ? "Tempo ramp armed (Auto)"
+                      : "Tempo ramp off");
         return;
     }
     if (hit(mixLayout.autoQueueChip)) {
@@ -6139,12 +6363,88 @@ void DesktopApp::Impl::handleMixClick(float x, float y, int clicks) {
                       : "Transition duration: " + formatNumber(value, 1) + " s");
         return;
     }
-    if (hit(mixLayout.rampPlus) || hit(mixLayout.rampMinus)) {
-        const double delta = hit(mixLayout.rampPlus) ? 1.0 : -1.0;
+    if (hit(mixLayout.modePrev) || hit(mixLayout.modeNext)) {
+        const int direction = hit(mixLayout.modeNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->mixMode());
+        const int next = (current + direction + 3) % 3;
+        const mix::MixMode mode = static_cast<mix::MixMode>(next);
+        mixSession->setMixMode(mode);
+        showToast(mode == mix::MixMode::Auto
+                      ? "Mode: Auto (adaptive, automatic scheduling)"
+                      : (mode == mix::MixMode::Manual
+                             ? "Mode: Manual (explicit type, manual start)"
+                             : "Mode: Preview (plans only, no auto-start)"));
+        return;
+    }
+    if (hit(mixLayout.rampModePrev) || hit(mixLayout.rampModeNext)) {
+        const int direction = hit(mixLayout.rampModeNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->tempoRampMode());
+        const int next = (current + direction + 3) % 3;
+        const mix::TempoRampMode mode = static_cast<mix::TempoRampMode>(next);
+        mixSession->setTempoRampMode(mode);
+        showToast(mode == mix::TempoRampMode::Off
+                      ? "Tempo ramp: Off"
+                      : (mode == mix::TempoRampMode::Auto
+                             ? "Tempo ramp: Auto"
+                             : "Tempo ramp: Manual"));
+        return;
+    }
+    if (hit(mixLayout.rampBarsPrev) || hit(mixLayout.rampBarsNext)) {
+        const double values[] = {0.0, 4.0, 8.0, 16.0};
+        int index = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (std::abs(values[i] - mixSession->tempoRampBars()) < 0.5) {
+                index = i;
+                break;
+            }
+        }
+        const int direction = hit(mixLayout.rampBarsNext) ? 1 : -1;
+        index = (index + direction + 4) % 4;
+        mixSession->setTempoRampBars(values[index]);
+        showToast(values[index] < 1.0 ? "Ramp length: Auto"
+                                      : "Ramp length: " +
+                                            formatNumber(values[index], 0) +
+                                            " bars");
+        return;
+    }
+    if (hit(mixLayout.curvePrev) || hit(mixLayout.curveNext)) {
+        const int direction = hit(mixLayout.curveNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->tempoCurve());
+        const int next = (current + direction + 3) % 3;
+        mixSession->setTempoCurve(static_cast<mix::TempoCurveKind>(next));
+        showToast(std::string("Tempo curve: ") +
+                  (next == 0 ? "Linear" : (next == 1 ? "Smooth" : "S-Curve")));
+        return;
+    }
+    if (hit(mixLayout.maxDeltaPrev) || hit(mixLayout.maxDeltaNext)) {
+        const double delta = hit(mixLayout.maxDeltaNext) ? 1.0 : -1.0;
         mixSession->setTempoRampMaxPercent(
-            std::clamp(mixSession->tempoRampMaxPercent() + delta, 1.0, 12.0));
-        showToast("Tempo Ramp cap: " +
+            std::clamp(mixSession->tempoRampMaxPercent() + delta, 1.0, 16.0));
+        showToast("Max tempo delta: " +
                   formatNumber(mixSession->tempoRampMaxPercent(), 0) + "%");
+        return;
+    }
+    if (hit(mixLayout.pitchChip)) {
+        mixSession->setPitchLock(!mixSession->pitchLock());
+        showToast(mixSession->pitchLock()
+                      ? "Pitch lock on (WSOLA)"
+                      : "Pitch lock off (resampling changes pitch)");
+        return;
+    }
+    if (hit(mixLayout.bassChip)) {
+        mixSession->setBassSwap(!mixSession->bassSwap());
+        showToast(mixSession->bassSwap() ? "Bass swap on" : "Bass swap off");
+        return;
+    }
+    if (hit(mixLayout.qualityStretchChip)) {
+        const mix::StretchQuality next =
+            mixSession->quality() == mix::StretchQuality::Quality
+                ? mix::StretchQuality::Performance
+                : mix::StretchQuality::Quality;
+        mixSession->setQuality(next);
+        showToast(next == mix::StretchQuality::Quality
+                      ? "Time-stretch: Quality (WSOLA, pitch locked)"
+                      : "Time-stretch: Fast (linear, pitch follows tempo)");
         return;
     }
 }
@@ -6175,7 +6475,7 @@ void DesktopApp::Impl::drawFooter() {
             "U UI SCALE",
             canvasW * 0.5f, bar.y + 13.0f, 8, FontWeight::SemiBold,
             theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
-        labelRight("BG MIX 0.1   ·   " BGMEDIA_VERSION_STRING, canvasW - 24.0f,
+        labelRight("BG MIX 0.2   ·   " BGMEDIA_VERSION_STRING, canvasW - 24.0f,
                    bar.y + 15.0f, 8, theme::dim, 0.6f);
         return;
     }

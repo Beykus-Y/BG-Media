@@ -63,16 +63,41 @@ public:
     void setTransitionDuration(double seconds);  // 0 = automatic
     void setAdaptive(bool enabled);
     void setTempoRampEnabled(bool enabled);
+    void setTempoRampMode(TempoRampMode mode);
     void setTempoRampMaxPercent(double percent);
+    // 0 (or any value < 1) means automatic bar count.
+    void setTempoRampBars(double bars);
+    void setTempoCurve(TempoCurveKind curve);
+    void setPitchLock(bool enabled);
+    void setQuality(StretchQuality quality);
+    void setMixMode(MixMode mode);
+    void setAggressiveness(Aggressiveness aggressiveness);
+    void setBassSwap(bool enabled);
+    void setPhraseBars(int bars);
     void setAutoQueue(bool enabled);
 
     [[nodiscard]] TransitionType transitionType() const noexcept { return type_; }
     [[nodiscard]] double transitionDuration() const noexcept { return duration_; }
     [[nodiscard]] bool adaptive() const noexcept { return adaptive_; }
-    [[nodiscard]] bool tempoRampEnabled() const noexcept { return tempoRamp_; }
+    [[nodiscard]] bool tempoRampEnabled() const noexcept {
+        return tempoRampMode_ != TempoRampMode::Off;
+    }
+    [[nodiscard]] TempoRampMode tempoRampMode() const noexcept {
+        return tempoRampMode_;
+    }
     [[nodiscard]] double tempoRampMaxPercent() const noexcept {
         return rampMaxPercent_;
     }
+    [[nodiscard]] double tempoRampBars() const noexcept { return rampBars_; }
+    [[nodiscard]] TempoCurveKind tempoCurve() const noexcept { return curve_; }
+    [[nodiscard]] bool pitchLock() const noexcept { return pitchLock_; }
+    [[nodiscard]] StretchQuality quality() const noexcept { return quality_; }
+    [[nodiscard]] MixMode mixMode() const noexcept { return mode_; }
+    [[nodiscard]] Aggressiveness aggressiveness() const noexcept {
+        return aggressiveness_;
+    }
+    [[nodiscard]] bool bassSwap() const noexcept { return bassSwap_; }
+    [[nodiscard]] int phraseBars() const noexcept { return phraseBars_; }
     [[nodiscard]] bool autoQueue() const noexcept { return autoQueue_; }
 
     // Must be called from the UI thread every frame.
@@ -116,6 +141,7 @@ private:
     [[nodiscard]] double deckDuration(DeckId deck) const;
     [[nodiscard]] std::uint64_t loadedId(DeckId deck) const;
     void installDeck(DeckId deck, const Item& item);
+    void applyStretchQuality();
     void startPlannedTransition(double durationOverride);
     [[nodiscard]] MixPlan buildPlan(DeckId from, DeckId to,
                                     const MixSnapshot& snap,
@@ -135,8 +161,18 @@ private:
     TransitionType type_ = TransitionType::SmartCrossfade;
     double duration_ = 0.0;
     bool adaptive_ = true;
-    bool tempoRamp_ = false;
+    TempoRampMode tempoRampMode_ = TempoRampMode::Auto;
     double rampMaxPercent_ = 6.0;
+    double rampBars_ = 0.0;  // 0 = automatic
+    TempoCurveKind curve_ = TempoCurveKind::SCurve;
+    bool pitchLock_ = true;
+    StretchQuality quality_ = StretchQuality::Quality;
+    MixMode mode_ = MixMode::Auto;
+    Aggressiveness aggressiveness_ = Aggressiveness::Balanced;
+    bool bassSwap_ = true;
+    int phraseBars_ = 4;
+    bool stretchDirty_ = false;
+    bool appliedPitchPreserving_ = true;
     bool autoQueue_ = true;
     bool autoPlay_ = false;
     bool nextRequested_ = false;
