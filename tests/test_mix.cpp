@@ -2209,8 +2209,84 @@ TEST_CASE("mix.wsola_mono_and_inverted_stereo") {
     }
     CHECK_NEAR(std::sqrt(invertedEnergy / static_cast<double>(1.1 * kRate)),
                0.4 / std::sqrt(2.0), 0.01);
-    std::printf("wsola mono rms=%.4f inverted rms=%.4f\n", monoRms,
-                std::sqrt(invertedEnergy / static_cast<double>(1.1 * kRate)));
+    // Non-unit rate: the mid signal is zero for inverted stereo, so the
+    // similarity search must use a non-cancelling channel.
+    const std::vector<float> invertedRamped =
+        renderStretch(*inverted, 1.05, 1.5, 0.0);
+    double rampedEnergy = 0.0;
+    double cross = 0.0;
+    double energyL = 0.0;
+    double energyR = 0.0;
+    for (std::size_t i = static_cast<std::size_t>(0.3 * kRate);
+         i < static_cast<std::size_t>(1.4 * kRate); ++i) {
+        rampedEnergy += static_cast<double>(invertedRamped[i * 2]) *
+                        invertedRamped[i * 2];
+        energyL += static_cast<double>(invertedRamped[i * 2]) *
+                   invertedRamped[i * 2];
+        energyR += static_cast<double>(invertedRamped[i * 2 + 1]) *
+                   invertedRamped[i * 2 + 1];
+        cross += static_cast<double>(invertedRamped[i * 2]) *
+                 invertedRamped[i * 2 + 1];
+    }
+    const double rampedRms =
+        std::sqrt(rampedEnergy / static_cast<double>(1.1 * kRate));
+    CHECK(rampedRms > 0.25);
+    CHECK(cross / std::sqrt(energyL * energyR) < -0.95);
+    std::printf("wsola mono rms=%.4f inverted rms=%.4f inverted1.05 rms=%.4f\n",
+                monoRms,
+                std::sqrt(invertedEnergy / static_cast<double>(1.1 * kRate)),
+                rampedRms);
+}
+
+TEST_CASE("mix.wsola_ramp_callback_size_independent") {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = 2 * kRate;
+    track->samples.assign(frames * 2, 0.0f);
+    const std::size_t burst = static_cast<std::size_t>(0.75 * kRate);
+    for (std::size_t i = 0; i < kRate / 50; ++i) {
+        const float value = static_cast<float>(
+            0.5 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 *
+                           static_cast<double>(i) / kRate));
+        track->samples[(burst + i) * 2] = value;
+        track->samples[(burst + i) * 2 + 1] = value;
+    }
+    auto burstTime = [](const std::vector<float>& out) {
+        for (std::size_t i = 0; i < out.size() / 2; ++i) {
+            if (std::abs(out[i * 2]) > 0.15f) {
+                return static_cast<double>(i) / kRate;
+            }
+        }
+        return -1.0;
+    };
+    bgmedia::mix::WsolaStretcher processor;
+    const auto one = processor.createStream(kRate);
+    double onePos = 0.0;
+    std::vector<float> oneOut(2 * kRate * 2, 0.0f);
+    one->render(*track, onePos, 0.5, 1.5, oneOut.data(), 2 * kRate);
+
+    const auto many = processor.createStream(kRate);
+    double manyPos = 0.0;
+    std::vector<float> manyOut(2 * kRate * 2, 0.0f);
+    std::vector<float> block(480 * 2, 0.0f);
+    std::size_t done = 0;
+    while (done < 2 * kRate) {
+        const double t0 = static_cast<double>(done) / (2.0 * kRate);
+        const double t1 = static_cast<double>(done + 480) / (2.0 * kRate);
+        many->render(*track, manyPos, 0.5 + t0, 0.5 + t1, block.data(), 480);
+        std::copy_n(block.begin(), 480 * 2,
+                    manyOut.begin() + static_cast<std::ptrdiff_t>(done * 2));
+        done += 480;
+    }
+    const double oneBurst = burstTime(oneOut);
+    const double manyBurst = burstTime(manyOut);
+    CHECK(oneBurst > 0.0);
+    CHECK(manyBurst > 0.0);
+    CHECK_NEAR(oneBurst, manyBurst, 0.03);
+    CHECK_NEAR(onePos, manyPos, 0.02);
+    std::printf("wsola ramp block independence: one=%.4f many=%.4f pos=%.4f\n",
+                oneBurst, manyBurst, onePos);
 }
 
 TEST_CASE("mix.engine_never_rewinds_playing_deck") {
@@ -2299,6 +2375,38 @@ TEST_CASE("mix.engine_future_start_waits_without_seek") {
     std::printf("future start: before=%.3f at0.1=%.3f stage0=%d at0.4=%.3f\n",
                 before, before + 0.10, static_cast<int>(snap.stage),
                 snap.decks[0].positionSeconds);
+}
+
+TEST_CASE("mix.engine_future_start_keeps_deck_rate") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 69, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 70, 120.0));
+    engine.setDeckRate(DeckId::A, 0.5);
+    engine.play(DeckId::A);
+    renderSeconds(engine, 1.0, nullptr);
+    const double before = engine.snapshot().decks[0].positionSeconds;
+    CHECK_NEAR(before, 0.5, 0.02);
+
+    MixPlan plan = crossfadePlan(engine, 2.0, 0.0);
+    plan.transitionStartA = 1.0;  // 0.5 s of media = 1.0 s at 0.5x
+    plan.transitionEndA = plan.transitionStartA + 2.0;
+    plan.tempoRampStartA = 1.0;
+    plan.preTransitionSeconds = 0.0;
+    CHECK(engine.startTransition(plan));
+    renderSeconds(engine, 0.9, nullptr);
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.stage == TransitionStage::Preparing);
+    CHECK(!snap.decks[1].playing);
+    // If the wait used 1.0x, the deck would already be at ~1.4 s.
+    CHECK(snap.decks[0].positionSeconds < 1.05);
+    CHECK(snap.decks[0].positionSeconds > 0.85);
+    std::printf("future rate wait: before=%.3f at0.9=%.3f\n", before,
+                snap.decks[0].positionSeconds);
+    renderSeconds(engine, 0.2, nullptr);
+    snap = engine.snapshot();
+    CHECK(snap.decks[1].playing);
 }
 
 TEST_CASE("mix.engine_future_start_block_sizes") {

@@ -727,6 +727,11 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
         // Never let a chunk straddle the pre-roll/crossfade boundary: the
         // incoming deck must become audible on exactly the planned frame.
+        if (running && framesRendered_ < runtime_.rampStartFrame) {
+            chunk = std::min<std::size_t>(
+                chunk, static_cast<std::size_t>(runtime_.rampStartFrame -
+                                                framesRendered_));
+        }
         if (running && framesRendered_ < transitionStartFrame_) {
             chunk = std::min<std::size_t>(
                 chunk, static_cast<std::size_t>(transitionStartFrame_ -
@@ -798,8 +803,18 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                  static_cast<double>(chunk) -
                  static_cast<double>(transitionStartFrame_)) /
                 outputSampleRate_;
-            rateFrom0 = planRate(elapsed0);
-            rateFrom1 = planRate(elapsed1);
+            if (framesRendered_ < runtime_.rampStartFrame) {
+                // Waiting for a future musical event: keep the deck's current
+                // playback rate, not the transition automation's first point.
+                const double waitRate =
+                    decks_[deckIndex(fromDeck)].requestedRate.load(
+                        std::memory_order_acquire);
+                rateFrom0 = waitRate;
+                rateFrom1 = waitRate;
+            } else {
+                rateFrom0 = planRate(elapsed0);
+                rateFrom1 = planRate(elapsed1);
+            }
             // The incoming deck holds the matched tempo until the handover,
             // then returns to natural speed across the tail of the fade so the
             // end of the transition has no rate step.

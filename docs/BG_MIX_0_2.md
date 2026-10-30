@@ -295,7 +295,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 59 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 61 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -318,9 +318,11 @@ including:
   reaches 4.0 s for a 1 s source), and outgoing continuity when a transition
   starts in place;
 * stereo WSOLA identity/ratios/hop continuity, mono and inverted-stereo
-  handling, gain-aware correlation headroom at the start and midpoint, no
-  backwards seek for a playing deck, future-start waiting, arbitrary block
-  sizes around the boundary, and forward-only planner snapping;
+  handling (including 1.05× with a non-cancelling reference), per-hop tempo
+  ramp and callback-size independence, gain-aware correlation headroom at the
+  start and midpoint, no backwards seek for a playing deck, future-start
+  waiting at the deck's requested rate, arbitrary block sizes around the
+  boundary, and forward-only planner snapping;
 * incoming-rate fitting: an 8 s source at `tempoRatioB = 1.25` shortens the
   fade to 6.74 s so `endB` is exactly the source end;
 * live-tempo adapter and master handover;

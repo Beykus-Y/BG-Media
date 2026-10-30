@@ -28,14 +28,22 @@ float sourceSample(const PcmTrack& track, std::size_t frame, std::uint32_t chann
     return track.samples[frame * 2 + channel];
 }
 
-float sourceMono(const PcmTrack& track, std::size_t frame) {
+// WSOLA needs one reference waveform for its similarity search. The mid
+// signal cancels for opposite-polarity stereo (R = -L), so choose the louder
+// source channel instead; the same offset is still applied to both channels.
+float sourceReference(const PcmTrack& track, std::size_t frame, int mode) {
     if (frame >= track.frameCount()) {
         return 0.0f;
     }
     if (track.channels == 1) {
         return track.samples[frame];
     }
-    return 0.5f * (track.samples[frame * 2] + track.samples[frame * 2 + 1]);
+    const float left = track.samples[frame * 2];
+    const float right = track.samples[frame * 2 + 1];
+    if (mode == 0) {
+        return 0.5f * (left + right);
+    }
+    return mode == 2 ? right : left;
 }
 
 class WsolaStream final : public ITimeStretchStream {
@@ -78,6 +86,7 @@ public:
         sourcePosition_ = std::max(0.0, sourcePositionFrames);
         primed_ = false;
         eof_ = false;
+        referenceMode_ = -1;
     }
 
     void render(const PcmTrack& track, double& positionFrames,
@@ -90,27 +99,40 @@ public:
             std::memset(out, 0, outFrames * 2 * sizeof(float));
             return;
         }
+        if (referenceMode_ < 0) {
+            chooseReference(track);
+        }
         if (positionFrames >= static_cast<double>(track.frameCount())) {
             std::memset(out, 0, outFrames * 2 * sizeof(float));
             return;
         }
         const double r0 = std::clamp(ratioStart, 0.05, 8.0);
         const double r1 = std::clamp(ratioEnd, 0.05, 8.0);
-        const double average = 0.5 * (r0 + r1);
+        const double span = outFrames > 1
+                                ? static_cast<double>(outFrames - 1)
+                                : 1.0;
+        // Integral of the linear ratio over the already queued output frames.
+        const double queued = static_cast<double>(ringCount_);
+        const double queuedSource =
+            r0 * queued + (r1 - r0) * queued * queued / (2.0 * span);
 
         // Re-anchor the analysis head to the output clock plus everything that
         // is already queued. This keeps the published media position and the
         // actual window source in lockstep across arbitrary callback sizes.
         sourcePosition_ =
-            std::max(0.0, positionFrames + static_cast<double>(ringCount_) * average);
+            std::max(0.0, positionFrames + queuedSource);
 
         // Generate and drain incrementally. The ring has a fixed capacity, so
         // filling it before draining would deadlock for any request larger
-        // than the ring (for example a one-shot 48 kHz second).
+        // than the ring (for example a one-shot 48 kHz second). Each synthesis
+        // hop uses the interpolated rate at its own output position, so a
+        // large block and a small-block sequence follow the same ramp.
         std::size_t written = 0;
         while (written < outFrames) {
             while (ringCount_ == 0) {
-                generate(track, average);
+                const double t = std::clamp(
+                    static_cast<double>(written + ringCount_) / span, 0.0, 1.0);
+                generate(track, r0 + (r1 - r0) * t);
             }
             const std::size_t chunk =
                 std::min(outFrames - written, ringCount_);
@@ -138,6 +160,41 @@ public:
     }
 
 private:
+    void chooseReference(const PcmTrack& track) noexcept {
+        if (track.channels == 1) {
+            referenceMode_ = 0;
+            return;
+        }
+        const std::size_t count =
+            std::min<std::size_t>(track.frameCount(), sampleRate_);
+        double left = 0.0;
+        double right = 0.0;
+        double mid = 0.0;
+        double side = 0.0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const double l = track.samples[i * 2];
+            const double r = track.samples[i * 2 + 1];
+            left += l * l;
+            right += r * r;
+            const double m = 0.5 * (l + r);
+            const double s = 0.5 * (l - r);
+            mid += m * m;
+            side += s * s;
+        }
+        // Mid is the natural reference for normal stereo. When the channels
+        // are close to opposite polarity, mid cancels; use the louder channel
+        // so the similarity search still has a signal.
+        if (side > mid * 4.0 && left + right > 1e-12) {
+            referenceMode_ = right > left ? 2 : 1;
+        } else {
+            referenceMode_ = 0;
+        }
+    }
+
+    float sourceRef(const PcmTrack& track, std::size_t frame) const noexcept {
+        return sourceReference(track, frame, referenceMode_);
+    }
+
     void push(float left, float right) noexcept {
         if (ringCount_ >= capacity_) {
             return;
@@ -153,9 +210,9 @@ private:
         double head = 0.0;
         double tail = 0.0;
         for (std::size_t i = 0; i < span; ++i) {
-            const double value = sourceMono(track, start + i);
+            const double value = sourceRef(track, start + i);
             head += value * value;
-            const double later = sourceMono(track, start + hop_ + i);
+            const double later = sourceRef(track, start + hop_ + i);
             tail += later * later;
         }
         if (head <= 1e-8) {
@@ -229,7 +286,7 @@ private:
                     double dot = 0.0;
                     double energy = 0.0;
                     for (std::size_t i = 0; i < hop_; i += 4) {
-                        const float value = sourceMono(
+                        const float value = sourceRef(
                             track, static_cast<std::size_t>(candidate) + i);
                         dot += static_cast<double>(value) * previous_[i];
                         energy += static_cast<double>(value) * value;
@@ -268,7 +325,7 @@ private:
         // window's first hop should match it, which is what keeps periodic
         // material phase-coherent instead of comb-filtered.
         for (std::size_t i = 0; i < hop_; ++i) {
-            previous_[i] = sourceMono(track, best + hop_ + i);
+            previous_[i] = sourceRef(track, best + hop_ + i);
         }
         primed_ = true;
         if (nominal >= static_cast<double>(maxStart)) {
@@ -311,6 +368,7 @@ private:
     std::vector<float> previous_;
     std::vector<float> hann_;
     double sourcePosition_ = 0.0;
+    int referenceMode_ = 0;
     bool primed_ = false;
     bool eof_ = false;
 };
