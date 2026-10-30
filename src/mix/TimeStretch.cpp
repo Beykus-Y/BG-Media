@@ -200,28 +200,37 @@ private:
                     static_cast<long long>(search_),
                     static_cast<long long>(lastStart) -
                         static_cast<long long>(base));
-                double bestScore = -std::numeric_limits<double>::max();
-                for (long long offset = lower; offset <= upper;
-                     offset += 4) {
+                auto scoreAt = [&](long long offset) {
                     const long long candidate =
                         static_cast<long long>(base) + offset;
                     double dot = 0.0;
                     double energy = 0.0;
-                    std::size_t count = 0;
                     for (std::size_t i = 0; i < hop_; i += 4) {
                         const float value = sourceMono(
                             track, static_cast<std::size_t>(candidate) + i);
                         dot += static_cast<double>(value) * previous_[i];
                         energy += static_cast<double>(value) * value;
-                        ++count;
                     }
                     if (energy <= 1e-9) {
+                        return -std::numeric_limits<double>::max();
+                    }
+                    return dot / std::sqrt(energy + 1e-12);
+                };
+                // Zero is the exact overlap at unity rate. The coarse stride
+                // starts at -search_ (odd at 48 kHz), so evaluate it
+                // explicitly instead of relying on the loop to land on it.
+                double bestScore = scoreAt(0);
+                best = base;
+                for (long long offset = lower; offset <= upper;
+                     offset += 4) {
+                    if (offset == 0) {
                         continue;
                     }
-                    const double score = dot / std::sqrt(energy + 1e-12);
+                    const double score = scoreAt(offset);
                     if (score > bestScore) {
                         bestScore = score;
-                        best = static_cast<std::size_t>(candidate);
+                        best = static_cast<std::size_t>(
+                            static_cast<long long>(base) + offset);
                     }
                 }
                 if (bestScore < 0.15) {
@@ -335,8 +344,14 @@ void WsolaStretcher::render(const PcmTrack& track, double& positionFrames,
     // calls render() directly still gets pitch-preserving output.
     static thread_local std::shared_ptr<ITimeStretchStream> oneShot;
     static thread_local std::uint32_t oneShotRate = 0;
-    if (!oneShot || oneShotRate != track.sampleRate) {
+    static thread_local const PcmTrack* oneShotTrack = nullptr;
+    // A new track, a new stream rate, or a rewind to the start begins an
+    // independent render. Reusing the previous track's overlap history here
+    // would leak its queued samples into the new export.
+    if (!oneShot || oneShotRate != track.sampleRate ||
+        oneShotTrack != &track || positionFrames <= 0.0) {
         oneShotRate = track.sampleRate;
+        oneShotTrack = &track;
         oneShot = std::make_shared<WsolaStream>(track.sampleRate);
         oneShot->reset(positionFrames);
     }

@@ -78,6 +78,26 @@ std::shared_ptr<PcmTrack> toneTrack(double seconds, double frequency,
     return track;
 }
 
+std::shared_ptr<PcmTrack> broadbandTrack(double seconds) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(seconds * kRate);
+    track->samples.resize(frames * 2);
+    const double frequencies[] = {110.0, 247.0, 613.0, 1499.0, 3101.0, 5237.0};
+    for (std::size_t i = 0; i < frames; ++i) {
+        double value = 0.0;
+        for (double frequency : frequencies) {
+            value += 0.09 * std::sin(2.0 * 3.14159265358979323846 * frequency *
+                                     static_cast<double>(i) / kRate);
+        }
+        const float sample = static_cast<float>(value);
+        track->samples[i * 2] = sample;
+        track->samples[i * 2 + 1] = sample;
+    }
+    return track;
+}
+
 AnalysisResult analysisFor(double bpm, double duration = 30.0,
                            bool confident = true) {
     AnalysisResult analysis;
@@ -1902,6 +1922,48 @@ TEST_CASE("mix.wsola_large_block_drains") {
     }
     CHECK(nonFinite == 0);
     CHECK(peak > 0.2f);
+}
+
+TEST_CASE("mix.wsola_one_shot_isolated") {
+    bgmedia::mix::WsolaStretcher processor;
+    auto positive = dcTrack(0.2, 0.4f);
+    auto negative = dcTrack(0.2, -0.4f);
+    constexpr int kFrames = 2000;
+    std::vector<float> first(kFrames * 2, 0.0f);
+    std::vector<float> second(kFrames * 2, 0.0f);
+    double positionA = 0.0;
+    double positionB = 0.0;
+    processor.render(*positive, positionA, 1.0, first.data(), kFrames);
+    processor.render(*negative, positionB, 1.0, second.data(), kFrames);
+    // The second one-shot render must not inherit the first track's queued
+    // positive samples or overlap history.
+    float tailAverage = 0.0f;
+    for (int i = kFrames / 2; i < kFrames; ++i) {
+        tailAverage += second[i * 2];
+    }
+    tailAverage /= static_cast<float>(kFrames / 2);
+    std::printf("one-shot isolation: tail=%.4f\n",
+                static_cast<double>(tailAverage));
+    CHECK(tailAverage < -0.1f);
+}
+
+TEST_CASE("mix.wsola_unity_reconstruction") {
+    const auto track = broadbandTrack(3.0);
+    const std::vector<float> output = renderStretch(*track, 1.0, 1.5, 0.0);
+    const std::size_t first = static_cast<std::size_t>(0.25 * kRate);
+    const std::size_t last = static_cast<std::size_t>(1.2 * kRate);
+    double error = 0.0;
+    double signal = 0.0;
+    for (std::size_t i = first; i < last; ++i) {
+        const double difference = static_cast<double>(output[i * 2]) -
+                                  track->samples[i * 2];
+        error += difference * difference;
+        signal += static_cast<double>(track->samples[i * 2]) *
+                  track->samples[i * 2];
+    }
+    const double relative = std::sqrt(error / std::max(1e-12, signal));
+    CHECK(relative < 0.05);
+    std::printf("wsola unity reconstruction: relative error %.4f\n", relative);
 }
 
 TEST_CASE("mix.engine_resamples_source_rate") {

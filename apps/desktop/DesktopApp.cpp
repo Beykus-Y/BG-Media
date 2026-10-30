@@ -1870,11 +1870,11 @@ struct DesktopApp::Impl {
         if (mixSession) {
             const mix::LiveMixTempo live = liveMixTempoNow();
             if (live.valid && live.playing && live.bpm > 0.0) {
-                // At natural speed the analysed grid carries the real
-                // downbeats and accents. A tempo-ramped master needs a
-                // constant grid at the live tempo, anchored on its phase.
-                if (mixDanceAnalysis && live.trackId == mixDanceTrackId &&
-                    std::abs(live.rate - 1.0) < 0.005) {
+                // The dance is sampled at the source-media position, so the
+                // analysed source-time grid stays correct at any deck rate
+                // and keeps the real beat offset/downbeats. Only fall back to
+                // a constant clock when no analysis is available yet.
+                if (mixDanceAnalysis && live.trackId == mixDanceTrackId) {
                     return motion::BeatClock::fromAnalysis(*mixDanceAnalysis);
                 }
                 // The dance is sampled at the source-media position, so the

@@ -45,8 +45,10 @@ render-epoch protocol as PCM buffers.
 normalised cross-correlation search on the mid signal. Windows are **never
 resampled**, so pitch is preserved. The window is 42 ms (2016 frames at 48 kHz,
 clamped to 1024–4096), the hop is half a window, and the search range is
-window/10. Sharp transients bypass the search so drum attacks are not smeared.
-Stereo uses one shared offset, so the image does not wander.
+window/10. The search always evaluates the nominal (zero) offset, so unity-rate
+playback reconstructs the source exactly (measured relative error 0.0000 on a
+broadband signal). Sharp transients bypass the search so drum attacks are not
+smeared. Stereo uses one shared offset, so the image does not wander.
 
 `latencyFrames()` reports window/2 (≈21 ms at 48 kHz) as algorithmic
 look-ahead. The engine's EOF de-click accounts for it.
@@ -230,10 +232,12 @@ moves at the handover, so a consumer automatically follows the audible
 reference.
 
 The desktop app uses it when no video track is playing: it installs a
-`BeatClock` through the existing `DancePlayer::setGrid()` API. At natural speed
-it uses the analysed grid (downbeats and accents); during a tempo ramp it uses a
-constant clock at the live tempo, anchored on the current phase. BG Motion 3.x
-is not modified.
+`BeatClock` through the existing `DancePlayer::setGrid()` API. The dance is
+sampled at the source-media position, so the analysed source-time grid
+(downbeats, accents and beat offset) stays correct at any deck rate; the live
+tempo is already expressed by that position advancing faster. A constant
+source-time clock is only a fallback when the analysis is not available yet.
+BG Motion 3.x is not modified.
 
 ---
 
@@ -269,7 +273,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 43 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 45 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -286,7 +290,8 @@ including:
 * no tempo-sync leak into a plain crossfade (including ambiguous candidates),
   and Manual mode not inventing an adaptive ramp;
 * source-rate normalization (44.1 kHz into a 48 kHz engine), large WSOLA block
-  draining and outgoing continuity when a transition starts in place;
+  draining, one-shot state isolation and unity-rate reconstruction (relative
+  error 0.0000), and outgoing continuity when a transition starts in place;
 * live-tempo adapter and master handover;
 * render budget (10 s of audio in ≈44 ms) and the real-time control stress.
 
