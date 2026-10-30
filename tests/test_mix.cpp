@@ -78,6 +78,24 @@ std::shared_ptr<PcmTrack> toneTrack(double seconds, double frequency,
     return track;
 }
 
+std::shared_ptr<PcmTrack> stereoTrack(double seconds, double leftHz,
+                                      double rightHz, float leftAmp = 0.35f,
+                                      float rightAmp = 0.25f) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(seconds * kRate);
+    track->samples.resize(frames * 2);
+    for (std::size_t i = 0; i < frames; ++i) {
+        const double t = static_cast<double>(i) / kRate;
+        track->samples[i * 2] = static_cast<float>(
+            leftAmp * std::sin(2.0 * 3.14159265358979323846 * leftHz * t));
+        track->samples[i * 2 + 1] = static_cast<float>(
+            rightAmp * std::sin(2.0 * 3.14159265358979323846 * rightHz * t));
+    }
+    return track;
+}
+
 std::shared_ptr<PcmTrack> broadbandTrack(double seconds) {
     auto track = std::make_shared<PcmTrack>();
     track->sampleRate = kRate;
@@ -206,6 +224,10 @@ TEST_CASE("mix.crossfade_equal_power") {
     }
     CHECK_NEAR(bgmedia::mix::correlationHeadroom(0.0f), 1.0, 1e-6);
     CHECK_NEAR(bgmedia::mix::correlationHeadroom(1.0f), 0.70710678, 1e-5);
+    // Gain-aware: a silent deck must not reduce the audible one.
+    CHECK_NEAR(bgmedia::mix::correlationHeadroom(1.0f, 1.0f, 0.0f), 1.0, 1e-6);
+    CHECK_NEAR(bgmedia::mix::correlationHeadroom(1.0f, 0.7071f, 0.7071f),
+               0.70710678, 1e-4);
 }
 
 TEST_CASE("mix.engine_gapless_transition") {
@@ -1998,6 +2020,26 @@ TEST_CASE("mix.wsola_one_shot_isolated") {
     CHECK(tailAverage < -0.1f);
 }
 
+TEST_CASE("mix.wsola_dc_unity") {
+    const auto track = dcTrack(2.0, 0.4f);
+    const std::vector<float> output = renderStretch(*track, 1.0, 1.5, 0.0);
+    const std::size_t first = static_cast<std::size_t>(0.5 * kRate);
+    const std::size_t last = static_cast<std::size_t>(1.4 * kRate);
+    double sum = 0.0;
+    float minimum = 1.0f;
+    float maximum = -1.0f;
+    for (std::size_t i = first; i < last; ++i) {
+        sum += output[i * 2];
+        minimum = std::min(minimum, output[i * 2]);
+        maximum = std::max(maximum, output[i * 2]);
+    }
+    const double mean = sum / static_cast<double>(last - first);
+    std::printf("wsola DC: mean=%.5f min=%.5f max=%.5f\n", mean,
+                static_cast<double>(minimum), static_cast<double>(maximum));
+    CHECK_NEAR(mean, 0.4, 0.005);
+    CHECK(maximum - minimum < 0.01f);
+}
+
 TEST_CASE("mix.wsola_unity_reconstruction") {
     const auto track = broadbandTrack(3.0);
     const std::vector<float> output = renderStretch(*track, 1.0, 1.5, 0.0);
@@ -2049,6 +2091,275 @@ TEST_CASE("mix.wsola_sub_unity_tail_reaches_source_end") {
     CHECK(rmsRange(4.05, 4.2) < 1e-4);
     std::printf("wsola 0.25x tail: 3.0-3.8 rms=%.4f, after 4.05 rms=%.6f\n",
                 rmsRange(3.0, 3.8), rmsRange(4.05, 4.2));
+}
+
+TEST_CASE("mix.wsola_stereo_identity") {
+    const auto track = stereoTrack(2.0, 220.0, 330.0, 0.35f, 0.25f);
+    const std::vector<float> output = renderStretch(*track, 1.0, 1.5, 0.0);
+    const std::size_t first = static_cast<std::size_t>(0.30 * kRate);
+    const std::size_t last = static_cast<std::size_t>(1.40 * kRate);
+    double errorL = 0.0, errorR = 0.0, signalL = 0.0, signalR = 0.0;
+    double outL = 0.0, outR = 0.0, inL = 0.0, inR = 0.0;
+    for (std::size_t i = first; i < last; ++i) {
+        const double dl = output[i * 2] - track->samples[i * 2];
+        const double dr = output[i * 2 + 1] - track->samples[i * 2 + 1];
+        errorL += dl * dl;
+        errorR += dr * dr;
+        signalL += static_cast<double>(track->samples[i * 2]) *
+                   track->samples[i * 2];
+        signalR += static_cast<double>(track->samples[i * 2 + 1]) *
+                   track->samples[i * 2 + 1];
+        outL += static_cast<double>(output[i * 2]) * output[i * 2];
+        outR += static_cast<double>(output[i * 2 + 1]) * output[i * 2 + 1];
+        inL += static_cast<double>(track->samples[i * 2]) *
+               track->samples[i * 2];
+        inR += static_cast<double>(track->samples[i * 2 + 1]) *
+               track->samples[i * 2 + 1];
+    }
+    const double relativeL = std::sqrt(errorL / std::max(1e-12, signalL));
+    const double relativeR = std::sqrt(errorR / std::max(1e-12, signalR));
+    CHECK(relativeL < 0.01);
+    CHECK(relativeR < 0.01);
+    CHECK_NEAR(std::sqrt(outL / inL), 1.0, 0.01);
+    CHECK_NEAR(std::sqrt(outR / inR), 1.0, 0.01);
+    std::printf("wsola stereo identity: errL=%.5f errR=%.5f rmsL=%.4f rmsR=%.4f\n",
+                relativeL, relativeR, std::sqrt(outL / inL),
+                std::sqrt(outR / inR));
+}
+
+TEST_CASE("mix.wsola_stereo_ratios") {
+    const auto track = stereoTrack(2.5, 220.0, 330.0, 0.35f, 0.25f);
+    const double ratios[] = {0.90, 1.05, 1.10};
+    for (double ratio : ratios) {
+        const std::vector<float> output = renderStretch(*track, ratio, 1.8, 0.0);
+        const std::size_t first = static_cast<std::size_t>(0.40 * kRate);
+        const std::size_t last = static_cast<std::size_t>(1.60 * kRate);
+        double outL = 0.0, outR = 0.0, inL = 0.0, inR = 0.0;
+        double peak = 0.0;
+        double cross = 0.0;
+        for (std::size_t i = first; i < last; ++i) {
+            outL += static_cast<double>(output[i * 2]) * output[i * 2];
+            outR += static_cast<double>(output[i * 2 + 1]) * output[i * 2 + 1];
+            inL += static_cast<double>(track->samples[i * 2]) *
+                   track->samples[i * 2];
+            inR += static_cast<double>(track->samples[i * 2 + 1]) *
+                   track->samples[i * 2 + 1];
+            peak = std::max(peak, std::max(
+                std::abs(static_cast<double>(output[i * 2])),
+                std::abs(static_cast<double>(output[i * 2 + 1]))));
+            cross += static_cast<double>(output[i * 2]) * output[i * 2 + 1];
+        }
+        const double rmsL = std::sqrt(outL / inL);
+        const double rmsR = std::sqrt(outR / inR);
+        const double correlation =
+            std::abs(cross / std::sqrt(std::max(1e-12, outL * outR)));
+        CHECK(rmsL > 0.85);
+        CHECK(rmsL < 1.15);
+        CHECK(rmsR > 0.85);
+        CHECK(rmsR < 1.15);
+        CHECK(peak < 0.9);
+        CHECK(correlation < 0.5);
+        std::printf("wsola stereo %.2fx: rmsL=%.4f rmsR=%.4f corr=%.3f peak=%.3f\n",
+                    ratio, rmsL, rmsR, correlation, peak);
+    }
+}
+
+TEST_CASE("mix.wsola_hop_boundary_continuity") {
+    const auto track = stereoTrack(2.5, 1000.0, 1500.0, 0.35f, 0.25f);
+    const std::vector<float> output = renderStretch(*track, 1.10, 2.0, 0.0);
+    float largestStep = 0.0f;
+    std::size_t zeroRuns = 0;
+    for (std::size_t i = 2; i < output.size(); i += 2) {
+        largestStep = std::max(largestStep, std::abs(output[i] - output[i - 2]));
+        if (output[i] == 0.0f && output[i - 2] != 0.0f) {
+            ++zeroRuns;
+        }
+    }
+    CHECK(largestStep < 0.20f);
+    CHECK(zeroRuns < 8);
+    std::printf("wsola hop continuity: maxStep=%.4f zeroStarts=%zu\n",
+                static_cast<double>(largestStep), zeroRuns);
+}
+
+TEST_CASE("mix.wsola_mono_and_inverted_stereo") {
+    auto mono = toneTrack(2.0, 440.0, 1);
+    const std::vector<float> monoOut = renderStretch(*mono, 1.0, 1.5, 0.0);
+    double monoEnergy = 0.0;
+    for (std::size_t i = static_cast<std::size_t>(0.3 * kRate);
+         i < static_cast<std::size_t>(1.4 * kRate); ++i) {
+        CHECK(monoOut[i * 2] == monoOut[i * 2 + 1]);
+        monoEnergy += static_cast<double>(monoOut[i * 2]) * monoOut[i * 2];
+    }
+    const double monoRms = std::sqrt(
+        monoEnergy / static_cast<double>(1.1 * kRate));
+    CHECK_NEAR(monoRms, 0.4 / std::sqrt(2.0), 0.01);
+
+    auto inverted = stereoTrack(2.0, 220.0, 220.0, 0.4f, 0.4f);
+    for (std::size_t i = 0; i < inverted->frameCount(); ++i) {
+        inverted->samples[i * 2 + 1] = -inverted->samples[i * 2];
+    }
+    const std::vector<float> invertedOut =
+        renderStretch(*inverted, 1.0, 1.5, 0.0);
+    double invertedEnergy = 0.0;
+    for (std::size_t i = static_cast<std::size_t>(0.3 * kRate);
+         i < static_cast<std::size_t>(1.4 * kRate); ++i) {
+        CHECK_NEAR(invertedOut[i * 2], -invertedOut[i * 2 + 1], 1e-5);
+        invertedEnergy += static_cast<double>(invertedOut[i * 2]) *
+                          invertedOut[i * 2];
+    }
+    CHECK_NEAR(std::sqrt(invertedEnergy / static_cast<double>(1.1 * kRate)),
+               0.4 / std::sqrt(2.0), 0.01);
+    std::printf("wsola mono rms=%.4f inverted rms=%.4f\n", monoRms,
+                std::sqrt(invertedEnergy / static_cast<double>(1.1 * kRate)));
+}
+
+TEST_CASE("mix.engine_never_rewinds_playing_deck") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 61, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 62, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 1.0, nullptr);
+    const double before = engine.snapshot().decks[0].positionSeconds;
+
+    MixPlan plan = crossfadePlan(engine, 2.0, 0.0);
+    // The planner asked for a point 200 ms behind the current cursor. The
+    // engine must not rewind; it starts the fade here instead.
+    plan.transitionStartA = before - 0.2;
+    plan.transitionEndA = plan.transitionStartA + 2.0;
+    plan.tempoRampStartA = before - 0.2;
+    plan.preTransitionSeconds = 0.0;
+    CHECK(engine.startTransition(plan));
+    std::vector<float> block(480 * 2, 0.0f);
+    engine.render(block.data(), 480);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.decks[0].positionSeconds >= before - 0.001);
+    CHECK(snap.phase == TransitionPhase::Running);
+    float minimum = 1.0f;
+    for (int i = 0; i < 100; ++i) {
+        minimum = std::min(minimum, std::abs(block[i * 2]));
+    }
+    // No reset hole and no correlation-headroom dip while B is still silent.
+    CHECK(minimum > 0.30f);
+    std::printf("no rewind: before=%.3f after=%.3f firstMin=%.4f\n", before,
+                snap.decks[0].positionSeconds, static_cast<double>(minimum));
+}
+
+TEST_CASE("mix.engine_correlation_headroom_at_midpoint") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 67, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 68, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.1, nullptr);
+    CHECK(engine.startTransition(crossfadePlan(engine, 2.0, 0.0)));
+    renderSeconds(engine, 1.0, nullptr);
+    std::vector<float> block(480 * 2, 0.0f);
+    engine.render(block.data(), 480);
+    // Two identical decks at the 50% point would sum to +6 dB without
+    // headroom; the correlated gain must keep the level at the source level.
+    CHECK_NEAR(block[0], 0.4f, 0.02f);
+    std::printf("correlated midpoint: %.4f\n",
+                static_cast<double>(block[0]));
+}
+
+TEST_CASE("mix.engine_future_start_waits_without_seek") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 63, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 64, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 1.0, nullptr);
+    const double before = engine.snapshot().decks[0].positionSeconds;
+
+    MixPlan plan = crossfadePlan(engine, 2.0, 0.0);
+    plan.transitionStartA = before + 0.25;
+    plan.transitionEndA = plan.transitionStartA + 2.0;
+    plan.tempoRampStartA = before + 0.25;
+    plan.preTransitionSeconds = 0.0;
+    CHECK(engine.startTransition(plan));
+
+    renderSeconds(engine, 0.10, nullptr);
+    bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.stage == TransitionStage::Preparing);
+    CHECK(!snap.decks[1].playing);
+    CHECK(snap.decks[0].positionSeconds >= before + 0.08);
+    CHECK(snap.decks[0].positionSeconds <= before + 0.12);
+
+    renderSeconds(engine, 0.30, nullptr);
+    snap = engine.snapshot();
+    CHECK(snap.phase == TransitionPhase::Running);
+    CHECK(snap.stage == TransitionStage::Mixing ||
+          snap.stage == TransitionStage::Handover);
+    CHECK(snap.decks[1].playing);
+    CHECK(snap.decks[0].positionSeconds > before + 0.30);
+    std::printf("future start: before=%.3f at0.1=%.3f stage0=%d at0.4=%.3f\n",
+                before, before + 0.10, static_cast<int>(snap.stage),
+                snap.decks[0].positionSeconds);
+}
+
+TEST_CASE("mix.engine_future_start_block_sizes") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(10.0, 0.4f);
+    auto b = dcTrack(10.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, a, 65, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 66, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.5, nullptr);
+    const double before = engine.snapshot().decks[0].positionSeconds;
+    MixPlan plan = crossfadePlan(engine, 1.5, 0.0);
+    plan.transitionStartA = before + 0.15;
+    plan.transitionEndA = plan.transitionStartA + 1.5;
+    plan.tempoRampStartA = before + 0.15;
+    plan.preTransitionSeconds = 0.0;
+    CHECK(engine.startTransition(plan));
+
+    const std::size_t sizes[] = {1, 7, 32, 63, 128, 256, 480, 512, 1000};
+    std::vector<float> buffer(1000 * 2, 0.0f);
+    double previous = before;
+    std::size_t nonFinite = 0;
+    bool bStarted = false;
+    for (int i = 0; i < 300; ++i) {
+        const std::size_t frames = sizes[i % 9];
+        engine.render(buffer.data(), frames);
+        for (std::size_t f = 0; f < frames * 2; ++f) {
+            if (!std::isfinite(buffer[f])) {
+                ++nonFinite;
+            }
+        }
+        const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+        CHECK(snap.decks[0].positionSeconds >= previous - 0.001);
+        previous = snap.decks[0].positionSeconds;
+        bStarted = bStarted || snap.decks[1].playing;
+    }
+    CHECK(nonFinite == 0);
+    CHECK(bStarted);
+    CHECK(engine.snapshot().decks[0].positionSeconds > before + 0.15);
+}
+
+TEST_CASE("mix.planner_execution_snaps_forward") {
+    PlannerConfig config;
+    config.tempoRampMode = TempoRampMode::Off;
+    MixPlanner planner(config);
+    const AnalysisResult a = analysisFor(120.0);
+    const double positions[] = {10.01, 10.20, 10.24, 10.49, 10.50, 10.51};
+    for (double position : positions) {
+        PlanRequest request;
+        request.type = TransitionType::SmartCrossfade;
+        request.requestedDuration = 4.0;
+        request.currentPositionA = position;
+        const MixPlan plan = planner.plan(a, analysisFor(120.0), request);
+        CHECK(plan.valid);
+        const double start = plan.overallStartA();
+        // Never rewind, and never wait more than one beat (0.5 s at 120 BPM).
+        CHECK(start >= position - 0.021);
+        CHECK(start <= position + 0.51);
+        std::printf("execution snap %.2f -> %.3f (%.1f ms ahead)\n", position,
+                    start, (start - position) * 1000.0);
+    }
 }
 
 TEST_CASE("mix.engine_resamples_source_rate") {

@@ -132,6 +132,63 @@ bool findGridPoint(const AnalysisResult& analysis, double target,
     return true;
 }
 
+// Next grid point at or after `target` (with a 20 ms grace for a point that is
+// already under the cursor). Used for an already-playing deck: the transition
+// may wait for the next beat, but it never seeks backwards.
+bool nextGridPoint(const AnalysisResult& analysis, double target,
+                   bool preferDownbeat, double maxWait, double* time,
+                   bool* downbeat, double* errorMs) {
+    if (analysis.beats.empty()) {
+        return false;
+    }
+    const double from = target - 0.020;
+    const double to = target + std::max(0.02, maxWait);
+    auto it = std::lower_bound(
+        analysis.beats.begin(), analysis.beats.end(), from,
+        [](const Beat& beat, double value) { return beat.time < value; });
+    int start = static_cast<int>(it - analysis.beats.begin());
+    if (start >= static_cast<int>(analysis.beats.size())) {
+        return false;
+    }
+    int chosen = -1;
+    if (preferDownbeat) {
+        for (int i = start; i < static_cast<int>(analysis.beats.size()); ++i) {
+            const Beat& beat = analysis.beats[static_cast<std::size_t>(i)];
+            if (beat.time > to) {
+                break;
+            }
+            if (beat.downbeat) {
+                chosen = i;
+                break;
+            }
+        }
+    }
+    if (chosen < 0) {
+        for (int i = start; i < static_cast<int>(analysis.beats.size()); ++i) {
+            const Beat& beat = analysis.beats[static_cast<std::size_t>(i)];
+            if (beat.time > to) {
+                break;
+            }
+            chosen = i;
+            break;
+        }
+    }
+    if (chosen < 0) {
+        return false;
+    }
+    const Beat& beat = analysis.beats[static_cast<std::size_t>(chosen)];
+    if (time) {
+        *time = beat.time;
+    }
+    if (downbeat) {
+        *downbeat = beat.downbeat;
+    }
+    if (errorMs) {
+        *errorMs = (beat.time - target) * 1000.0;
+    }
+    return true;
+}
+
 float compositeConfidence(const AnalysisResult& a, const AnalysisResult& b,
                           bool useDownbeats) {
     if (a.empty() || b.empty()) {
@@ -520,6 +577,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     plan.confidence = compositeConfidence(a, b, downbeats);
     const bool lowConfidence = plan.confidence < config_.minConfidence;
     const bool grids = !a.beats.empty() && !b.beats.empty();
+    const bool execution = request.currentPositionA >= 0.0;
     const int bpbA = a.beatsPerBar >= 2 ? a.beatsPerBar : 4;
     const int bpbB = b.beatsPerBar >= 2 ? b.beatsPerBar : 4;
     const int phraseBars = std::clamp(config_.phraseBars, 2, 16);
@@ -666,15 +724,25 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
 
     if (request.currentPositionA >= 0.0) {
         overallStartA = std::min(request.currentPositionA, a.info.duration);
-        // Snap the ramp start to the outgoing grid when it is close. Snapping
-        // backwards is allowed because the engine seeks the deck to the plan.
+        // A playing deck is never seeked backwards. Snap forward to the next
+        // beat/downbeat (at most one beat away); the engine waits for that
+        // event, so the source timeline stays continuous.
         if (grids && plan.confidence >= config_.minConfidence) {
+            const double beatSeconds = 60.0 / std::max(1.0, localBpmA);
             double aligned = 0.0;
+            bool alignedDownbeat = false;
             double error = 0.0;
-            if (findGridPoint(a, overallStartA, downbeats, &aligned, nullptr,
-                              &error) &&
-                std::abs(error) <= 0.25 * 1000.0) {
+            if (nextGridPoint(a, overallStartA, downbeats,
+                              beatSeconds * 1.25, &aligned,
+                              &alignedDownbeat, &error)) {
                 overallStartA = aligned;
+                plan.reasons.push_back(format(
+                    alignedDownbeat
+                        ? "A start: waits for the next downbeat at %.3f s "
+                          "(%.1f ms ahead)"
+                        : "A start: waits for the next beat at %.3f s "
+                          "(%.1f ms ahead)",
+                    overallStartA, std::max(0.0, error)));
             }
         }
         crossfadeStartA = overallStartA + (ramp ? rampMediaSeconds : 0.0);
@@ -916,7 +984,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             snapped = true;
             snappedDownbeat = false;
         }
-        if (snapped &&
+        if (snapped && (!execution || aligned >= crossfadeStartA - 0.020) &&
             overallStartA + (aligned - crossfadeStartA) >= 0.0) {
             const double shift = aligned - crossfadeStartA;
             crossfadeStartA = aligned;

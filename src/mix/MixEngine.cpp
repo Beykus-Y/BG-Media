@@ -390,6 +390,9 @@ TransitionStage MixEngine::liveStage() const noexcept {
         return TransitionStage::Cancelled;
     }
     if (phase == static_cast<int>(Phase::Running)) {
+        if (framesRendered_ < runtime_.rampStartFrame) {
+            return TransitionStage::Preparing;
+        }
         if (framesRendered_ < runtime_.crossfadeStartFrame) {
             const double remaining =
                 static_cast<double>(runtime_.crossfadeStartFrame - framesRendered_) /
@@ -442,14 +445,43 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     runtime_.beatPhaseErrorMs = plan.beatPhaseErrorMs;
     runtime_.tempoRatioB =
         std::clamp(plan.tempoRatioB, 0.75, 1.33);
-    runtime_.startFrame = frame;
 
     const double sampleRate = static_cast<double>(outputSampleRate_);
     const double seconds = std::max(0.0, plan.duration);
     const double preSeconds =
         runtime_.directCut ? 0.0 : std::max(0.0, plan.preTransitionSeconds);
+
+    DeckRuntime& from = decks_[deckIndex(runtime_.from)];
+    DeckRuntime& to = decks_[deckIndex(runtime_.to)];
+    const bool fromWasPlaying = from.playing;
+    const PcmTrack* fromSource = from.audio.load(std::memory_order_acquire);
+    double cueA = runtime_.directCut ? plan.transitionStartA
+                                     : plan.overallStartA();
+    const double currentMedia =
+        fromSource && fromSource->sampleRate > 0
+            ? from.positionFrames / static_cast<double>(fromSource->sampleRate)
+            : 0.0;
+
+    // A playing deck is never seeked backwards. If the planner selected a
+    // future musical event, wait for it; if it selected a point slightly
+    // behind the current cursor, start the ramp here instead of repeating
+    // audio. The crossfade boundary shifts with the actual ramp start.
+    std::uint64_t rampStartFrame = frame;
+    if (fromWasPlaying) {
+        if (cueA < currentMedia - 1e-6) {
+            cueA = currentMedia;
+        }
+        const double delaySeconds =
+            std::max(0.0, cueA - currentMedia) /
+            std::max(0.25, from.requestedRate.load(std::memory_order_acquire));
+        rampStartFrame += static_cast<std::uint64_t>(
+            std::llround(delaySeconds * sampleRate));
+    }
+    runtime_.startFrame = rampStartFrame;
+    runtime_.rampStartFrame = rampStartFrame;
     runtime_.crossfadeStartFrame =
-        frame + static_cast<std::uint64_t>(std::llround(preSeconds * sampleRate));
+        rampStartFrame +
+        static_cast<std::uint64_t>(std::llround(preSeconds * sampleRate));
     runtime_.endFrame =
         runtime_.crossfadeStartFrame +
         static_cast<std::uint64_t>(std::llround(seconds * sampleRate));
@@ -476,31 +508,24 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
         runtime_.eqIn[i] = plan.eqCurveIn[static_cast<std::size_t>(i)];
     }
 
-    DeckRuntime& from = decks_[deckIndex(runtime_.from)];
-    DeckRuntime& to = decks_[deckIndex(runtime_.to)];
-    const bool fromWasPlaying = from.playing;
-    // The outgoing deck starts at the beginning of the pre-roll, which may be
-    // earlier than the crossfade cue. `overallStartA()` handles both 0.1 plans
-    // (no pre-roll) and 0.2 plans (ramp before the overlay).
-    const double cueA = runtime_.directCut ? plan.transitionStartA
-                                           : plan.overallStartA();
-    double targetFromFrames = from.positionFrames;
-    if (const PcmTrack* source = from.audio.load(std::memory_order_acquire)) {
-        targetFromFrames = std::clamp(cueA, 0.0, source->duration()) *
-                           source->sampleRate;
+    // A playing deck keeps its cursor, WSOLA history and EQ state. A stopped
+    // deck is cued to the planned point. This is what makes NEXT/auto-start
+    // continuous instead of a hidden rewind.
+    if (!fromWasPlaying) {
+        double targetFromFrames = from.positionFrames;
+        if (fromSource) {
+            targetFromFrames = std::clamp(cueA, 0.0, fromSource->duration()) *
+                               fromSource->sampleRate;
+        }
+        from.positionFrames = targetFromFrames;
+        resetStretchStream(runtime_.from, from.positionFrames);
+        from.eq.reset();
     }
-    // A transition that starts exactly where the deck already is must keep the
-    // WSOLA overlap history. Resetting the stream would restart the Hann
-    // window from silence and punch a ~21 ms hole into the outgoing deck.
-    const bool fromContinuous =
-        from.playing && std::abs(targetFromFrames - from.positionFrames) <= 1.0;
-    from.positionFrames = targetFromFrames;
     from.playing = true;
     from.ended = false;
     from.fade = fromWasPlaying ? 1.0f : 0.0f;
     from.rate = 1.0;
     from.rampRate = 1.0;
-    from.eq.reset();
     // The incoming deck is prepared but stays stopped until the crossfade
     // boundary so its first beat lands exactly on the overlay start.
     to.positionFrames = plan.startB;
@@ -516,9 +541,6 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     to.eq.reset();
     to.targetPlay.store(false, std::memory_order_release);
     from.targetPlay.store(true, std::memory_order_release);
-    if (!fromContinuous) {
-        resetStretchStream(runtime_.from, from.positionFrames);
-    }
     resetStretchStream(runtime_.to, to.positionFrames);
     incomingStarted_ = false;
 
@@ -911,7 +933,19 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                 rho = std::clamp(rho, 0.0f, 1.0f);
             }
         }
-        const float headroom = correlationHeadroom(rho);
+        float headroom = 1.0f;
+        if (running || cancelling) {
+            const float gainA = 0.5f * (gainFrom0 + gainFrom1);
+            const float gainB = 0.5f * (gainTo0 + gainTo1);
+            const float target = correlationHeadroom(rho, gainA, gainB);
+            const float coefficient =
+                1.0f - std::exp(-static_cast<float>(chunk) /
+                                (0.030f * static_cast<float>(outputSampleRate_)));
+            headroomSmoothed_ += (target - headroomSmoothed_) * coefficient;
+            headroom = headroomSmoothed_;
+        } else {
+            headroomSmoothed_ = 1.0f;
+        }
 
         float peak = 0.0f;
         for (std::size_t i = 0; i < chunk; ++i) {

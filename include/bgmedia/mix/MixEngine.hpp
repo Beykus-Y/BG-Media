@@ -87,6 +87,7 @@ private:
         DeckId from = DeckId::A;
         DeckId to = DeckId::B;
         std::uint64_t startFrame = 0;          // ramp / overall start
+        std::uint64_t rampStartFrame = 0;      // pre-roll begins (may be delayed)
         std::uint64_t crossfadeStartFrame = 0; // overlay begins
         std::uint64_t endFrame = 0;            // overlay ends
         double startB = 0.0;
@@ -225,6 +226,7 @@ private:
     float pauseFade_ = 0.0f;
     std::uint64_t framesRendered_ = 0;
     bool handoverDone_ = false;
+    float headroomSmoothed_ = 1.0f;
     float limiterGain_ = 1.0f;
     float outputPeak_ = 0.0f;
     std::vector<float> scratchA_;

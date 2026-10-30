@@ -27,6 +27,20 @@ namespace bgmedia::mix {
     return 1.0f / std::sqrt(1.0f + rho);
 }
 
+// Gain-aware version. Correlation only matters when both decks are actually
+// audible: at the very start or end of a fade one gain is near zero, and
+// reducing the other deck there would create an audible level dip.
+[[nodiscard]] inline float correlationHeadroom(float rho, float gainA,
+                                               float gainB) noexcept {
+    const float sum = gainA + gainB;
+    if (sum <= 1e-6f) {
+        return 1.0f;
+    }
+    const float balance =
+        2.0f * std::sqrt(std::max(0.0f, gainA * gainB)) / sum;
+    return correlationHeadroom(std::clamp(rho * balance, 0.0f, 1.0f));
+}
+
 // Smooth 0..1 ramp used by tempo automation and de-click envelopes.
 [[nodiscard]] inline double smoothStep(double t) noexcept {
     t = std::clamp(t, 0.0, 1.0);

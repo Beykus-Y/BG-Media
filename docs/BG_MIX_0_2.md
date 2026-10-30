@@ -220,6 +220,15 @@ and `Cancelled` after a reverse fade.
    outgoing rate back to 1.0, returns the EQ to unity, and never starts the
    incoming deck if the cancel happened during pre-roll.
 
+An already-playing deck is **never seeked backwards**. For a manual NEXT or an
+automatic start the planner snaps to the next beat/downbeat (at most one beat
+ahead); the engine waits for that future event and starts the pre-roll there.
+If the requested cue is slightly behind the cursor, the engine starts at the
+cursor instead of repeating audio. The outgoing WSOLA history and EQ state are
+preserved. Correlation headroom is gain-aware (a silent incoming deck cannot
+duck the outgoing one) and smoothed over 30 ms; the limiter is a safety net, not
+a compressor, and a host can leave 3–4 dB of deck-gain headroom on loud masters.
+
 Pause, resume, seek, next, stop, cancel, deck load/clear, decode failure and EOF
 are covered by the existing serial-based control protocol; the pre-roll adds no
 new shared state. A PCM shortage or EOF still fades to silence; the incoming
@@ -286,7 +295,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 49 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 59 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -308,6 +317,10 @@ including:
   0.0000), EOF tail drain to silence at unity and at 0.25× (the stretched tail
   reaches 4.0 s for a 1 s source), and outgoing continuity when a transition
   starts in place;
+* stereo WSOLA identity/ratios/hop continuity, mono and inverted-stereo
+  handling, gain-aware correlation headroom at the start and midpoint, no
+  backwards seek for a playing deck, future-start waiting, arbitrary block
+  sizes around the boundary, and forward-only planner snapping;
 * incoming-rate fitting: an 8 s source at `tempoRatioB = 1.25` shortens the
   fade to 6.74 s so `endB` is exactly the source end;
 * live-tempo adapter and master handover;
