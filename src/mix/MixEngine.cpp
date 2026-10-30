@@ -18,6 +18,50 @@ float sanitize(float value) {
     return std::isfinite(value) ? value : 0.0f;
 }
 
+// Control-thread sample-rate conversion. WSOLA copies source windows without
+// resampling them, so a track recorded at a different rate must be normalized
+// before it reaches the stretcher; otherwise the pitch would be wrong even at
+// playback rate 1.0. Catmull-Rom keeps the conversion clean enough for music.
+std::shared_ptr<const PcmTrack> resampleTrack(
+    const std::shared_ptr<const PcmTrack>& source, std::uint32_t targetRate) {
+    if (!source || targetRate == 0 || source->sampleRate == targetRate) {
+        return source;
+    }
+    auto converted = std::make_shared<PcmTrack>();
+    converted->sampleRate = targetRate;
+    converted->channels = source->channels;
+    const double ratio =
+        static_cast<double>(targetRate) / static_cast<double>(source->sampleRate);
+    const std::size_t sourceFrames = source->frameCount();
+    const std::size_t outFrames = std::max<std::size_t>(
+        1, static_cast<std::size_t>(std::llround(
+               static_cast<double>(sourceFrames) * ratio)));
+    converted->samples.resize(outFrames * source->channels);
+    const std::size_t last = sourceFrames > 0 ? sourceFrames - 1 : 0;
+    auto at = [&](std::size_t frame, std::uint32_t channel) {
+        const std::size_t clamped = std::min(frame, last);
+        return sanitize(source->samples[clamped * source->channels + channel]);
+    };
+    for (std::size_t i = 0; i < outFrames; ++i) {
+        const double position =
+            static_cast<double>(i) / std::max(1e-9, ratio);
+        const auto index = static_cast<std::size_t>(position);
+        const float frac = static_cast<float>(position - static_cast<double>(index));
+        for (std::uint32_t c = 0; c < source->channels; ++c) {
+            const float p0 = at(index > 0 ? index - 1 : 0, c);
+            const float p1 = at(index, c);
+            const float p2 = at(index + 1, c);
+            const float p3 = at(index + 2, c);
+            const float a = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+            const float b = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+            const float cc = -0.5f * p0 + 0.5f * p2;
+            const float value = ((a * frac + b) * frac + cc) * frac + p1;
+            converted->samples[i * source->channels + c] = sanitize(value);
+        }
+    }
+    return converted;
+}
+
 } // namespace
 
 MixEngine::MixEngine(std::uint32_t outputSampleRate)
@@ -57,11 +101,14 @@ bool MixEngine::loadDeck(DeckId deck, std::shared_ptr<const PcmTrack> track,
         return false;
     }
     DeckRuntime& runtime = decks_[deckIndex(deck)];
+    // Normalize to the engine rate on the control thread before publishing.
+    std::shared_ptr<const PcmTrack> prepared =
+        resampleTrack(track, outputSampleRate_);
     // Ownership is handed over on the control thread, but the old buffer stays
     // in the retire list until the callback heartbeat proves that no in-flight
     // render can still hold a raw pointer to it.
     std::shared_ptr<const PcmTrack> previous = std::move(runtime.owned);
-    runtime.owned = std::move(track);
+    runtime.owned = std::move(prepared);
     runtime.audio.store(runtime.owned.get(), std::memory_order_release);
     retireTrack(deck, std::move(previous));
     runtime.trackId.store(trackId, std::memory_order_release);
@@ -129,11 +176,14 @@ void MixEngine::rebuildStretchStreams() {
         std::shared_ptr<ITimeStretchStream> previous =
             std::move(streamOwned_[i]);
         streamOwned_[i] = stretchOwned_->createStream(outputSampleRate_);
-        stream_[i].store(streamOwned_[i].get(), std::memory_order_release);
-        retireStream(std::move(previous));
+        // Reset before publication. Once the callback can observe the pointer,
+        // its mutable ring/overlap state belongs exclusively to the audio
+        // thread; resetting afterwards would race with render().
         if (streamOwned_[i]) {
             streamOwned_[i]->reset(0.0);
         }
+        stream_[i].store(streamOwned_[i].get(), std::memory_order_release);
+        retireStream(std::move(previous));
     }
     reclaimRetired();
 }
@@ -434,10 +484,17 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     // (no pre-roll) and 0.2 plans (ramp before the overlay).
     const double cueA = runtime_.directCut ? plan.transitionStartA
                                            : plan.overallStartA();
+    double targetFromFrames = from.positionFrames;
     if (const PcmTrack* source = from.audio.load(std::memory_order_acquire)) {
-        from.positionFrames = std::clamp(cueA, 0.0, source->duration()) *
-                              source->sampleRate;
+        targetFromFrames = std::clamp(cueA, 0.0, source->duration()) *
+                           source->sampleRate;
     }
+    // A transition that starts exactly where the deck already is must keep the
+    // WSOLA overlap history. Resetting the stream would restart the Hann
+    // window from silence and punch a ~21 ms hole into the outgoing deck.
+    const bool fromContinuous =
+        from.playing && std::abs(targetFromFrames - from.positionFrames) <= 1.0;
+    from.positionFrames = targetFromFrames;
     from.playing = true;
     from.ended = false;
     from.fade = fromWasPlaying ? 1.0f : 0.0f;
@@ -459,7 +516,9 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     to.eq.reset();
     to.targetPlay.store(false, std::memory_order_release);
     from.targetPlay.store(true, std::memory_order_release);
-    resetStretchStream(runtime_.from, from.positionFrames);
+    if (!fromContinuous) {
+        resetStretchStream(runtime_.from, from.positionFrames);
+    }
     resetStretchStream(runtime_.to, to.positionFrames);
     incomingStarted_ = false;
 

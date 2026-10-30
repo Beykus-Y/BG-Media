@@ -103,15 +103,24 @@ public:
         sourcePosition_ =
             std::max(0.0, positionFrames + static_cast<double>(ringCount_) * average);
 
-        while (ringCount_ < outFrames) {
-            generate(track, average);
-        }
-
-        for (std::size_t i = 0; i < outFrames; ++i) {
-            out[i * 2] = ring_[ringRead_ * 2];
-            out[i * 2 + 1] = ring_[ringRead_ * 2 + 1];
-            ringRead_ = (ringRead_ + 1) % capacity_;
-            --ringCount_;
+        // Generate and drain incrementally. The ring has a fixed capacity, so
+        // filling it before draining would deadlock for any request larger
+        // than the ring (for example a one-shot 48 kHz second).
+        std::size_t written = 0;
+        while (written < outFrames) {
+            while (ringCount_ == 0) {
+                generate(track, average);
+            }
+            const std::size_t chunk =
+                std::min(outFrames - written, ringCount_);
+            for (std::size_t i = 0; i < chunk; ++i) {
+                const std::size_t index = written + i;
+                out[index * 2] = ring_[ringRead_ * 2];
+                out[index * 2 + 1] = ring_[ringRead_ * 2 + 1];
+                ringRead_ = (ringRead_ + 1) % capacity_;
+                --ringCount_;
+            }
+            written += chunk;
         }
 
         for (std::size_t i = 0; i < outFrames; ++i) {
