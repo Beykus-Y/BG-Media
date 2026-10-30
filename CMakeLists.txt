@@ -65,6 +65,12 @@ add_library(bgmedia_core STATIC
     src/cache/AnalysisCache.cpp
     src/sync/PlaybackClock.cpp
     src/choreography/Choreography.cpp
+    src/mix/MixTypes.cpp
+    src/mix/PcmTrack.cpp
+    src/mix/TimeStretch.cpp
+    src/mix/MixPlanner.cpp
+    src/mix/MixEngine.cpp
+    src/mix/MixSession.cpp
 )
 add_library(BGMedia::Core ALIAS bgmedia_core)
 target_include_directories(bgmedia_core
@@ -78,6 +84,8 @@ target_compile_features(bgmedia_core PUBLIC cxx_std_20)
 target_compile_options(bgmedia_core PRIVATE ${BGMEDIA_WARNING_FLAGS})
 target_include_directories(bgmedia_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
 target_sources(bgmedia_core PRIVATE $<TARGET_OBJECTS:bgmedia_kissfft>)
+find_package(Threads REQUIRED)
+target_link_libraries(bgmedia_core PUBLIC Threads::Threads)
 if(MSVC)
     target_compile_definitions(bgmedia_core PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

@@ -1,0 +1,161 @@
+#pragma once
+
+// BG Mix session: queue, background preparation and deck scheduling on top of
+// the real-time MixEngine. It is UI-agnostic; the desktop app supplies a decode
+// + BG Beat preparation callback and pumps update() once per frame.
+
+#include "bgmedia/analysis/AnalysisResult.hpp"
+#include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixPlanner.hpp"
+#include "bgmedia/mix/MixTypes.hpp"
+#include "bgmedia/mix/PcmTrack.hpp"
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+namespace bgmedia::mix {
+
+struct PreparedMixTrack {
+    std::shared_ptr<const PcmTrack> audio;
+    std::shared_ptr<const AnalysisResult> analysis;
+};
+
+// Returns false with `error` set on failure. The progress callback may be
+// invoked from the preparation thread.
+using MixPrepareCallback = std::function<bool(
+    const std::filesystem::path&, PreparedMixTrack&, std::string& error,
+    std::function<void(float, std::string_view)> progress)>;
+
+class MixSession {
+public:
+    MixSession(MixEngine& engine, MixPrepareCallback prepare,
+               MixPlanner planner = MixPlanner{});
+    ~MixSession();
+
+    MixSession(const MixSession&) = delete;
+    MixSession& operator=(const MixSession&) = delete;
+
+    // Queue management. addTrack returns 0 when the path is empty.
+    std::uint64_t addTrack(const std::filesystem::path& path);
+    std::vector<std::uint64_t> addTracks(
+        const std::vector<std::filesystem::path>& paths);
+    bool removeTrack(std::uint64_t id);
+    void clearQueue();
+
+    // Transport.
+    void play();
+    void pause();
+    void next();                  // manual transition with a smooth crossfade
+    void startTransitionNow();    // same, but always uses the current plan
+    void cancelTransition();
+    void stopAll();
+
+    void setTransitionType(TransitionType type);
+    void setTransitionDuration(double seconds);  // 0 = automatic
+    void setAdaptive(bool enabled);
+    void setTempoRampEnabled(bool enabled);
+    void setTempoRampMaxPercent(double percent);
+    void setAutoQueue(bool enabled);
+
+    [[nodiscard]] TransitionType transitionType() const noexcept { return type_; }
+    [[nodiscard]] double transitionDuration() const noexcept { return duration_; }
+    [[nodiscard]] bool adaptive() const noexcept { return adaptive_; }
+    [[nodiscard]] bool tempoRampEnabled() const noexcept { return tempoRamp_; }
+    [[nodiscard]] double tempoRampMaxPercent() const noexcept {
+        return rampMaxPercent_;
+    }
+    [[nodiscard]] bool autoQueue() const noexcept { return autoQueue_; }
+
+    // Must be called from the UI thread every frame.
+    void update();
+
+    [[nodiscard]] MixSessionSnapshot snapshot() const;
+    [[nodiscard]] std::shared_ptr<const AnalysisResult> deckAnalysis(
+        DeckId deck) const;
+    [[nodiscard]] std::string deckName(DeckId deck) const;
+    [[nodiscard]] MixEngine& engine() noexcept { return engine_; }
+
+private:
+    struct Item {
+        std::uint64_t id = 0;
+        std::filesystem::path path;
+        std::string name;
+        QueueState state = QueueState::Pending;
+        float progress = 0.0f;
+        std::shared_ptr<const PcmTrack> audio;
+        std::shared_ptr<const AnalysisResult> analysis;
+        std::string error;
+    };
+
+    struct CompletedJob {
+        std::uint64_t id = 0;
+        bool ok = false;
+        PreparedMixTrack prepared;
+        std::string error;
+    };
+
+    [[nodiscard]] Item* findItem(std::uint64_t id);
+    [[nodiscard]] const Item* findItem(std::uint64_t id) const;
+    void workerLoop();
+    void startWorkerIfNeeded();
+    void collectCompleted();
+    void serviceDecks();
+    void handleTransitionCompletion();
+    void refreshPlan();
+    [[nodiscard]] double deckPosition(DeckId deck) const;
+    [[nodiscard]] DeckId masterDeck() const;
+    [[nodiscard]] double deckDuration(DeckId deck) const;
+    [[nodiscard]] std::uint64_t loadedId(DeckId deck) const;
+    void installDeck(DeckId deck, const Item& item);
+    void startPlannedTransition(double durationOverride, bool automatic);
+    [[nodiscard]] MixPlan buildPlan(DeckId from, DeckId to,
+                                    const MixSnapshot& snap,
+                                    double durationOverride, bool automatic);
+
+    MixEngine& engine_;
+    MixPrepareCallback prepare_;
+    MixPlanner planner_;
+
+    mutable std::mutex mutex_;  // protects items_ and preview_/status strings
+    std::vector<Item> items_;
+    std::uint64_t nextId_ = 1;
+    std::uint64_t currentId_ = 0;
+    std::uint64_t lastCompleted_ = 0;
+
+    TransitionType type_ = TransitionType::SmartCrossfade;
+    double duration_ = 0.0;
+    bool adaptive_ = true;
+    bool tempoRamp_ = false;
+    double rampMaxPercent_ = 6.0;
+    bool autoQueue_ = true;
+    bool autoPlay_ = false;
+    bool nextRequested_ = false;
+    bool clearDecksRequested_ = false;
+    std::string status_;
+    std::string lastError_;
+    MixPlan preview_;
+
+    std::thread worker_;
+    std::mutex jobMutex_;
+    std::condition_variable jobCv_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> jobRunning_{false};
+    bool jobActive_ = false;
+    std::uint64_t jobId_ = 0;
+    std::filesystem::path jobPath_;
+    std::uint64_t preparingId_ = 0;
+    std::atomic<float> preparingProgress_{0.0f};
+    std::string preparingStage_;
+    std::vector<CompletedJob> completed_;
+};
+
+} // namespace bgmedia::mix
