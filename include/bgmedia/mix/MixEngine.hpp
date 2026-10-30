@@ -59,6 +59,16 @@ public:
     void setPaused(bool paused);
     [[nodiscard]] bool paused() const noexcept;
 
+    // Full stop: freezes the transport, clears both play requests and drops an
+    // active transition. Unlike setPaused() this is a one-way request; the
+    // callback settles deck state before its paused early-out.
+    void stop();
+
+    // Control thread: frees tracks that the audio callback can no longer
+    // reference. Tracks replaced by loadDeck()/clearDeck() are retained until
+    // the render epoch proves that at least one callback started afterwards.
+    void reclaimRetired();
+
     void setOutputLatency(double seconds);
     void setTimeStretch(std::shared_ptr<const ITimeStretchProcessor> processor);
     [[nodiscard]] const ITimeStretchProcessor& timeStretch() const noexcept;
@@ -105,6 +115,11 @@ private:
         double seekSeconds = 0.0;      // guarded by seekSerial release/acquire
         std::uint64_t seekApplied = 0;
 
+        // Audio-thread reset request. loadDeck()/clearDeck() must not touch
+        // positionFrames/playing/gain: those belong to the callback.
+        std::atomic<std::uint64_t> resetSerial{0};
+        std::uint64_t resetApplied = 0;
+
         // Audio-thread state.
         double positionFrames = 0.0;
         double rate = 1.0;
@@ -126,6 +141,18 @@ private:
                     float gain1, double rate0, double rate1) noexcept;
     void finishTransition() noexcept;
 
+    struct RetiredTrack {
+        std::shared_ptr<const PcmTrack> owner;
+        std::uint64_t epoch = 0;
+    };
+    struct RetiredProcessor {
+        std::shared_ptr<const ITimeStretchProcessor> owner;
+        std::uint64_t epoch = 0;
+    };
+    void retireTrack(DeckId deck, std::shared_ptr<const PcmTrack> owner);
+    void retireProcessor(
+        std::shared_ptr<const ITimeStretchProcessor> owner);
+
     std::uint32_t outputSampleRate_ = 48000;
     DeckRuntime decks_[2];
     std::shared_ptr<const ITimeStretchProcessor> stretchOwned_;
@@ -134,9 +161,17 @@ private:
     std::atomic<int> master_{0};
     std::atomic<int> phase_{static_cast<int>(Phase::Idle)};
     std::atomic<bool> paused_{false};
+    std::atomic<bool> stopRequested_{false};
     std::atomic<bool> planReady_{false};
     std::atomic<std::uint64_t> completed_{0};
     std::atomic<double> outputLatency_{0.0};
+
+    // Monotonic heartbeat incremented at the start of every render call. It is
+    // the acknowledgement used to defer destruction of replaced audio buffers
+    // and time-stretch processors.
+    std::atomic<std::uint64_t> renderEpoch_{0};
+    std::vector<RetiredTrack> retiredTracks_[2];
+    std::vector<RetiredProcessor> retiredProcessors_;
 
     MixPlan pendingPlan_;
     RuntimePlan runtime_;

@@ -55,22 +55,23 @@ bool MixEngine::loadDeck(DeckId deck, std::shared_ptr<const PcmTrack> track,
         return false;
     }
     DeckRuntime& runtime = decks_[deckIndex(deck)];
+    // Ownership is handed over on the control thread, but the old buffer stays
+    // in the retire list until the callback heartbeat proves that no in-flight
+    // render can still hold a raw pointer to it.
+    std::shared_ptr<const PcmTrack> previous = std::move(runtime.owned);
     runtime.owned = std::move(track);
     runtime.audio.store(runtime.owned.get(), std::memory_order_release);
+    retireTrack(deck, std::move(previous));
     runtime.trackId.store(trackId, std::memory_order_release);
     runtime.analysedBpm.store(std::max(0.0, analysedBpm),
                               std::memory_order_release);
     runtime.targetPlay.store(false, std::memory_order_release);
     runtime.seekSeconds = 0.0;
     runtime.seekSerial.fetch_add(1, std::memory_order_acq_rel);
-    runtime.positionFrames = 0.0;
-    runtime.rate = 1.0;
-    runtime.rampRate = 1.0;
-    runtime.playing = false;
-    runtime.ended = false;
-    runtime.fade = 0.0f;
-    runtime.gain = 0.0f;
-    runtime.wasTargetPlaying = false;
+    // The callback owns position/playing/fade/gain. Ask it to reset them; the
+    // control thread must not write those fields concurrently.
+    runtime.resetSerial.fetch_add(1, std::memory_order_acq_rel);
+    reclaimRetired();
     return true;
 }
 
@@ -80,15 +81,56 @@ void MixEngine::clearDeck(DeckId deck) {
     }
     DeckRuntime& runtime = decks_[deckIndex(deck)];
     runtime.audio.store(nullptr, std::memory_order_release);
-    runtime.owned.reset();
+    std::shared_ptr<const PcmTrack> previous = std::move(runtime.owned);
+    retireTrack(deck, std::move(previous));
     runtime.trackId.store(0, std::memory_order_release);
     runtime.analysedBpm.store(0.0, std::memory_order_release);
-    runtime.positionFrames = 0.0;
-    runtime.playing = false;
-    runtime.ended = false;
-    runtime.fade = 0.0f;
-    runtime.gain = 0.0f;
+    runtime.targetPlay.store(false, std::memory_order_release);
+    runtime.resetSerial.fetch_add(1, std::memory_order_acq_rel);
+    reclaimRetired();
 }
+
+void MixEngine::retireTrack(DeckId deck,
+                            std::shared_ptr<const PcmTrack> owner) {
+    if (!owner) {
+        return;
+    }
+    // +1 guarantees that the callback which could have observed the old atomic
+    // pointer has returned before this object may be destroyed.
+    const std::uint64_t epoch =
+        renderEpoch_.load(std::memory_order_acquire) + 1;
+    retiredTracks_[deckIndex(deck)].push_back(
+        RetiredTrack{std::move(owner), epoch});
+}
+
+void MixEngine::retireProcessor(
+    std::shared_ptr<const ITimeStretchProcessor> owner) {
+    if (!owner) {
+        return;
+    }
+    const std::uint64_t epoch =
+        renderEpoch_.load(std::memory_order_acquire) + 1;
+    retiredProcessors_.push_back(RetiredProcessor{std::move(owner), epoch});
+}
+
+void MixEngine::reclaimRetired() {
+    const std::uint64_t epoch = renderEpoch_.load(std::memory_order_acquire);
+    for (auto& retired : retiredTracks_) {
+        retired.erase(
+            std::remove_if(retired.begin(), retired.end(),
+                           [epoch](const RetiredTrack& entry) {
+                               return entry.epoch <= epoch;
+                           }),
+            retired.end());
+    }
+    retiredProcessors_.erase(
+        std::remove_if(retiredProcessors_.begin(), retiredProcessors_.end(),
+                       [epoch](const RetiredProcessor& entry) {
+                           return entry.epoch <= epoch;
+                       }),
+        retiredProcessors_.end());
+}
+
 
 bool MixEngine::deckLoaded(DeckId deck) const noexcept {
     return decks_[deckIndex(deck)].audio.load(std::memory_order_acquire) !=
@@ -168,15 +210,27 @@ bool MixEngine::paused() const noexcept {
     return paused_.load(std::memory_order_acquire);
 }
 
+void MixEngine::stop() {
+    paused_.store(true, std::memory_order_release);
+    for (DeckRuntime& deck : decks_) {
+        deck.targetPlay.store(false, std::memory_order_release);
+    }
+    stopRequested_.store(true, std::memory_order_release);
+}
+
 void MixEngine::setOutputLatency(double seconds) {
     outputLatency_.store(std::max(0.0, seconds), std::memory_order_release);
 }
 
 void MixEngine::setTimeStretch(
     std::shared_ptr<const ITimeStretchProcessor> processor) {
+    std::shared_ptr<const ITimeStretchProcessor> previous =
+        std::move(stretchOwned_);
     stretchOwned_ = processor ? std::move(processor)
                               : std::make_shared<LinearResampleStretcher>();
     stretch_.store(stretchOwned_.get(), std::memory_order_release);
+    retireProcessor(std::move(previous));
+    reclaimRetired();
 }
 
 const ITimeStretchProcessor& MixEngine::timeStretch() const noexcept {
@@ -286,14 +340,63 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     if (!output) {
         return;
     }
+    renderEpoch_.fetch_add(1, std::memory_order_acq_rel);
     std::memset(output, 0, frames * 2 * sizeof(float));
     if (frames == 0) {
         publishSnapshot();
         return;
     }
 
+    // A hard stop cancels an in-flight or pending transition before the pause
+    // freeze. It also drops a plan that was published but not consumed yet.
+    if (stopRequested_.exchange(false, std::memory_order_acq_rel)) {
+        planReady_.store(false, std::memory_order_release);
+        cancelRequested_.store(false, std::memory_order_release);
+        phase_.store(static_cast<int>(Phase::Idle), std::memory_order_release);
+        runtimeStarted_ = false;
+        handoverDone_ = false;
+        pendingPlan_ = {};
+    }
+
+    // loadDeck()/clearDeck() publish a reset serial instead of writing the
+    // callback-owned transport fields. Apply it first so a newly installed
+    // track can never inherit the previous track's position or playing state.
+    for (DeckRuntime& deck : decks_) {
+        const std::uint64_t serial = deck.resetSerial.load(std::memory_order_acquire);
+        if (serial != deck.resetApplied) {
+            deck.resetApplied = serial;
+            deck.positionFrames = 0.0;
+            deck.rate = 1.0;
+            deck.rampRate = 1.0;
+            deck.playing = false;
+            deck.ended = false;
+            deck.fade = 0.0f;
+            deck.gain = 0.0f;
+            deck.wasTargetPlaying = false;
+        }
+    }
+
+    // Apply pending seeks BEFORE consuming a transition plan. A deck loaded in
+    // this same callback still has the zero seek published by loadDeck(); if
+    // that loop ran after consumeStartRequest() it would overwrite the cue
+    // positions selected by the plan.
+    for (DeckRuntime& deck : decks_) {
+        const std::uint64_t serial = deck.seekSerial.load(std::memory_order_acquire);
+        if (serial != deck.seekApplied) {
+            deck.seekApplied = serial;
+            if (const PcmTrack* source = deck.audio.load(std::memory_order_acquire)) {
+                deck.positionFrames =
+                    std::clamp(deck.seekSeconds, 0.0, source->duration()) *
+                    source->sampleRate;
+            }
+            deck.ended = false;
+            deck.fade = 0.0f;
+            deck.playing = deck.targetPlay.load(std::memory_order_acquire);
+        }
+    }
+
     // A pending start is consumed at a block boundary so both decks begin on
-    // exactly the same output frame.
+    // exactly the same output frame. Plan markers win over load-time seeks.
     if (planReady_.load(std::memory_order_acquire)) {
         consumeStartRequest(framesRendered_);
     }
@@ -312,7 +415,6 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                        0.0, 1.0);
     }
 
-    const bool paused = paused_.load(std::memory_order_acquire);
     // A play request on an empty deck is a no-op. Without this the deck would
     // stay "playing" forever, and loadAllowed() would reject every later load.
     for (DeckRuntime& deck : decks_) {
@@ -323,6 +425,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             deck.gain = 0.0f;
         }
     }
+
+    const bool paused = paused_.load(std::memory_order_acquire);
     const float pauseStep =
         1.0f / static_cast<float>(outputSampleRate_ * kDeclickSeconds);
     if (paused) {
@@ -331,28 +435,18 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         pauseFade_ = std::min(1.0f, pauseFade_ + pauseStep * frames);
     }
     if (paused && pauseFade_ <= 0.0f) {
-        // Freeze the transport while fully silent.
+        // Freeze the transport only after stop/pause requests have settled the
+        // deck flags. Otherwise a stopped deck would report "playing" forever
+        // and Clear Queue could never release it.
         for (DeckRuntime& deck : decks_) {
             deck.gain = 0.0f;
+            if (!deck.targetPlay.load(std::memory_order_acquire)) {
+                deck.playing = false;
+                deck.fade = 0.0f;
+            }
         }
         publishSnapshot();
         return;
-    }
-
-    // Apply pending seeks on the audio thread.
-    for (DeckRuntime& deck : decks_) {
-        const std::uint64_t serial = deck.seekSerial.load(std::memory_order_acquire);
-        if (serial != deck.seekApplied) {
-            deck.seekApplied = serial;
-            if (const PcmTrack* source = deck.audio.load(std::memory_order_acquire)) {
-                deck.positionFrames =
-                    std::clamp(deck.seekSeconds, 0.0, source->duration()) *
-                    source->sampleRate;
-            }
-            deck.ended = false;
-            deck.fade = 0.0f;
-            deck.playing = deck.targetPlay.load(std::memory_order_acquire);
-        }
     }
 
     for (DeckRuntime& deck : decks_) {
@@ -546,13 +640,27 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         } else if (cancelling &&
                    framesRendered_ - cancelStartFrame_ >=
                        static_cast<std::uint64_t>(kCancelSeconds * outputSampleRate_)) {
-            decks_[deckIndex(runtime_.to)].targetPlay.store(
-                false, std::memory_order_release);
-            decks_[deckIndex(runtime_.to)].playing = false;
-            decks_[deckIndex(runtime_.to)].gain = 0.0f;
+            const DeckId from = runtime_.from;
+            const DeckId to = runtime_.to;
+            decks_[deckIndex(to)].targetPlay.store(false,
+                                                  std::memory_order_release);
+            decks_[deckIndex(to)].playing = false;
+            decks_[deckIndex(to)].gain = 0.0f;
+            decks_[deckIndex(to)].fade = 0.0f;
             runtimeStarted_ = false;
             phase_.store(static_cast<int>(Phase::Idle),
                          std::memory_order_release);
+            // If the cancel happened after the handover point, master_ points
+            // at the stopped incoming deck. The outgoing deck kept playing, so
+            // it must become the musical reference again.
+            if (decks_[deckIndex(from)].audio.load(std::memory_order_acquire) !=
+                nullptr) {
+                decks_[deckIndex(from)].targetPlay.store(true,
+                                                         std::memory_order_release);
+                decks_[deckIndex(from)].rate = 1.0;
+                decks_[deckIndex(from)].rampRate = 1.0;
+                master_.store(deckIndex(from), std::memory_order_release);
+            }
         }
         if (phase_.load(std::memory_order_acquire) ==
             static_cast<int>(Phase::Idle)) {
@@ -579,6 +687,7 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
         static_cast<double>(source->frameCount()) - 1.0) {
         runtime.ended = true;
         runtime.playing = false;
+        runtime.targetPlay.store(false, std::memory_order_release);
         runtime.gain = 0.0f;
         std::memset(out, 0, frames * 2 * sizeof(float));
         return;
@@ -591,8 +700,17 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
         (static_cast<double>(source->sampleRate) /
          static_cast<double>(outputSampleRate_));
     const double lastFrame = static_cast<double>(source->frameCount()) - 1.0;
-    const bool reachesEnd =
-        runtime.positionFrames + step * static_cast<double>(frames) >= lastFrame;
+    const double startPosition = runtime.positionFrames;
+    // Number of output frames that still land on real source samples. The
+    // stretcher writes zeros after this point, so the de-click fade must be
+    // anchored here rather than at the end of the requested callback block.
+    const std::size_t playable =
+        startPosition >= lastFrame || step <= 0.0
+            ? 0
+            : std::min(frames,
+                       static_cast<std::size_t>(
+                           std::ceil((lastFrame - startPosition) / step)));
+    const bool reachesEnd = playable < frames;
     const ITimeStretchProcessor* stretch = stretch_.load(std::memory_order_acquire);
     if (!stretch) {
         std::memset(out, 0, frames * 2 * sizeof(float));
@@ -623,19 +741,26 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
                                         std::abs(out[i * 2 + 1])));
     }
     runtime.gain = std::max(0.0f, std::abs(gainEnd)) * runtime.fade;
-    if (reachesEnd) {
-        // De-click the physical end of the track with a short linear tail so
-        // an unattended EOF never produces a hard step.
+    if (reachesEnd && playable > 0) {
+        // De-click the physical end of the track with a short linear tail that
+        // ends on the last playable sample, never on trailing zeros.
         const std::size_t fadeFrames = std::min<std::size_t>(
-            frames, static_cast<std::size_t>(0.008 * outputSampleRate_));
+            playable, static_cast<std::size_t>(0.008 * outputSampleRate_));
+        const std::size_t first = playable - fadeFrames;
         for (std::size_t i = 0; i < fadeFrames; ++i) {
             const float scale =
-                static_cast<float>(fadeFrames - i) /
+                static_cast<float>(fadeFrames - 1 - i) /
                 static_cast<float>(std::max<std::size_t>(1, fadeFrames));
-            const std::size_t index = frames - fadeFrames + i;
+            const std::size_t index = first + i;
             out[index * 2] *= scale;
             out[index * 2 + 1] *= scale;
         }
+    }
+    if (reachesEnd) {
+        runtime.ended = true;
+        runtime.playing = false;
+        runtime.targetPlay.store(false, std::memory_order_release);
+        runtime.gain = 0.0f;
     }
 }
 
