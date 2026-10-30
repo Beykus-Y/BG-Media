@@ -537,12 +537,23 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 plan.fallbackReason =
                     "adaptive: " + match.reason + "; using EQ bass-swap crossfade";
                 plan.reasons.push_back(plan.fallbackReason);
-            } else if (match.matched && config_.rampEnabled()) {
-                type = TransitionType::TempoRamp;
-                plan.reasons.push_back(format(
-                    "Adaptive: compatible tempo (%.1f%% delta) -> pre-transition "
-                    "tempo ramp",
-                    match.deltaPercent));
+            } else if (match.matched) {
+                // Manual means "ramp only when the caller explicitly asks for
+                // a tempo-synced type"; an adaptive Smart Crossfade must not
+                // invent one.
+                if (config_.tempoRampMode == TempoRampMode::Auto &&
+                    config_.rampEnabled()) {
+                    type = TransitionType::TempoRamp;
+                    plan.reasons.push_back(format(
+                        "Adaptive: compatible tempo (%.1f%% delta) -> "
+                        "pre-transition tempo ramp",
+                        match.deltaPercent));
+                } else {
+                    type = TransitionType::SmartCrossfade;
+                    plan.fallbackReason =
+                        "adaptive: tempo sync needs the tempo ramp in Auto "
+                        "mode; using EQ bass-swap crossfade";
+                }
             } else if (config_.preferPhraseBoundaries) {
                 type = TransitionType::PhraseAware;
                 plan.reasons.push_back(
@@ -664,6 +675,10 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                     "the remaining outgoing audio");
             }
         }
+        // Even without a ramp (or after the ramp was shortened), the window
+        // must never run past the outgoing track. The low-confidence path has
+        // no grid correction below, so clamp it here for every plan.
+        endA = std::min(endA, a.info.duration);
     } else {
         endA = musicalEnd(a);
         crossfadeStartA = std::max(0.0, endA - duration);

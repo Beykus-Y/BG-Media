@@ -1877,10 +1877,13 @@ struct DesktopApp::Impl {
                     std::abs(live.rate - 1.0) < 0.005) {
                     return motion::BeatClock::fromAnalysis(*mixDanceAnalysis);
                 }
-                const double period = 60.0 / live.bpm;
+                // The dance is sampled at the source-media position, so the
+                // clock must use the source-time beat period. The live BPM is
+                // sourceBpm * rate and would apply the rate twice.
+                const double period = live.beatPeriodSeconds;
                 const double firstBeat =
                     live.positionSeconds - live.beatPhase * period;
-                return motion::BeatClock::constant(live.bpm, firstBeat, 4);
+                return motion::BeatClock::constant(live.sourceBpm, firstBeat, 4);
             }
         }
         return motion::BeatClock::constant(danceLabBpm, 0.0, 4);

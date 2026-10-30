@@ -19,7 +19,14 @@ LiveMixTempo liveMixTempo(const MixSnapshot& snapshot) noexcept {
         return state;
     }
     state.valid = true;
-    state.beatPeriodSeconds = 60.0 / state.bpm;
+    state.sourceBpm = deck.analysedBpm > 0.0
+                          ? deck.analysedBpm
+                          : (state.rate > 1e-9 ? state.bpm / state.rate
+                                               : state.bpm);
+    if (state.sourceBpm <= 0.0) {
+        state.sourceBpm = state.bpm;
+    }
+    state.beatPeriodSeconds = 60.0 / state.sourceBpm;
     state.positionSeconds =
         std::max(0.0, deck.positionSeconds - state.outputLatencySeconds);
     const double beats = state.positionSeconds / state.beatPeriodSeconds;
