@@ -564,6 +564,9 @@ bool stressRun(const Options& options, const PreparedMixTrack& a,
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    const std::uint64_t measuredNonFinite =
+        realCallback ? device->nonFiniteSamples() : nonFinite.load();
+    const double measuredPeak = realCallback ? device->outputPeak() : peak.load();
 
     std::printf(
         "  stress: callback=%s ops=%llu loads=%llu transitions=%llu "
@@ -574,18 +577,19 @@ bool stressRun(const Options& options, const PreparedMixTrack& a,
         static_cast<unsigned long long>(transitions),
         static_cast<unsigned long long>(cancels),
         static_cast<unsigned long long>(renders.load()),
-        static_cast<double>(realCallback ? snap.outputPeak : peak.load()),
-        static_cast<unsigned long long>(nonFinite.load()),
+        measuredPeak,
+        static_cast<unsigned long long>(measuredNonFinite),
         static_cast<int>(snap.phase));
     if (device) {
         std::printf(
             "  stress device: latency %.1f ms, callback load %.2f%%, "
-            "overruns %llu\n",
+            "overruns %llu, samples measured %llu\n",
             device->baseLatency() * 1000.0, device->callbackLoad() * 100.0,
-            static_cast<unsigned long long>(device->overruns()));
+            static_cast<unsigned long long>(device->overruns()),
+            static_cast<unsigned long long>(device->renderedSamples()));
         device->close();
     }
-    return nonFinite.load() == 0;
+    return measuredNonFinite == 0;
 }
 
 } // namespace

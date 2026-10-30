@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 
@@ -29,6 +30,9 @@ struct MiniaudioMixDevice::Impl {
     std::atomic<double> baseLatency{0.0};
     std::atomic<double> callbackLoad{0.0};
     std::atomic<std::uint64_t> overruns{0};
+    std::atomic<std::uint64_t> renderedSamples{0};
+    std::atomic<std::uint64_t> nonFiniteSamples{0};
+    std::atomic<float> outputPeak{0.0f};
 
     static void dataCallback(ma_device* device, void* output, const void*,
                              ma_uint32 frameCount) {
@@ -42,6 +46,28 @@ struct MiniaudioMixDevice::Impl {
         }
         const auto started = std::chrono::steady_clock::now();
         self->engine.render(samples, static_cast<std::size_t>(frameCount));
+        // Validate what the device will actually play, not a copy rendered on
+        // another thread. This is what makes the stress report meaningful for
+        // real-device runs.
+        const std::size_t count =
+            static_cast<std::size_t>(frameCount) * kChannels;
+        std::uint64_t bad = 0;
+        float localPeak = 0.0f;
+        for (std::size_t i = 0; i < count; ++i) {
+            const float value = samples[i];
+            if (!std::isfinite(value)) {
+                ++bad;
+                continue;
+            }
+            localPeak = std::max(localPeak, std::abs(value));
+        }
+        if (bad != 0) {
+            self->nonFiniteSamples.fetch_add(bad, std::memory_order_relaxed);
+        }
+        if (localPeak > self->outputPeak.load(std::memory_order_relaxed)) {
+            self->outputPeak.store(localPeak, std::memory_order_relaxed);
+        }
+        self->renderedSamples.fetch_add(count, std::memory_order_relaxed);
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           started)
@@ -112,6 +138,9 @@ bool MiniaudioMixDevice::open(std::uint32_t sampleRate,
                              std::memory_order_relaxed);
     impl_->callbackLoad.store(0.0, std::memory_order_relaxed);
     impl_->overruns.store(0, std::memory_order_relaxed);
+    impl_->renderedSamples.store(0, std::memory_order_relaxed);
+    impl_->nonFiniteSamples.store(0, std::memory_order_relaxed);
+    impl_->outputPeak.store(0.0f, std::memory_order_relaxed);
 
     if (ma_device_start(&impl_->device) != MA_SUCCESS) {
         impl_->error = "failed to start mix audio device";
@@ -159,6 +188,18 @@ double MiniaudioMixDevice::callbackLoad() const noexcept {
 
 std::uint64_t MiniaudioMixDevice::overruns() const noexcept {
     return impl_->overruns.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MiniaudioMixDevice::renderedSamples() const noexcept {
+    return impl_->renderedSamples.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MiniaudioMixDevice::nonFiniteSamples() const noexcept {
+    return impl_->nonFiniteSamples.load(std::memory_order_relaxed);
+}
+
+float MiniaudioMixDevice::outputPeak() const noexcept {
+    return impl_->outputPeak.load(std::memory_order_relaxed);
 }
 
 } // namespace bgmedia

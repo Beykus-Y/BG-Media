@@ -36,6 +36,13 @@ public:
     // miniaudio does not expose an xrun counter for WASAPI).
     [[nodiscard]] std::uint64_t overruns() const noexcept;
 
+    // Output validation gathered by the real callback. Stress runs use these
+    // instead of an emulated render thread, so a real-device run measures the
+    // samples the sound card actually received.
+    [[nodiscard]] std::uint64_t renderedSamples() const noexcept;
+    [[nodiscard]] std::uint64_t nonFiniteSamples() const noexcept;
+    [[nodiscard]] float outputPeak() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
