@@ -25,9 +25,38 @@ is a host; the engine can run in another host or be tested headlessly.
 * One audio callback calls `MixEngine::render()`. The callback swaps no
   `shared_ptr`s: decks are loaded only while idle and not playing, and the
   engine publishes a double-buffered snapshot with an atomic try-lock.
+* Track and time-stretch buffers replaced by `loadDeck()`, `clearDeck()` or
+  `setTimeStretch()` are not freed on the control thread. They go to a retire
+  list and are reclaimed by the control thread only after a render epoch shows
+  that at least one callback started after the swap (`reclaimRetired()`).
+  `MixSession::update()` pumps this reclamation once per frame.
+* `loadDeck()`/`clearDeck()` publish a reset serial instead of writing playback
+  state. The callback owns `positionFrames`, `playing`, fade/gain/rate and
+  applies a pending seek or reset in a fixed order: hard stop, reset requests,
+  pending seeks, plan consumption, cancellation, empty-deck cleanup, pause
+  freeze, then normal rendering. There is exactly one writer for live transport
+  state.
 * `MixSession::update()` must be pumped every UI frame. When no output device
   exists (headless capture, device failure), the desktop pumps the engine
   silently so the clock and snapshots still advance.
+
+## Transport and failure semantics
+
+* **Stop** is a hard stop: it freezes the transport, clears both play requests
+  and drops an active or pending transition. A pause freeze alone is not used,
+  because the callback must first settle the deck `playing` flags.
+* **Manual transitions** plan from the outgoing deck's current position. Only
+  the preview uses the end-of-track window, so pressing Next no longer seeks
+  the playing deck.
+* **Refilling** the deck that just handed over loads it stopped. It does not
+  start at full independent gain next to the new master.
+* **EOF before handover** promotes an already prepared deck instead of ignoring
+  it because it was not playing yet, and clears the finished deck.
+* **Cancel after handover** restores `master` to the outgoing deck and resumes
+  it, so the next transition does not start from silence.
+* **EOF** applies its de-click fade over the last playable source sample, not
+  over the rest of the callback block, so the final sample approaches silence
+  instead of stepping from full amplitude to zero.
 
 ## Master deck and musical handover
 
@@ -96,33 +125,88 @@ The desktop reads the real drawable size (`SDL_GetRenderOutputSize`), not the
 window points. It picks a UI scale from the display scale and the output size,
 applies `SDL_SetRenderScale`, and lays out in a logical canvas
 (`physical / scale`). Glyph atlases are baked at `size * scale` and drawn 1:1
-into the framebuffer, so text stays crisp. Window minimum is 1280x860 logical
-points, which keeps the adaptive layout valid at 100% and 200% DPI.
+into the framebuffer, so text stays crisp. The font-face cache key includes the
+scale as well as the baked pixel size: 10 px at 100% and 8 px at 125% bake the
+same atlas but need different logical metrics.
+
+The canvas is clamped to at least 1100x900 logical points; the BG Beat / BG
+Motion cards need ~900 points of height, and the BG Mix three-column layout
+needs the width. A requested scale that would go below that canvas is reduced,
+and the UI scale chip reports the effective value (for example
+`UI 200% / 120%` on a 1920x1080 window). A window shorter than 900 points is
+scaled slightly below 100% instead of clipping its bottom card row. The
+supported window minimum is 1280x860 points.
 
 UI scale can be automatic or fixed at 100/125/150/175/200/225/250%. The choice,
-window size, maximized/fullscreen state and 3D quality persist in
-`desktop.ini` under `SDL_GetPrefPath("BGMedia", "BGMedia")`.
+windowed size, maximized/fullscreen state and 3D quality persist in
+`desktop.ini` under `SDL_GetPrefPath("BGMedia", "BGMedia")`. While fullscreen,
+the saved window geometry is the windowed size, so leaving fullscreen restores
+the previous window instead of a screen-sized one.
+
+Fullscreen is SDL borderless fullscreen. `F`, `F11`, `Alt+Enter` toggle it,
+`Esc` leaves it (before the screen-specific Esc action). Enter/leave events
+mirror the OS state; if `SDL_SetWindowFullscreen` fails the reason is shown in a
+toast and the window stays windowed. The capture path fills the display: a
+2560x1440 fullscreen capture is 2560x1440, with content laid out across the whole
+frame. A first run without saved geometry starts maximized.
 
 The VRM target follows the stage size at runtime, is capped at 3840x2160 for
 readback, and is recreated only when the required size changes.
 
+## Review fixes (PR #32)
+
+Each finding from the first review has a reproducing test:
+
+| Finding | Fix | Regression test |
+| --- | --- | --- |
+| Outgoing deck refilled and auto-played | Refill loads stopped; playing is opt-in | `mix.session_refilled_deck_stays_stopped` |
+| Manual Next seeked the playing deck | Execution plans from the current position | `mix.session_next_starts_at_current_position` |
+| Stop left decks "playing" / Clear Queue stuck | `MixEngine::stop()` settles state in the callback | `mix.session_stop_and_clear_queue_recover` |
+| Heap use-after-free on deck replacement | Deferred retirement by render epoch | `mix.engine_retired_track_lifetime` |
+| Cancel after handover left a stopped master | Restore `master` to the outgoing deck | `mix.engine_cancel_after_handover_restores_master` |
+| EOF ignored a prepared incoming deck | Promote the prepared deck and clear the ended one | `mix.session_eof_promotes_prepared_deck` |
+| Glyph cache key ignored UI scale | `fontFaceCacheKey(size, scale, weight)` | `ui.font_cache_key_includes_scale` |
+| Click at the end of a track | Fade anchored to the last playable sample | `mix.engine_eof_declick_has_no_hard_edge` |
+| Load-time seek overrode the transition plan | Reset requests run before plan consumption | `mix.engine_load_seek_does_not_override_plan` |
+| Controls overflowed the screen at large scale | Canvas clamp + responsive columns | `ui.effective_scale_keeps_canvas_usable`, `ui.mix_columns_never_overflow` |
+
+`mix.engine_concurrent_controls_stress` runs a real render thread against a
+control thread hammering play/pause/seek/load/clear/next/cancel/stop, and is
+meant to be run under AddressSanitizer.
+
 ## Verification (2026-10-30)
 
-* `bgmedia_tests mix.`: 15 tests, including equal-power curves, gapless
+* `bgmedia_tests mix.`: 24 tests, including equal-power curves, gapless
   transition, EOF/empty decks, pause/resume/cancel, seek during a transition,
   conflicting commands, Direct Cut, underrun-sized blocks, 44.1/48 kHz,
   mono/stereo/6-channel downmix, 92/123/163/180 BPM alignment, low-confidence
   and unstable-tempo fallbacks, short incoming track, Tempo Ramp phase/mean/
-  slowdown/cap/disabled, render budget, session queue/transport.
-* Full CTest: 24/24 suites.
+  slowdown/cap/disabled, render budget, session queue/transport, and the nine
+  regressions above.
+* `bgmedia_tests ui.`: 3 tests for scale clamping, column overflow and the font
+  cache key.
+* Full CTest: 25/25 suites.
+* AddressSanitizer (MSVC `/fsanitize=address`, RelWithDebInfo): full test
+  binary 352 passed, 0 failed, no ASan report, including the concurrent stress
+  test and the deferred-reclamation lifetime test.
+* Stress, emulated callback thread, real prepared tracks, 2 s: 344 control
+  operations (68 loads, 34 transitions, 34 cancels), 573,687 render blocks,
+  peak 0.749, 0 non-finite.
+* Stress, real WASAPI device (`Наушники (fifine SC9)`), 3 s: 1,675 control
+  operations (218 loads, 160 transitions, 167 cancels), 32.0 ms latency, 0.04%
+  callback load, 0 overruns, 0 non-finite.
 * Real tracks (BG Beat + decoder, 48 kHz): Smart 123 -> 123, 8 s requested,
   shortened to 3.55 s because the incoming edit is 4 s. Peak 0.443, 0 clipped,
   0 non-finite, 0.1% of one core offline.
 * Real Tempo Ramp 92 -> 100 BPM (9%): outgoing A advanced 8.694 s during an 8 s
   output transition (mean rate 1.0867), incoming B advanced exactly 8.000 s.
   Peak 0.793, 0 clipped, 0 non-finite, 0.1% of one core offline.
-* Real device (`MiniaudioMixDevice`, WASAPI shared): 32.0 ms internal latency,
-  0.06% callback load, 0 overruns, transition completed.
+* Display checks (captures): BG Mix and BG Beat at 1920x1080 and 2560x1440 with
+  UI scale 100/125/137/150/175/200%. Content fills the frame, the Mix queue,
+  both decks, plan and transport stay on-screen, and the BG Beat bottom card
+  row is above the footer. At 1280x860 the canvas falls to 96% and still fits.
+  A borderless-fullscreen capture is 2560x1440 with the layout across the whole
+  display.
 
 ## Limitations
 
