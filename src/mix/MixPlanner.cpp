@@ -896,10 +896,20 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     // ------------------------------------------------------------------
     // Fit the fade to the available incoming audio.
     // ------------------------------------------------------------------
+    // The incoming deck may play at a matched rate during the fade and then
+    // return to 1.0 after the handover. Fit the fade against the source it
+    // actually consumes, not against wall-clock duration.
+    const double incomingRate = ramp ? tempo.ratioB : 1.0;
+    const double handover = 0.5;
+    const double meanRateB =
+        incomingRate * handover +
+        0.5 * (incomingRate + 1.0) * (1.0 - handover);
     const double availableB = b.info.duration - startB;
+    const double maxByB =
+        meanRateB > 1e-6 ? availableB / meanRateB : availableB;
     const double availableA = plan.transitionEndA - plan.transitionStartA;
     const double fitted =
-        std::min(plan.duration, std::min(availableA, availableB));
+        std::min(plan.duration, std::min(availableA, maxByB));
     if (fitted < plan.duration - 1e-6) {
         plan.duration = std::max(0.0, fitted);
         plan.transitionEndA = plan.transitionStartA + plan.duration;
@@ -908,7 +918,8 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             plan.duration, fitted));
     }
     plan.startB = startB;
-    plan.endB = std::min(b.info.duration, startB + plan.duration);
+    plan.endB = std::min(b.info.duration,
+                         startB + meanRateB * plan.duration);
     plan.handoverProgress = 0.5;
     plan.phraseBars = phraseBars;
     plan.beatPhaseErrorMs =

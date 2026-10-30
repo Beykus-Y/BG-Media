@@ -184,12 +184,15 @@ private:
 
     void generate(const PcmTrack& track, double ratio) noexcept {
         const std::size_t frameCount = track.frameCount();
-        const std::size_t lastStart =
-            frameCount > window_ ? frameCount - window_ : 0;
+        // Windows may start up to the source end and are zero-padded past it.
+        // Stopping at frameCount - window would cut a sub-unity stretched tail
+        // short: at 0.25x the last window still has four times its length of
+        // output to emit.
+        const std::size_t maxStart = frameCount;
         if (eof_) {
             // Drain the overlap tail of the final window, then silence. Do not
-            // clamp back to lastStart: that would repeat the final window for
-            // the whole rest of the requested block.
+            // clamp back to the last full-window start: that would repeat the
+            // final window for the whole rest of the requested block.
             const std::size_t emit = std::min(
                 hop_, ringCount_ < capacity_ ? capacity_ - ringCount_ : 0);
             for (std::size_t i = 0; i < emit; ++i) {
@@ -206,7 +209,7 @@ private:
             return;
         }
         const double nominal = std::clamp(
-            sourcePosition_, 0.0, static_cast<double>(lastStart));
+            sourcePosition_, 0.0, static_cast<double>(maxStart));
         std::size_t base = static_cast<std::size_t>(std::llround(nominal));
 
         std::size_t best = base;
@@ -218,7 +221,7 @@ private:
                     -static_cast<long long>(base));
                 const long long upper = std::min<long long>(
                     static_cast<long long>(search_),
-                    static_cast<long long>(lastStart) -
+                    static_cast<long long>(maxStart) -
                         static_cast<long long>(base));
                 auto scoreAt = [&](long long offset) {
                     const long long candidate =
@@ -268,9 +271,9 @@ private:
             previous_[i] = sourceMono(track, best + hop_ + i);
         }
         primed_ = true;
-        if (nominal >= static_cast<double>(lastStart)) {
-            // The final source window has been rendered. Subsequent calls
-            // drain its overlap tail and then emit silence.
+        if (nominal >= static_cast<double>(maxStart)) {
+            // The analysis head has reached the actual source end. Subsequent
+            // calls drain the overlap tail and then emit silence.
             eof_ = true;
         }
 
@@ -291,7 +294,7 @@ private:
                   acc_.end(), 0.0f);
 
         sourcePosition_ =
-            std::min(static_cast<double>(lastStart),
+            std::min(static_cast<double>(maxStart),
                      nominal + static_cast<double>(hop_) * ratio);
     }
 

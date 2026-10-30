@@ -1810,6 +1810,29 @@ TEST_CASE("mix.planner_ramp_smoothness") {
                 plan.preTransitionSeconds);
 }
 
+TEST_CASE("mix.planner_fits_incoming_rate") {
+    AnalysisResult b = analysisFor(100.0, 8.0);
+    b.octaveAmbiguous = true;
+    b.bpmCandidates = {125.0};
+    PlannerConfig config;
+    config.tempoRampMode = TempoRampMode::Manual;
+    config.maxTempoDeltaPercent = 30.0;
+    MixPlanner planner(config);
+    PlanRequest request;
+    request.type = TransitionType::TempoRamp;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 10.0;
+    const MixPlan plan = planner.plan(analysisFor(125.0), b, request);
+    CHECK(plan.valid);
+    CHECK(plan.tempoRampActive);
+    CHECK_NEAR(plan.tempoRatioB, 1.25, 1e-3);
+    // 8 s of source at a mean incoming rate of 1.1875 lasts 6.74 s.
+    CHECK(plan.duration < 6.8);
+    CHECK(plan.endB <= 8.0 + 1e-6);
+    std::printf("incoming rate fit: duration=%.2f endB=%.3f ratioB=%.2f\n",
+                plan.duration, plan.endB, plan.tempoRatioB);
+}
+
 TEST_CASE("mix.planner_no_sync_leak_into_crossfade") {
     AnalysisResult a = analysisFor(120.0);
     AnalysisResult b = analysisFor(160.0);
@@ -1978,6 +2001,26 @@ TEST_CASE("mix.wsola_stops_at_eof") {
     const double rms = std::sqrt(sum / static_cast<double>(last - first));
     CHECK(rms < 1e-4);
     std::printf("wsola EOF tail: rms after source end %.6f\n", rms);
+}
+
+TEST_CASE("mix.wsola_sub_unity_tail_reaches_source_end") {
+    const auto track = toneTrack(1.0, 220.0);
+    const std::vector<float> output = renderStretch(*track, 0.25, 4.2, 0.0);
+    auto rmsRange = [&](double from, double to) {
+        const std::size_t first = static_cast<std::size_t>(from * kRate);
+        const std::size_t last = static_cast<std::size_t>(to * kRate);
+        double sum = 0.0;
+        for (std::size_t i = first; i < last; ++i) {
+            sum += static_cast<double>(output[i * 2]) * output[i * 2];
+        }
+        return std::sqrt(sum / static_cast<double>(last - first));
+    };
+    // 1 s of source at 0.25x lasts 4 s; the stretched tail must not stop at
+    // the last full window (~3.88 s).
+    CHECK(rmsRange(3.0, 3.8) > 0.05);
+    CHECK(rmsRange(4.05, 4.2) < 1e-4);
+    std::printf("wsola 0.25x tail: 3.0-3.8 rms=%.4f, after 4.05 rms=%.6f\n",
+                rmsRange(3.0, 3.8), rmsRange(4.05, 4.2));
 }
 
 TEST_CASE("mix.engine_resamples_source_rate") {

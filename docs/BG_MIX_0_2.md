@@ -47,10 +47,12 @@ resampled**, so pitch is preserved. The window is 42 ms (2016 frames at 48 kHz,
 clamped to 1024–4096), the hop is half a window, and the search range is
 window/10. The search always evaluates the nominal (zero) offset, so unity-rate
 playback reconstructs the source exactly (measured relative error 0.0000 on a
-broadband signal). At EOF the stream drains the final window's overlap tail and
-then emits silence; it never repeats the last window. Sharp transients bypass
-the search so drum attacks are not smeared. Stereo uses one shared offset, so
-the image does not wander.
+broadband signal). At EOF the analysis head continues through zero-padded
+windows until the real source end, then drains the final overlap tail and emits
+silence; it never repeats the last window. This also preserves the stretched
+tail at sub-unity rates (a 1 s source at 0.25× is audible to 4.0 s). Sharp
+transients bypass the search so drum attacks are not smeared. Stereo uses one
+shared offset, so the image does not wander.
 
 `latencyFrames()` reports window/2 (≈21 ms at 48 kHz) as algorithmic
 look-ahead. The engine's EOF de-click accounts for it.
@@ -277,7 +279,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 46 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 48 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -295,8 +297,11 @@ including:
   and Manual mode not inventing an adaptive ramp;
 * source-rate normalization (44.1 kHz into a 48 kHz engine), large WSOLA block
   draining, one-shot state isolation, unity-rate reconstruction (relative error
-  0.0000), EOF tail drain to silence, and outgoing continuity when a transition
+  0.0000), EOF tail drain to silence at unity and at 0.25× (the stretched tail
+  reaches 4.0 s for a 1 s source), and outgoing continuity when a transition
   starts in place;
+* incoming-rate fitting: an 8 s source at `tempoRatioB = 1.25` shortens the
+  fade to 6.74 s so `endB` is exactly the source end;
 * live-tempo adapter and master handover;
 * render budget (10 s of audio in ≈44 ms) and the real-time control stress.
 
