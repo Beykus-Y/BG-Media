@@ -4,6 +4,7 @@
 #include "TextRenderer.hpp"
 #include "Theme.hpp"
 #include "Ui.hpp"
+#include "UiMetrics.hpp"
 #include "VrmScene.hpp"
 #include "bgmedia/analysis/Analyzer.hpp"
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
@@ -556,10 +557,15 @@ struct DesktopApp::Impl {
     float uiScale = 1.0f;
     float autoUiScale = 1.0f;
     float uiScaleSetting = 0.0f;   // 0 = automatic
+    float requestedUiScale = 1.0f;
+    bool uiScaleLimited = false;
     float canvasW = 1440.0f;
     float canvasH = 900.0f;
     int vrmQuality = 100;          // percent of the stage size
     bool maximized = false;
+    int windowedW = 0;
+    int windowedH = 0;
+    bool restoreWindowedOnLeave = false;
     int savedWindowW = 0;
     int savedWindowH = 0;
     bool savedMaximized = false;
@@ -716,6 +722,13 @@ struct DesktopApp::Impl {
         int w = 0;
         int h = 0;
         SDL_GetWindowSize(window, &w, &h);
+        if (fullscreen && windowedW > 0 && windowedH > 0) {
+            // Persist the windowed geometry, not the fullscreen display size;
+            // otherwise leaving fullscreen on the next run restores a
+            // screen-sized window.
+            w = windowedW;
+            h = windowedH;
+        }
         std::error_code ec;
         std::filesystem::create_directories(settingsPath.parent_path(), ec);
         std::ofstream file(settingsPath, std::ios::trunc);
@@ -756,7 +769,13 @@ struct DesktopApp::Impl {
         autoUiScale = std::clamp(std::max(dpi, resolutionScale), 1.0f, 2.5f);
         const float requested =
             uiScaleSetting > 0.0f ? uiScaleSetting : autoUiScale;
-        uiScale = std::clamp(requested, 1.0f, 2.5f);
+        // Keep enough logical pixels for the widest layout (queue + decks +
+        // plan/transport). Without this clamp a 1280-point window at 200% would
+        // leave only 640 logical pixels and push the transport off-screen.
+        requestedUiScale = requested;
+        uiScale = effectiveUiScale(static_cast<float>(w), static_cast<float>(h),
+                                   requested);
+        uiScaleLimited = requested > uiScale + 0.005f;
         outputWidth = w;
         outputHeight = h;
         canvasW = static_cast<float>(w) / uiScale;
@@ -770,11 +789,40 @@ struct DesktopApp::Impl {
     }
 
     void toggleFullscreen(bool enabled) {
+        if (!window) {
+            return;
+        }
+        if (enabled && !fullscreen) {
+            int w = 0;
+            int h = 0;
+            SDL_GetWindowSize(window, &w, &h);
+            if (w > 0 && h > 0) {
+                windowedW = w;
+                windowedH = h;
+            }
+        }
+        const bool wasFullscreen = fullscreen;
         fullscreen = enabled;
-        (void)SDL_SetWindowFullscreen(window, enabled);
+        if (!SDL_SetWindowFullscreen(window, enabled)) {
+            fullscreen = wasFullscreen;
+            showToast(std::string("Fullscreen failed: ") + SDL_GetError());
+            return;
+        }
+        if (!enabled && wasFullscreen && windowedW > 0 && windowedH > 0) {
+            // SDL normally restores the previous geometry; enforce it so a
+            // display change while fullscreen cannot leave a tiny window. Some
+            // platforms apply the mode change asynchronously, so the leave
+            // event repeats this once the window is windowed again.
+            restoreWindowedOnLeave = true;
+            SDL_SetWindowSize(window, windowedW, windowedH);
+            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED,
+                                  SDL_WINDOWPOS_CENTERED);
+        }
         refreshRenderMetrics();
         computeLayout();
         settingsDirty = true;
+        showToast(enabled ? "Fullscreen  ·  F11 or Esc for windowed"
+                          : "Windowed  ·  F11 for fullscreen");
     }
 
     void cycleUiScale() {
@@ -790,10 +838,31 @@ struct DesktopApp::Impl {
         refreshRenderMetrics();
         computeLayout();
         settingsDirty = true;
-        showToast(uiScaleSetting <= 0.0f
-                      ? "UI scale: automatic"
-                      : "UI scale: " +
-                            formatNumber(uiScaleSetting * 100.0, 0) + "%");
+        std::string message =
+            uiScaleSetting <= 0.0f
+                ? "UI scale: automatic"
+                : "UI scale: " + formatNumber(uiScaleSetting * 100.0, 0) + "%";
+        if (uiScaleLimited) {
+            message += " (limited to " + formatNumber(uiScale * 100.0, 0) +
+                       "% so the controls stay on screen)";
+        }
+        showToast(message);
+    }
+
+    [[nodiscard]] std::string uiScaleCaption() const {
+        const int effective =
+            static_cast<int>(std::lround(uiScale * 100.0f));
+        if (uiScaleSetting <= 0.0f) {
+            return uiScaleLimited ? "UI AUTO / " + std::to_string(effective) + "%"
+                                  : "UI AUTO";
+        }
+        std::string caption =
+            "UI " +
+            formatNumber(uiScaleSetting * 100.0, 0) + "%";
+        if (uiScaleLimited) {
+            caption += " / " + std::to_string(effective) + "%";
+        }
+        return caption;
     }
 
     void cycleVrmQuality() {
@@ -888,7 +957,7 @@ struct DesktopApp::Impl {
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
         if (options.uiScale > 0.0f) {
-            uiScaleSetting = std::clamp(options.uiScale, 1.0f, 2.0f);
+            uiScaleSetting = std::clamp(options.uiScale, 1.0f, kUiScaleMax);
         }
         if (options.vrmQuality > 0) {
             vrmQuality = std::clamp(options.vrmQuality, 50, 100);
@@ -997,6 +1066,13 @@ struct DesktopApp::Impl {
         if (options.fullscreen) {
             toggleFullscreen(true);
         } else if (savedMaximized && options.windowWidth == 0) {
+            SDL_MaximizeWindow(window);
+            maximized = true;
+            refreshRenderMetrics();
+        } else if (options.captureFile.empty() && options.windowWidth == 0 &&
+                   savedWindowW == 0 && savedWindowH == 0) {
+            // First run without explicit geometry: start maximized so the
+            // layout fills the display instead of a small 1440x900 window.
             SDL_MaximizeWindow(window);
             maximized = true;
             refreshRenderMetrics();
@@ -2560,10 +2636,40 @@ struct DesktopApp::Impl {
         case SDL_EVENT_WINDOW_RESIZED:
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
-        case SDL_EVENT_WINDOW_MAXIMIZED:
-        case SDL_EVENT_WINDOW_RESTORED:
             refreshRenderMetrics();
             computeLayout();
+            break;
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+            // The OS owns the transition; mirror its state instead of calling
+            // SDL_SetWindowFullscreen() again from the event handler.
+            fullscreen = true;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+            fullscreen = false;
+            if (restoreWindowedOnLeave && windowedW > 0 && windowedH > 0) {
+                SDL_SetWindowSize(window, windowedW, windowedH);
+                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED,
+                                      SDL_WINDOWPOS_CENTERED);
+                restoreWindowedOnLeave = false;
+            }
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+            maximized = true;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_RESTORED:
+            maximized = false;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
             break;
         case SDL_EVENT_DROP_FILE:
             if (event.drop.data) {
@@ -2674,6 +2780,17 @@ struct DesktopApp::Impl {
     void handleKey(const SDL_KeyboardEvent& key) {
         const bool shift = (key.mod & SDL_KMOD_SHIFT) != 0;
         const bool ctrl = (key.mod & SDL_KMOD_CTRL) != 0;
+        const bool alt = (key.mod & SDL_KMOD_ALT) != 0;
+        // Window management is global: F11 and Alt+Enter work on every screen.
+        if (key.key == SDLK_F11 ||
+            ((key.key == SDLK_RETURN || key.key == SDLK_KP_ENTER) && alt)) {
+            toggleFullscreen(!fullscreen);
+            return;
+        }
+        if (key.key == SDLK_ESCAPE && fullscreen) {
+            toggleFullscreen(false);
+            return;
+        }
         if (module == Module::Mix && mixSession) {
             switch (key.key) {
             case SDLK_SPACE:
@@ -2896,10 +3013,6 @@ struct DesktopApp::Impl {
             if (presentation) {
                 presentation = false;
                 break;
-            }
-            if (fullscreen) {
-                fullscreen = false;
-                toggleFullscreen(false);
             }
             break;
         default:
@@ -5186,17 +5299,11 @@ void DesktopApp::Impl::computeMixLayout() {
     const float footerY = canvasH - 44.0f;
     const float bottom = footerY - 12.0f;
     const float contentH = std::max(220.0f, bottom - top);
-    const float width = std::max(400.0f, canvasW - margin * 2.0f);
 
-    float queueW = std::clamp(canvasW * 0.215f, 250.0f, 340.0f);
-    float rightW = std::clamp(canvasW * 0.255f, 330.0f, 440.0f);
-    float centerW = width - queueW - rightW - gap * 2.0f;
-    if (centerW < 420.0f) {
-        const float deficit = 420.0f - centerW;
-        queueW = std::max(210.0f, queueW - deficit * 0.45f);
-        rightW = std::max(300.0f, rightW - deficit * 0.55f);
-        centerW = std::max(260.0f, width - queueW - rightW - gap * 2.0f);
-    }
+    const MixColumns columns = computeMixColumns(canvasW);
+    float queueW = columns.queueW;
+    float rightW = columns.rightW;
+    float centerW = columns.centerW;
 
     const Rect queue{ margin, top, queueW, contentH };
     const Rect deckA{ margin + queueW + gap, top, centerW,
@@ -5749,10 +5856,7 @@ void DesktopApp::Impl::drawMixControls(const Rect& card,
     drawMixButton(mixLayout.previewButton, "PREVIEW PLAN", mixPlanDetail,
                   theme::accent);
 
-    const std::string uiCaption =
-        uiScaleSetting > 0.0f
-            ? "UI " + formatNumber(uiScaleSetting * 100.0, 0) + "%"
-            : "UI AUTO";
+    const std::string uiCaption = uiScaleCaption();
     drawMixButton(mixLayout.uiScaleChip, uiCaption,
                   uiScaleSetting > 0.0f, theme::violet);
     drawMixButton(mixLayout.qualityChip,

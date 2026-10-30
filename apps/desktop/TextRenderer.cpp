@@ -1,5 +1,7 @@
 ﻿#include "TextRenderer.hpp"
 
+#include "UiMetrics.hpp"
+
 #include "stb_truetype.h"
 
 #include <algorithm>
@@ -140,7 +142,7 @@ struct TextRenderer::Impl {
     stbtt_fontinfo semibold{};
     bool regularReady = false;
     bool semiboldReady = false;
-    std::unordered_map<int, Face> faces;
+    std::unordered_map<std::uint64_t, Face> faces;
 
     ~Impl() {
         for (auto& [key, face] : faces) {
@@ -163,7 +165,8 @@ struct TextRenderer::Impl {
         const int bakedSize = std::clamp(
             static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
             192);
-        const int key = bakedSize * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
+        const std::uint64_t key = fontFaceCacheKey(
+            bakedSize, scale, weight == FontWeight::SemiBold);
         auto it = faces.find(key);
         if (it != faces.end()) {
             return &it->second;
@@ -320,7 +323,8 @@ struct TextRenderer::Impl {
         const int bakedSize = std::clamp(
             static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
             192);
-        const int key = bakedSize * 2 + (weight == FontWeight::SemiBold ? 1 : 0);
+        const std::uint64_t key = fontFaceCacheKey(
+            bakedSize, scale, weight == FontWeight::SemiBold);
         auto it = faces.find(key);
         return it != faces.end() ? &it->second : nullptr;
     }
