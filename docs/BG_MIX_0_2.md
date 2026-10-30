@@ -47,8 +47,10 @@ resampled**, so pitch is preserved. The window is 42 ms (2016 frames at 48 kHz,
 clamped to 1024–4096), the hop is half a window, and the search range is
 window/10. The search always evaluates the nominal (zero) offset, so unity-rate
 playback reconstructs the source exactly (measured relative error 0.0000 on a
-broadband signal). Sharp transients bypass the search so drum attacks are not
-smeared. Stereo uses one shared offset, so the image does not wander.
+broadband signal). At EOF the stream drains the final window's overlap tail and
+then emits silence; it never repeats the last window. Sharp transients bypass
+the search so drum attacks are not smeared. Stereo uses one shared offset, so
+the image does not wander.
 
 `latencyFrames()` reports window/2 (≈21 ms at 48 kHz) as algorithmic
 look-ahead. The engine's EOF de-click accounts for it.
@@ -237,6 +239,8 @@ sampled at the source-media position, so the analysed source-time grid
 (downbeats, accents and beat offset) stays correct at any deck rate; the live
 tempo is already expressed by that position advancing faster. A constant
 source-time clock is only a fallback when the analysis is not available yet.
+`setAnalysis()` is re-installed only when the master track changes, so a ramp
+does not restart the Auto blend every time the live BPM crosses a threshold.
 BG Motion 3.x is not modified.
 
 ---
@@ -273,7 +277,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 45 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 46 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -290,8 +294,9 @@ including:
 * no tempo-sync leak into a plain crossfade (including ambiguous candidates),
   and Manual mode not inventing an adaptive ramp;
 * source-rate normalization (44.1 kHz into a 48 kHz engine), large WSOLA block
-  draining, one-shot state isolation and unity-rate reconstruction (relative
-  error 0.0000), and outgoing continuity when a transition starts in place;
+  draining, one-shot state isolation, unity-rate reconstruction (relative error
+  0.0000), EOF tail drain to silence, and outgoing continuity when a transition
+  starts in place;
 * live-tempo adapter and master handover;
 * render budget (10 s of audio in ≈44 ms) and the real-time control stress.
 

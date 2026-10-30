@@ -1773,7 +1773,6 @@ struct DesktopApp::Impl {
     // Live-mix follow: the master deck id and tempo last installed into the
     // dance grid, so a handover or a tempo ramp re-anchors exactly once.
     std::uint64_t mixDanceTrackId = 0;
-    double mixDanceBpm = 0.0;
     // DancePlayer keeps a raw analysis pointer, so the mix follow adapter must
     // own the analysis for as long as it is installed.
     std::shared_ptr<const AnalysisResult> mixDanceAnalysis;
@@ -2200,15 +2199,13 @@ struct DesktopApp::Impl {
         if (!live.valid || !live.playing) {
             return;
         }
-        // Re-anchor only when the musical master or its tempo actually changes,
-        // not every frame: re-installing the grid each tick would reset the
-        // beat phase and make the dancer stutter.
-        if (live.trackId == mixDanceTrackId &&
-            std::abs(live.bpm - mixDanceBpm) < 0.01) {
+        // Re-install only when the musical master changes, not when its live
+        // rate changes: the analysed source-time grid stays valid at any rate,
+        // and setAnalysis() rebuilds the Auto plan and restarts its blend.
+        if (live.trackId == mixDanceTrackId && mixDanceAnalysis) {
             return;
         }
         mixDanceTrackId = live.trackId;
-        mixDanceBpm = live.bpm;
         mixDanceAnalysis = mixSession->deckAnalysis(live.master);
         if (mixDanceAnalysis) {
             dance.setAnalysis(mixDanceAnalysis.get(), danceTime());

@@ -77,6 +77,7 @@ public:
         std::fill(previous_.begin(), previous_.end(), 0.0f);
         sourcePosition_ = std::max(0.0, sourcePositionFrames);
         primed_ = false;
+        eof_ = false;
     }
 
     void render(const PcmTrack& track, double& positionFrames,
@@ -185,6 +186,25 @@ private:
         const std::size_t frameCount = track.frameCount();
         const std::size_t lastStart =
             frameCount > window_ ? frameCount - window_ : 0;
+        if (eof_) {
+            // Drain the overlap tail of the final window, then silence. Do not
+            // clamp back to lastStart: that would repeat the final window for
+            // the whole rest of the requested block.
+            const std::size_t emit = std::min(
+                hop_, ringCount_ < capacity_ ? capacity_ - ringCount_ : 0);
+            for (std::size_t i = 0; i < emit; ++i) {
+                push(acc_[i * 2], acc_[i * 2 + 1]);
+            }
+            const std::size_t keep = window_ - hop_;
+            for (std::size_t i = 0; i < keep; ++i) {
+                acc_[i * 2] = acc_[(i + hop_) * 2];
+                acc_[i * 2 + 1] = acc_[(i + hop_) * 2 + 1];
+            }
+            std::fill(acc_.begin() + static_cast<std::ptrdiff_t>(keep * 2),
+                      acc_.end(), 0.0f);
+            sourcePosition_ += static_cast<double>(hop_) * ratio;
+            return;
+        }
         const double nominal = std::clamp(
             sourcePosition_, 0.0, static_cast<double>(lastStart));
         std::size_t base = static_cast<std::size_t>(std::llround(nominal));
@@ -248,6 +268,11 @@ private:
             previous_[i] = sourceMono(track, best + hop_ + i);
         }
         primed_ = true;
+        if (nominal >= static_cast<double>(lastStart)) {
+            // The final source window has been rendered. Subsequent calls
+            // drain its overlap tail and then emit silence.
+            eof_ = true;
+        }
 
         const std::size_t emit = std::min(hop_, ringCount_ < capacity_
                                                      ? capacity_ - ringCount_
@@ -284,6 +309,7 @@ private:
     std::vector<float> hann_;
     double sourcePosition_ = 0.0;
     bool primed_ = false;
+    bool eof_ = false;
 };
 
 } // namespace

@@ -1966,6 +1966,20 @@ TEST_CASE("mix.wsola_unity_reconstruction") {
     std::printf("wsola unity reconstruction: relative error %.4f\n", relative);
 }
 
+TEST_CASE("mix.wsola_stops_at_eof") {
+    const auto track = toneTrack(1.0, 440.0);
+    const std::vector<float> output = renderStretch(*track, 1.0, 2.0, 0.0);
+    const std::size_t first = static_cast<std::size_t>(1.25 * kRate);
+    const std::size_t last = static_cast<std::size_t>(1.90 * kRate);
+    double sum = 0.0;
+    for (std::size_t i = first; i < last; ++i) {
+        sum += static_cast<double>(output[i * 2]) * output[i * 2];
+    }
+    const double rms = std::sqrt(sum / static_cast<double>(last - first));
+    CHECK(rms < 1e-4);
+    std::printf("wsola EOF tail: rms after source end %.6f\n", rms);
+}
+
 TEST_CASE("mix.engine_resamples_source_rate") {
     // 44.1 kHz source into a 48 kHz engine: WSOLA must not play it 8.8% sharp.
     MixEngine engine(kRate);
