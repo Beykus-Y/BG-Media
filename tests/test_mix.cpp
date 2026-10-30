@@ -761,6 +761,17 @@ bgmedia::mix::MixPrepareCallback makeTestPrepare() {
             region.confidence = 0.9f;
             analysis->silences.push_back(region);
         }
+        // "marker" fixtures expose a late intro cue, so a direct cut that
+        // ignores the planned incoming marker visibly starts at zero instead.
+        if (name.find("marker") != std::string::npos && duration > 8.0) {
+            analysis->sections.clear();
+            analysis->sections.push_back(
+                {0.0, 5.2, SectionKind::Build, 0.8f, 0.8f});
+            analysis->sections.push_back(
+                {5.2, duration, SectionKind::Intro, 0.9f, 0.8f});
+            analysis->sections.push_back(
+                {5.2, duration, SectionKind::Main, 0.9f, 0.8f});
+        }
         out.analysis = analysis;
         if (progress) {
             progress(1.0f, "ready");
@@ -1160,9 +1171,6 @@ TEST_CASE("mix.session_auto_transition_uses_planned_window") {
     for (int i = 0; i < 8000 && !started; ++i) {
         pump.once();
         started = engine.snapshot().phase == TransitionPhase::Running;
-        if (!started) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
     }
     CHECK(started);
 
@@ -1172,6 +1180,70 @@ TEST_CASE("mix.session_auto_transition_uses_planned_window") {
     CHECK(startedAt > 17.0);
     CHECK(startedAt < 23.0);
     CHECK_NEAR(snap.transitionDuration, 4.0, 0.35);
+}
+
+TEST_CASE("mix.engine_pause_fade_is_per_sample") {
+    // Finding: the pause envelope subtracted the whole block's fade step at
+    // once, so a 480-frame callback at 48 kHz jumped from full amplitude to
+    // silence (and back) and bypassed the 8 ms de-click.
+    MixEngine engine(kRate);
+    CHECK(engine.loadDeck(DeckId::A, dcTrack(1.0, 0.4f), 1, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.2, nullptr);
+
+    std::vector<float> block(480 * 2, 0.0f);
+    engine.setPaused(true);
+    engine.render(block.data(), 480);
+    // The first sample of the pause block must still carry audio, and the
+    // block must end at true silence.
+    CHECK(std::abs(block[0]) > 0.25f);
+    CHECK(std::abs(block[480 * 2 - 1]) == 0.0f);
+
+    engine.setPaused(false);
+    engine.render(block.data(), 480);
+    // Resume ramps up from silence instead of snapping to full level.
+    CHECK(std::abs(block[0]) < 0.02f);
+    CHECK(std::abs(block[480 * 2 - 1]) > 0.30f);
+}
+
+TEST_CASE("mix.session_auto_direct_cut_uses_marker") {
+    // Finding: automatic scheduling skipped valid zero-duration Direct Cut
+    // plans, so it fell back to EOF promotion, which started the incoming deck
+    // at zero and recorded no completed transition.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-silence-alpha.wav");
+    session.addTrack("long-marker-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.setAdaptive(true);
+    session.setTransitionType(TransitionType::DirectCut);
+    session.setTransitionDuration(0.0);
+    session.play();
+    pump.once();
+
+    const bgmedia::mix::MixPlan preview = session.snapshot().preview;
+    CHECK(preview.valid);
+    CHECK(preview.type == TransitionType::DirectCut);
+    CHECK_NEAR(preview.duration, 0.0, 1e-6);
+    // The cut point is the end of the musical window, before the 24 s silence.
+    CHECK(preview.transitionStartA > 23.0);
+    CHECK(preview.transitionStartA < 24.5);
+    CHECK(preview.startB > 1.0);
+
+    const std::uint64_t completedBefore = engine.completedTransitions();
+    bool cut = false;
+    for (int i = 0; i < 8000 && !cut; ++i) {
+        pump.once();
+        cut = engine.completedTransitions() > completedBefore;
+    }
+    CHECK(cut);
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    CHECK(snap.master == DeckId::B);
+    CHECK(snap.decks[1].playing);
+    CHECK(snap.decks[1].positionSeconds >= preview.startB - 0.2);
+    CHECK(snap.decks[1].positionSeconds < preview.startB + 1.0);
 }
 
 TEST_CASE("mix.engine_concurrent_controls_stress") {
@@ -1259,7 +1331,13 @@ TEST_CASE("mix.engine_concurrent_controls_stress") {
                 engine.cancelTransition();
                 break;
             default:
+                // Directly adjacent stop + submit: the callback discards the
+                // pending plan while the control thread publishes a new one.
+                // The payload is control-thread-owned, so startTransition()
+                // may overwrite it only after the ready flag is cleared.
                 engine.stop();
+                (void)engine.startTransition(
+                    crossfadePlan(engine, 0.5, 0.0));
                 break;
             }
             std::this_thread::yield();
