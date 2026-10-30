@@ -130,7 +130,6 @@ struct TextRenderer::Impl {
         float ascent = 0.0f;
         float descent = 0.0f;
         float lineHeight = 0.0f;
-        float inverseScale = 1.0f;
         std::unordered_map<std::uint32_t, Glyph> glyphs;
     };
 
@@ -165,8 +164,8 @@ struct TextRenderer::Impl {
         const int bakedSize = std::clamp(
             static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
             192);
-        const std::uint64_t key = fontFaceCacheKey(
-            bakedSize, scale, weight == FontWeight::SemiBold);
+        const std::uint64_t key =
+            fontFaceCacheKey(bakedSize, weight == FontWeight::SemiBold);
         auto it = faces.find(key);
         if (it != faces.end()) {
             return &it->second;
@@ -178,7 +177,6 @@ struct TextRenderer::Impl {
         }
 
         Face baked;
-        baked.inverseScale = 1.0f / std::max(0.01f, scale);
         baked.ascent = static_cast<float>(bakedSize) * 0.80f;
         const float fontScale = stbtt_ScaleForPixelHeight(info, static_cast<float>(bakedSize));
         int ascent = 0;
@@ -323,8 +321,8 @@ struct TextRenderer::Impl {
         const int bakedSize = std::clamp(
             static_cast<int>(std::lround(static_cast<float>(size) * scale)), 8,
             192);
-        const std::uint64_t key = fontFaceCacheKey(
-            bakedSize, scale, weight == FontWeight::SemiBold);
+        const std::uint64_t key =
+            fontFaceCacheKey(bakedSize, weight == FontWeight::SemiBold);
         auto it = faces.find(key);
         return it != faces.end() ? &it->second : nullptr;
     }
@@ -376,7 +374,8 @@ void TextRenderer::draw(std::string_view text, float x, float y, int size,
     SDL_SetTextureAlphaMod(face->texture, static_cast<Uint8>(
         std::clamp(alpha * static_cast<float>(color.a) / 255.0f, 0.0f, 1.0f) * 255.0f));
 
-    const float baseline = y + face->ascent * face->inverseScale;
+    const float inverseScale = fontInverseScale(impl_->scale);
+    const float baseline = y + face->ascent * inverseScale;
     std::size_t index = 0;
     while (index < text.size()) {
         const std::uint32_t cp = decodeUtf8(text, index);
@@ -389,13 +388,13 @@ void TextRenderer::draw(std::string_view text, float x, float y, int size,
                                 glyph->v0 * face->atlasHeight,
                                 glyph->width, glyph->height};
             const SDL_FRect dst{
-                x + glyph->bearingX * face->inverseScale,
-                baseline + glyph->bearingY * face->inverseScale,
-                glyph->width * face->inverseScale,
-                glyph->height * face->inverseScale};
+                x + glyph->bearingX * inverseScale,
+                baseline + glyph->bearingY * inverseScale,
+                glyph->width * inverseScale,
+                glyph->height * inverseScale};
             SDL_RenderTexture(impl_->renderer, face->texture, &src, &dst);
         }
-        x += glyph->advance * face->inverseScale + letterSpacing;
+        x += glyph->advance * inverseScale + letterSpacing;
     }
 }
 
@@ -421,6 +420,7 @@ float TextRenderer::measure(std::string_view text, int size, FontWeight weight,
         return 0.0f;
     }
     float width = 0.0f;
+    const float inverseScale = fontInverseScale(impl_->scale);
     std::size_t index = 0;
     while (index < text.size()) {
         const std::uint32_t cp = decodeUtf8(text, index);
@@ -428,20 +428,20 @@ float TextRenderer::measure(std::string_view text, int size, FontWeight weight,
         if (!glyph) {
             continue;
         }
-        width += glyph->advance * face->inverseScale + letterSpacing;
+        width += glyph->advance * inverseScale + letterSpacing;
     }
     return width;
 }
 
 float TextRenderer::lineHeight(int size, FontWeight weight) const {
     const Impl::Face* face = impl_->faceRead(size, weight);
-    return face ? face->lineHeight * face->inverseScale
+    return face ? face->lineHeight * fontInverseScale(impl_->scale)
                 : static_cast<float>(size) * 1.2f;
 }
 
 float TextRenderer::ascent(int size, FontWeight weight) const {
     const Impl::Face* face = impl_->faceRead(size, weight);
-    return face ? face->ascent * face->inverseScale
+    return face ? face->ascent * fontInverseScale(impl_->scale)
                 : static_cast<float>(size) * 0.8f;
 }
 

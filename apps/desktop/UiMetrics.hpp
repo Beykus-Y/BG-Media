@@ -74,18 +74,22 @@ struct MixColumns {
     return {queueW, rightW, centerW};
 }
 
-// Cache key for a baked glyph atlas. The baked pixel size alone is not unique:
-// round(10 px * 1.00) and round(8 px * 1.25) both bake a 10 px face but require
-// different logical metrics, so the scale must participate in the key.
-[[nodiscard]] inline std::uint64_t fontFaceCacheKey(int bakedSize, float scale,
+// Cache key for a baked glyph atlas. The key is the baked pixel size and the
+// weight only: the atlas itself does not depend on the UI scale. Logical
+// metrics are derived per frame from the current scale (see fontInverseScale),
+// so continuous window resizing reuses one atlas per pixel size instead of
+// retaining an entry for every scale step.
+[[nodiscard]] inline std::uint64_t fontFaceCacheKey(int bakedSize,
                                                     bool semibold) {
-    const auto scaleKey = static_cast<std::uint32_t>(
-        std::lround(std::clamp(scale, 0.5f, 4.0f) * 1000.0f));
     return (static_cast<std::uint64_t>(
-                static_cast<std::uint32_t>(bakedSize))
-            << 32) |
-           (static_cast<std::uint64_t>(scaleKey) << 1) |
+                static_cast<std::uint32_t>(std::clamp(bakedSize, 1, 4096)))
+            << 1) |
            (semibold ? 1u : 0u);
+}
+
+// Converts baked glyph metrics back into logical canvas points.
+[[nodiscard]] inline float fontInverseScale(float scale) {
+    return 1.0f / std::max(0.01f, scale);
 }
 
 } // namespace bgmedia::desktop
