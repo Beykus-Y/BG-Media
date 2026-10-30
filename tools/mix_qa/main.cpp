@@ -11,6 +11,7 @@
 #include "bgmedia/mix/MixPlanner.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -50,6 +52,7 @@ struct Options {
     double rampPercent = 6.0;
     double warmupSeconds = 8.0;
     double tailSeconds = 1.5;
+    double stressSeconds = 0.0;
     bool device = false;
     bool noCache = false;
 };
@@ -103,6 +106,8 @@ void printUsage() {
         "  --duration <s>                manual crossfade length (0 = auto)\n"
         "  --ramp <percent>              Tempo Ramp max delta (default 6)\n"
         "  --warmup <s>                  playback before the transition (8)\n"
+        "  --stress <s>                  concurrent play/pause/seek/load/clear/\n"
+        "                                next/stop stress for this many seconds\n"
         "  --device                      also run on the real output device\n"
         "  --cache <dir>                 analysis cache directory\n"
         "  --no-cache                    ignore the analysis cache\n");
@@ -156,6 +161,10 @@ bool parseOptions(int argc, char** argv, Options& options) {
             const char* value = next("--warmup");
             if (!value) return false;
             options.warmupSeconds = std::atof(value);
+        } else if (arg == "--stress") {
+            const char* value = next("--stress");
+            if (!value) return false;
+            options.stressSeconds = std::atof(value);
         } else if (arg == "--cache") {
             const char* value = next("--cache");
             if (!value) return false;
@@ -390,6 +399,195 @@ bool deviceRun(const Options& options, const PreparedMixTrack& a,
     return snap.completedTransitions >= 1;
 }
 
+std::shared_ptr<const bgmedia::mix::PcmTrack> stressPcm(double seconds,
+                                                       float value) {
+    auto track = std::make_shared<bgmedia::mix::PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames =
+        static_cast<std::size_t>(std::llround(seconds * kRate));
+    track->samples.assign(frames * 2, value);
+    return track;
+}
+
+MixPlan stressPlan(const MixEngine& engine) {
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+    if (snap.phase != TransitionPhase::Idle || !snap.decks[0].loaded ||
+        !snap.decks[1].loaded) {
+        return {};
+    }
+    const DeckId from = snap.master;
+    const DeckId to = bgmedia::mix::otherDeck(from);
+    MixPlan plan;
+    plan.valid = true;
+    plan.type = TransitionType::Crossfade;
+    plan.requestedType = TransitionType::Crossfade;
+    plan.from = from;
+    plan.to = to;
+    plan.duration = 0.6;
+    plan.transitionStartA =
+        snap.decks[static_cast<int>(from)].positionSeconds;
+    plan.transitionEndA = plan.transitionStartA + plan.duration;
+    plan.startB = 0.0;
+    plan.endB = plan.duration;
+    plan.handoverProgress = 0.5;
+    plan.gainCurveOut = {{0.0, 1.0f}, {plan.duration, 0.0f}};
+    plan.gainCurveIn = {{0.0, 0.0f}, {plan.duration, 1.0f}};
+    return plan;
+}
+
+// Concurrent stress: play/pause/seek/load/clear/next/cancel/stop while either a
+// real output callback (--device) or an emulated render thread consumes the
+// engine. Run the binary under ASan to turn the ownership protocol into a
+// checkable memory-safety test; this mode is not a performance benchmark.
+bool stressRun(const Options& options, const PreparedMixTrack& a,
+               const PreparedMixTrack& b) {
+    MixEngine engine(kRate);
+    if (!engine.loadDeck(DeckId::A, a.audio, 1, a.analysis->bpm) ||
+        !engine.loadDeck(DeckId::B, b.audio, 2, b.analysis->bpm)) {
+        std::fprintf(stderr, "stress: failed to load prepared decks\n");
+        return false;
+    }
+    engine.play(DeckId::A);
+    engine.setMaster(DeckId::A);
+
+    std::unique_ptr<MiniaudioMixDevice> device;
+    bool realCallback = false;
+    if (options.device) {
+        device = std::make_unique<MiniaudioMixDevice>(engine);
+        std::string error;
+        if (device->open(kRate, &error)) {
+            realCallback = true;
+            std::printf("  stress device: %s\n", device->deviceName().c_str());
+        } else {
+            std::printf("  stress device unavailable (%s); using an emulated "
+                        "render thread\n",
+                        error.c_str());
+            device.reset();
+        }
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> renders{0};
+    std::atomic<std::uint64_t> nonFinite{0};
+    std::atomic<float> peak{0.0f};
+    std::thread audio;
+    if (!realCallback) {
+        audio = std::thread([&] {
+            std::vector<float> buffer(kBlock * 2, 0.0f);
+            while (!stop.load(std::memory_order_acquire)) {
+                engine.render(buffer.data(), kBlock);
+                float localPeak = 0.0f;
+                for (float value : buffer) {
+                    if (!std::isfinite(value)) {
+                        nonFinite.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    localPeak = std::max(localPeak, std::abs(value));
+                }
+                peak.store(std::max(peak.load(std::memory_order_relaxed),
+                                    localPeak),
+                           std::memory_order_relaxed);
+                renders.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(
+            static_cast<int>(std::max(0.1, options.stressSeconds) * 1000.0));
+    std::uint64_t ops = 0;
+    std::uint64_t loads = 0;
+    std::uint64_t transitions = 0;
+    std::uint64_t cancels = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        switch (ops % 10) {
+        case 0:
+            engine.setPaused(false);
+            engine.play(DeckId::A);
+            engine.setMaster(DeckId::A);
+            break;
+        case 1:
+            engine.play(DeckId::B);
+            engine.setMaster(DeckId::B);
+            break;
+        case 2:
+            engine.pause(DeckId::A);
+            engine.pause(DeckId::B);
+            break;
+        case 3:
+            engine.seek(DeckId::A, static_cast<double>(ops % 160) * 0.05);
+            break;
+        case 4:
+            engine.seek(DeckId::B, static_cast<double>(ops % 160) * 0.05);
+            break;
+        case 5:
+        case 6: {
+            const DeckId deck = (ops & 1) ? DeckId::A : DeckId::B;
+            const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+            const int index = static_cast<int>(deck);
+            if (!snap.decks[index].playing && !snap.paused &&
+                snap.phase == TransitionPhase::Idle) {
+                (void)engine.loadDeck(deck, stressPcm(0.25, 0.05f), 1000 + ops,
+                                      120.0);
+                ++loads;
+            }
+            break;
+        }
+        case 7: {
+            const MixPlan plan = stressPlan(engine);
+            if (plan.valid && engine.startTransition(plan)) {
+                ++transitions;
+            }
+            break;
+        }
+        case 8:
+            engine.cancelTransition();
+            ++cancels;
+            break;
+        default:
+            engine.stop();
+            break;
+        }
+        ++ops;
+        // Keep the control rate in the same order of magnitude as a human UI
+        // (plus automation) instead of millions of no-op tickets; the audio
+        // callback keeps running continuously in the meantime.
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    stop.store(true, std::memory_order_release);
+    if (audio.joinable()) {
+        audio.join();
+    }
+    if (device) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    const bgmedia::mix::MixSnapshot snap = engine.snapshot();
+
+    std::printf(
+        "  stress: callback=%s ops=%llu loads=%llu transitions=%llu "
+        "cancels=%llu renders=%llu peak=%.3f nonfinite=%llu phase=%d\n",
+        realCallback ? "real device" : "emulated thread",
+        static_cast<unsigned long long>(ops),
+        static_cast<unsigned long long>(loads),
+        static_cast<unsigned long long>(transitions),
+        static_cast<unsigned long long>(cancels),
+        static_cast<unsigned long long>(renders.load()),
+        static_cast<double>(realCallback ? snap.outputPeak : peak.load()),
+        static_cast<unsigned long long>(nonFinite.load()),
+        static_cast<int>(snap.phase));
+    if (device) {
+        std::printf(
+            "  stress device: latency %.1f ms, callback load %.2f%%, "
+            "overruns %llu\n",
+            device->baseLatency() * 1000.0, device->callbackLoad() * 100.0,
+            static_cast<unsigned long long>(device->overruns()));
+        device->close();
+    }
+    return nonFinite.load() == 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -414,6 +612,11 @@ int main(int argc, char** argv) {
                 std::string(reinterpret_cast<const char*>(pathB.data()),
                             pathB.size())
                     .c_str());
+
+    if (options.stressSeconds > 0.0) {
+        const bool ok = stressRun(options, a, b);
+        return ok ? 0 : 1;
+    }
 
     const bool offline = offlineRun(options, a, b);
     if (!offline) {
