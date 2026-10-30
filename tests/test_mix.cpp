@@ -1790,6 +1790,45 @@ TEST_CASE("mix.planner_ramp_smoothness") {
                 plan.preTransitionSeconds);
 }
 
+TEST_CASE("mix.planner_no_sync_leak_into_crossfade") {
+    AnalysisResult a = analysisFor(120.0);
+    AnalysisResult b = analysisFor(160.0);
+    b.octaveAmbiguous = true;
+    b.bpmCandidates = {160.0, 120.0};
+
+    PlannerConfig config;
+    config.tempoRampMode = TempoRampMode::Off;
+    MixPlanner planner(config);
+    PlanRequest request;
+    request.type = TransitionType::Crossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 10.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(!plan.tempoRampActive);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRampPercent, 0.0, 1e-9);
+
+    // Manual mode must not let an adaptive Smart Crossfade invent a ramp.
+    PlannerConfig manual;
+    manual.tempoRampMode = TempoRampMode::Manual;
+    MixPlanner manualPlanner(manual);
+    PlanRequest adaptive;
+    adaptive.type = TransitionType::SmartCrossfade;
+    adaptive.requestedDuration = 8.0;
+    adaptive.currentPositionA = 10.0;
+    const MixPlan manualPlan =
+        manualPlanner.plan(analysisFor(120.0), analysisFor(126.0), adaptive);
+    CHECK(manualPlan.type != TransitionType::TempoRamp);
+    CHECK(!manualPlan.tempoRampActive);
+    CHECK(manualPlan.fallbackReason.find("Auto") != std::string::npos);
+    std::printf("no sync leak: crossfade ratioB=%.3f manualType=%s\n",
+                plan.tempoRatioB,
+                bgmedia::mix::transitionTypeName(manualPlan.type));
+}
+
 TEST_CASE("mix.live_tempo_follows_master") {
     bgmedia::mix::MixSnapshot snap;
     snap.master = DeckId::B;

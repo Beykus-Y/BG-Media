@@ -269,7 +269,7 @@ layout; the renderer scales the logical canvas, so text and cards stay sharp.
 
 ### 7.1 Automated tests
 
-`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 42 tests,
+`ctest --test-dir build/windows` - 25/25 pass. `bgmedia.mix` contains 43 tests,
 including:
 
 * equal-power and correlation headroom;
@@ -283,6 +283,10 @@ including:
 * planner ramp start/end rates, curve smoothness, media integral, slow-down,
   cap/disabled/unstable/low-confidence fallbacks;
 * phrase-aware cue and the adaptive compatible/incompatible/unstable cases;
+* no tempo-sync leak into a plain crossfade (including ambiguous candidates),
+  and Manual mode not inventing an adaptive ramp;
+* source-rate normalization (44.1 kHz into a 48 kHz engine), large WSOLA block
+  draining and outgoing continuity when a transition starts in place;
 * live-tempo adapter and master handover;
 * render budget (10 s of audio in ≈44 ms) and the real-time control stress.
 

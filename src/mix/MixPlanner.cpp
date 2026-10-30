@@ -771,12 +771,11 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 : "tempo is not compatible for beatmatching; using a plain "
                   "crossfade";
     }
-    if (type == TransitionType::Beatmatched && tempo.matched &&
-        !config_.rampEnabled()) {
+    if (type == TransitionType::Beatmatched && tempo.matched && !ramp) {
         type = TransitionType::Crossfade;
         plan.fallbackReason =
-            "beatmatching needs tempo sync but the tempo ramp is off; using a "
-            "plain crossfade";
+            "beatmatching needs tempo sync but the tempo ramp cannot run here; "
+            "using a plain crossfade";
     }
     if (type == TransitionType::PhraseAware && (!grids || lowConfidence)) {
         type = TransitionType::Crossfade;
@@ -944,13 +943,16 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
 
     plan.type = type;
     plan.tempoRampActive = ramp;
-    plan.tempoRampPercent = tempo.deltaPercent;
+    // A plain crossfade is not tempo-synced. Do not leak an octave-candidate
+    // incoming ratio into a fallback: the engine applies tempoRatioB for the
+    // whole fade, which would slow the incoming track without any ramp.
+    plan.tempoRampPercent = ramp ? tempo.deltaPercent : 0.0;
     plan.tempoRatioAStart = 1.0;
-    plan.tempoRatioAEnd = ratioA;
-    plan.tempoRatioB = tempo.ratioB;
+    plan.tempoRatioAEnd = ramp ? ratioA : 1.0;
+    plan.tempoRatioB = ramp ? tempo.ratioB : 1.0;
     plan.preTransitionSeconds = ramp ? rampSeconds : 0.0;
     plan.tempoRampStartA = ramp ? overallStartA : crossfadeStartA;
-    plan.targetBpm = tempo.compatible ? tempo.targetBpm : b.bpm;
+    plan.targetBpm = ramp ? tempo.targetBpm : b.bpm;
 
     // ------------------------------------------------------------------
     // Tempo automation: ramp before the overlay, then hold the matched rate.
