@@ -349,13 +349,15 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
     // A hard stop cancels an in-flight or pending transition before the pause
     // freeze. It also drops a plan that was published but not consumed yet.
+    // The plan payload itself stays control-thread-owned: the callback only
+    // clears the ready flag. Clearing pendingPlan_ here would race with
+    // startTransition() overwriting it after it observed Phase::Idle.
     if (stopRequested_.exchange(false, std::memory_order_acq_rel)) {
         planReady_.store(false, std::memory_order_release);
         cancelRequested_.store(false, std::memory_order_release);
         phase_.store(static_cast<int>(Phase::Idle), std::memory_order_release);
         runtimeStarted_ = false;
         handoverDone_ = false;
-        pendingPlan_ = {};
     }
 
     // loadDeck()/clearDeck() publish a reset serial instead of writing the
@@ -431,11 +433,10 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     const bool paused = paused_.load(std::memory_order_acquire);
     const float pauseStep =
         1.0f / static_cast<float>(outputSampleRate_ * kDeclickSeconds);
-    if (paused) {
-        pauseFade_ = std::max(0.0f, pauseFade_ - pauseStep * frames);
-    } else {
-        pauseFade_ = std::min(1.0f, pauseFade_ + pauseStep * frames);
-    }
+    // Already silent: freeze the transport without rendering another block.
+    // The envelope is applied per sample below, so a pause that starts inside
+    // this block still renders its 8 ms de-click ramp instead of muting the
+    // whole callback and stepping from full amplitude to zero.
     if (paused && pauseFade_ <= 0.0f) {
         // Freeze the transport only after stop/pause requests have settled the
         // deck flags. Otherwise a stopped deck would report "playing" forever
@@ -450,6 +451,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         publishSnapshot();
         return;
     }
+    float pauseEnvelope = pauseFade_;
+    const float pauseDelta = paused ? -pauseStep : pauseStep;
 
     for (DeckRuntime& deck : decks_) {
         const bool target = deck.targetPlay.load(std::memory_order_acquire);
@@ -597,12 +600,18 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
         float peak = 0.0f;
         for (std::size_t i = 0; i < chunk; ++i) {
+            // Per-sample de-click envelope. Advancing one step per sample
+            // keeps the 8 ms ramp intact even for callback blocks longer than
+            // the ramp (480 frames at 48 kHz), where a per-block step would
+            // jump straight to zero.
+            pauseEnvelope =
+                std::clamp(pauseEnvelope + pauseDelta, 0.0f, 1.0f);
             for (int c = 0; c < 2; ++c) {
                 float value =
                     (scratchA_[i * 2 + static_cast<std::size_t>(c)] +
                      scratchB_[i * 2 + static_cast<std::size_t>(c)]) *
                     headroom;
-                value *= pauseFade_;
+                value *= pauseEnvelope;
                 value = sanitize(value);
                 peak = std::max(peak, std::abs(value));
                 output[(done + i) * 2 + static_cast<std::size_t>(c)] = value;
@@ -667,6 +676,19 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         if (phase_.load(std::memory_order_acquire) ==
             static_cast<int>(Phase::Idle)) {
             // Remaining output in this callback is independent deck playback.
+        }
+    }
+
+    pauseFade_ = pauseEnvelope;
+    // The ramp finished inside this block: now it is safe to freeze the
+    // transport and settle the deck flags.
+    if (paused && pauseFade_ <= 0.0f) {
+        for (DeckRuntime& deck : decks_) {
+            deck.gain = 0.0f;
+            if (!deck.targetPlay.load(std::memory_order_acquire)) {
+                deck.playing = false;
+                deck.fade = 0.0f;
+            }
         }
     }
 
