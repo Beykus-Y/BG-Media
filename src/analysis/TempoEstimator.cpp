@@ -636,6 +636,13 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         double refinedBpm = phase.fittedLag > 1.0
                                 ? 60.0 * fps / phase.fittedLag
                                 : bpm;
+        // Regression may leave a caller's narrow BPM window (e.g. 190..200).
+        // Never return an out-of-range period even if the fit scores better
+        // than the nearby constrained candidates.
+        if (!std::isfinite(refinedBpm) || refinedBpm < minBpm || refinedBpm > maxBpm) {
+            refinedBpm = bpm;
+            phase = bestPhase(peaks, env, lag, toleranceFrames, totalPeakStrength);
+        }
         if (phase.beatCount >= 2 && phase.phase >= 0.0) {
             // Search around the fitted slope when regression succeeded,
             // rather than silently discarding the measured period.

@@ -199,3 +199,16 @@ TEST_CASE(audio.antiphase_stereo_keeps_analysable_pulse) {
     CHECK_NEAR(normal[0], 0.7, 1e-6);
     CHECK_NEAR(normal[1], -0.6, 1e-6);
 }
+
+TEST_CASE(audio.multichannel_downmix_keeps_distinct_channels) {
+    using namespace bgmedia;
+    AudioData surround;
+    surround.sampleRate = 48000;
+    surround.channels = 6;
+    surround.samples = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                        0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const std::vector<float> mono = surround.toMono();
+    REQUIRE(mono.size() == 2);
+    CHECK_NEAR(mono[0], 1.0 / 6.0, 1e-6);
+    CHECK_NEAR(mono[1], 1.0 / 6.0, 1e-6);
+}

@@ -2,6 +2,7 @@
 
 #include "bgmedia/analysis/Analyzer.hpp"
 #include "analysis/EventDetection.hpp"
+#include "analysis/TempoEstimator.hpp"
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "support/SyntheticSignals.hpp"
 
@@ -632,4 +633,51 @@ TEST_CASE(analysis.bass_accent_uses_relative_local_period_window) {
     REQUIRE(accents.size() == 1);
     CHECK(accents.front().nearestBeat == 0);
     CHECK_NEAR(accents.front().offsetFromBeat, 0.17, 0.01);
+}
+
+TEST_CASE(analysis.regression_refinement_stays_in_configured_bpm_range) {
+    using namespace bgmedia;
+    constexpr double fps = 100.0;
+    constexpr double actualBpm = 200.2;
+    std::vector<float> envelope(2000, 0.0f);
+    for (double time = 0.4; time < 19.8; time += 60.0 / actualBpm) {
+        const double frame = time * fps;
+        const int centre = static_cast<int>(std::lround(frame));
+        for (int delta = -3; delta <= 3; ++delta) {
+            const int index = centre + delta;
+            if (index < 0 || index >= static_cast<int>(envelope.size())) {
+                continue;
+            }
+            const double distance = (static_cast<double>(index) - frame) / 1.1;
+            envelope[static_cast<std::size_t>(index)] +=
+                static_cast<float>(std::exp(-0.5 * distance * distance));
+        }
+    }
+    AnalysisConfig config;
+    config.minBpm = 190.0;
+    config.maxBpm = 200.0;
+    config.preferredBpm = 195.0;
+    const TempoEstimate estimate = estimateTempo(envelope, fps, config, 1.0);
+    REQUIRE(estimate.bpm > 0.0);
+    CHECK(estimate.bpm >= config.minBpm);
+    CHECK(estimate.bpm <= config.maxBpm);
+    for (const TempoCandidate& candidate : estimate.candidates) {
+        CHECK(candidate.bpm >= config.minBpm);
+        CHECK(candidate.bpm <= config.maxBpm);
+    }
+}
+
+TEST_CASE(analysis.periodic_120_bpm_envelope_has_no_phantom_sections) {
+    using namespace bgmedia;
+    SpectralFeatures features;
+    features.framesPerSecond = 100.0;
+    features.rms.resize(3000);
+    for (std::size_t i = 0; i < features.rms.size(); ++i) {
+        const double t = static_cast<double>(i) / features.framesPerSecond;
+        const double phase = std::fmod(t, 0.5);
+        features.rms[i] = static_cast<float>(
+            0.03 + 0.5 * std::exp(-phase / 0.06));
+    }
+    const auto sections = detectSections(features, 30.0, {});
+    CHECK(sections.size() <= 2);
 }

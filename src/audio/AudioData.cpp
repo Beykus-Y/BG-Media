@@ -56,9 +56,10 @@ std::vector<float> AudioData::toMono() const {
     }
 
     // A simple average can cancel nearly anti-phase stereo completely.
-    // Only use a dominant channel when the average has lost most of its
-    // signal power; preserve the normal average for ordinary stereo mixes.
-    if (channels > 1) {
+    // Only use a dominant channel for stereo when the average has lost most
+    // of its signal power. Multichannel surround must retain the channel
+    // average, even when some channels are inactive.
+    if (channels == 2) {
         const auto loudest = std::max_element(channelPower.begin(), channelPower.end());
         if (loudest != channelPower.end() && *loudest > 1e-12 &&
             monoPower < *loudest * 0.12) {
