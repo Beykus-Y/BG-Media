@@ -600,6 +600,14 @@ TEST_CASE(analysis.section_detection_resolves_sustained_energy_changes) {
     const std::vector<Section> stable = detectSections(features, 30.0, {});
     REQUIRE(stable.size() == 1);
     CHECK_NEAR(stable.front().end, 30.0, 1e-9);
+
+    // A repeating periodic drum pattern is not a new song section on each
+    // transient. Repeated accent cycles should not create phantom boundaries.
+    for (std::size_t i = 0; i < features.rms.size(); ++i) {
+        features.rms[i] = (i % 50 < 10) ? 0.55f : 0.03f;
+    }
+    const std::vector<Section> periodic = detectSections(features, 30.0, {});
+    CHECK(periodic.size() <= 2);
 }
 
 TEST_CASE(analysis.bass_accent_uses_relative_local_period_window) {

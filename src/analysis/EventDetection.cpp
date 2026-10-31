@@ -256,6 +256,10 @@ std::vector<Section> detectSections(const SpectralFeatures& features,
     // insensitive to mastering gain and works in both directions (drops/builds).
     const double fps = features.framesPerSecond;
     const int radius = std::max(3, static_cast<int>(std::lround(0.85 * fps)));
+    // Long-term evidence distinguishes a genuine new section from one loud
+    // kick or a repeating drum fill inside an otherwise unchanged phrase.
+    const int contextRadius = std::max(radius,
+        std::min(n / 4, static_cast<int>(std::lround(4.0 * fps))));
     const int stride = std::max(1, static_cast<int>(std::lround(0.10 * fps)));
     const double reference = std::max(1e-5, static_cast<double>(dsp::percentile(rms, 0.90)));
     const double floor = std::max(1e-6, reference * 0.025);
@@ -276,7 +280,7 @@ std::vector<Section> detectSections(const SpectralFeatures& features,
     // relative novelty signal, not a calibrated spectral distance.
     const bool haveSpectrum = features.spectrogram.valid() &&
                               features.spectrogram.framesPerSecond > 0.0;
-    auto timbreNovelty = [&](double time) {
+    auto timbreNovelty = [&](double time, double windowSeconds) {
         if (!haveSpectrum) {
             return 0.0;
         }
@@ -285,7 +289,7 @@ std::vector<Section> detectSections(const SpectralFeatures& features,
         const int centre = std::clamp(
             static_cast<int>(std::lround(time * spec.framesPerSecond)), 0, frames - 1);
         const int window = std::max(2, static_cast<int>(
-            std::lround(0.55 * spec.framesPerSecond)));
+            std::lround(windowSeconds * spec.framesPerSecond)));
         const int leftStart = std::max(0, centre - window);
         const int rightEnd = std::min(frames, centre + window);
         if (leftStart >= centre || rightEnd <= centre) {
@@ -313,9 +317,11 @@ std::vector<Section> detectSections(const SpectralFeatures& features,
         double score = 0.0;
     };
     std::vector<Change> candidates;
-    for (int frame = radius; frame + radius < n; frame += stride) {
+    for (int frame = contextRadius; frame + contextRadius < n; frame += stride) {
         const double left = average(frame - radius, frame);
         const double right = average(frame, frame + radius);
+        const double longLeft = average(frame - contextRadius, frame);
+        const double longRight = average(frame, frame + contextRadius);
         if (std::max(left, right) < 0.10 * reference) {
             continue;
         }
@@ -323,9 +329,14 @@ std::vector<Section> detectSections(const SpectralFeatures& features,
         if (time < 2.0 || time > duration - 2.0) {
             continue;
         }
-        const double energyChange =
+        const double shortChange =
             std::min(3.0, std::abs(std::log((right + floor) / (left + floor))));
-        const double novelty = energyChange + 1.8 * timbreNovelty(time);
+        const double longChange =
+            std::min(3.0, std::abs(std::log((longRight + floor) / (longLeft + floor))));
+        const double energyChange = std::min(shortChange, 1.6 * longChange);
+        const double spectralChange =
+            std::min(timbreNovelty(time, 0.55), 1.4 * timbreNovelty(time, 1.8));
+        const double novelty = energyChange + 1.8 * spectralChange;
         if (novelty >= 0.30) {
             candidates.push_back({time, novelty});
         }
