@@ -202,7 +202,11 @@ std::vector<BassAccent> detectBassAccents(
                 0.40 * ratioScore,
             0.0, 1.0));
 
-        int beat = nearestBeatIndex(beats, accent.time, 0.11);
+        // Find the closest beat first, then apply the local-period gate.
+        // A fixed 110 ms pre-filter wrongly rejects aligned accents at 55 BPM
+        // even though the accepted window is 28% of the beat interval.
+        int beat = nearestBeatIndex(beats, accent.time,
+                                    std::numeric_limits<double>::infinity());
         double offset = 0.0;
         if (beat >= 0) {
             offset = accent.time - beats[static_cast<std::size_t>(beat)].time;
