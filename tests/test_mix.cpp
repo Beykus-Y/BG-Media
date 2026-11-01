@@ -4936,3 +4936,54 @@ TEST_CASE("mix.codex_finding_baseline_plan_clears_strategy_and_curves") {
     CHECK(baseline.tailSendAmount == 0.0f);
     CHECK(!baseline.vocalEqCarve);
 }
+
+TEST_CASE("mix.codex_finding_preserve_equal_power_envelopes_for_explicit_crossfade") {
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlannerConfig;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    const auto a = analysisFor(120.0, 30.0);
+    const auto b = analysisFor(120.0, 30.0);
+
+    // 1. Explicit Crossfade of 2.0s with adaptive = false
+    {
+        PlannerConfig config;
+        config.adaptive = false;
+        config.bassSwap = false;
+        MixPlanner planner(config);
+
+        PlanRequest request;
+        request.type = TransitionType::Crossfade;
+        request.requestedDuration = 2.0;
+
+        const auto plan = planner.plan(a, b, nullptr, nullptr, request);
+        CHECK(plan.valid);
+        CHECK(plan.type == TransitionType::Crossfade);
+        CHECK(plan.strategy == MixStrategyKind::SmoothBlend);
+        CHECK(!plan.gainCurveOut.empty());
+        CHECK(std::abs(plan.gainCurveOut[8].gain - 0.7071f) < 0.01f);
+        CHECK(std::abs(plan.gainCurveIn[8].gain - 0.7071f) < 0.01f);
+    }
+
+    // 2. Explicit Crossfade of 2.0s even with adaptive = true
+    {
+        PlannerConfig config;
+        config.adaptive = true;
+        config.bassSwap = false;
+        MixPlanner planner(config);
+
+        PlanRequest request;
+        request.type = TransitionType::Crossfade;
+        request.requestedDuration = 2.0;
+
+        const auto plan = planner.plan(a, b, nullptr, nullptr, request);
+        CHECK(plan.valid);
+        CHECK(plan.type == TransitionType::Crossfade);
+        CHECK(plan.strategy == MixStrategyKind::SmoothBlend);
+        CHECK(!plan.gainCurveOut.empty());
+        CHECK(std::abs(plan.gainCurveOut[8].gain - 0.7071f) < 0.01f);
+        CHECK(std::abs(plan.gainCurveIn[8].gain - 0.7071f) < 0.01f);
+    }
+}

@@ -2037,8 +2037,19 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
     }
 
     // Determine high-level MixStrategyKind.
-    if (plan.type == TransitionType::DirectCut || overrideSpec.forceImpactCut ||
-        (plan.duration > 0.0 && plan.duration <= 2.2)) {
+    const bool allowAdaptiveStrategy =
+        config_.adaptive &&
+        (plan.type == TransitionType::SmartCrossfade ||
+         plan.type == TransitionType::Beatmatched ||
+         plan.type == TransitionType::PhraseAware ||
+         plan.type == TransitionType::TempoRamp ||
+         plan.type == TransitionType::BreakdownBridge);
+
+    if (plan.type == TransitionType::DirectCut || overrideSpec.forceImpactCut) {
+        plan.strategy = MixStrategyKind::DropImpactCut;
+    } else if (!allowAdaptiveStrategy) {
+        plan.strategy = MixStrategyKind::SmoothBlend;
+    } else if (plan.duration > 0.0 && plan.duration <= 2.2) {
         plan.strategy = MixStrategyKind::DropImpactCut;
     } else if (voc.available && voc.cleanVocalHandoff &&
                (voc.outgoingVocalMean >= 0.28f || voc.incomingVocalMean >= 0.28f)) {
