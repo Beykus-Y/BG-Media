@@ -699,4 +699,10 @@ TEST_CASE(analysis.issue_40_tempo_regressions_fixed) {
         CHECK_NEAR(run.result.bpm, 100.0, 2.0);
         CHECK(run.result.bpm > 85.0);
     }
+    // 3. Offbeat track at 120 BPM should estimate ~120 BPM, not subharmonic ~60 BPM
+    {
+        const auto run = analyzeTrack(test::makeOffbeatTrack(120.0, 18.0));
+        CHECK_NEAR(run.result.bpm, 120.0, 2.0);
+        CHECK(run.result.bpm > 100.0);
+    }
 }
