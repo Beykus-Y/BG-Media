@@ -1042,8 +1042,9 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                     overallStartA, std::max(0.0, error)));
             }
         }
+        const double mediaFadeA = duration * ratioA;
         crossfadeStartA = overallStartA + (ramp ? rampMediaSeconds : 0.0);
-        endA = crossfadeStartA + duration;
+        endA = crossfadeStartA + mediaFadeA;
         if (ramp && endA > a.info.duration + 1e-6) {
             // The full ramp plus the fade does not fit after the current
             // position. Shorten the ramp in whole bars instead of collapsing
@@ -1051,7 +1052,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             const double barMedia =
                 static_cast<double>(bpbA) * 60.0 / localBpmA;
             const double room =
-                a.info.duration - duration - overallStartA;
+                a.info.duration - mediaFadeA - overallStartA;
             const int fitBars =
                 room > 0.0 ? static_cast<int>(std::floor(room / barMedia)) : 0;
             if (fitBars >= 1 && (fitBars >= 2 || room >= 3.0 || std::abs(ratioA - 1.0) <= 0.03)) {
@@ -1060,7 +1061,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                     static_cast<double>(rampBars * bpbA) * 60.0 / localBpmA;
                 rampSeconds = rampMediaSeconds / (0.5 * (1.0 + ratioA));
                 crossfadeStartA = overallStartA + rampMediaSeconds;
-                endA = std::min(a.info.duration, crossfadeStartA + duration);
+                endA = std::min(a.info.duration, crossfadeStartA + mediaFadeA);
                 plan.reasons.push_back(format(
                     "Tempo ramp shortened to %.0f bars so the %.1f s crossfade "
                     "still fits before the end of the outgoing track",
@@ -1072,7 +1073,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 rampMediaSeconds = 0.0;
                 ratioA = 1.0;
                 crossfadeStartA = overallStartA;
-                endA = std::min(a.info.duration, crossfadeStartA + duration);
+                endA = std::min(a.info.duration, crossfadeStartA + duration * ratioA);
                 plan.reasons.push_back(
                     "Tempo ramp disabled: the crossfade must start now to fit "
                     "the remaining outgoing audio");
@@ -1084,7 +1085,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         endA = std::min(endA, a.info.duration);
     } else {
         endA = musicalEnd(a);
-        crossfadeStartA = std::max(0.0, endA - duration);
+        crossfadeStartA = std::max(0.0, endA - duration * ratioA);
         if (grids && plan.confidence >= config_.minConfidence) {
             double aligned = 0.0;
             double error = 0.0;
@@ -1094,7 +1095,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 crossfadeStartA = aligned;
             }
         }
-        endA = std::min(a.info.duration, crossfadeStartA + duration);
+        endA = std::min(a.info.duration, crossfadeStartA + duration * ratioA);
         overallStartA = std::max(0.0, crossfadeStartA -
                                           (ramp ? rampMediaSeconds : 0.0));
         if (ramp && crossfadeStartA - overallStartA <
@@ -1136,7 +1137,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             "transition window does not fit the loaded outgoing track";
         return plan;
     }
-    duration = endA - crossfadeStartA;
+    duration = (endA - crossfadeStartA) / std::max(1e-4, ratioA);
     plan.localBpmA = localBpmA;
     plan.duration = duration;
     plan.transitionStartA = crossfadeStartA;
@@ -1173,7 +1174,8 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             plan.fallbackReason = reason;
         }
     }
-    if (type == TransitionType::Beatmatched &&
+    if ((type == TransitionType::Beatmatched ||
+         type == TransitionType::PhraseAware) &&
         (!tempo.compatible || lowConfidence || !grids)) {
         type = TransitionType::Crossfade;
         plan.fallbackReason =

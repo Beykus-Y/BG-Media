@@ -2873,3 +2873,39 @@ TEST_CASE("mix.phrase_fallback_disables_prepared_ramp") {
     CHECK_NEAR(plan.preTransitionSeconds, 0.0, 1e-9);
     CHECK(!plan.fallbackReason.empty());
 }
+
+
+TEST_CASE("mix.phrase_incompatible_tempo_falls_back_to_crossfade") {
+    // Confident grids but incompatible tempos (120 vs 160, outside 6% delta).
+    // An explicit PhraseAware request must honestly fall back to Crossfade.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::PhraseAware;
+    request.requestedDuration = 8.0;
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(160.0, 120.0);
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(!plan.fallbackReason.empty());
+    CHECK(plan.fallbackReason.find("tempo is not compatible") !=
+          std::string::npos);
+}
+
+TEST_CASE("mix.fade_window_fits_outgoing_ramped_playback_rate") {
+    // Outgoing track duration 100.0 s, 120 -> 126 BPM (ratioA = 1.05).
+    // An 8 s fade starting near the end must take the held 1.05 rate into
+    // account so source media consumed does not exceed 100.0 s.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::Beatmatched;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 92.0;
+    AnalysisResult a = analysisFor(120.0, 100.0);
+    AnalysisResult b = analysisFor(126.0, 100.0);
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.transitionEndA <= a.info.duration + 1e-6);
+    CHECK(plan.transitionStartA + plan.duration * plan.tempoRatioAEnd <=
+          a.info.duration + 1e-6);
+}
