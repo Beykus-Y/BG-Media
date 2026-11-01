@@ -595,7 +595,8 @@ PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
                                   const AnalysisResult& b, double startA,
                                   double rateA, double startB, double rateB,
                                   double duration, double release,
-                                  const MetricRelation& relation) {
+                                  const MetricRelation& relation,
+                                  double periodA) {
     PhaseMeasurement result;
     if (duration <= 0.5 || rateA <= 1e-6 || a.beats.empty() ||
         b.beats.empty()) {
@@ -625,7 +626,19 @@ PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
         return result;
     }
     const int stride = std::max(1, relation.aBeats);
-    int index = 0;
+    // Musical beat index relative to the cue beat comes from elapsed beat
+    // periods, not from vector positions, so a missing detection does not
+    // shift which outgoing beats are expected to coincide.
+    double cueTime = -1.0;
+    for (const Beat& beat : a.beats) {
+        if (beat.time >= startA - 0.02) {
+            cueTime = beat.time;
+            break;
+        }
+    }
+    if (cueTime < 0.0 || periodA <= 1e-3) {
+        return result;
+    }
     std::vector<double> errors;  // signed ms
     for (const Beat& beat : a.beats) {
         if (beat.time < startA - 0.02) {
@@ -640,7 +653,9 @@ PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
         if (t < bTimes.front() - 0.05 || t > bTimes.back() + 0.05) {
             continue;
         }
-        if (index++ % stride != 0) {
+        const long musicalIndex =
+            std::lround((beat.time - cueTime) / periodA);
+        if (musicalIndex % stride != 0) {
             continue;
         }
         double nearest = bTimes.front();
@@ -1292,7 +1307,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         const PhaseMeasurement phase = measureBeatPhase(
             a, b, plan.transitionStartA, ramp ? ratioA : 1.0, startB,
             syncB ? tempo.ratioB : 1.0, plan.duration, rateRelease,
-            tempo.relation);
+            tempo.relation, 60.0 / std::max(1.0, localBpmA));
         if (phase.measured) {
             plan.phaseMeasured = true;
             plan.phasePairs = phase.pairs;
@@ -1318,6 +1333,21 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 ratioA = 1.0;
                 syncB = false;
                 meanRateB = 1.0;
+                // Without the matched incoming rate B is consumed at natural
+                // speed: refit the overlap to what B and A can still supply.
+                const double refit = std::min(
+                    plan.duration,
+                    std::min(plan.transitionEndA - plan.transitionStartA,
+                             b.info.duration - startB));
+                if (refit < plan.duration - 1e-6) {
+                    plan.duration = std::max(0.0, refit);
+                    plan.transitionEndA =
+                        plan.transitionStartA + plan.duration;
+                    plan.reasons.push_back(format(
+                        "Shortened to %.2f s after the phase fallback: the "
+                        "incoming track supplies no more at natural speed",
+                        plan.duration));
+                }
                 plan.endB = std::min(b.info.duration,
                                      startB + plan.duration);
             }

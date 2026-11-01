@@ -2755,3 +2755,48 @@ TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
     CHECK(exact.metricRelation.bBeats == 2);
     CHECK(exact.tempoMatchKind == TempoMatchKind::ExactMetric);
 }
+
+TEST_CASE("mix.phase_fallback_refits_overlap_to_incoming_audio") {
+    // B claims 132 BPM but its beats run at 140: the phase check rejects the
+    // sync, and the 7.5 s incoming track must not be overrun by the fade.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(132.0, 7.5);
+    const double interval = 60.0 / 140.0;
+    for (std::size_t i = 0; i < b.beats.size(); ++i) {
+        b.beats[i].time = static_cast<double>(i) * interval;
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK(plan.startB + plan.duration <= b.info.duration + 1e-6);
+    CHECK(plan.endB <= b.info.duration + 1e-6);
+}
+
+TEST_CASE("mix.phase_measure_survives_missing_beat") {
+    // Exact 120 -> 60 (1:2). Dropping one unpaired outgoing detection must
+    // not shift the stride parity and reject an aligned transition.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(60.0, 120.0);
+    for (auto it = a.beats.begin(); it != a.beats.end(); ++it) {
+        if (std::abs(it->time - 21.5) < 1e-6) {
+            a.beats.erase(it);
+            break;
+        }
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phaseP95Ms <= 40.0);
+    CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
+    CHECK(plan.fallbackReason.empty());
+}
