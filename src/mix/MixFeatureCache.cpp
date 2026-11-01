@@ -640,15 +640,18 @@ FeatureCacheLoadResult MixFeatureCache::load(
     const PcmTrack& track,
     const AnalysisResult& analysis,
     const MixFeatureConfig& config) const {
-    AudioData audio;
-    audio.sampleRate = track.sampleRate;
-    audio.channels = track.channels;
-    audio.samples = track.samples;
-    PcmBuffer pcm = PcmBuffer::fromAudio(audio);
-    if (analysis.info.contentHash != 0) {
-        pcm.contentHash = analysis.info.contentHash;
+    if (!track.valid()) {
+        FeatureCacheLoadResult res;
+        res.status = FeatureCacheStatus::Error;
+        res.message = "cannot load feature cache for an invalid PCM track";
+        return res;
     }
-    return load(audio, pcm, analysis, config);
+    const InterleavedAudioView view = InterleavedAudioView::fromTrack(track);
+    const PcmBuffer pcm = MixFeatureExtractor::downmixViewToMono(view, analysis);
+    const std::uint64_t contentHash =
+        MixFeatureExtractor::contentHashFor(view, pcm, analysis);
+    return load(contentHash, analysis.info.configHash, config,
+                track.sampleRate, track.channels, track.duration());
 }
 
 FeatureCacheLoadResult MixFeatureCache::load(

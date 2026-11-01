@@ -3600,6 +3600,15 @@ TEST_CASE("mix.vocal_detector_distinguishes_voice_from_sine_and_drums") {
     CHECK(instStart.vocalScore < 0.22f);
     CHECK(instEnd.vocalScore < 0.22f);
 
+    // A pure mid-band 440 Hz sine wave (single harmonic, no overtones) must not
+    // be misclassified as a lead vocal via sub-harmonic candidate F0s.
+    auto midSine = toneTrack(4.0, 440.0, 2, kRate);
+    const AnalysisResult sineAnalysis = analysisFor(120.0, 4.0);
+    const MixFeatureMap midSineMap = extractor.extractFromTrack(*midSine, sineAnalysis);
+    CHECK(midSineMap.vocal.available);
+    CHECK(midSineMap.vocal.regions.empty());
+    CHECK(midSineMap.summarizeWindow(0.5, 3.5).vocalScore < 0.15f);
+
     // Disabled vocal detector must honestly report available = false and confidence = 0.
     MixFeatureConfig offCfg;
     offCfg.vocalDetector = VocalDetectorKind::None;
@@ -3659,6 +3668,20 @@ TEST_CASE("mix.vocal_overlap_clash_vs_clean_handoff") {
     CHECK(handoff.available);
     CHECK(handoff.vocalClashScore < 0.15f);
     CHECK(handoff.cleanVocalHandoff);
+
+    // 3. Muted instrumental deck must not contribute to vocalOverInstrumentalScore,
+    // and an outgoing vocal phrase that finishes naturally while still at unity gain
+    // must not be flagged as cutsMidVocalPhraseA.
+    const std::vector<bgmedia::mix::GainPoint> heldOut = {
+        {0.0, 1.0f}, {7.0, 1.0f}, {8.0, 0.0f}};
+    const std::vector<bgmedia::mix::GainPoint> mutedIn = {
+        {0.0, 0.0f}, {8.0, 0.0f}};
+    const auto instOnlyB = toneTrack(duration, 110.0, 2, kRate);
+    const MixFeatureMap featInstB = extractor.extractFromTrack(*instOnlyB, analysis);
+    const VocalOverlapAssessment heldAOverMutedB =
+        evaluateVocalOverlap(featA, 0.0, 1.0, featInstB, 0.0, 1.0, 8.0, heldOut, mutedIn);
+    CHECK_NEAR(heldAOverMutedB.vocalOverInstrumentalScore, 0.0f, 1e-5f);
+    CHECK(!heldAOverMutedB.cutsMidVocalPhraseA);
 }
 
 TEST_CASE("mix.harmonic_key_estimation_and_camelot_helper") {

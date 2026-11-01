@@ -39,7 +39,7 @@ public:
 
     [[nodiscard]] virtual VocalDetectionOutput detect(
         const PcmBuffer& monoPcm,
-        const PcmTrack* stereoTrack,
+        InterleavedAudioView stereoAudio,
         const AnalysisResult& analysis,
         const std::vector<MixFeatureFrame>& frames,
         double frameStepSeconds) const = 0;
@@ -66,7 +66,7 @@ public:
 
     [[nodiscard]] VocalDetectionOutput detect(
         const PcmBuffer& monoPcm,
-        const PcmTrack* stereoTrack,
+        InterleavedAudioView stereoAudio,
         const AnalysisResult& analysis,
         const std::vector<MixFeatureFrame>& frames,
         double frameStepSeconds) const override;
@@ -88,7 +88,7 @@ public:
 
     [[nodiscard]] VocalDetectionOutput detect(
         const PcmBuffer& monoPcm,
-        const PcmTrack* stereoTrack,
+        InterleavedAudioView stereoAudio,
         const AnalysisResult& analysis,
         const std::vector<MixFeatureFrame>& frames,
         double frameStepSeconds) const override;

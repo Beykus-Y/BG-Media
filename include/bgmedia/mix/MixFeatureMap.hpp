@@ -307,6 +307,38 @@ struct MixFeatureMap {
     [[nodiscard]] SectionKind sectionAt(double time, float* confidenceOut = nullptr) const noexcept;
 };
 
+// Non-owning view over interleaved single/multi-channel PCM samples. Avoids
+// duplicating full-track sample buffers during feature and vocal extraction.
+struct InterleavedAudioView {
+    const float* samples = nullptr;
+    std::size_t sampleCount = 0;
+    std::uint32_t sampleRate = 0;
+    std::uint32_t channels = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return samples != nullptr && sampleRate > 0 && channels > 0 &&
+               sampleCount >= channels && (sampleCount % channels) == 0;
+    }
+
+    [[nodiscard]] std::size_t frameCount() const noexcept {
+        return channels > 0 ? (sampleCount / channels) : 0;
+    }
+
+    [[nodiscard]] static InterleavedAudioView fromAudio(const AudioData& audio) noexcept {
+        if (!audio.valid()) {
+            return {};
+        }
+        return {audio.samples.data(), audio.samples.size(), audio.sampleRate, audio.channels};
+    }
+
+    [[nodiscard]] static InterleavedAudioView fromTrack(const PcmTrack& track) noexcept {
+        if (!track.valid()) {
+            return {};
+        }
+        return {track.samples.data(), track.samples.size(), track.sampleRate, track.channels};
+    }
+};
+
 class IVocalActivityDetector;
 
 class MixFeatureExtractor {
@@ -321,9 +353,20 @@ public:
     // stereo/multi-channel sources with identical mono downmixes but different
     // channel powers (e.g. (s, s) vs (2s, 0)) never collide in the .bgf cache.
     [[nodiscard]] static std::uint64_t contentHashFor(
-        const AudioData& audio,
+        InterleavedAudioView source,
         const PcmBuffer& monoPcm,
         const AnalysisResult& analysis) noexcept;
+
+    [[nodiscard]] static std::uint64_t contentHashFor(
+        const AudioData& audio,
+        const PcmBuffer& monoPcm,
+        const AnalysisResult& analysis) noexcept {
+        return contentHashFor(InterleavedAudioView::fromAudio(audio), monoPcm, analysis);
+    }
+
+    [[nodiscard]] static PcmBuffer downmixViewToMono(
+        InterleavedAudioView source,
+        const AnalysisResult& analysis);
 
     // Full extraction from multi-channel AudioData + mono PcmBuffer + BG Beat AnalysisResult.
     // Preserves per-channel K-weighted powers for ITU-R BS.1770-4 loudness while using
@@ -338,7 +381,8 @@ public:
                                         const PcmTrack* stereoTrack = nullptr) const;
 
     // Convenience overload for mixer PcmTrack (downmixes to mono for analysis
-    // while preserving stereo Mid/Side vocal cues and contentHash).
+    // while preserving stereo Mid/Side vocal cues and contentHash without
+    // duplicating the interleaved stereo buffer).
     [[nodiscard]] MixFeatureMap extractFromTrack(const PcmTrack& track,
                                                  const AnalysisResult& analysis) const;
 
@@ -348,6 +392,10 @@ public:
         const AnalysisResult& analysis) const;
 
 private:
+    [[nodiscard]] MixFeatureMap extractFromView(InterleavedAudioView source,
+                                                const PcmBuffer& monoPcm,
+                                                const AnalysisResult& analysis) const;
+
     MixFeatureConfig config_;
     const IVocalActivityDetector* customVocalDetector_ = nullptr;
 };

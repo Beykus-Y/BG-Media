@@ -164,7 +164,7 @@ bool timeInsideVocalRegion(const VocalTrackSummary& vocal, double time,
 
 VocalDetectionOutput MusicVocalDetector::detect(
     const PcmBuffer& monoPcm,
-    const PcmTrack* stereoTrack,
+    InterleavedAudioView stereoAudio,
     const AnalysisResult& /*analysis*/,
     const std::vector<MixFeatureFrame>& frames,
     double frameStepSeconds) const {
@@ -198,9 +198,9 @@ VocalDetectionOutput MusicVocalDetector::detect(
     const double binHz = sr / static_cast<double>(fftSize);
     std::vector<float> magSq(static_cast<std::size_t>(bins), 0.0f);
 
-    const bool hasStereo = stereoTrack != nullptr && stereoTrack->channels >= 2 &&
-                           stereoTrack->sampleRate == monoPcm.sampleRate &&
-                           stereoTrack->frameCount() >= monoPcm.samples.size();
+    const bool hasStereo = stereoAudio.valid() && stereoAudio.channels >= 2 &&
+                           stereoAudio.sampleRate == monoPcm.sampleRate &&
+                           stereoAudio.frameCount() >= monoPcm.samples.size();
 
     std::vector<float> rawScores(n, 0.0f);
     std::vector<float> rawConfs(n, 0.0f);
@@ -226,11 +226,11 @@ VocalDetectionOutput MusicVocalDetector::detect(
                 s = monoPcm.samples[static_cast<std::size_t>(idx)];
                 if (!std::isfinite(s)) s = 0.0f;
                 if (hasStereo) {
-                    const float l = stereoTrack->samples[static_cast<std::size_t>(idx) *
-                                                         stereoTrack->channels];
-                    const float r = stereoTrack->samples[static_cast<std::size_t>(idx) *
-                                                             stereoTrack->channels +
-                                                         1];
+                    const float l = stereoAudio.samples[static_cast<std::size_t>(idx) *
+                                                        stereoAudio.channels];
+                    const float r = stereoAudio.samples[static_cast<std::size_t>(idx) *
+                                                            stereoAudio.channels +
+                                                        1];
                     const double m = 0.5 * (static_cast<double>(l) + r);
                     const double side = 0.5 * (static_cast<double>(l) - r);
                     midSq += m * m;
@@ -277,7 +277,7 @@ VocalDetectionOutput MusicVocalDetector::detect(
         // 1. Harmonic comb search over human vocal fundamental range (105..720 Hz).
         // A true voice has a clear fundamental F0 AND at least 2 upper harmonics
         // (2*F0..6*F0) carrying significant formant energy, unlike a pure sine wave
-        // (0 upper harmonics) or broadband snare noise (high inter-harmonic trough).
+        // (which only excites a single frequency bin and must not match sub-harmonic F0s).
         double bestCombScore = 0.0;
         double bestUpperHarmonicRatio = 0.0;
         double bestF0 = 0.0;
@@ -286,6 +286,7 @@ VocalDetectionOutput MusicVocalDetector::detect(
             double harmonicSum = 0.0;
             double upperHarmonicSum = 0.0;
             double troughSum = 0.0;
+            bool fundamentalPresent = false;
             int harmonicsFound = 0;
 
             for (int k = 1; k <= 6; ++k) {
@@ -301,7 +302,11 @@ VocalDetectionOutput MusicVocalDetector::detect(
                 }
                 const double weight = (k == 1) ? 0.85 : (1.0 / std::sqrt(static_cast<double>(k)));
                 harmonicSum += weight * peakP;
-                if (k >= 2) {
+                if (k == 1) {
+                    if (peakP > totalPower * 0.008) {
+                        fundamentalPresent = true;
+                    }
+                } else {
                     upperHarmonicSum += peakP;
                     if (peakP > totalPower * 0.008) {
                         ++harmonicsFound;
@@ -313,14 +318,17 @@ VocalDetectionOutput MusicVocalDetector::detect(
                 troughSum += weight * static_cast<double>(magSq[static_cast<std::size_t>(tBin)]);
             }
 
-            // Require multi-harmonic structure (rejects pure single-frequency sine waves).
+            // Require genuine multi-harmonic structure (fundamental + >= 2 upper
+            // harmonics). Rejects pure single-frequency sine waves at any pitch,
+            // including sub-harmonic candidate F0s where only a single overtone bin hits.
+            if (!fundamentalPresent || harmonicsFound < 2) {
+                continue;
+            }
             const double upperRatio =
                 harmonicSum > 1e-12 ? (upperHarmonicSum / (harmonicSum + 1e-12)) : 0.0;
             const double hnr =
                 (harmonicSum - troughSum) / (harmonicSum + 2.5 * troughSum + 1e-12);
-            const double multiBonus =
-                harmonicsFound >= 2 ? 1.0 : (harmonicsFound == 1 ? 0.45 : 0.05);
-            const double score = std::max(0.0, hnr) * multiBonus *
+            const double score = std::max(0.0, hnr) *
                                  std::clamp(upperRatio * 2.5, 0.08, 1.0);
             if (score > bestCombScore) {
                 bestCombScore = score;
@@ -330,14 +338,16 @@ VocalDetectionOutput MusicVocalDetector::detect(
         }
         f0Track[f] = static_cast<float>(bestF0);
 
-        // 2. Multi-formant balance across F1 + F2 + F3.
+        // 2. Multi-formant balance across F1 + F2 + F3 (gated by multi-harmonic evidence).
         const double formantShare = (f1Power + f2Power + 0.5 * f3Power) / totalPower;
         const bool hasMultipleFormants =
             (f1Power > totalPower * 0.03 && f2Power > totalPower * 0.015) ||
-            (bestUpperHarmonicRatio >= 0.18 && formantShare >= 0.25);
+            (bestUpperHarmonicRatio >= 0.18 && f1Power > totalPower * 0.02 &&
+             f2Power > totalPower * 0.01);
+        const double harmonicGate = bestCombScore >= 0.12 ? 1.0 : 0.12;
         const double formantScore =
             std::clamp((formantShare - 0.12) / 0.52, 0.0, 1.0) *
-            (hasMultipleFormants ? 1.0 : 0.28);
+            (hasMultipleFormants ? 1.0 : 0.25) * harmonicGate;
 
         // 3. Percussive / sub-bass suppression: strong transient onset spikes or
         // overwhelming sub-bass reduce vocal probability unless harmonic comb is strong.
@@ -419,7 +429,7 @@ ExternalStemVocalDetector::ExternalStemVocalDetector(
 
 VocalDetectionOutput ExternalStemVocalDetector::detect(
     const PcmBuffer& monoPcm,
-    const PcmTrack* /*stereoTrack*/,
+    InterleavedAudioView /*stereoAudio*/,
     const AnalysisResult& /*analysis*/,
     const std::vector<MixFeatureFrame>& frames,
     double frameStepSeconds) const {
@@ -588,8 +598,10 @@ VocalOverlapAssessment evaluateVocalOverlap(
                           evalMidEqCurve(eqCurveIn, tOut);
 
         // Audibility-weighted vocal activity on each deck.
-        const float effVocalA = fA.vocalScore * std::clamp(gOut * 1.25f, 0.0f, 1.0f);
-        const float effVocalB = fB.vocalScore * std::clamp(gIn * 1.25f, 0.0f, 1.0f);
+        const float audOut = std::clamp(gOut * 1.25f, 0.0f, 1.0f);
+        const float audIn = std::clamp(gIn * 1.25f, 0.0f, 1.0f);
+        const float effVocalA = fA.vocalScore * audOut;
+        const float effVocalB = fB.vocalScore * audIn;
 
         outVocalSum += fA.vocalScore;
         inVocalSum += fB.vocalScore;
@@ -609,13 +621,13 @@ VocalOverlapAssessment evaluateVocalOverlap(
         }
 
         // Vocal-over-instrumental: one deck has clear vocal while the other
-        // deck provides an active instrumental bed (low vocal score).
-        const double aOverInstB =
-            static_cast<double>(effVocalA) * (1.0 - fB.vocalScore) *
-            (fB.active ? 1.0 : 0.0);
-        const double bOverInstA =
-            static_cast<double>(effVocalB) * (1.0 - fA.vocalScore) *
-            (fA.active ? 1.0 : 0.0);
+        // deck provides an audible active instrumental bed (low vocal score).
+        const double instBedB =
+            (fB.active ? 1.0 : 0.0) * (1.0 - fB.vocalScore) * static_cast<double>(audIn);
+        const double instBedA =
+            (fA.active ? 1.0 : 0.0) * (1.0 - fA.vocalScore) * static_cast<double>(audOut);
+        const double aOverInstB = static_cast<double>(effVocalA) * instBedB;
+        const double bOverInstA = static_cast<double>(effVocalB) * instBedA;
         vocalBedAccum += std::max(aOverInstB, bOverInstA);
     }
 
@@ -634,12 +646,45 @@ VocalOverlapAssessment evaluateVocalOverlap(
     result.vocalOverInstrumentalScore = static_cast<float>(
         std::clamp((vocalBedAccum / count) * 1.35, 0.0, 1.0));
 
-    // Check whether outgoing A is cut mid-vocal phrase at the end of the fade
-    // or incoming B enters mid-vocal phrase at startB.
+    // Check whether an audible outgoing vocal phrase on A is cut off or faded
+    // out before its completion, or whether incoming B enters mid-vocal phrase.
     const double endA = startA + duration * safeRateA;
-    result.cutsMidVocalPhraseA =
-        timeInsideVocalRegion(featuresA.vocal, endA, 0.30) ||
-        timeInsideVocalRegion(featuresA.vocal, startA + 0.5 * duration * safeRateA, 0.35);
+    bool cutsMidVocalA = timeInsideVocalRegion(featuresA.vocal, endA, 0.30);
+    if (!cutsMidVocalA) {
+        constexpr double kMargin = 0.30;
+        for (const VocalRegion& reg : featuresA.vocal.regions) {
+            if (!reg.leadLikely || reg.end - reg.start < 2.0 * kMargin) {
+                continue;
+            }
+            const double overlapStart = std::max(startA, reg.start);
+            const double overlapEnd = std::min(endA, reg.end - kMargin);
+            if (overlapEnd <= overlapStart) {
+                continue;
+            }
+            // Check whether the vocal phrase was audibly heard in the overlap
+            // and then lost audibility (gOut < 0.35) before finishing.
+            bool heardPhrase = false;
+            for (int i = 0; i <= steps; ++i) {
+                const double tOut = i * dt;
+                const double posA = startA + tOut * safeRateA;
+                if (posA < reg.start + kMargin || posA > reg.end - kMargin) {
+                    continue;
+                }
+                const float gOut = evalGainCurve(gainCurveOut, tOut, duration, false) *
+                                   evalMidEqCurve(eqCurveOut, tOut);
+                if (gOut >= 0.35f) {
+                    heardPhrase = true;
+                } else if (heardPhrase) {
+                    cutsMidVocalA = true;
+                    break;
+                }
+            }
+            if (cutsMidVocalA) {
+                break;
+            }
+        }
+    }
+    result.cutsMidVocalPhraseA = cutsMidVocalA;
     result.entersMidVocalPhraseB =
         timeInsideVocalRegion(featuresB.vocal, startB, 0.30);
 

@@ -1014,19 +1014,20 @@ MixFeatureExtractor::MixFeatureExtractor(
 }
 
 std::uint64_t MixFeatureExtractor::contentHashFor(
-    const AudioData& audio,
+    InterleavedAudioView source,
     const PcmBuffer& monoPcm,
     const AnalysisResult& analysis) noexcept {
     const std::uint64_t baseHash =
         monoPcm.contentHash != 0 ? monoPcm.contentHash : analysis.info.contentHash;
-    if (!audio.valid() || audio.channels <= 1) {
+    if (!source.valid() || source.channels <= 1) {
         return baseHash;
     }
     std::uint64_t h = baseHash != 0 ? baseHash : kFnvOffset;
-    hashMixU64(h, static_cast<std::uint64_t>(audio.sampleRate));
-    hashMixU64(h, static_cast<std::uint64_t>(audio.channels));
-    hashMixU64(h, static_cast<std::uint64_t>(audio.samples.size()));
-    for (float sample : audio.samples) {
+    hashMixU64(h, static_cast<std::uint64_t>(source.sampleRate));
+    hashMixU64(h, static_cast<std::uint64_t>(source.channels));
+    hashMixU64(h, static_cast<std::uint64_t>(source.sampleCount));
+    for (std::size_t i = 0; i < source.sampleCount; ++i) {
+        float sample = source.samples[i];
         if (!std::isfinite(sample) || sample == 0.0f) {
             sample = 0.0f;
         }
@@ -1038,22 +1039,83 @@ std::uint64_t MixFeatureExtractor::contentHashFor(
     return h;
 }
 
+PcmBuffer MixFeatureExtractor::downmixViewToMono(
+    InterleavedAudioView source,
+    const AnalysisResult& analysis) {
+    PcmBuffer out;
+    if (!source.valid()) {
+        return out;
+    }
+    const std::size_t frames = source.frameCount();
+    const std::uint32_t channels = source.channels;
+    out.samples.assign(frames, 0.0f);
+    out.sampleRate = source.sampleRate;
+    out.sourceChannels = channels;
+
+    const float invChannels = 1.0f / static_cast<float>(channels);
+    std::vector<double> channelPower(channels, 0.0);
+    double monoPower = 0.0;
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        double sum = 0.0;
+        for (std::uint32_t ch = 0; ch < channels; ++ch) {
+            float value = source.samples[frame * channels + ch];
+            if (!std::isfinite(value)) {
+                value = 0.0f;
+            }
+            sum += value;
+            channelPower[ch] += static_cast<double>(value) * value;
+        }
+        float m = static_cast<float>(sum * invChannels);
+        if (!std::isfinite(m) || m == 0.0f) {
+            m = 0.0f;
+        }
+        out.samples[frame] = m;
+        monoPower += static_cast<double>(m) * m;
+    }
+
+    if (channels == 2) {
+        const auto loudest = std::max_element(channelPower.begin(), channelPower.end());
+        if (loudest != channelPower.end() && *loudest > 1e-12 &&
+            monoPower < *loudest * 0.12) {
+            const std::size_t channel =
+                static_cast<std::size_t>(loudest - channelPower.begin());
+            for (std::size_t frame = 0; frame < frames; ++frame) {
+                float value = source.samples[frame * channels + channel];
+                if (!std::isfinite(value) || value == 0.0f) {
+                    value = 0.0f;
+                }
+                out.samples[frame] = value;
+            }
+        }
+    }
+
+    if (analysis.info.contentHash != 0) {
+        out.contentHash = analysis.info.contentHash;
+    } else {
+        out.contentHash = contentHashOf(out.samples);
+    }
+    return out;
+}
+
 MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
                                            const AnalysisResult& analysis,
                                            const PcmTrack* stereoTrack) const {
-    if (stereoTrack != nullptr && stereoTrack->valid()) {
-        AudioData audio;
-        audio.sampleRate = stereoTrack->sampleRate;
-        audio.channels = stereoTrack->channels;
-        audio.samples = stereoTrack->samples;
-        return extract(audio, pcm, analysis);
-    }
-    return extract(AudioData{}, pcm, analysis);
+    const InterleavedAudioView view =
+        (stereoTrack != nullptr && stereoTrack->valid())
+            ? InterleavedAudioView::fromTrack(*stereoTrack)
+            : InterleavedAudioView{};
+    return extractFromView(view, pcm, analysis);
 }
 
 MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
                                            const PcmBuffer& pcm,
                                            const AnalysisResult& analysis) const {
+    return extractFromView(InterleavedAudioView::fromAudio(audio), pcm, analysis);
+}
+
+MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
+                                                   const PcmBuffer& pcm,
+                                                   const AnalysisResult& analysis) const {
     if (!pcm.valid()) {
         return buildFromAnalysisOnly(analysis);
     }
@@ -1064,7 +1126,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     map.info.analyzerVersion = analysis.info.analyzerVersion > 0
                                    ? analysis.info.analyzerVersion
                                    : kAnalyzerVersion;
-    map.info.contentHash = contentHashFor(audio, pcm, analysis);
+    map.info.contentHash = contentHashFor(source, pcm, analysis);
     map.info.analysisConfigHash = analysis.info.configHash;
     map.info.featureConfigHash = config_.fingerprint();
     map.info.vocalDetectorKind = config_.vocalDetector;
@@ -1074,7 +1136,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     map.info.duration = pcm.duration();
     map.info.sampleRate = pcm.sampleRate;
     map.info.sourceChannels =
-        (audio.valid() && audio.channels > 0) ? audio.channels : pcm.sourceChannels;
+        (source.valid() && source.channels > 0) ? source.channels : pcm.sourceChannels;
     map.info.frameStepSeconds = config_.frameStepSeconds;
     map.info.fromPcm = true;
 
@@ -1101,10 +1163,10 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     // 1. Single pass over source channels (when available) or mono PCM for
     // ITU-R BS.1770-4 K-weighted channel power sum, plain RMS, and sample peak.
     const bool useMultiChannel =
-        audio.valid() && audio.sampleRate == pcm.sampleRate &&
-        audio.channels >= 1 && audio.frameCount() == totalSamples;
+        source.valid() && source.sampleRate == pcm.sampleRate &&
+        source.channels >= 1 && source.frameCount() == totalSamples;
     const std::size_t numChannels =
-        useMultiChannel ? static_cast<std::size_t>(audio.channels) : 1u;
+        useMultiChannel ? static_cast<std::size_t>(source.channels) : 1u;
 
     std::vector<Biquad> stage1(numChannels, makeKWeightStage1(sr));
     std::vector<Biquad> stage2(numChannels, makeKWeightStage2(sr));
@@ -1147,7 +1209,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
                 double frameKSq = 0.0;
                 const std::size_t base = i * numChannels;
                 for (std::size_t ch = 0; ch < numChannels; ++ch) {
-                    float v = audio.samples[base + ch];
+                    float v = source.samples[base + ch];
                     if (!std::isfinite(v)) {
                         v = 0.0f;
                     }
@@ -1504,23 +1566,19 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
 
     computeAudibleBoundsAndActivity(map, analysis, config_);
 
-    PcmTrack stereoView;
-    const PcmTrack* stereoTrack = nullptr;
-    if (audio.valid() && audio.channels >= 2 && audio.sampleRate == pcm.sampleRate) {
-        stereoView.sampleRate = audio.sampleRate;
-        stereoView.channels = audio.channels;
-        stereoView.samples = audio.samples;
-        stereoTrack = &stereoView;
-    }
+    const InterleavedAudioView stereoAudio =
+        (source.valid() && source.channels >= 2 && source.sampleRate == pcm.sampleRate)
+            ? source
+            : InterleavedAudioView{};
 
     if (customVocalDetector_ != nullptr) {
         const VocalDetectionOutput voc = customVocalDetector_->detect(
-            pcm, stereoTrack, analysis, map.frames, actualStep);
+            pcm, stereoAudio, analysis, map.frames, actualStep);
         applyVocalDetection(map, voc);
     } else if (config_.vocalDetector == VocalDetectorKind::MusicVocalModel) {
         MusicVocalDetector detector;
         const VocalDetectionOutput voc =
-            detector.detect(pcm, stereoTrack, analysis, map.frames, actualStep);
+            detector.detect(pcm, stereoAudio, analysis, map.frames, actualStep);
         applyVocalDetection(map, voc);
     } else if (config_.vocalDetector == VocalDetectorKind::SpectralProxy) {
         map.vocal.available = true;
@@ -1543,15 +1601,9 @@ MixFeatureMap MixFeatureExtractor::extractFromTrack(
     if (!track.valid()) {
         return buildFromAnalysisOnly(analysis);
     }
-    AudioData audio;
-    audio.sampleRate = track.sampleRate;
-    audio.channels = track.channels;
-    audio.samples = track.samples;
-    PcmBuffer pcm = PcmBuffer::fromAudio(audio);
-    if (analysis.info.contentHash != 0) {
-        pcm.contentHash = analysis.info.contentHash;
-    }
-    return extract(audio, pcm, analysis);
+    const InterleavedAudioView view = InterleavedAudioView::fromTrack(track);
+    const PcmBuffer pcm = downmixViewToMono(view, analysis);
+    return extractFromView(view, pcm, analysis);
 }
 
 MixFeatureMap MixFeatureExtractor::buildFromAnalysisOnly(
