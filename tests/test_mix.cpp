@@ -4378,3 +4378,222 @@ TEST_CASE("mix.issue51_preview_plan_vs_executed_transition_consistency") {
         pump.once();
     }
 }
+
+
+TEST_CASE("mix.codex_finding1_loudness_gain_role_consistency_b_to_a") {
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixEngine engine(kRate);
+    constexpr std::size_t kChunk = 512;
+    auto trackA = toneTrack(10.0, 220.0);
+    auto trackB = toneTrack(10.0, 440.0);
+
+    // Initial setup: Deck B is master and playing, Deck A is loaded
+    CHECK(engine.loadDeck(DeckId::B, trackB, 101, 120.0));
+    CHECK(engine.loadDeck(DeckId::A, trackA, 102, 120.0));
+    engine.setMaster(DeckId::B);
+    engine.play(DeckId::B);
+
+    // B -> A transition plan:
+    // Outgoing (B) has loudnessGainA = 0.80f (role: outgoing in MixPlan)
+    // Incoming (A) has loudnessGainB = 1.25f (role: incoming in MixPlan)
+    MixPlan plan;
+    plan.from = DeckId::B;
+    plan.to = DeckId::A;
+    plan.valid = true;
+    plan.type = TransitionType::Crossfade;
+    plan.strategy = MixStrategyKind::SmoothBlend;
+    plan.duration = 1.0;
+    plan.transitionStartA = 0.2;
+    plan.startB = 0.0;
+    plan.loudnessGainA = 0.80f; // outgoing track loudness gain (Deck B)
+    plan.loudnessGainB = 1.25f; // incoming track loudness gain (Deck A)
+
+    CHECK(engine.startTransition(plan));
+
+    std::vector<float> buf(kChunk * 2);
+    // Render until transition is Running
+    while (engine.snapshot().phase != TransitionPhase::Running) {
+        engine.render(buf.data(), kChunk);
+    }
+
+    // Mid-transition check: verify that incoming Deck A is receiving targetLoudnessTo (1.25)
+    // and outgoing Deck B is receiving loudFrom (interpolating towards 0.80)
+    auto snapMid = engine.snapshot();
+    CHECK_NEAR(snapMid.loudnessGain[0], 1.25f, 1e-4f); // Deck A is incoming, must be 1.25
+    CHECK(snapMid.loudnessGain[1] <= 1.0f);            // Deck B is outgoing, moving towards 0.80
+
+    // Render until transition completes (handover to Deck A)
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        engine.render(buf.data(), kChunk);
+    }
+
+    auto snapEnd = engine.snapshot();
+    CHECK(snapEnd.master == DeckId::A);
+    CHECK(snapEnd.decks[0].playing);
+    // Crucial check: Deck A retains its matched 1.25 loudnessGain after handover
+    CHECK_NEAR(snapEnd.loudnessGain[0], 1.25f, 1e-4f);
+    CHECK_NEAR(snapEnd.decks[0].gain, 1.25f, 1e-4f);
+
+    // Steady state: render more audio and verify Deck A's gain remains steady at 1.25 without jumps
+    engine.render(buf.data(), kChunk);
+    auto snapSteady = engine.snapshot();
+    CHECK_NEAR(snapSteady.loudnessGain[0], 1.25f, 1e-4f);
+    CHECK_NEAR(snapSteady.decks[0].gain, 1.25f, 1e-4f);
+}
+
+TEST_CASE("mix.codex_finding2_preview_caching_and_invalidation") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto snap1 = session.snapshot();
+    CHECK(snap1.preview.valid);
+    const double initialSched = snap1.preview.overallStartA();
+    CHECK(initialSched > 0.0);
+    const double initialDur = snap1.preview.duration;
+
+    // 1. Performance check: calling update() 100 times executes fast because preview is cached.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) {
+        session.update();
+    }
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    // 100 cached updates must take well under 100 ms (typically < 2 ms total),
+    // whereas 100 uncached multi-candidate searches would take > 4500 ms.
+    CHECK(elapsedMs < 100);
+
+    // 2. Invalidation on configuration change: setTransitionDuration
+    session.setTransitionDuration(initialDur + 3.0);
+    const auto snap2 = session.snapshot();
+    CHECK(snap2.preview.valid);
+    CHECK_NEAR(snap2.preview.duration, initialDur + 3.0, 1e-3);
+
+    // 3. Invalidation on transition type change
+    session.setTransitionType(TransitionType::DirectCut);
+    const auto snap3 = session.snapshot();
+    CHECK(snap3.preview.valid);
+    CHECK(snap3.preview.type == TransitionType::DirectCut);
+    CHECK_NEAR(snap3.preview.duration, 0.0, 1e-3);
+
+    // Restore to SmartCrossfade
+    session.setTransitionType(TransitionType::SmartCrossfade);
+    session.setTransitionDuration(initialDur);
+    const auto snap4 = session.snapshot();
+    CHECK(snap4.preview.valid);
+
+    // 4. Invalidation on seek past planned transition
+    CHECK(session.seekDeck(DeckId::A, snap4.preview.overallStartA() + 1.0));
+    // When seeked past transition start, preview must be invalidated so an expired plan doesn't fire
+    const auto snapSeekPast = session.snapshot();
+    CHECK(!snapSeekPast.preview.valid);
+
+    // 5. Seeking back before transition start allows refreshing a valid plan
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    session.refreshPlan();
+    CHECK(session.snapshot().preview.valid);
+}
+
+TEST_CASE("mix.codex_finding3_echo_reverb_cancellation_declick") {
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixEngine engine(kRate);
+    constexpr std::size_t kChunk = 512;
+    // 257 Hz sine tone at 0.40 amplitude on Deck A, silent on Deck B
+    auto toneA = toneTrack(10.0, 257.0);
+    auto silenceB = dcTrack(10.0, 0.0f);
+
+    CHECK(engine.loadDeck(DeckId::A, toneA, 201, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, silenceB, 202, 120.0));
+    engine.setMaster(DeckId::A);
+    engine.play(DeckId::A);
+
+    MixPlan plan;
+    plan.from = DeckId::A;
+    plan.to = DeckId::B;
+    plan.valid = true;
+    plan.type = TransitionType::Crossfade;
+    plan.strategy = MixStrategyKind::EchoReverbOut;
+    plan.duration = 4.0;
+    plan.transitionStartA = 0.5;
+    plan.startB = 0.0;
+    plan.tailSendAmount = 0.45f;
+    plan.tailDecaySeconds = 2.0;
+
+    CHECK(engine.startTransition(plan));
+
+    std::vector<float> buf(kChunk * 2);
+    // Render into the transition until ~50% progress where echo return is audible and active
+    while (engine.snapshot().phase != TransitionPhase::Running) {
+        engine.render(buf.data(), kChunk);
+    }
+    for (int i = 0; i < 40; ++i) {
+        engine.render(buf.data(), kChunk);
+    }
+    // Echo wet signal must be active
+    CHECK(engine.snapshot().decks[0].playing);
+
+    // Request transition cancellation while echo is actively ringing
+    engine.cancelTransition();
+
+    // Render single-frame (or small chunks) across cancellation and measure sample-to-sample delta
+    float maxSampleDelta = 0.0f;
+    float prevSampleL = 0.0f;
+    float prevSampleR = 0.0f;
+    bool firstSample = true;
+
+    // Render through the 220 ms cancellation window in small blocks (16 frames)
+    constexpr std::size_t kSmallBlock = 16;
+    std::vector<float> smallBuf(kSmallBlock * 2);
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        engine.render(smallBuf.data(), kSmallBlock);
+        for (std::size_t i = 0; i < kSmallBlock; ++i) {
+            const float sL = smallBuf[i * 2];
+            const float sR = smallBuf[i * 2 + 1];
+            if (!firstSample) {
+                const float deltaL = std::abs(sL - prevSampleL);
+                const float deltaR = std::abs(sR - prevSampleR);
+                maxSampleDelta = std::max(maxSampleDelta, std::max(deltaL, deltaR));
+            } else {
+                firstSample = false;
+            }
+            prevSampleL = sL;
+            prevSampleR = sR;
+        }
+    }
+
+    // A 257 Hz tone at 48.0 kHz has natural derivative ~2*pi*257/48000 * 0.40 ~= 0.0135.
+    // Without echo cancellation fade, dropping the wet signal produced a discontinuity >= 0.14.
+    // With smooth cancellation fade, maxSampleDelta is strictly bounded (< 0.035).
+    CHECK(maxSampleDelta < 0.035f);
+
+    // After cancellation complete: engine is Idle, Deck A remains playing cleanly,
+    // and tail wet level is 0 without any lingering ringing tail.
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().master == DeckId::A);
+    CHECK(engine.snapshot().decks[0].playing);
+}

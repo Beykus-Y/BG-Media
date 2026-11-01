@@ -174,7 +174,9 @@ private:
     void resetTailEcho() noexcept;
     void configureTailEcho(double bpm, double decaySeconds) noexcept;
     void processTailEcho(float* stereo, std::size_t frames, double progress0,
-                         double progress1) noexcept;
+                         double progress1, bool cancelling = false,
+                         float cancelFade0 = 1.0f,
+                         float cancelFade1 = 1.0f) noexcept;
     [[nodiscard]] TransitionStage liveStage() const noexcept;
     void renderDeck(DeckId deck, float* out, std::size_t frames, float gain0,
                     float gain1, double rate0, double rate1, EqGains eq0,
@@ -263,6 +265,7 @@ private:
     float tailPrevInput_[2] = {0.0f, 0.0f};
     float tailLpState_[2] = {0.0f, 0.0f};
     float tailWetLevel_ = 0.0f;
+    float cancelWetGainStart_ = 0.0f;
 
     // Snapshot publication: the audio thread writes the inactive buffer and
     // publishes it with a short-lived flag. It never blocks on the UI thread:

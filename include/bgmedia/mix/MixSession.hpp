@@ -162,6 +162,8 @@ private:
                                     const MixSnapshot& snap,
                                     double durationOverride, bool execution);
     void promoteEndedMaster(const MixSnapshot& snap);
+    void ensurePlanValid();
+    void invalidatePlan();
 
     MixEngine& engine_;
     MixPrepareCallback prepare_;
@@ -197,6 +199,10 @@ private:
     MixPlan preview_;
     MixPlan lastExecutedPlan_;
     bool hasExecutedPlan_ = false;
+    bool planDirty_ = true;
+    std::uint64_t cachedFromId_ = 0;
+    std::uint64_t cachedToId_ = 0;
+    DeckId cachedMasterDeck_ = DeckId::A;
 
     std::thread worker_;
     std::mutex jobMutex_;

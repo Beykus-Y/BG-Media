@@ -444,7 +444,9 @@ void MixEngine::configureTailEcho(double bpm, double decaySeconds) noexcept {
 }
 
 void MixEngine::processTailEcho(float* stereo, std::size_t frames,
-                                double progress0, double progress1) noexcept {
+                                double progress0, double progress1,
+                                bool cancelling,
+                                float cancelFade0, float cancelFade1) noexcept {
     if (!stereo || frames == 0 || tailBuffer_.empty() || tailMaxFrames_ == 0 ||
         runtime_.tailSendAmount <= 0.0f) {
         tailWetLevel_ = 0.0f;
@@ -459,15 +461,27 @@ void MixEngine::processTailEcho(float* stereo, std::size_t frames,
     float blockWetPeak = 0.0f;
     for (std::size_t i = 0; i < frames; ++i) {
         const double t = frames > 1 ? static_cast<double>(i) / static_cast<double>(frames - 1) : 1.0;
-        const double p = std::clamp(progress0 + (progress1 - progress0) * t, 0.0, 1.0);
-        // Feed the echo line across the first 78% of the transition, and let
-        // the wet return decay smoothly to zero at p = 1.0 so there is no step.
-        const float sendEnv = (p < 0.80)
-                                  ? static_cast<float>(std::sin(3.14159265358979323846 * (p / 0.80)))
-                                  : 0.0f;
-        const float wetReturnEnv = static_cast<float>(std::sin(3.14159265358979323846 * p));
-        const float sendGain = maxSend * sendEnv;
-        const float wetGain = (0.55f + 0.35f * maxSend) * wetReturnEnv;
+        float sendGain = 0.0f;
+        float wetGain = 0.0f;
+        if (!cancelling) {
+            const double p = std::clamp(progress0 + (progress1 - progress0) * t, 0.0, 1.0);
+            // Feed the echo line across the first 78% of the transition, and let
+            // the wet return decay smoothly to zero at p = 1.0 so there is no step.
+            const float sendEnv = (p < 0.80)
+                                      ? static_cast<float>(std::sin(3.14159265358979323846 * (p / 0.80)))
+                                      : 0.0f;
+            const float wetReturnEnv = static_cast<float>(std::sin(3.14159265358979323846 * p));
+            sendGain = maxSend * sendEnv;
+            wetGain = (0.55f + 0.35f * maxSend) * wetReturnEnv;
+        } else {
+            // During cancellation, do not send more dry signal into the delay.
+            // Fade the existing echo return smoothly to zero over the cancellation envelope.
+            sendGain = 0.0f;
+            const float cancelFade = std::clamp(
+                cancelFade0 + (cancelFade1 - cancelFade0) * static_cast<float>(t),
+                0.0f, 1.0f);
+            wetGain = cancelWetGainStart_ * cancelFade;
+        }
 
         const std::size_t readL =
             (tailWriteIndex_ + tailMaxFrames_ - tailDelayFramesL_) % tailMaxFrames_;
@@ -647,10 +661,10 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
         (runtime_.gainOutCount >= 2 && runtime_.gainInCount >= 2);
     runtime_.startLoudnessFrom = std::clamp(from.loudnessGain, 0.25f, 2.5f);
     runtime_.targetLoudnessFrom = std::clamp(
-        runtime_.from == DeckId::A ? plan.loudnessGainA : plan.loudnessGainB,
+        plan.loudnessGainA,
         0.25f, 2.5f);
     runtime_.targetLoudnessTo = std::clamp(
-        runtime_.to == DeckId::A ? plan.loudnessGainA : plan.loudnessGainB,
+        plan.loudnessGainB,
         0.25f, 2.5f);
     to.loudnessGain = runtime_.targetLoudnessTo;
     runtime_.tailSendAmount =
@@ -836,6 +850,13 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                                  : defIn;
         cancelLoudnessFromStart_ = decks_[deckIndex(runtime_.from)].loudnessGain;
         cancelIncomingStarted_ = incomingStarted_;
+        if (runtime_.tailSendAmount > 0.0f && framesRendered_ >= transitionStartFrame_) {
+            cancelWetGainStart_ =
+                (0.55f + 0.35f * std::clamp(runtime_.tailSendAmount, 0.0f, 0.90f)) *
+                static_cast<float>(std::sin(3.14159265358979323846 * cancelStartProgress_));
+        } else {
+            cancelWetGainStart_ = 0.0f;
+        }
     }
 
     // A play request on an empty deck is a no-op. Without this the deck would
@@ -1125,9 +1146,24 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
         renderDeck(fromDeck, scratchA_.data(), chunk, gainFrom0, gainFrom1,
                    rateFrom0, rateFrom1, eqFrom0, eqFrom1);
-        if (running && framesRendered_ >= transitionStartFrame_ &&
+        if ((running || (cancelling && cancelWetGainStart_ > 0.0f)) &&
+            framesRendered_ >= transitionStartFrame_ &&
             runtime_.tailSendAmount > 0.0f) {
-            processTailEcho(scratchA_.data(), chunk, progress0, progress1);
+            float cancelFade0 = 1.0f;
+            float cancelFade1 = 1.0f;
+            if (cancelling) {
+                const double span = std::max(1.0, kCancelSeconds * outputSampleRate_);
+                const double t0 = std::clamp(
+                    static_cast<double>(framesRendered_ - cancelStartFrame_) / span,
+                    0.0, 1.0);
+                const double t1 = std::clamp(
+                    static_cast<double>(framesRendered_ + chunk - cancelStartFrame_) / span,
+                    0.0, 1.0);
+                cancelFade0 = 1.0f - static_cast<float>(t0);
+                cancelFade1 = 1.0f - static_cast<float>(t1);
+            }
+            processTailEcho(scratchA_.data(), chunk, progress0, progress1,
+                            cancelling, cancelFade0, cancelFade1);
         } else {
             tailWetLevel_ = 0.0f;
         }
@@ -1245,6 +1281,9 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                 decks_[deckIndex(from)].rampRate = 1.0;
                 master_.store(deckIndex(from), std::memory_order_release);
             }
+            resetTailEcho();
+            tailWetLevel_ = 0.0f;
+            cancelWetGainStart_ = 0.0f;
         }
         if (phase_.load(std::memory_order_acquire) ==
             static_cast<int>(Phase::Idle)) {

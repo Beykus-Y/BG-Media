@@ -332,6 +332,7 @@ void MixSession::installDeck(DeckId deck, const Item& item) {
     const double bpm = item.analysis ? item.analysis->bpm : 0.0;
     if (engine_.loadDeck(deck, item.audio, item.id, bpm)) {
         status_ = "Loaded " + item.name;
+        planDirty_ = true;
     } else {
         lastError_ = "Could not load " + item.name + " into a busy deck";
     }
@@ -423,6 +424,7 @@ void MixSession::collectCompleted() {
             item->state = QueueState::Ready;
             item->progress = 1.0f;
             status_ = "Ready: " + item->name;
+            planDirty_ = true;
         } else {
             item->state = QueueState::Failed;
             item->error = job.error.empty() ? "preparation failed" : job.error;
@@ -452,6 +454,8 @@ void MixSession::handleTransitionCompletion() {
         }
         currentId_ = snap.decks[deckIndex(master)].trackId;
         nextRequested_ = false;
+        hasExecutedPlan_ = false;
+        planDirty_ = true;
         status_ = "Transition complete";
     }
     engine_.play(master);
@@ -610,7 +614,11 @@ bool MixSession::seekDeck(DeckId deck, double seconds) {
     const double target = std::clamp(seconds, 0.0, snap.decks[idx].durationSeconds);
     engine_.seek(deck, target);
     if (deck == snap.master) {
-        refreshPlan();
+        std::lock_guard lock(mutex_);
+        if (!preview_.valid || target >= preview_.overallStartA() - 0.5) {
+            planDirty_ = true;
+            preview_ = {};
+        }
     }
     return true;
 }
@@ -635,13 +643,47 @@ bool MixSession::jumpToPlannedTransition(double leadSeconds) {
     return seekDeck(snap.master, target);
 }
 
-void MixSession::refreshPlan() {
+void MixSession::invalidatePlan() {
     std::lock_guard lock(mutex_);
-    preview_ = {};
+    planDirty_ = true;
+}
+
+void MixSession::ensurePlanValid() {
+    std::lock_guard lock(mutex_);
     const MixSnapshot snap = engine_.snapshot();
     const DeckId from = snap.master;
     const DeckId to = otherDeck(from);
-    preview_ = buildPlan(from, to, snap, duration_, false);
+    const std::uint64_t fromId = snap.decks[deckIndex(from)].trackId;
+    const std::uint64_t toId = snap.decks[deckIndex(to)].trackId;
+
+    if (!planDirty_ && preview_.valid &&
+        fromId == cachedFromId_ && toId == cachedToId_ &&
+        from == cachedMasterDeck_) {
+        return;
+    }
+    preview_ = {};
+    if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
+        preview_ = buildPlan(from, to, snap, duration_, false);
+    }
+    cachedFromId_ = fromId;
+    cachedToId_ = toId;
+    cachedMasterDeck_ = from;
+    planDirty_ = false;
+}
+
+void MixSession::refreshPlan() {
+    std::lock_guard lock(mutex_);
+    const MixSnapshot snap = engine_.snapshot();
+    const DeckId from = snap.master;
+    const DeckId to = otherDeck(from);
+    preview_ = {};
+    if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
+        preview_ = buildPlan(from, to, snap, duration_, false);
+    }
+    cachedFromId_ = snap.decks[deckIndex(from)].trackId;
+    cachedToId_ = snap.decks[deckIndex(to)].trackId;
+    cachedMasterDeck_ = from;
+    planDirty_ = false;
 }
 
 void MixSession::startPlannedTransition(double durationOverride) {
@@ -760,6 +802,11 @@ void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
     // Release the finished deck so serviceDecks() can refill it with the next
     // prepared queue item.
     engine_.clearDeck(from);
+    {
+        std::lock_guard lock(mutex_);
+        hasExecutedPlan_ = false;
+        planDirty_ = true;
+    }
 }
 
 void MixSession::update() {
@@ -782,7 +829,7 @@ void MixSession::update() {
         }
     }
 
-    refreshPlan();
+    ensurePlanValid();
 
     const MixSnapshot snap = engine_.snapshot();
     // Auto scheduling only runs in Auto mode. Manual and Preview still allow

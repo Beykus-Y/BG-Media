@@ -265,10 +265,10 @@ struct MixPlan {
 
     // BG Mix 0.3 strategy, loudness normalization, tail processor, and candidate scores.
     MixStrategyKind strategy = MixStrategyKind::SmoothBlend;
-    float loudnessTrimDbA = 0.0f;   // dB gain trim applied to outgoing deck A
-    float loudnessTrimDbB = 0.0f;   // dB gain trim applied to incoming deck B
-    float loudnessGainA = 1.0f;     // linear gain multiplier for deck A (headroom-clamped)
-    float loudnessGainB = 1.0f;     // linear gain multiplier for deck B (headroom-clamped)
+    float loudnessTrimDbA = 0.0f;   // dB gain trim applied to outgoing track (role from)
+    float loudnessTrimDbB = 0.0f;   // dB gain trim applied to incoming track (role to)
+    float loudnessGainA = 1.0f;     // linear gain multiplier for outgoing track (role from, headroom-clamped)
+    float loudnessGainB = 1.0f;     // linear gain multiplier for incoming track (role to, headroom-clamped)
     float tailSendAmount = 0.0f;    // 0..1 echo/reverb tail send for EchoReverbOut
     double tailDecaySeconds = 0.0;  // tail decay length in seconds
     MixCandidateScore scoreBreakdown;
