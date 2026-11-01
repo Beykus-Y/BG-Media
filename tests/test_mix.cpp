@@ -2733,4 +2733,23 @@ TEST_CASE("mix.engine_holds_incoming_rate_while_both_audible") {
     CHECK_NEAR(end, expected, 0.06);
     std::printf("rate hold: B early=%.3f (%.3f) end=%.3f (%.3f)\n", early,
                 2.0 + 1.1 * 3.4, end, expected);
+TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
+    // 60 -> 118 needs A to move to 59 BPM, but A (30 s) has no room for the
+    // ramp at 20 s plus an 8 s fade: the plan must not keep a tempo-synced
+    // type and a successful match classification at 1.0x rates.
+    const MixPlan plan = planMetric(60.0, 118.0, {},
+                                    TransitionType::SmartCrossfade, 30.0);
+    CHECK(plan.valid);
+    CHECK(!plan.tempoRampActive);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(!plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.unison());
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    // An exact 60 -> 120 pair needs no ramp and keeps its relation.
+    const MixPlan exact = planMetric(60.0, 120.0, {},
+                                     TransitionType::SmartCrossfade, 30.0);
+    CHECK(exact.metricRelation.bBeats == 2);
+    CHECK(exact.tempoMatchKind == TempoMatchKind::ExactMetric);
 }

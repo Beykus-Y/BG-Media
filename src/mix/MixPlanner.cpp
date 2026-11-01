@@ -1118,8 +1118,12 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 : "tempo is not compatible for beatmatching; using a plain "
                   "crossfade";
     }
-    if (type == TransitionType::Beatmatched && tempo.matched && !ramp &&
+    if ((type == TransitionType::Beatmatched ||
+         type == TransitionType::PhraseAware) &&
+        tempo.compatible && tempo.matched && !ramp &&
         std::abs(tempo.ratioA - 1.0) > 1e-4) {
+        // The outgoing deck would have to change speed to hold the reported
+        // metric relation, but no ramp will run, so the decks would drift.
         type = TransitionType::Crossfade;
         plan.fallbackReason =
             "beatmatching needs tempo sync but the tempo ramp cannot run here; "
