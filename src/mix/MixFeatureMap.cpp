@@ -1086,8 +1086,11 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
         return 1.0;
     };
 
-    std::vector<double> frameKMeanSq(static_cast<std::size_t>(frameCount), 0.0);
-    std::vector<double> prefixK(static_cast<std::size_t>(frameCount) + 1, 0.0);
+    const std::size_t subStepSamples =
+        std::max<std::size_t>(1, static_cast<std::size_t>(std::lround(0.010 * sr)));
+    const std::size_t subCount =
+        std::max<std::size_t>(1, (totalSamples + subStepSamples - 1) / subStepSamples);
+    std::vector<double> subPrefixK(subCount + 1, 0.0);
     double totalRawSq = 0.0;
     float samplePeak = 0.0f;
 
@@ -1096,7 +1099,6 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
         const std::size_t s1 = std::min(totalSamples, s0 + static_cast<std::size_t>(stepSamples));
         const std::size_t count = std::max<std::size_t>(1, s1 - s0);
         double sumRawSq = 0.0;
-        double sumKSq = 0.0;
         if (useMultiChannel) {
             const double invCh = 1.0 / static_cast<double>(numChannels);
             for (std::size_t i = s0; i < s1; ++i) {
@@ -1115,7 +1117,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
                     frameKSq += bs1770ChannelWeight(ch) * (y * y);
                 }
                 sumRawSq += frameRawSq * invCh;
-                sumKSq += frameKSq;
+                subPrefixK[i / subStepSamples + 1] += frameKSq;
             }
         } else {
             for (std::size_t i = s0; i < s1; ++i) {
@@ -1127,69 +1129,82 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
                 const double x = static_cast<double>(v);
                 sumRawSq += x * x;
                 const double y = stage2[0].process(stage1[0].process(x));
-                sumKSq += y * y;
+                subPrefixK[i / subStepSamples + 1] += y * y;
             }
         }
         totalRawSq += sumRawSq;
         const double rawRms = std::sqrt(sumRawSq / static_cast<double>(count));
-        const double kMeanSq = sumKSq / static_cast<double>(count);
         map.frames[static_cast<std::size_t>(f)].time =
             std::min(map.info.duration, (static_cast<double>(f) + 0.5) * actualStep);
         map.frames[static_cast<std::size_t>(f)].rms = static_cast<float>(rawRms);
-        frameKMeanSq[static_cast<std::size_t>(f)] = kMeanSq;
-        prefixK[static_cast<std::size_t>(f) + 1] =
-            prefixK[static_cast<std::size_t>(f)] + sumKSq;
     }
 
-    const int momFrames = std::max(1, static_cast<int>(std::lround(0.40 / actualStep)));
-    const int stFrames = std::max(1, static_cast<int>(std::lround(3.00 / actualStep)));
-    const std::size_t momSamples =
-        static_cast<std::size_t>(momFrames) * static_cast<std::size_t>(stepSamples);
-    const std::size_t stSamples =
-        static_cast<std::size_t>(stFrames) * static_cast<std::size_t>(stepSamples);
+    for (std::size_t k = 1; k <= subCount; ++k) {
+        subPrefixK[k] += subPrefixK[k - 1];
+    }
 
-    auto windowKMeanSq = [&](int fStart, int fEnd, std::size_t minSamples) noexcept {
-        int a = std::clamp(fStart, 0, frameCount - 1);
-        const int b = std::clamp(fEnd, a + 1, frameCount);
-        std::size_t s0 =
-            static_cast<std::size_t>(a) * static_cast<std::size_t>(stepSamples);
-        const std::size_t s1 = std::min(
-            totalSamples,
-            static_cast<std::size_t>(b) * static_cast<std::size_t>(stepSamples));
-        if (b == frameCount && (s1 - s0) < minSamples && a > 0) {
+    constexpr int kMomSubBlocks = 40;  // 400 ms (40 x 10 ms)
+    constexpr int kStSubBlocks = 300;  // 3.0 s  (300 x 10 ms)
+    constexpr int kHopSubBlocks = 10;  // 100 ms BS.1770-4 gating hop
+
+    auto subWindowKMeanSq = [&](int endSub, int winSubs) noexcept {
+        const int b = std::clamp(endSub, 1, static_cast<int>(subCount));
+        int a = std::max(0, b - winSubs);
+        std::size_t s0 = static_cast<std::size_t>(a) * subStepSamples;
+        const std::size_t s1 =
+            std::min(totalSamples, static_cast<std::size_t>(b) * subStepSamples);
+        const std::size_t minSamples =
+            static_cast<std::size_t>(winSubs) * subStepSamples;
+        if (b == static_cast<int>(subCount) && (s1 - s0) < minSamples && a > 0) {
             --a;
-            s0 = static_cast<std::size_t>(a) * static_cast<std::size_t>(stepSamples);
+            s0 = static_cast<std::size_t>(a) * subStepSamples;
         }
         const std::size_t samplesInWin = std::max<std::size_t>(1, s1 - s0);
-        return (prefixK[static_cast<std::size_t>(b)] -
-                prefixK[static_cast<std::size_t>(a)]) /
+        return (subPrefixK[static_cast<std::size_t>(b)] -
+                subPrefixK[static_cast<std::size_t>(a)]) /
                static_cast<double>(samplesInWin);
     };
+
+    for (int f = 0; f < frameCount; ++f) {
+        const std::size_t s1 = std::min(
+            totalSamples,
+            static_cast<std::size_t>(f + 1) * static_cast<std::size_t>(stepSamples));
+        const int endSub = std::clamp(
+            static_cast<int>((s1 + subStepSamples / 2) / subStepSamples),
+            1, static_cast<int>(subCount));
+        map.frames[static_cast<std::size_t>(f)].momentaryLufs =
+            powerToLufs(subWindowKMeanSq(endSub, kMomSubBlocks));
+        map.frames[static_cast<std::size_t>(f)].shortTermLufs =
+            powerToLufs(subWindowKMeanSq(endSub, kStSubBlocks));
+    }
 
     float maxMomentary = -70.0f;
     float maxShortTerm = -70.0f;
     std::vector<double> gatingBlocks;
-    gatingBlocks.reserve(static_cast<std::size_t>(frameCount));
+    gatingBlocks.reserve(subCount / kHopSubBlocks + 2);
     std::vector<double> shortTermAbsBlocks;
-    shortTermAbsBlocks.reserve(static_cast<std::size_t>(frameCount));
+    shortTermAbsBlocks.reserve(subCount / kHopSubBlocks + 2);
 
-    for (int f = 0; f < frameCount; ++f) {
-        const double momMeanSq = windowKMeanSq(f - momFrames + 1, f + 1, momSamples);
-        const double stMeanSq = windowKMeanSq(f - stFrames + 1, f + 1, stSamples);
+    const int totalSubs = static_cast<int>(subCount);
+    for (int bSub = kHopSubBlocks; ; bSub += kHopSubBlocks) {
+        const int curSub = std::min(bSub, totalSubs);
+        const double momMeanSq = subWindowKMeanSq(curSub, kMomSubBlocks);
+        const double stMeanSq = subWindowKMeanSq(curSub, kStSubBlocks);
         const float momLufs = powerToLufs(momMeanSq);
         const float stLufs = powerToLufs(stMeanSq);
-        map.frames[static_cast<std::size_t>(f)].momentaryLufs = momLufs;
-        map.frames[static_cast<std::size_t>(f)].shortTermLufs = stLufs;
 
-        if (f + 1 >= momFrames || frameCount < momFrames) {
+        if (curSub >= kMomSubBlocks || totalSubs < kMomSubBlocks) {
             maxMomentary = std::max(maxMomentary, momLufs);
             gatingBlocks.push_back(momMeanSq);
         }
-        if (f + 1 >= stFrames || frameCount < stFrames) {
+        if (curSub >= kStSubBlocks || totalSubs < kStSubBlocks) {
             maxShortTerm = std::max(maxShortTerm, stLufs);
             if (stLufs > -70.0f) {
                 shortTermAbsBlocks.push_back(stMeanSq);
             }
+        }
+        if (curSub >= totalSubs) {
+            break;
         }
     }
 

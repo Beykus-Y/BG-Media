@@ -3092,6 +3092,21 @@ TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
     const MixFeatureMap mapMidPip = extractor.extractFromTrack(*midPip, partialAnalysis);
     CHECK_NEAR(mapEndPip.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.25f);
     CHECK_NEAR(mapEndPip.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.25f);
+
+    // Changing frameStepSeconds (e.g. 0.25 s or 0.30 s) must not alter the
+    // 400 ms momentary or integrated loudness measurement intervals.
+    bgmedia::mix::MixFeatureConfig cfg025;
+    cfg025.frameStepSeconds = 0.25;
+    bgmedia::mix::MixFeatureConfig cfg030;
+    cfg030.frameStepSeconds = 0.30;
+    MixFeatureExtractor ext025(cfg025);
+    MixFeatureExtractor ext030(cfg030);
+    const MixFeatureMap mapMid025 = ext025.extractFromTrack(*midPip, partialAnalysis);
+    const MixFeatureMap mapMid030 = ext030.extractFromTrack(*midPip, partialAnalysis);
+    CHECK_NEAR(mapMid025.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapMid030.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapMid025.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.05f);
+    CHECK_NEAR(mapMid030.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.05f);
 }
 
 TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {
