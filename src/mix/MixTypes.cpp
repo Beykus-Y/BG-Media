@@ -36,6 +36,19 @@ const char* transitionTypeName(TransitionType type) noexcept {
     return "Unknown";
 }
 
+const char* tempoMatchKindName(TempoMatchKind kind) noexcept {
+    switch (kind) {
+    case TempoMatchKind::None: return "no tempo sync";
+    case TempoMatchKind::ExactMetric: return "exact metric match";
+    case TempoMatchKind::MetricWithStretch:
+        return "metric match + bounded stretch";
+    case TempoMatchKind::ExperimentalPolyrhythm:
+        return "experimental polyrhythm";
+    case TempoMatchKind::FallbackCrossfade: return "fallback to crossfade";
+    }
+    return "unknown";
+}
+
 const char* transitionTypeShortName(TransitionType type) noexcept {
     switch (type) {
     case TransitionType::Off: return "OFF";

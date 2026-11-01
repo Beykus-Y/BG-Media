@@ -84,6 +84,44 @@ enum class MixMode : std::uint8_t {
 // Types the UI may offer as setup choices (working + experimental).
 [[nodiscard]] std::vector<TransitionType> selectableTransitionTypes();
 
+// Beat-rate relationship between the two decks over the same output time:
+// `bBeats` incoming beats are played for every `aBeats` outgoing beats. It is
+// independent of the audio playback-rate correction (tempoRatioA/B): 60 -> 120
+// BPM is 2:1 with both decks at 1.0x. The two concepts must never be derived
+// from each other by dividing metric-alternative BPM candidates.
+struct MetricRelation {
+    int bBeats = 1;
+    int aBeats = 1;
+
+    [[nodiscard]] constexpr double ratio() const noexcept {
+        return aBeats > 0 ? static_cast<double>(bBeats) / aBeats : 1.0;
+    }
+    [[nodiscard]] constexpr bool unison() const noexcept {
+        return bBeats == aBeats;
+    }
+    // 1:1, 2:1 and 1:2 are ordinary metric levels; anything else (3:2, 2:3)
+    // is a polyrhythm and stays opt-in/experimental.
+    [[nodiscard]] constexpr bool polyrhythm() const noexcept {
+        return !(unison() || bBeats == 2 * aBeats || aBeats == 2 * bBeats);
+    }
+    [[nodiscard]] constexpr bool operator==(
+        const MetricRelation& other) const noexcept {
+        return bBeats == other.bBeats && aBeats == other.aBeats;
+    }
+};
+
+// How the tempo of the two decks was reconciled. Surfaced to the UI so an
+// experimental or fallback result is never presented as a plain beatmatch.
+enum class TempoMatchKind : std::uint8_t {
+    None = 0,                // no tempo sync (plain crossfade, direct cut)
+    ExactMetric,             // metric relation holds at 1.0x on both decks
+    MetricWithStretch,       // metric relation + bounded residual rate change
+    ExperimentalPolyrhythm,  // opt-in 3:2 / 2:3
+    FallbackCrossfade        // tempo sync was wanted but rejected
+};
+
+[[nodiscard]] const char* tempoMatchKindName(TempoMatchKind kind) noexcept;
+
 struct TempoPoint {
     // Seconds from the crossfade start. Negative points belong to the
     // pre-transition tempo ramp, which is exactly the 0.2 behaviour: the
@@ -134,6 +172,13 @@ struct MixPlan {
     double tempoRatioAStart = 1.0;
     double tempoRatioAEnd = 1.0;
     double tempoRatioB = 1.0;
+
+    // Metric-relative matching. `targetBpm` is kept as the incoming (B) BPM
+    // the pair meets at; `targetBpmA` is the outgoing equivalent. The two are
+    // related by `metricRelation`, not necessarily equal (60 -> 120 BPM).
+    MetricRelation metricRelation;
+    TempoMatchKind tempoMatchKind = TempoMatchKind::None;
+    double targetBpmA = 0.0;
 
     bool beatAligned = false;
     bool downbeatAligned = false;
@@ -195,6 +240,12 @@ struct PlannerConfig {
     bool pitchLock = true;
     Aggressiveness aggressiveness = Aggressiveness::Balanced;
     int phraseBars = 4;  // musical phrase length in bars (4 or 8 typical)
+    // Octave-related metric levels (2:1 / 1:2) may be beatmatched at 1.0x when
+    // 1:1 is out of range. Needs trustworthy level/phase confidence.
+    bool allowMetricRelations = true;
+    double minMetricConfidence = 0.5;
+    // Opt-in only: 3:2 and 2:3 polyrhythms. Never enabled automatically.
+    bool allowPolyrhythm = false;
 
     // Effective ramp enable: Off wins over the legacy allowTempoRamp flag.
     [[nodiscard]] bool rampEnabled() const noexcept {
