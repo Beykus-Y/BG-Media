@@ -1,4 +1,4 @@
-#include "bgmedia/sdlgpu/SdlGpuVrmRenderer.hpp"
+﻿#include "bgmedia/sdlgpu/SdlGpuVrmRenderer.hpp"
 
 #include "shaders/generated/background_frag.h"
 #include "shaders/generated/background_vert.h"
@@ -175,6 +175,8 @@ struct SdlGpuVrmRenderer::Impl {
     const vrm::VrmModel* model = nullptr;
     bool ready = false;
     bool modelReady = false;
+    int width = kWidth;
+    int height = kHeight;
     std::vector<std::uint8_t> pixels =
         std::vector<std::uint8_t>(static_cast<std::size_t>(kWidth) * kHeight * 4);
     FrameStats stats;
@@ -183,6 +185,9 @@ struct SdlGpuVrmRenderer::Impl {
     std::uint32_t downloadBytes = 0;
 
     [[nodiscard]] bool initialize(std::string* error);
+    [[nodiscard]] bool resizeTargets(int newWidth, int newHeight,
+                                     std::string* error);
+    void releaseTargets();
     void shutdown();
     void releaseModelResources();
     [[nodiscard]] bool createPipelines(std::string* error);
@@ -288,8 +293,8 @@ bool SdlGpuVrmRenderer::Impl::initialize(std::string* error) {
     colorInfo.format = kColorFormat;
     colorInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER |
                       SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-    colorInfo.width = kWidth;
-    colorInfo.height = kHeight;
+    colorInfo.width = static_cast<Uint32>(width);
+    colorInfo.height = static_cast<Uint32>(height);
     colorInfo.layer_count_or_depth = 1;
     colorInfo.num_levels = 1;
     colorInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
@@ -307,8 +312,8 @@ bool SdlGpuVrmRenderer::Impl::initialize(std::string* error) {
     depthInfo.type = SDL_GPU_TEXTURETYPE_2D;
     depthInfo.format = kDepthFormat;
     depthInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
-    depthInfo.width = kWidth;
-    depthInfo.height = kHeight;
+    depthInfo.width = static_cast<Uint32>(width);
+    depthInfo.height = static_cast<Uint32>(height);
     depthInfo.layer_count_or_depth = 1;
     depthInfo.num_levels = 1;
     depthInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
@@ -322,7 +327,7 @@ bool SdlGpuVrmRenderer::Impl::initialize(std::string* error) {
         return false;
     }
 
-    downloadBytes = static_cast<std::uint32_t>(kWidth) * kHeight * 4;
+    downloadBytes = static_cast<std::uint32_t>(width) * static_cast<std::uint32_t>(height) * 4;
     SDL_GPUTransferBufferCreateInfo downloadInfo{};
     downloadInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
     downloadInfo.size = downloadBytes;
@@ -340,6 +345,7 @@ bool SdlGpuVrmRenderer::Impl::initialize(std::string* error) {
         shutdown();
         return false;
     }
+    pixels.assign(static_cast<std::size_t>(width) * height * 4, 0);
     ready = true;
     return true;
 }
@@ -667,18 +673,18 @@ SDL_GPUTexture* SdlGpuVrmRenderer::Impl::uploadTexture(
         texture.height <= 0) {
         return nullptr;
     }
-    const std::uint32_t width = static_cast<std::uint32_t>(texture.width);
-    const std::uint32_t height = static_cast<std::uint32_t>(texture.height);
-    const std::uint32_t byteCount = width * height * 4;
+    const std::uint32_t texWidth = static_cast<std::uint32_t>(texture.width);
+    const std::uint32_t texHeight = static_cast<std::uint32_t>(texture.height);
+    const std::uint32_t byteCount = texWidth * texHeight * 4;
     SDL_GPUTextureCreateInfo info{};
     info.type = SDL_GPU_TEXTURETYPE_2D;
     info.format = kColorFormat;
     info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER |
                  SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-    info.width = width;
-    info.height = height;
+    info.width = texWidth;
+    info.height = texHeight;
     info.layer_count_or_depth = 1;
-    info.num_levels = mipLevelsFor(width, height);
+    info.num_levels = mipLevelsFor(texWidth, texHeight);
     info.sample_count = SDL_GPU_SAMPLECOUNT_1;
     SDL_GPUTexture* gpuTexture = SDL_CreateGPUTexture(device_, &info);
     if (!gpuTexture) {
@@ -714,8 +720,8 @@ SDL_GPUTexture* SdlGpuVrmRenderer::Impl::uploadTexture(
         return nullptr;
     }
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command);
-    SDL_GPUTextureTransferInfo source{transfer, 0, width, height};
-    SDL_GPUTextureRegion destination{gpuTexture, 0, 0, 0, 0, 0, width, height, 1};
+    SDL_GPUTextureTransferInfo source{transfer, 0, texWidth, texHeight};
+    SDL_GPUTextureRegion destination{gpuTexture, 0, 0, 0, 0, 0, texWidth, texHeight, 1};
     SDL_UploadToGPUTexture(copy, &source, &destination, false);
     SDL_EndGPUCopyPass(copy);
     if (info.num_levels > 1) {
@@ -858,6 +864,86 @@ void SdlGpuVrmRenderer::Impl::releaseModelResources() {
     stats = {};
 }
 
+bool SdlGpuVrmRenderer::Impl::resizeTargets(int newWidth, int newHeight,
+                                            std::string* error) {
+    newWidth = std::clamp(newWidth, 64, 3840);
+    newHeight = std::clamp(newHeight, 64, 2160);
+    if (!device_ || !ready) {
+        // Size is stored and applied during initialize().
+        width = newWidth;
+        height = newHeight;
+        return true;
+    }
+    if (newWidth == width && newHeight == height) {
+        return true;
+    }
+    SDL_WaitForGPUIdle(device_);
+    releaseTargets();
+
+    SDL_GPUTextureCreateInfo colorInfo{};
+    colorInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    colorInfo.format = kColorFormat;
+    colorInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER |
+                      SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    colorInfo.width = static_cast<Uint32>(newWidth);
+    colorInfo.height = static_cast<Uint32>(newHeight);
+    colorInfo.layer_count_or_depth = 1;
+    colorInfo.num_levels = 1;
+    colorInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    colorTarget = SDL_CreateGPUTexture(device_, &colorInfo);
+
+    SDL_GPUTextureCreateInfo depthInfo{};
+    depthInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    depthInfo.format = kDepthFormat;
+    depthInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    depthInfo.width = static_cast<Uint32>(newWidth);
+    depthInfo.height = static_cast<Uint32>(newHeight);
+    depthInfo.layer_count_or_depth = 1;
+    depthInfo.num_levels = 1;
+    depthInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    depthTarget = SDL_CreateGPUTexture(device_, &depthInfo);
+
+    downloadBytes = static_cast<std::uint32_t>(newWidth) *
+                    static_cast<std::uint32_t>(newHeight) * 4;
+    SDL_GPUTransferBufferCreateInfo downloadInfo{};
+    downloadInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    downloadInfo.size = downloadBytes;
+    downloadBuffer = SDL_CreateGPUTransferBuffer(device_, &downloadInfo);
+
+    if (!colorTarget || !depthTarget || !downloadBuffer) {
+        if (error) {
+            *error = "3D render target resize failed: " +
+                     std::string(SDL_GetError());
+        }
+        releaseTargets();
+        ready = false;
+        return false;
+    }
+    width = newWidth;
+    height = newHeight;
+    pixels.assign(static_cast<std::size_t>(width) * height * 4, 0);
+    return true;
+}
+
+void SdlGpuVrmRenderer::Impl::releaseTargets() {
+    if (!device_) {
+        return;
+    }
+    if (colorTarget) {
+        SDL_ReleaseGPUTexture(device_, colorTarget);
+        colorTarget = nullptr;
+    }
+    if (depthTarget) {
+        SDL_ReleaseGPUTexture(device_, depthTarget);
+        depthTarget = nullptr;
+    }
+    if (downloadBuffer) {
+        SDL_ReleaseGPUTransferBuffer(device_, downloadBuffer);
+        downloadBuffer = nullptr;
+    }
+    downloadBytes = 0;
+}
+
 void SdlGpuVrmRenderer::Impl::shutdown() {
     if (device_) {
         SDL_WaitForGPUIdle(device_);
@@ -967,7 +1053,7 @@ bool SdlGpuVrmRenderer::Impl::render(
                               Mat4::translation(-pivotScaled) * scaleMatrix;
     Vec3 target = cameraMatrix.transformPoint(boundsCenter);
     target.y += camera.targetYBias;
-    const float height = std::max(0.1f, model->height * scale);
+    const float modelHeight = std::max(0.1f, model->height * scale);
     const float distance =
         std::max(0.5f, model->height * 2.15f * std::sqrt(scale)) *
         std::clamp(camera.distanceScale, 0.35f, 3.0f);
@@ -980,7 +1066,7 @@ bool SdlGpuVrmRenderer::Impl::render(
     const Mat4 view = math::lookAtLH(eye, target, {0.0f, 1.0f, 0.0f});
     Mat4 projection =
         math::perspectiveFovLH(std::clamp(camera.fov, 0.2f, 1.4f),
-                               static_cast<float>(kWidth) / kHeight,
+                               static_cast<float>(width) / static_cast<float>(std::max(1, height)),
                                std::max(0.02f, distance * 0.01f), 200.0f);
     // glTF/VRM data is right handed while lookAtLH/perspectiveFovLH build a
     // left handed view. Without this correction the image is a mirror image:
@@ -1031,10 +1117,10 @@ bool SdlGpuVrmRenderer::Impl::render(
         SDL_CancelGPUCommandBuffer(command);
         return false;
     }
-    const SDL_GPUViewport viewport{0.0f, 0.0f, static_cast<float>(kWidth),
-                                   static_cast<float>(kHeight), 0.0f, 1.0f};
+    const SDL_GPUViewport viewport{0.0f, 0.0f, static_cast<float>(width),
+                                   static_cast<float>(height), 0.0f, 1.0f};
     SDL_SetGPUViewport(pass, &viewport);
-    const SDL_Rect scissor{0, 0, kWidth, kHeight};
+    const SDL_Rect scissor{0, 0, width, height};
     SDL_SetGPUScissor(pass, &scissor);
 
     // Background gradient (depth disabled).
@@ -1044,8 +1130,8 @@ bool SdlGpuVrmRenderer::Impl::render(
     // Ground and contact shadow.
     FloorVsUniforms floorVs{};
     copyMatrix(floorVs.viewProj, viewProjection);
-    floorVs.floorParams[0] = std::max(3.0f, height * 4.0f);
-    floorVs.floorParams[1] = height;
+    floorVs.floorParams[0] = std::max(3.0f, modelHeight * 4.0f);
+    floorVs.floorParams[1] = modelHeight;
     floorVs.floorParams[2] = 0.0f;
     floorVs.floorParams[3] = 0.0f;
     FloorFsUniforms floorFs{};
@@ -1056,7 +1142,7 @@ bool SdlGpuVrmRenderer::Impl::render(
     const Vec3 footCenter = modelMatrix.transformPoint({0.0f, model->bounds.min.y, 0.0f});
     floorFs.shadow[0] = footCenter.x;
     floorFs.shadow[1] = footCenter.z;
-    floorFs.shadow[2] = height * 0.55f;
+    floorFs.shadow[2] = modelHeight * 0.55f;
     floorFs.shadow[3] = 0.95f;
     SDL_BindGPUGraphicsPipeline(pass, floorPipeline);
     SDL_PushGPUVertexUniformData(command, 0, &floorVs, sizeof(floorVs));
@@ -1156,11 +1242,11 @@ bool SdlGpuVrmRenderer::Impl::render(
 
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command);
     SDL_GPUTextureRegion source{colorTarget, 0, 0, 0, 0, 0,
-                                static_cast<Uint32>(kWidth),
-                                static_cast<Uint32>(kHeight), 1};
+                                static_cast<Uint32>(width),
+                                static_cast<Uint32>(height), 1};
     SDL_GPUTextureTransferInfo destination{downloadBuffer, 0,
-                                           static_cast<Uint32>(kWidth),
-                                           static_cast<Uint32>(kHeight)};
+                                           static_cast<Uint32>(width),
+                                           static_cast<Uint32>(height)};
     SDL_DownloadFromGPUTexture(copy, &source, &destination);
     SDL_EndGPUCopyPass(copy);
 
@@ -1185,8 +1271,8 @@ bool SdlGpuVrmRenderer::Impl::render(
     SDL_UnmapGPUTransferBuffer(device_, downloadBuffer);
 
     stats.valid = true;
-    stats.width = kWidth;
-    stats.height = kHeight;
+    stats.width = width;
+    stats.height = height;
     stats.driver = driver_;
     stats.deviceName = deviceName;
     stats.gpuMilliseconds =
@@ -1247,8 +1333,14 @@ const std::vector<std::uint8_t>& SdlGpuVrmRenderer::pixels() const {
     return impl_->pixels;
 }
 
-int SdlGpuVrmRenderer::width() const { return kWidth; }
-int SdlGpuVrmRenderer::height() const { return kHeight; }
-const FrameStats& SdlGpuVrmRenderer::stats() const { return impl_->stats; }
+int SdlGpuVrmRenderer::width() const { return impl_->width; }
+int SdlGpuVrmRenderer::height() const { return impl_->height; }
+
+void SdlGpuVrmRenderer::setRenderSize(int width, int height) {
+    (void)impl_->resizeTargets(width, height, nullptr);
+}const FrameStats& SdlGpuVrmRenderer::stats() const { return impl_->stats; }
 
 } // namespace bgmedia::sdlgpu
+
+
+

@@ -6,7 +6,7 @@
 //
 //   bgmedia_motion_diag --model M.vrm --audio T.mp3 --clip fluidSignal [--mode manual|auto]
 //       [--overlay off|light|full|hands] [--warp off|soft|expressive] [--spring 0|1]
-//       [--fps 60] [--from 0] [--to 30] [--select-at 0] [--immediate 0|1]
+//       [--thigh-colliders 0|1] [--fps 60] [--from 0] [--to 30] [--select-at 0] [--immediate 0|1]
 //       [--mesh-hz 15] [--csv out.csv] [--focus 1.16] [--seek 1.16]
 //
 // Playback is always sequential from `--from`, one fresh DancePlayer per run (a reused
@@ -20,6 +20,8 @@
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "bgmedia/vrm/ThighColliders.hpp"
+#include "../../tests/motion_metrics.hpp"
 #include "support/MeshProbe.hpp"
 #include "support/PathUtf8.hpp"
 
@@ -44,9 +46,11 @@ struct Options {
     std::string clip = "fluidSignal";
     std::string mode = "manual", overlay = "full", warp = "off";
     bool spring = false, immediate = false;
+    bool thighColliders = false;  // BG Motion 3.3 opt-in thigh/hip spring colliders
     double fps = 60.0, from = 0.0, to = 30.0, selectAt = 0.0, mesh_hz = 15.0, focus = -1.0, seek = -1.0;
     bool legMesh = true, armMesh = true;
     bool legProxy = false, armProxy = true;
+    bool softIK = false;  // BG Motion 3.3 soft reach, stable bend and joint limits
     float footworkGap = 2.5f;
     std::string footwork = "model";  // off | ref | model (authored footwork pre-pass)
     double skip = 0.0;  // ignore the first seconds in the summaries (clip fade-in transient)
@@ -124,6 +128,7 @@ int main(int argc, char** argv) {
         else if (a == "--overlay") o.overlay = next();
         else if (a == "--warp") o.warp = next();
         else if (a == "--spring") o.spring = std::atoi(next().c_str()) != 0;
+        else if (a == "--thigh-colliders") o.thighColliders = std::atoi(next().c_str()) != 0;
         else if (a == "--immediate") o.immediate = std::atoi(next().c_str()) != 0;
         else if (a == "--fps") o.fps = std::atof(next().c_str());
         else if (a == "--from") o.from = std::atof(next().c_str());
@@ -134,6 +139,8 @@ int main(int argc, char** argv) {
         else if (a == "--seek") o.seek = std::atof(next().c_str());
         else if (a == "--no-leg-proxy") o.legProxy = false;
         else if (a == "--leg-proxy") o.legProxy = true;
+        else if (a == "--soft-ik") o.softIK = true;
+        else if (a == "--no-soft-ik") o.softIK = false;
         else if (a == "--footwork") o.footwork = next();
         else if (a == "--footwork-gap") o.footworkGap = static_cast<float>(std::atof(next().c_str()));
         else if (a == "--no-arm-proxy") o.armProxy = false;
@@ -145,6 +152,17 @@ int main(int argc, char** argv) {
     if (!loaded.ok()) {
         std::fprintf(stderr, "model load failed: %s\n", loaded.error.c_str());
         return 1;
+    }
+    if (o.thighColliders) {
+        // Must run before SecondaryDynamics is constructed: the collider groups are read at build time.
+        vrm::ThighColliderOptions thigh;
+        thigh.enabled = true;
+        const vrm::ThighColliderReport report = vrm::synthesizeThighColliders(*loaded.model, thigh);
+        std::printf("thigh colliders: %s (groups %d, spheres %d, chains %d, radius L %.4f R %.4f m%s)\n",
+                    report.applied ? "added" : report.skipReason.c_str(), report.groupsAdded,
+                    report.spheresAdded, report.chainsTouched, report.leftRadius, report.rightRadius,
+                    report.applied && (report.leftRadiusFromMesh || report.rightRadiusFromMesh)
+                        ? ", mesh-fitted" : "");
     }
     const vrm::VrmModel& model = *loaded.model;
     animation::HumanoidRetargeter rig(model);
@@ -242,6 +260,11 @@ int main(int argc, char** argv) {
     const int total = static_cast<int>((o.to - o.from) * o.fps);
     const int meshEvery = std::max(1, static_cast<int>(o.fps / std::max(1.0, o.mesh_hz)));
     double lastMedia = -1e9;
+    // BG Motion 3.3 soft IK counters, summed over the played frames (--soft-ik).
+    long softSolves = 0, bendBlends = 0, flexLimits = 0, plantedFlex = 0, plantedReach = 0;
+    float softCompression = 0.0f;
+    double ikErrorSum = 0.0;
+    int ikErrorCount = 0;
     for (int f = 0; f < total; ++f) {
         const double t = o.from + f * dt;
         if (!selected && t >= o.selectAt) {
@@ -254,6 +277,7 @@ int main(int argc, char** argv) {
         const motion::DanceFrame df = player.update(t);
         animation::RetargetOptions ropt;
         ropt.legCollision = o.legProxy;
+        ropt.softIK = o.softIK;
         ropt.armCollision = o.armProxy;
         animation::RetargetedPose pose = rig.applyClip(df.pose, t, ropt);
         if (o.spring) {
@@ -297,6 +321,16 @@ int main(int argc, char** argv) {
         fr.legCorr = pose.stats.legCorrection;
         fr.legClear = pose.stats.legClearanceRaw;
         fr.legConflict = pose.stats.legConflictPlanted;
+        if (o.softIK && f >= static_cast<int>(o.skip * o.fps)) {
+            softSolves += pose.stats.softReachSolves;
+            softCompression = std::max(softCompression, pose.stats.softReachCompression);
+            bendBlends += pose.stats.bendBlends;
+            flexLimits += pose.stats.flexLimits;
+            plantedFlex += pose.stats.plantedFlexConflicts;
+            plantedReach += pose.stats.plantedReachConflicts;
+            ikErrorSum += pose.stats.maxFootError;
+            ++ikErrorCount;
+        }
         if (f % meshEvery == 0) {
             meshProbe.skin(pose);
             if (o.legMesh) fr.legCross = static_cast<int>(meshProbe.crossings(probe::Region::LegL, probe::Region::LegR).size());
@@ -398,9 +432,11 @@ int main(int argc, char** argv) {
     const float h = model.height;
     for (int ft = 0; ft < 2; ++ft) {
         const int ankleK = ft == 0 ? 8 : 9;
-        double maxSlide = 0, dragDist = 0, dragTime = 0, maxHorizSpeedPlanted = 0;
+        double maxSlide = 0;
         std::size_t runStart = 0;
         bool inRun = false;
+        std::vector<qa::FootSample> track;
+        track.reserve(n - skipIdx);
         for (std::size_t i = skipIdx; i < n; ++i) {
             const bool planted = frames[i].planted[ft];
             if (planted && !inRun) {
@@ -412,17 +448,16 @@ int main(int argc, char** argv) {
                 maxSlide = std::max<double>(maxSlide, std::hypot(d.x, d.z));
             }
             if (!planted) inRun = false;
-            if (i == skipIdx) continue;
-            const Vec3 d = frames[i].pos[ankleK] - frames[i - 1].pos[ankleK];
-            const double horiz = std::hypot(d.x, d.z);
-            if (!planted && frames[i].footTarget[ft].y < 0.012f && horiz / dt > 0.15) {
-                dragDist += horiz;
-                dragTime += dt;
-            }
+            track.push_back({frames[i].t, frames[i].pos[ankleK], frames[i].footTarget[ft].y, planted});
         }
-        (void)maxHorizSpeedPlanted;
-        std::printf("%s foot: max slide inside a planted run %.2f mm | GROUND DRAG (not planted, lift < %.1f cm, moving > 0.15 m/s): %.1f cm over %.2f s\n",
-                    ft == 0 ? "left " : "right", maxSlide * 1000.0, 0.012 * h * 100.0, dragDist * 100.0, dragTime);
+        // Drag is integrated on a fixed reference grid; the per-sample figure is what the
+        // reports showed before and is printed next to it so the sampling dependence is visible.
+        const qa::GroundDrag drag = qa::measureGroundDrag(track, 0.012f, 0.15);
+        const qa::GroundDrag legacy = qa::measureGroundDragPerSample(track, 0.012f, 0.15);
+        std::printf("%s foot: max slide inside a planted run %.2f mm | GROUND DRAG (not planted, lift < %.1f cm, moving > 0.15 m/s): %.1f cm over %.2f s "
+                    "(per-sample %.1f cm)\n",
+                    ft == 0 ? "left " : "right", maxSlide * 1000.0, 0.012 * h * 100.0, drag.distance * 100.0, drag.seconds,
+                    legacy.distance * 100.0);
     }
     int legFrames = 0, legMax = 0, armFrames = 0, armMax = 0, sampled = 0;
     for (const Frame& f : frames) {
@@ -450,6 +485,12 @@ int main(int argc, char** argv) {
         }
         std::printf("LEG PROXY: %d frames corrected, max foot-target move %.1f mm, %d frames with both feet planted and overlapping (not movable)\n",
                     corrected, maxCorr * 1000.0, conflicts);
+    }
+    if (o.softIK) {
+        std::printf("SOFT IK: %ld soft-reach solves (max shortfall %.1f mm), %ld bend blends, %ld flexion-limited free solves, "
+                    "planted: %ld flexion conflicts, %ld beyond-reach; mean max foot error %.2f cm\n",
+                    softSolves, softCompression * 1000.0, bendBlends, flexLimits, plantedFlex, plantedReach,
+                    ikErrorCount > 0 ? 100.0 * ikErrorSum / ikErrorCount : 0.0);
     }
     // list leg-crossing time ranges
     {

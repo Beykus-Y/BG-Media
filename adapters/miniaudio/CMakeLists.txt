@@ -1,6 +1,8 @@
 add_library(bgmedia_miniaudio STATIC
     src/MiniaudioDecoder.cpp
     src/MiniaudioImpl.cpp
+    src/MiniaudioMixDevice.cpp
+    src/MiniaudioMixLoader.cpp
 )
 add_library(BGMedia::Miniaudio ALIAS bgmedia_miniaudio)
 target_include_directories(bgmedia_miniaudio

@@ -60,6 +60,11 @@ public:
     [[nodiscard]] bool initialize(std::string* error);
     void shutdown();
 
+    // Dynamic offscreen size. Recreates the color/depth targets and the
+    // readback buffer only when the size actually changes, so a window resize
+    // does not allocate GPU resources per frame. Clamped to 3840x2160.
+    void setRenderSize(int width, int height);
+
     [[nodiscard]] bool setModel(const vrm::VrmModel& model, std::string* error);
     void releaseModel();
 

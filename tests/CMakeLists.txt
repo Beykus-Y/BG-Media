@@ -16,6 +16,15 @@ add_executable(bgmedia_tests
     test_quality.cpp
     test_spatial.cpp
     test_spring.cpp
+    test_intent.cpp
+    test_wrist_planner.cpp
+    test_elbow_solver.cpp
+    test_soft_ik.cpp
+    test_triangle.cpp
+    test_alive.cpp
+    test_beat_clock.cpp
+    test_mix.cpp
+    test_ui.cpp
 )
 target_link_libraries(bgmedia_tests PRIVATE
     bgmedia_core
@@ -26,7 +35,7 @@ if(TARGET bgmedia_miniaudio)
     target_link_libraries(bgmedia_tests PRIVATE bgmedia_miniaudio)
     target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_MINIAUDIO=1)
 endif()
-target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3)
+target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3 ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/apps/desktop)
 target_compile_definitions(bgmedia_tests PRIVATE
     BGMEDIA_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
     BGMEDIA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -36,7 +45,7 @@ if(MSVC)
     target_compile_definitions(bgmedia_tests PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
-foreach(test_name audio analysis cache sync choreography motion timeline warp sync31 vrm retarget dance motion32 quality spatial spring)
+foreach(test_name audio analysis cache sync choreography motion timeline warp sync31 vrm retarget dance motion32 quality spatial spring intent planner elbow soft_ik triangle alive beat_clock mix ui)
     add_test(NAME bgmedia.${test_name} COMMAND bgmedia_tests ${test_name}.)
     set_tests_properties(bgmedia.${test_name} PROPERTIES
         TIMEOUT 120

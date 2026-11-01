@@ -1,11 +1,3 @@
-add_library(bgmedia_test_signals STATIC
-    support/SyntheticSignals.cpp
-)
-target_link_libraries(bgmedia_test_signals PUBLIC bgmedia_core)
-target_include_directories(bgmedia_test_signals PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(bgmedia_test_signals PUBLIC cxx_std_20)
-target_compile_options(bgmedia_test_signals PRIVATE ${BGMEDIA_WARNING_FLAGS})
-
 add_executable(bgmedia_fixturegen
     fixturegen/main.cpp
 )
@@ -34,6 +26,26 @@ if(BGMEDIA_BUILD_MINIAUDIO)
     if(WIN32)
         target_link_libraries(bgmedia_analyze PRIVATE shell32)
     endif()
+
+    # Real-track BG Mix transition measurement (offline + optional device).
+    add_executable(bgmedia_mix_qa
+        mix_qa/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_qa PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_qa PRIVATE shell32)
+    endif()
+
+    # Batch listening-test renderer: real BG Beat + planner + engine, WAV out.
+    add_executable(bgmedia_mix_listening
+        mix_listening/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_listening PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_listening PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_listening PRIVATE shell32)
+    endif()
 endif()
 
 add_executable(bgmedia_motion_qa
@@ -41,6 +53,12 @@ add_executable(bgmedia_motion_qa
 )
 target_link_libraries(bgmedia_motion_qa PRIVATE bgmedia_rig)
 target_compile_options(bgmedia_motion_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+add_executable(bgmedia_qa_matrix
+    qa_matrix/main.cpp
+)
+target_link_libraries(bgmedia_qa_matrix PRIVATE bgmedia_rig)
+target_compile_options(bgmedia_qa_matrix PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
 add_executable(bgmedia_procedural_dance
     procedural_dance/main.cpp
@@ -59,6 +77,7 @@ add_executable(bgmedia_mesh_clip
     mesh_clip/main.cpp
 )
 target_link_libraries(bgmedia_mesh_clip PRIVATE bgmedia_rig)
+target_include_directories(bgmedia_mesh_clip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(bgmedia_mesh_clip PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
 if(BGMEDIA_BUILD_MINIAUDIO)

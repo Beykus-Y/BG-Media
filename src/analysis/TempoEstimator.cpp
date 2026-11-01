@@ -30,6 +30,8 @@ struct PhaseScore {
     double grid = 0.0;
     int beatCount = 0;
     int hitCount = 0;
+    // Refined period from onset regression; not recoverable from phase alone.
+    double fittedLag = 0.0;
 };
 
 struct LowEvidence {
@@ -228,12 +230,18 @@ LowEvidence bestLowPhase(const std::vector<OnsetPeak>& peaks,
         }
     };
     if (std::isfinite(hintPhase)) {
+        // Evaluate low-band pulse near the beat phase and near the syncopated
+        // 8th-note offbeat (hintPhase + 0.5 * lag). This supports both onbeat
+        // kicks and syncopated bass without letting an unrelated phase promote
+        // an incorrect metric subharmonic.
         for (int i = -4; i <= 4; ++i) {
             tryPhase(hintPhase + static_cast<double>(i) * lag / 32.0);
+            tryPhase(hintPhase + 0.5 * lag + static_cast<double>(i) * lag / 32.0);
         }
-    }
-    for (int step = 0; step < steps; ++step) {
-        tryPhase(static_cast<double>(step) * lag / static_cast<double>(steps));
+    } else {
+        for (int step = 0; step < steps; ++step) {
+            tryPhase(static_cast<double>(step) * lag / static_cast<double>(steps));
+        }
     }
     return best;
 }
@@ -339,6 +347,7 @@ PhaseScore refineWithRegression(const std::vector<OnsetPeak>& peaks,
     if (refined.grid + 0.02 < initial.grid) {
         return initial;
     }
+    refined.fittedLag = refinedLag;
     return refined;
 }
 
@@ -657,6 +666,8 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         const double refinedLag = 60.0 * fps / refinedBpm;
         const double acScore = std::clamp(acAtLag(ac, refinedLag), 0.0, 1.2);
         const double lowTolerance = std::max(2.0, 0.035 * fps);
+        // Search for low-frequency pulse aligned to the broadband beat phase or to
+        // syncopated 8th-note offbeats (phase.phase + 0.5 * refinedLag).
         LowEvidence low = bestLowPhase(lowPeaks, lowReference, refinedLag, lowTolerance,
                                        totalLowPeakStrength, phase.phase);
         const double prior = std::exp(
@@ -716,8 +727,10 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         candidate.prior = prior;
         candidate.score = (0.55 * evidence + 0.45 * std::clamp(acScore, 0.0, 1.0)) *
                           (0.90 + 0.10 * prior) * continuityFactor;
+
         evaluated.push_back(candidate);
     }
+
 
     if (evaluated.empty()) {
         return result;

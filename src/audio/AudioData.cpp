@@ -39,16 +39,36 @@ std::vector<float> AudioData::toMono() const {
     std::vector<float> mono(frames, 0.0f);
     const float invChannels = 1.0f / static_cast<float>(channels);
 
+    std::vector<double> channelPower(channels, 0.0);
+    double monoPower = 0.0;
     for (std::size_t frame = 0; frame < frames; ++frame) {
-        float sum = 0.0f;
+        double sum = 0.0;
         for (std::uint32_t ch = 0; ch < channels; ++ch) {
             float value = samples[frame * channels + ch];
             if (!std::isfinite(value)) {
                 value = 0.0f;
             }
             sum += value;
+            channelPower[ch] += static_cast<double>(value) * value;
         }
-        mono[frame] = sum * invChannels;
+        mono[frame] = static_cast<float>(sum * invChannels);
+        monoPower += static_cast<double>(mono[frame]) * mono[frame];
+    }
+
+    // A simple average can cancel nearly anti-phase stereo completely.
+    // Only use a dominant channel for stereo when the average has lost most
+    // of its signal power. Multichannel surround must retain the channel
+    // average, even when some channels are inactive.
+    if (channels == 2) {
+        const auto loudest = std::max_element(channelPower.begin(), channelPower.end());
+        if (loudest != channelPower.end() && *loudest > 1e-12 &&
+            monoPower < *loudest * 0.12) {
+            const std::size_t channel = static_cast<std::size_t>(loudest - channelPower.begin());
+            for (std::size_t frame = 0; frame < frames; ++frame) {
+                const float value = samples[frame * channels + channel];
+                mono[frame] = std::isfinite(value) ? value : 0.0f;
+            }
+        }
     }
     return mono;
 }

@@ -20,8 +20,11 @@
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "bgmedia/motion3/MusicalTimeWarp.hpp"
 
+#include <array>
 #include <functional>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -39,6 +42,25 @@ struct ScheduleSegment {
     bool barPhaseTrusted = true;   // the musical bar phase was trusted at entry
     int meter = 4;                 // musical meter used for the entry
     double alignmentErrorSeconds = 0.0;  // |alignTime - nearest target boundary|
+    // Planted-foot hand-over window per foot (BG Motion 3.3, A1). DanceSchedule::append with a
+    // timeline resolves it once, from the swing that is in the window at scheduling time. It is
+    // never searched again: a rebase shifts a pending window's media seconds with the segment's
+    // alignment, and the progress follows the swing's clip beats. An unresolved window is
+    // searched on demand.
+    struct FootSwingWindow {
+        double begin = 0.0;    // media seconds: the foot leaves its outgoing position
+        double end = 0.0;      // media seconds: the foot reaches its incoming position
+        // The same swing in linear clip beats of the clip it was found in (the outgoing
+        // segment's when `fromOutgoing`). The hand-over progress is read from these, so a
+        // tempo rebase, which keeps each clip's beat at the rebase time, keeps the progress
+        // continuous and the hand-over on the swing at the new tempo.
+        double beginBeat = 0.0;
+        double endBeat = 0.0;
+        bool fromOutgoing = false;
+        bool slide = false;    // no swing in the window: the foot slides through the fade
+        bool resolved = false;
+    };
+    std::array<FootSwingWindow, 2> footSwing{};
 };
 
 // Optional per-segment pose post-process (BG Motion 3.2 overlays). It is applied
@@ -61,6 +83,7 @@ struct DanceFrame {
     float effectiveSpeed = 1.0f;   // playbackSpeed * warpRate
     bool speedLimited = false;     // tempo outside the clip's comfortable range
     float transitionProgress = -1.0f;  // 0..1 while crossfading, else -1
+    float idleWeight = 0.0f;  // share of the Idle clip in the shown pose (0..1), crossfades included
     double bpm = 0.0;
     bool oneShotFinished = false;
     std::string reason;
@@ -92,7 +115,33 @@ class DanceSchedule {
 public:
     void clear() { segments_.clear(); }
     void setPoseDecorator(PoseDecorator decorator) { decorator_ = std::move(decorator); }
+    // Opt-in (BG Motion 3.3, #8). Upper-body bones carry the outgoing pose through a
+    // segment crossfade as a decaying rotation offset instead of a smootherstep blend.
+    // Off by default: the blend stays the reference behaviour until A/B-tested.
+    void setInertialTransitions(bool enabled) { inertialTransitions_ = enabled; }
+    [[nodiscard]] bool inertialTransitions() const { return inertialTransitions_; }
+    // Opt-in (BG Motion 3.3, #9; WP-E). Upper-body follow-through: each bone of followThroughBones()
+    // is displayed at its chain rotation delayed by its lag share, so motion overlaps down the
+    // chain (hand behind forearm behind upper arm). Pure function of media time: it reads basePose
+    // at earlier times, so seeking and playback agree and the frame rate does not matter. Hips,
+    // spine, legs, feet, toes and eyes are never changed. Off by default, and DancePlayer does not
+    // enable it: a lagged child raises the bone acceleration of keyed clips (see the WP-E report).
+    void setFollowThrough(bool enabled) { followThrough_ = enabled; }
+    [[nodiscard]] bool followThrough() const { return followThrough_; }
+    struct FollowThroughBone {
+        vrm::HumanoidBone bone;
+        float weight;      // share of the lag: delay = weight * 0.12 s
+        float capDegrees;  // bound on the offset from the bone's own motion
+    };
+    [[nodiscard]] static const std::array<FollowThroughBone, 12>& followThroughBones();
     void append(ScheduleSegment segment);
+    // Appends and resolves the planted-foot hand-over windows against the predecessor, the
+    // grid and the warp in effect now. Use it when scheduling: later grid changes then keep
+    // the windows instead of moving the foot hand-over.
+    void append(ScheduleSegment segment, const MusicalTimeline& timeline, const WarpProfile& warp);
+    // Searches again the hand-over windows of every segment after the grid changed without a
+    // re-anchor (a plain setBeatClock / setMusicalTimeline). A re-anchored rebase keeps them.
+    void refreshFootSwings(const MusicalTimeline& timeline, const WarpProfile& warp);
     // Removes segments that start after `time` (used before appending a manual
     // switch so the future is replaced rather than stacked).
     void truncateAfter(double time);
@@ -118,11 +167,40 @@ public:
                                                 double* deviation = nullptr);
 
 private:
+    // Pose of one segment at one time, memoized per sample() call: with overlapping
+    // fades the recursion would otherwise revisit the same (segment, time) pairs.
+    using PoseMemo = std::map<std::pair<std::size_t, double>, ClipPose>;
     [[nodiscard]] ClipPose poseOf(std::size_t index, double mediaTime,
                                   const MusicalTimeline& timeline,
-                                  const WarpProfile& warp, float* transition) const;
+                                  const WarpProfile& warp, float* transition,
+                                  PoseMemo& memo) const;
+    [[nodiscard]] ClipPose basePose(std::size_t index, double mediaTime,
+                                    const MusicalTimeline& timeline,
+                                    const WarpProfile& warp, double* clipBeat) const;
+    [[nodiscard]] ClipPose ownPose(std::size_t index, double mediaTime,
+                                   const MusicalTimeline& timeline,
+                                   const WarpProfile& warp) const;
+    // BG Motion 3.3 (A1). Stage-position hand-over of each foot of segment `index`. The
+    // foot keeps its outgoing position until the incoming clip starts a swing for it, then
+    // moves to the incoming position with smootherstep over that swing. `active` is false
+    // once the hand-over has completed. Pure function of media time.
+    struct FootHandOver {
+        float progress = 1.0f;  // 0 = outgoing position, 1 = incoming position
+        bool active = false;
+    };
+    [[nodiscard]] std::array<FootHandOver, 2> footHandOver(std::size_t index, double mediaTime,
+                                                           const MusicalTimeline& timeline,
+                                                           const WarpProfile& warp) const;
+    // Searches the hand-over window of one foot of segment `index` (see FootSwingWindow).
+    [[nodiscard]] ScheduleSegment::FootSwingWindow findFootSwing(std::size_t index, int foot,
+                                                                 const MusicalTimeline& timeline,
+                                                                 const WarpProfile& warp) const;
+    void applyFollowThrough(ClipPose& pose, std::size_t index, double mediaTime,
+                            const MusicalTimeline& timeline, const WarpProfile& warp) const;
     std::vector<ScheduleSegment> segments_;
     PoseDecorator decorator_;
+    bool inertialTransitions_ = false;
+    bool followThrough_ = false;
 };
 
 enum class DanceMode { Manual, Auto };
@@ -173,8 +251,9 @@ public:
     void planAuto(const AnalysisResult& analysis, const AutoPlanOptions& options = {});
     // Fresh schedule that is just Idle.
     void reset(double now = 0.0);
-    // Restarts the selected style at `now`, aligned to the bar structure of the
-    // grid, without a fade (used after a seek).
+    // Restarts the selected clip at `now`, aligned to the musical beat of the grid, without a
+    // fade (used when the time precedes the schedule). The clip beat is the unwrapped musical
+    // beat, so the loop (and its per-loop variation) matches continuous play from the grid origin.
     void reseed(double now);
     // Installs a new beat grid while keeping the current clip and its phase, so
     // a tempo change never makes the pose jump.
@@ -190,7 +269,13 @@ public:
     [[nodiscard]] std::string describeSchedule() const;
     [[nodiscard]] DanceSchedule& schedule() { return schedule_; }
     [[nodiscard]] DanceStyle selectedStyle() const { return selected_; }
-    void setSelectedStyle(DanceStyle style) { selected_ = style; }
+    // The clip the Manual selection plays. Generated Custom clips share one style, so a
+    // reseed must follow the clip id, not the style.
+    [[nodiscard]] const std::string& selectedClipId() const { return selectedClip_; }
+    void setSelectedClip(const std::string& clipId, DanceStyle style) {
+        selectedClip_ = clipId;
+        selected_ = style;
+    }
     [[nodiscard]] const DanceLibrary* library() const { return library_; }
 
     // Next point where a manual switch can start without breaking the bar.
@@ -203,6 +288,10 @@ public:
                                            bool* limited = nullptr);
 
 private:
+    // BG Motion 3.3 (A5). Re-anchors the schedule after the grid changed from `before` to
+    // clock_/timeline_ at `now`: active segments keep their blend and their clip beat at
+    // `now`, pending segments keep their musical alignment beat. Used by rebase().
+    void reanchorSchedule(double now, const BeatClock& before);
     [[nodiscard]] double fadeFor(double atTime) const;
     [[nodiscard]] const HumanoidClip* clipFor(DanceStyle style) const;
     [[nodiscard]] double entryTimeFor(const HumanoidClip& clip, double now,
@@ -214,6 +303,7 @@ private:
     WarpProfile warp_;
     DanceSchedule schedule_;
     DanceStyle selected_ = DanceStyle::Idle;
+    std::string selectedClip_;
 };
 
 } // namespace bgmedia::motion

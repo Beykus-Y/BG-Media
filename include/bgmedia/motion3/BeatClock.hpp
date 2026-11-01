@@ -3,9 +3,9 @@
 // BeatClock: the stable media-time <-> musical-beat mapping used by BG Motion.
 //
 // It is deliberately independent from the analyser and from rendering. A clock
-// can be built from a BG Beat analysis (piecewise-linear interpolation between
-// smoothed beat timestamps, including gaps), or from a constant Motion Lab
-// tempo. The clock never divides by a zero interval and never extrapolates with
+// can be built from a BG Beat analysis (a monotone cubic Hermite through the
+// smoothed beat timestamps, so the tempo changes smoothly across every beat),
+// or from a constant Motion Lab tempo. The clock never divides by a zero interval and never extrapolates with
 // a non-finite period; the edge cases are handled explicitly below.
 
 #include "bgmedia/analysis/AnalysisResult.hpp"
@@ -62,6 +62,7 @@ private:
     int barOffset_ = 0;
     float confidence_ = 1.0f;
     std::vector<double> times_;  // smoothed beat times; empty = constant grid
+    std::vector<double> tangents_;  // d(beat)/dt at each grid time (monotone)
     double headPeriod_ = 0.6;
     double tailPeriod_ = 0.6;
 };

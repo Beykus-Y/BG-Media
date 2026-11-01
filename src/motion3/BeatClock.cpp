@@ -17,6 +17,59 @@ struct CleanBeat {
     bool extrapolated = false;
 };
 
+// Fritsch-Carlson monotone tangents for the curve beat(t) that passes through
+// (times[k], k). Returns d(beat)/dt at every knot. Interior tangents are the
+// mean of the neighbouring secants, the end tangents are the nominal head and
+// tail rates, and the limiter shrinks any interval whose tangents leave the
+// monotone region. Shrinking never breaks an interval that already passed, so
+// one pass is enough.
+std::vector<double> monotoneTangents(const std::vector<double>& times, double headRate,
+                                     double tailRate) {
+    const std::size_t n = times.size();
+    if (n < 2) {
+        return {headRate};
+    }
+    std::vector<double> secant(n - 1);
+    for (std::size_t k = 0; k + 1 < n; ++k) {
+        secant[k] = 1.0 / (times[k + 1] - times[k]);
+    }
+    std::vector<double> m(n, 0.0);
+    m.front() = std::isfinite(headRate) && headRate > 0.0 ? headRate : secant.front();
+    m.back() = std::isfinite(tailRate) && tailRate > 0.0 ? tailRate : secant.back();
+    for (std::size_t k = 1; k + 1 < n; ++k) {
+        m[k] = 0.5 * (secant[k - 1] + secant[k]);
+    }
+    for (std::size_t k = 0; k + 1 < n; ++k) {
+        const double d = secant[k];
+        const double a = m[k] / d;
+        const double b = m[k + 1] / d;
+        const double r2 = a * a + b * b;
+        if (r2 > 9.0) {
+            const double tau = 3.0 / std::sqrt(r2);
+            m[k] = tau * a * d;
+            m[k + 1] = tau * b * d;
+        }
+    }
+    return m;
+}
+
+// Cubic Hermite basis on one knot interval, s in [0, 1]. y0 and y1 are beat
+// values at the ends, m0 and m1 are slopes in beats per second, h is the
+// interval length in seconds.
+double hermiteValue(double y0, double y1, double m0, double m1, double h, double s) {
+    const double s2 = s * s;
+    const double s3 = s2 * s;
+    return (2.0 * s3 - 3.0 * s2 + 1.0) * y0 + (s3 - 2.0 * s2 + s) * h * m0 +
+           (3.0 * s2 - 2.0 * s3) * y1 + (s3 - s2) * h * m1;
+}
+
+// d(value)/ds of hermiteValue. Divide by h for the time derivative.
+double hermiteSlope(double y0, double y1, double m0, double m1, double h, double s) {
+    const double s2 = s * s;
+    return (6.0 * s2 - 6.0 * s) * y0 + (3.0 * s2 - 4.0 * s + 1.0) * h * m0 +
+           (6.0 * s - 6.0 * s2) * y1 + (3.0 * s2 - 2.0 * s) * h * m1;
+}
+
 } // namespace
 
 BeatClock BeatClock::constant(double bpm, double firstBeatTime, int beatsPerBar) {
@@ -219,6 +272,8 @@ BeatClock BeatClock::fromAnalysis(const AnalysisResult& analysis, double fallbac
     }
     clock.headPeriod_ = std::clamp(clock.headPeriod_, 0.15, 3.0);
     clock.tailPeriod_ = std::clamp(clock.tailPeriod_, 0.15, 3.0);
+    clock.tangents_ = monotoneTangents(clock.times_, 1.0 / clock.headPeriod_,
+                                       1.0 / clock.tailPeriod_);
     return clock;
 }
 
@@ -230,20 +285,22 @@ double BeatClock::beatAt(double t) const {
         return (t - first_) * bpm_ / 60.0;
     }
     if (t <= times_.front()) {
-        return (t - times_.front()) / headPeriod_;
+        return (t - times_.front()) * tangents_.front();
     }
     if (t >= times_.back()) {
         return static_cast<double>(times_.size() - 1) +
-               (t - times_.back()) / tailPeriod_;
+               (t - times_.back()) * tangents_.back();
     }
     const auto it = std::upper_bound(times_.begin(), times_.end(), t);
     const std::size_t hi = static_cast<std::size_t>(it - times_.begin());
     const std::size_t lo = hi - 1;
-    const double interval = times_[hi] - times_[lo];
-    if (!(interval > 1e-6)) {
+    const double h = times_[hi] - times_[lo];
+    if (!(h > 1e-9)) {
         return static_cast<double>(lo);
     }
-    return static_cast<double>(lo) + (t - times_[lo]) / interval;
+    const double s = std::clamp((t - times_[lo]) / h, 0.0, 1.0);
+    return hermiteValue(static_cast<double>(lo), static_cast<double>(hi), tangents_[lo],
+                        tangents_[hi], h, s);
 }
 
 double BeatClock::timeAtBeat(double beat) const {
@@ -255,40 +312,77 @@ double BeatClock::timeAtBeat(double beat) const {
         return first_ + beat * 60.0 / bpm_;
     }
     if (beat <= 0.0) {
-        return times_.front() + beat * headPeriod_;
+        return times_.front() + beat / tangents_.front();
     }
     const double last = static_cast<double>(times_.size() - 1);
     if (beat >= last) {
-        return times_.back() + (beat - last) * tailPeriod_;
+        return times_.back() + (beat - last) / tangents_.back();
     }
+    // Exact inverse of beatAt. The spline is strictly monotone on each knot
+    // interval, so solve for the Hermite parameter s with a Newton iteration
+    // that falls back to bisection whenever it leaves the bracket [a, b].
     const std::size_t lo = static_cast<std::size_t>(std::floor(beat));
-    const double f = beat - static_cast<double>(lo);
-    if (lo + 1 >= times_.size()) {
-        return times_.back();
+    const std::size_t hi = lo + 1;
+    const double h = times_[hi] - times_[lo];
+    if (!(h > 1e-9)) {
+        return times_[lo];
     }
-    const double interval = times_[lo + 1] - times_[lo];
-    return times_[lo] + f * std::max(0.05, interval);
+    const double target = beat - static_cast<double>(lo);
+    const double m0 = tangents_[lo];
+    const double m1 = tangents_[hi];
+    double a = 0.0;
+    double b = 1.0;
+    double s = target;
+    for (int iteration = 0; iteration < 80; ++iteration) {
+        const double value = hermiteValue(0.0, 1.0, m0, m1, h, s) - target;
+        if (std::abs(value) <= 1e-14) {
+            break;
+        }
+        if (value > 0.0) {
+            b = s;
+        } else {
+            a = s;
+        }
+        const double slope = hermiteSlope(0.0, 1.0, m0, m1, h, s);
+        double next = slope > 0.0 ? s - value / slope : 0.5 * (a + b);
+        if (!(next > a && next < b)) {
+            next = 0.5 * (a + b);
+        }
+        const bool settled = std::abs(next - s) <= 1e-15;
+        s = next;
+        if (settled) {
+            break;
+        }
+    }
+    return times_[lo] + s * h;
 }
 
 double BeatClock::bpmAt(double t) const {
-    if (times_.empty()) {
+    if (times_.empty() || !std::isfinite(t)) {
         return bpm_;
     }
-    if (!std::isfinite(t)) {
-        return bpm_;
-    }
-    double period = headPeriod_;
-    if (t >= times_.back()) {
-        period = tailPeriod_;
-    } else if (t > times_.front()) {
+    // bpmAt is the time derivative of beatAt, so the two stay consistent and
+    // the tempo is continuous at every beat boundary.
+    double rate = 0.0;
+    if (t <= times_.front()) {
+        rate = tangents_.front();
+    } else if (t >= times_.back()) {
+        rate = tangents_.back();
+    } else {
         const auto it = std::upper_bound(times_.begin(), times_.end(), t);
         const std::size_t hi = static_cast<std::size_t>(it - times_.begin());
-        period = times_[hi] - times_[hi - 1];
+        const std::size_t lo = hi - 1;
+        const double h = times_[hi] - times_[lo];
+        if (!(h > 1e-9)) {
+            return bpm_;
+        }
+        const double s = std::clamp((t - times_[lo]) / h, 0.0, 1.0);
+        rate = hermiteSlope(0.0, 1.0, tangents_[lo], tangents_[hi], h, s) / h;
     }
-    if (!std::isfinite(period) || period <= 0.05) {
+    if (!std::isfinite(rate) || rate <= 0.0) {
         return bpm_;
     }
-    return std::clamp(60.0 / period, 20.0, 400.0);
+    return std::clamp(60.0 * rate, 20.0, 400.0);
 }
 
 int BeatClock::beatInBar(double beat) const {

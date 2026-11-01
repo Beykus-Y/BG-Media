@@ -70,9 +70,14 @@ public:
     // after a seek, a model reload, a teleport or a large time jump.
     void reset(const RetargetedPose& pose);
 
-    // Advances the simulation by `deltaSeconds` (wall/media time) and writes
-    // the spring node globals back into `pose`. When disabled, the pose is left
-    // untouched and the accumulator is kept bounded.
+    // Advances the simulation by `deltaSeconds` and writes the spring node globals
+    // back into `pose`. The host passes WALL-clock time, not media time, so hair
+    // keeps settling while playback is paused and does not speed up with playback
+    // speed. Each fixed step samples the animated pose at its own time, and the written
+    // offset from the animated pose is interpolated between the last two steps. The
+    // output is smooth at any frame rate, and a steadily moving chain carries no lag
+    // from the frame cadence.
+    // When disabled, the pose is left untouched and the accumulator is kept bounded.
     void update(RetargetedPose& pose, double deltaSeconds,
                 const SecondarySettings& settings);
 

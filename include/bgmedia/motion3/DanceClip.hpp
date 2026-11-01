@@ -21,9 +21,11 @@
 #include "bgmedia/vrm/VrmModel.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -44,6 +46,10 @@ enum class DanceStyle : std::uint8_t {
     Energetic,
     Custom
 };
+
+// Number of DanceStyle values, for per-style tables. Derived from the last enumerator, so a new
+// style cannot outgrow a table indexed by style.
+inline constexpr std::size_t kDanceStyleCount = static_cast<std::size_t>(DanceStyle::Custom) + 1;
 
 [[nodiscard]] const char* styleName(DanceStyle style);
 [[nodiscard]] DanceStyle styleFromName(const std::string& name);
@@ -168,6 +174,9 @@ struct ClipPose {
 // Samples at a clip beat. Looping clips wrap; one-shot clips clamp.
 void sampleClip(const HumanoidClip& clip, double clipBeat, ClipPose& out);
 [[nodiscard]] ClipPose sampleClip(const HumanoidClip& clip, double clipBeat);
+// Contact (0 swing .. 1 planted) of one foot at a clip beat. Same value sampleClip reports,
+// without evaluating the bone tracks.
+[[nodiscard]] float footContactAt(const HumanoidClip& clip, int foot, double clipBeat);
 
 // Authored accent envelope at a clip beat (0..1). Used by the musical time
 // warp when no external BG Beat accent map exists (Motion Lab clips).
@@ -208,15 +217,55 @@ struct ClipLoadResult {
 void validateClip(const HumanoidClip& clip, const std::string& sourceName,
                   std::vector<ClipDiagnostic>& out);
 
+// --- BG Motion 3.4 variety ---------------------------------------------------
+
+// Id suffix of a mirrored clip. Mirroring toggles the suffix, so mirroring twice gives
+// back the original clip, id and name included.
+inline constexpr const char* kMirrorSuffix = "~m";
+
+// Mirror across the sagittal plane (x -> -x, the clip's left and right swap). Left and right
+// bone tracks, hand layers, foot tracks and contact segments swap sides. Every rotation
+// (x, y, z, w) becomes (x, -y, -z, w), the conjugate by the reflection (an axis is a
+// pseudovector, so its x component stays and its y and z flip). Lateral positions and
+// root/hips x flip, and so do root yaw and foot yaw. Pitch-like channels (toe roll, wrist
+// pitch, finger curl and spread semantics) stay. Pure data transform: the result validates
+// like any authored clip.
+[[nodiscard]] HumanoidClip mirrorClip(const HumanoidClip& clip);
+
+// Which bone is the other side of a left/right pair (self for the midline bones).
+[[nodiscard]] vrm::HumanoidBone mirroredBone(vrm::HumanoidBone bone);
+
+// Loop-seam blend of a per-loop choice. Loops are counted from the clip origin:
+// loop = floor(clipBeat / beats), never below 0 (the time before beat 0 is loop 0, so no blend
+// ever uses a negative loop). The last `windowBeats` before each seam blend the choice from the
+// loop before the seam to the loop after it (smootherstep over the window). The window ends at
+// the seam: at the seam the choice is the loop after it, and outside the window `from == to` and
+// `w == 0`. Pure function of its inputs, continuous in clipBeat.
+struct LoopBlend {
+    std::int64_t from = 0;
+    std::int64_t to = 0;
+    float w = 0.0f;  // 0 = `from`, 1 = `to`
+};
+[[nodiscard]] LoopBlend loopBlendAt(double clipBeat, double loopBeats, double windowBeats);
+
+// Platform independent integer hashing for deterministic per-clip, per-loop variation
+// (overlay seeds, amplitude draws). Never std::hash: its values differ between standard
+// libraries.
+[[nodiscard]] std::uint64_t variationHash(const std::string& text);
+[[nodiscard]] std::uint64_t variationMix(std::uint64_t value);
+
 class DanceLibrary {
 public:
     // Loads every *.json file in the directory. Invalid clips are reported in
     // diagnostics() and skipped; they never abort loading of the others.
     void loadDirectory(const std::filesystem::path& directory);
+    // Refuses a duplicate id, and an id that ends with kMirrorSuffix (reported in diagnostics()).
     bool add(HumanoidClip clip);
 
+    // Also resolves the mirrored id of a loaded clip (id + kMirrorSuffix).
     [[nodiscard]] const HumanoidClip* find(const std::string& id) const;
     // Replaces a loaded clip in place (same address, so running schedules stay valid).
+    // A cached mirror of that clip is refreshed in place too.
     bool replace(const HumanoidClip& clip);
     [[nodiscard]] const HumanoidClip* forStyle(DanceStyle style) const;
     [[nodiscard]] const std::deque<HumanoidClip>& clips() const { return clips_; }
@@ -224,10 +273,22 @@ public:
         return diagnostics_;
     }
     [[nodiscard]] bool empty() const { return clips_.empty(); }
+    // Mirrored variant of a loaded clip, created on first use and owned by the library: the
+    // pointer stays valid for the library's lifetime (replace() updates it in place).
+    [[nodiscard]] const HumanoidClip* mirrorOf(const HumanoidClip& clip) const;
 
 private:
+    [[nodiscard]] const HumanoidClip* findOriginal(const std::string& id) const;
+
     std::deque<HumanoidClip> clips_;  // stable addresses for schedules
     std::vector<ClipDiagnostic> diagnostics_;
+    // Lazily created mirrors (stable addresses). Indexed by the original id, so a copied
+    // library owns its own mirrors.
+    // Not thread-safe: find() and mirrorOf() are const but fill this cache, so they must not run
+    // concurrently. A library is for single-threaded use; share it between threads only behind a
+    // lock, or give each thread its own copy.
+    mutable std::deque<HumanoidClip> mirrors_;
+    mutable std::map<std::string, std::size_t> mirrorIndex_;
 };
 
 } // namespace bgmedia::motion

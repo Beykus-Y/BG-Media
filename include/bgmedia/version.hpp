@@ -13,11 +13,18 @@
 namespace bgmedia {
 
 // Schema 2 adds the split confidence fields and the metric-phase semantics.
-// Analyzer 3 adds conservative metric-level refinement (a slow subharmonic can
-// be promoted to the audible pulse). Analyzer changes invalidate every prior
-// tempo/beat cache entry. Cache format 2 persists the unchanged fields.
+// Analyzer 4 changes stereo downmix, metric candidate refinement and section
+// boundaries. Changing analyzer semantics invalidates previous tempo/beat and
+// section caches. Schema 2 and cache format 2 remain structurally compatible.
 inline constexpr std::uint32_t kAnalysisSchemaVersion = 2;
-inline constexpr std::uint32_t kAnalyzerVersion = 3;
+inline constexpr std::uint32_t kAnalyzerVersion = 4;
 inline constexpr std::uint32_t kCacheFormatVersion = 2;
+
+// BG Mix 0.3 musical feature map versions. Kept independent from BG Beat's
+// kAnalysisSchemaVersion / kCacheFormatVersion so existing .bgm caches remain
+// readable while feature maps (.bgf) evolve with vocal/harmonic extractors.
+inline constexpr std::uint32_t kMixFeatureSchemaVersion = 1;
+inline constexpr std::uint32_t kMixFeatureExtractorVersion = 1;
+inline constexpr std::uint32_t kMixFeatureCacheFormatVersion = 1;
 
 } // namespace bgmedia

@@ -2,6 +2,7 @@
 
 #include "bgmedia/vrm/VrmModel.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -74,6 +76,51 @@ TEST_CASE(vrm.minimal_fixture_import) {
     // The fixture's eyes are on -Z, so the generic detector must not assume +Z.
     CHECK(model.forward.z < -0.9f);
     CHECK(model.boneBindPosition(HumanoidBone::Head).y > 1.2f);
+}
+
+namespace {
+
+// Rewrites a JSON array literal in the GLB JSON chunk in place. The replacement
+// must have the same length so the chunk sizes and accessor offsets stay valid.
+bool replaceJsonLiteral(std::vector<std::uint8_t>& bytes, std::string_view from,
+                        std::string_view to) {
+    if (from.size() != to.size()) {
+        return false;
+    }
+    const auto it = std::search(bytes.begin(), bytes.end(), from.begin(), from.end());
+    if (it == bytes.end()) {
+        return false;
+    }
+    if (std::search(it + 1, bytes.end(), from.begin(), from.end()) != bytes.end()) {
+        return false;
+    }
+    std::copy(to.begin(), to.end(), it);
+    return true;
+}
+
+} // namespace
+
+TEST_CASE(vrm.tiny_eye_offset_uses_default_forward) {
+    using namespace bgmedia::vrm;
+    // Move both eyes to within 0.5 mm of the head's centre line, on -Z. The
+    // eye midpoint is then far below the 5 mm threshold, so the loader must
+    // keep the +Z default instead of trusting the sub-millimetre direction.
+    std::vector<std::uint8_t> bytes = readFile(fixturePath());
+    CHECK(!bytes.empty());
+    if (bytes.empty()) {
+        return;
+    }
+    CHECK(replaceJsonLiteral(bytes, "[-0.03,0.06,-0.05]", "[-5e-4,0.06,-5e-4]"));
+    CHECK(replaceJsonLiteral(bytes, "[0.03,0.06,-0.05]", "[5e-4,0.06,-5e-4]"));
+    const LoadResult loaded = VrmLoader::loadFromMemory(bytes, "tiny-eyes.vrm");
+    CHECK(loaded.ok());
+    if (!loaded.ok()) {
+        std::cout << "\n            " << loaded.error;
+        return;
+    }
+    const VrmModel& model = *loaded.model;
+    CHECK(model.forward.z > 0.99f);
+    CHECK(std::abs(model.forward.lengthSquared() - 1.0f) < 1e-5f);
 }
 
 TEST_CASE(vrm.rejects_malformed_containers) {

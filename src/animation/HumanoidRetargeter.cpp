@@ -1,4 +1,5 @@
 #include "bgmedia/animation/HumanoidRetargeter.hpp"
+#include "bgmedia/animation/TwoBoneSolver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +39,64 @@ float lengthOr(Vec3 v, float fallback) {
     return length > kTiny ? length : fallback;
 }
 
+// Rest bend of a joint: its offset from the bind reach line, in model space. A
+// straight bind has no offset, so the fallback axis (the joint's natural side) is used.
+Vec3 restBendOf(Vec3 root, Vec3 joint, Vec3 end, Vec3 fallback) {
+    const Vec3 line = end - root;
+    const float length = line.length();
+    if (length > kTiny) {
+        const Vec3 direction = line / length;
+        const Vec3 offset = (joint - root) - direction * math::dot(joint - root, direction);
+        if (offset.lengthSquared() > 1.0e-10f) {
+            return math::normalize(offset);
+        }
+    }
+    return math::normalize(fallback);
+}
+
+// Free weight of a foot: 1 when it is in the air, 0 when it is planted (contact >= 0.5).
+float freeWeightOf(float contact) {
+    return std::clamp(1.0f - 2.0f * contact, 0.0f, 1.0f);
+}
+
+// Solver limits of one limb. Off (BG Motion 3.2 hard reach) unless softIK is set; then the
+// stable bend is on, and the flexion window is enforced only where freeWeight > 0.
+TwoBoneLimits limbLimits(bool softIK, float length, float softFraction, float flexMin,
+                         float flexMax, float freeWeight) {
+    TwoBoneLimits limits;
+    if (!softIK) {
+        return limits;
+    }
+    limits.softReach = softFraction * length * std::clamp(freeWeight, 0.0f, 1.0f);
+    limits.stableBend = true;
+    limits.flexWindow = true;
+    limits.flexMin = flexMin;
+    limits.flexMax = flexMax;
+    limits.flexEnforced = freeWeight > 0.0f;
+    return limits;
+}
+
+// Diagnostics of one solve. Only called with soft IK on (see the callers).
+void noteSolve(RetargetStats& stats, const TwoBoneSolution& solution, bool planted) {
+    if (solution.softShift != 0.0f) {
+        ++stats.softReachSolves;
+        stats.softReachCompression = std::max(stats.softReachCompression, std::abs(solution.softShift));
+    }
+    if (solution.bendBlended) {
+        ++stats.bendBlends;
+    }
+    if (solution.flexBound) {
+        if (planted) {
+            ++stats.plantedFlexConflicts;
+        } else {
+            ++stats.flexLimits;
+        }
+    }
+    if (planted && solution.beyondReach) {
+        ++stats.plantedReachConflicts;
+    }
+}
+
 } // namespace
 
 struct LegRig {
@@ -53,6 +112,7 @@ struct LegRig {
     Vec3 bindKnee{};
     Vec3 bindThighDirection{};
     Vec3 bindCalfDirection{};
+    TwoBoneChain chain;  // the one two-bone solve of this leg
 };
 
 struct HumanoidRetargeter::Impl {
@@ -95,13 +155,16 @@ struct HumanoidRetargeter::Impl {
 
     bool initialize(const vrm::VrmModel& source);
     void calibrateProxies();
+    // Rest-pose two-bone geometry of each arm (left, right); lengths are taken per frame.
+    TwoBoneChain armChains[2];
     // Pushes the forearms/hands out of the torso proxy. Arm bones only: the
     // hips and legs are untouched, so foot IK is unaffected.
     void refineArms(std::vector<Mat4>& locals, std::vector<Mat4>& globals,
-                    float margin, RetargetStats& stats) const;
+                    const RetargetOptions& options, RetargetStats& stats) const;
     // Pushes the FREE foot's IK target away from the other leg (see RetargetOptions::legCollision).
     void refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2], const Vec3 poles[2],
-                    const float contact[2], float margin, RetargetStats& stats) const;
+                    const float contact[2], const TwoBoneLimits limits[2], bool solvedEndpoints,
+                    float margin, RetargetStats& stats) const;
     void evaluate(const std::vector<Mat4>& locals,
                   std::vector<Mat4>& globals) const;
     void applyLocalDelta(std::vector<Mat4>& locals, int node,
@@ -116,7 +179,8 @@ struct HumanoidRetargeter::Impl {
                           float& solver) const;
     void solveLeg(const LegRig& leg, const std::vector<Mat4>& globals,
                   std::vector<Mat4>& locals, Vec3 target, Vec3 pole, float& footError,
-                  float& lowestY, Vec3& reachableTarget,
+                  float& lowestY, Vec3& reachableTarget, const TwoBoneLimits& limits,
+                  bool planted, RetargetStats& stats,
                   const Quat& footWorldDelta = Quat::identity()) const;
 };
 
@@ -202,6 +266,14 @@ bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
             math::normalize(leg.bindAnkle - leg.bindKnee);
         leg.upperLength = lengthOr(leg.bindKnee - leg.bindUpper, 0.0f);
         leg.lowerLength = lengthOr(leg.bindAnkle - leg.bindKnee, 0.0f);
+        // The knee's natural side is the bind offset from the hip-ankle line; a straight
+        // bind falls back to forward (knees bend forward).
+        leg.chain.upper = leg.upperLength;
+        leg.chain.lower = leg.lowerLength;
+        leg.chain.restBend = restBendOf(leg.bindUpper, leg.bindKnee, leg.bindAnkle, source.forward);
+        leg.chain.up = source.up;
+        leg.chain.right = source.right;
+        leg.chain.forward = source.forward;
     };
     setupLeg(legs[0], vrm::HumanoidBone::LeftUpperLeg,
              vrm::HumanoidBone::LeftLowerLeg, vrm::HumanoidBone::LeftFoot,
@@ -209,6 +281,16 @@ bool HumanoidRetargeter::Impl::initialize(const vrm::VrmModel& source) {
     setupLeg(legs[1], vrm::HumanoidBone::RightUpperLeg,
              vrm::HumanoidBone::RightLowerLeg, vrm::HumanoidBone::RightFoot,
              vrm::HumanoidBone::RightToes);
+    // Arms: the elbow's natural side is the opposite of the knee's (elbows bend backward).
+    const auto setupArm = [&](TwoBoneChain& chain, int upper, int lower, int hand) {
+        chain.restBend = restBendOf(bindPosition(upper), bindPosition(lower),
+                                    bindPosition(hand), source.forward * -1.0f);
+        chain.up = source.up;
+        chain.right = source.right;
+        chain.forward = source.forward;
+    };
+    setupArm(armChains[0], leftUpperArm, leftLowerArm, leftHand);
+    setupArm(armChains[1], rightUpperArm, rightLowerArm, rightHand);
     for (const LegRig& leg : legs) {
         if (leg.upperLength < 0.01f || leg.lowerLength < 0.01f) {
             error = "VRM leg bones have unusable lengths";
@@ -603,7 +685,8 @@ void HumanoidRetargeter::Impl::calibrateProxies() {
 }
 
 void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
-                                          std::vector<Mat4>& globals, float margin,
+                                          std::vector<Mat4>& globals,
+                                          const RetargetOptions& options,
                                           RetargetStats& stats) const {
     if (!proxy.valid || hips < 0) {
         return;
@@ -636,7 +719,7 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
                          ? forwardAxis
                          : forwardAxis * -1.0f;
 
-    const float gap = margin * height;
+    const float gap = options.armClearanceMargin * height;
     const float eps = 0.004f * height;
     const float armLimit = 0.35f;  // fraction of arm length a correction may move a joint
 
@@ -695,7 +778,8 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
     float finalMin = std::numeric_limits<float>::max();
     bool changed = false;
 
-    for (const ArmNodes& arm : arms) {
+    for (int side = 0; side < 2; ++side) {
+        const ArmNodes& arm = arms[side];
         if (arm.upper < 0 || arm.lower < 0 || arm.hand < 0) {
             continue;
         }
@@ -707,6 +791,11 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         if (l1 < 0.02f || l2 < 0.02f) {
             continue;
         }
+        TwoBoneLimits armLimits = limbLimits(options.softIK, l1 + l2, options.armSoftReach,
+                                             options.elbowFlexMin, options.elbowFlexMax, 1.0f);
+        // BG Motion 3.2's arm pole threshold (squared). With soft IK off, the arm solve must
+        // match 3.2 exactly, so a pole this small still sets the bend side.
+        armLimits.poleEpsilon = 1.0e-10f;
         const Vec3 E0 = E;
         const Vec3 W0 = W;
 
@@ -773,6 +862,20 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
         samples(E, W);
         float armRaw = *std::min_element(c.begin(), c.end());
         rawMin = std::min(rawMin, armRaw);
+        // The soft band and the stable bend fade in with the collision depth: full at 1 cm of height inside
+        // the torso, zero at the surface. Without the fade, the band would switch on as the
+        // arm crosses the surface and jump the wrist (6.5 mm on the issue #26 reproduction).
+        // Soft off: softReach is already 0, so the weight changes nothing.
+        {
+            const float depthT = std::clamp(-armRaw / (0.01f * height), 0.0f, 1.0f);
+            const float fade = depthT * depthT * (3.0f - 2.0f * depthT);
+            armLimits.softReach *= fade;
+            // The stable bend and the elbow flexion window fade in the same way: the
+            // authored arm (FK) has neither, so applying them in full on the first
+            // collision solve would snap the elbow.
+            armLimits.stableBendWeight = fade;
+            armLimits.flexWeight = fade;
+        }
 
         // A few bounded iterations: moving the elbow changes the forearm sample.
         for (int it = 0; it < 6 && armRaw < 0.0f; ++it) {
@@ -802,25 +905,28 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
             const Vec3 targetE = E + (pF > pE ? n[2] : n[1]) * moveE;
             const Vec3 targetW = W + moveWVec;
             // Re-solve the two-bone chain: elbow on the circle closest to targetE.
-            Vec3 reach = targetW - S;
-            float dist = reach.length();
-            const float maxReach = l1 + l2 - 0.002f;
-            const float minReach = std::abs(l1 - l2) + 0.002f;
+            // The one two-bone solve of this arm (TwoBoneSolver): the elbow on the circle
+            // around S-W, bent toward the elbow target.
+            const Vec3 reach = targetW - S;
+            const float dist = reach.length();
             if (dist < kTiny) {
                 break;
             }
+            const Vec3 pole = targetE - S;
             const Vec3 dir = reach / dist;
-            dist = std::clamp(dist, minReach, maxReach);
-            Vec3 pole = targetE - S;
-            pole = pole - dir * math::dot(pole, dir);
-            if (pole.lengthSquared() < 1.0e-10f) {
-                break;
+            const Vec3 poleSide = pole - dir * math::dot(pole, dir);
+            if (!options.softIK && poleSide.lengthSquared() < 1.0e-10f) {
+                break;  // BG Motion 3.2: a pole on the reach line gives no bend side
             }
-            pole = math::normalize(pole);
-            const float along = (l1 * l1 - l2 * l2 + dist * dist) / (2.0f * dist);
-            const float lift = std::sqrt(std::max(0.0f, l1 * l1 - along * along));
-            Vec3 newE = S + dir * along + pole * lift;
-            Vec3 newW = S + dir * dist;
+            TwoBoneChain chain = armChains[side];
+            chain.upper = l1;
+            chain.lower = l2;
+            const TwoBoneSolution solved = solveTwoBone(S, targetW, pole, chain, armLimits);
+            if (armLimits.stableBend) {
+                noteSolve(stats, solved, false);
+            }
+            Vec3 newE = solved.knee;
+            Vec3 newW = solved.end;
             // Safe fallback: never move a joint further than a fraction of the arm.
             const float limit = armLimit * (l1 + l2);
             Vec3 dE = newE - E0;
@@ -880,40 +986,24 @@ void HumanoidRetargeter::Impl::refineArms(std::vector<Mat4>& locals,
 }
 
 void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3 targets[2],
-                                          const Vec3 poles[2], const float contact[2], float margin,
+                                          const Vec3 poles[2], const float contact[2],
+                                          const TwoBoneLimits limits[2], bool solvedEndpoints,
+                                          float margin,
                                           RetargetStats& stats) const {
     if (!proxy.valid || proxy.thighRadius <= 0.0f || legs[0].upper < 0 || legs[1].upper < 0) {
         return;
     }
     stats.legProxy = true;
     const float gap = margin * height;
-    const float eps = 0.004f * height;
     const float maxMove = 0.18f * height;
     const Vec3 up = model->up;
     const Vec3 forward = model->forward;
     Vec3 hip[2] = {actualPosition(globals, legs[0].upper), actualPosition(globals, legs[1].upper)};
     const Vec3 original[2] = {targets[0], targets[1]};
 
-    // The knee the two-bone solver will choose (same maths as solveLeg).
-    const auto kneeOf = [&](int f, Vec3 target) {
-        const LegRig& leg = legs[f];
-        Vec3 reach = target - hip[f];
-        float distance = reach.length();
-        if (distance < kTiny) {
-            reach = -up;
-            distance = kTiny;
-        }
-        const Vec3 direction = reach / distance;
-        const float maxReach = leg.upperLength + leg.lowerLength - 0.002f;
-        const float minReach = std::abs(leg.upperLength - leg.lowerLength) + 0.002f;
-        distance = std::clamp(distance, minReach, maxReach);
-        Vec3 bend = poles[f] - direction * math::dot(poles[f], direction);
-        if (bend.lengthSquared() < 1.0e-8f) bend = math::cross(model->right, direction);
-        bend = math::normalize(bend);
-        const float along = (leg.upperLength * leg.upperLength - leg.lowerLength * leg.lowerLength + distance * distance) /
-                            (2.0f * distance);
-        const float lift = std::sqrt(std::max(0.0f, leg.upperLength * leg.upperLength - along * along));
-        return hip[f] + direction * along + bend * lift;
+    // The chain the two-bone solver will build for a target: the same solve as solveLeg.
+    const auto solveOf = [&](int f, Vec3 target) {
+        return solveTwoBone(hip[f], target, poles[f], legs[f].chain, limits[f]);
     };
 
     struct Cap {
@@ -930,12 +1020,14 @@ void HumanoidRetargeter::Impl::refineLegs(const std::vector<Mat4>& globals, Vec3
         Cap caps[2][3];
         float legParam[2][3][2];  // leg parameter range of each capsule
         for (int f = 0; f < 2; ++f) {
-            const Vec3 knee = kneeOf(f, targets[f]);
-            const float lenT = (knee - hip[f]).length(), lenS = (targets[f] - knee).length();
+            const TwoBoneSolution solution = solveOf(f, targets[f]);
+            const Vec3 knee = solution.knee;
+            const Vec3 ankle = solvedEndpoints ? solution.end : targets[f];
+            const float lenT = (knee - hip[f]).length(), lenS = (ankle - knee).length();
             const float total = std::max(1.0e-4f, lenT + lenS);
             caps[f][0] = {hip[f], knee, proxy.thighRadius, 0.45f};
-            caps[f][1] = {knee, targets[f], proxy.shinRadius, 0.0f};
-            caps[f][2] = {targets[f], targets[f] + forward * proxy.footLength, proxy.footRadius, 0.0f};
+            caps[f][1] = {knee, ankle, proxy.shinRadius, 0.0f};
+            caps[f][2] = {ankle, ankle + forward * proxy.footLength, proxy.footRadius, 0.0f};
             legParam[f][0][0] = 0.0f;
             legParam[f][0][1] = lenT / total;
             legParam[f][1][0] = lenT / total;
@@ -1127,47 +1219,25 @@ void HumanoidRetargeter::Impl::solveLeg(const LegRig& leg,
                                         std::vector<Mat4>& locals, Vec3 target,
                                         Vec3 pole, float& footError,
                                         float& lowestY, Vec3& reachableTarget,
+                                        const TwoBoneLimits& limits, bool planted,
+                                        RetargetStats& stats,
                                         const Quat& footWorldDelta) const {
     reachableTarget = target;
     if (leg.upper < 0 || leg.lower < 0 || leg.foot < 0 || leg.parent < 0) {
         return;
     }
     const Vec3 hip = actualPosition(globals, leg.upper);
-    Vec3 reach = target - hip;
-    float distance = reach.length();
-    const float maxReach = leg.upperLength + leg.lowerLength - 0.002f;
-    const float minReach = std::abs(leg.upperLength - leg.lowerLength) + 0.002f;
-    if (distance < kTiny) {
-        reach = -model->up;
-        distance = kTiny;
+    // The one authoritative solve of this leg. The solved end is the closest point the
+    // chain can reach: distance from the requested target to it is the reach deficit
+    // (including any soft-reach shortfall); the rest of the error is solver error.
+    const TwoBoneSolution solution = solveTwoBone(hip, target, pole, leg.chain, limits);
+    if (limits.stableBend) {
+        noteSolve(stats, solution, planted);
     }
-    const Vec3 direction = reach / distance;
-    const float requestedDistance = distance;
-    distance = std::clamp(distance, minReach, maxReach);
-    // The closest point the two-bone chain can actually reach. Distance from
-    // the requested target to it is the (geometric) reach deficit; any further
-    // error measured on the evaluated skeleton is solver error.
-    reachableTarget = hip + direction * distance;
-    footError = std::max(footError, std::abs(requestedDistance - distance));
-
-    Vec3 bendAxis = pole - direction * math::dot(pole, direction);
-    if (bendAxis.lengthSquared() < 1.0e-8f) {
-        bendAxis = math::cross(model->right, direction);
-    }
-    if (bendAxis.lengthSquared() < 1.0e-8f) {
-        bendAxis = math::cross(model->forward, direction);
-    }
-    bendAxis = math::normalize(bendAxis);
-
-    const float along =
-        (leg.upperLength * leg.upperLength - leg.lowerLength * leg.lowerLength +
-         distance * distance) /
-        (2.0f * distance);
-    const float heightOffset =
-        std::sqrt(std::max(0.0f, leg.upperLength * leg.upperLength -
-                                     along * along));
-    const Vec3 knee = hip + direction * along + bendAxis * heightOffset;
-    const Vec3 ankle = hip + direction * distance;
+    reachableTarget = solution.end;
+    footError = std::max(footError, std::abs(solution.requestedDistance - solution.solvedDistance));
+    const Vec3 knee = solution.knee;
+    const Vec3 ankle = solution.end;
 
     const Vec3 thighDirection = math::normalize(knee - hip);
     const Vec3 calfDirection = math::normalize(ankle - knee);
@@ -1251,6 +1321,7 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
     std::vector<Mat4> globals;
     impl_->evaluate(locals, globals);
 
+    out.stats.softIK = options.softIK;
     const bool idle = pose.move == MoveKind::Idle && pose.energy < 0.02f;
     float idleBreath = 0.0f;
     if (options.idleMotion && idle) {
@@ -1390,10 +1461,20 @@ RetargetedPose HumanoidRetargeter::apply(const CharacterPose& pose,
         float footError = 0.0f;
         float lowest = std::numeric_limits<float>::max();
         Vec3 reachable[2];
-        impl_->solveLeg(impl_->legs[0], globals, locals, targetLeft, pole,
-                        footError, lowest, reachable[0]);
-        impl_->solveLeg(impl_->legs[1], globals, locals, targetRight, pole,
-                        footError, lowest, reachable[1]);
+        // Legacy pose path: a foot on the floor (no lift) counts as planted.
+        const float freeLeft = freeWeightOf(1.0f - std::max(0.0f, safeClamp(pose.footLeft, 0.0f, 1.0f)));
+        const float freeRight = freeWeightOf(1.0f - std::max(0.0f, safeClamp(pose.footRight, 0.0f, 1.0f)));
+        const float legLength[2] = {impl_->legs[0].upperLength + impl_->legs[0].lowerLength,
+                                    impl_->legs[1].upperLength + impl_->legs[1].lowerLength};
+        const float freeWeight[2] = {freeLeft, freeRight};
+        for (int f = 0; f < 2; ++f) {
+            const TwoBoneLimits limits = limbLimits(options.softIK, legLength[f],
+                                                    options.legSoftReach, options.kneeFlexMin,
+                                                    options.kneeFlexMax, freeWeight[f]);
+            impl_->solveLeg(impl_->legs[f], globals, locals, f == 0 ? targetLeft : targetRight,
+                            pole, footError, lowest, reachable[f], limits, freeWeight[f] <= 0.0f,
+                            out.stats);
+        }
         impl_->evaluate(locals, globals);
         const Vec3 wanted[2] = {targetLeft, targetRight};
         impl_->measureFootError(globals, wanted, reachable, out.stats.maxFootError,
@@ -1471,6 +1552,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     const Vec3 up = model.up;
     const Vec3 forward = model.forward;
     const Vec3 left = -model.right;  // clip frame: +X is the character's left
+    out.stats.softIK = options.softIK;
 
     // Clip frame -> model axes (a proper rotation, so quaternion vector parts
     // map directly). Contract: every rotation below is first *authored* about
@@ -1504,19 +1586,20 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         impl_->applyLocalDelta(locals, impl_->boneNode[b], quatToModel(q));
     }
 
-    // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade.
-    // BG Motion 3.2 uses the detailed per-finger pose when the clip, an overlay
-    // or the hand layer provides one; otherwise the v1 scalar is preserved
-    // exactly so old clips keep their authored look.
+    // Finger curl: 0 = open hand, 1 = fist. A relaxed hand is not a flat blade. Every hand
+    // takes the detailed per-finger path (BG Motion 3.3, A7). A clip without detailed hands
+    // is posed with the relaxed pose of its scalar curl, so turning detailedHands on no
+    // longer pops the fingers from the v1 look.
     {
         static constexpr float kFlex[5][3] = {{22.0f, 30.0f, 20.0f}, {38.0f, 52.0f, 34.0f},
                                               {40.0f, 56.0f, 36.0f}, {38.0f, 54.0f, 34.0f},
                                               {36.0f, 50.0f, 32.0f}};
         for (int sd = 0; sd < 2; ++sd) {
-            const bool detailed = pose.detailedHands;
-            const motion::HandPose& handPose =
-                pose.handPose[static_cast<std::size_t>(sd)];
-            if (detailed) {
+            const motion::HandPose handPose =
+                pose.detailedHands ? pose.handPose[static_cast<std::size_t>(sd)]
+                                   : motion::relaxedHandPose(
+                                         pose.hand[static_cast<std::size_t>(sd)]);
+            if (pose.detailedHands) {
                 const int handNode = sd == 0 ? impl_->leftHand : impl_->rightHand;
                 const Quat wrist =
                     // Pitch keeps the established convention (positive = about
@@ -1527,24 +1610,16 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                         .normalized();
                 impl_->applyLocalDelta(locals, handNode, quatToModel(wrist));
             }
-            const float curl =
-                std::clamp(pose.hand[static_cast<std::size_t>(sd)], 0.0f, 1.0f);
             for (int fg = 0; fg < 5; ++fg) {
                 for (int jt = 0; jt < 3; ++jt) {
                     const int node = impl_->fingers[sd][fg][jt];
                     if (node < 0) {
                         continue;
                     }
-                    float amount = 0.0f;
-                    if (detailed) {
-                        amount = handPose.curl[static_cast<std::size_t>(fg)]
-                                             [static_cast<std::size_t>(jt)];
-                        if (fg == 0) {
-                            amount = std::min(1.0f, amount +
-                                                        0.22f * handPose.thumbOpposition);
-                        }
-                    } else {
-                        amount = curl;
+                    float amount = handPose.curl[static_cast<std::size_t>(fg)]
+                                                [static_cast<std::size_t>(jt)];
+                    if (fg == 0) {
+                        amount = std::min(1.0f, amount + 0.22f * handPose.thumbOpposition);
                     }
                     const float angle =
                         kFlex[fg][jt] * amount * (kPi / 180.0f) *
@@ -1556,7 +1631,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                 }
                 // Spread fans the fingers in the palm plane. It is deliberately
                 // small: a large value reads as a broken hand, not a gesture.
-                if (detailed && fg > 0) {
+                if (fg > 0) {
                     const float fan = handPose.spread[static_cast<std::size_t>(fg)] *
                                       (static_cast<float>(fg) - 2.0f) * 0.10f;
                     const Quat spreadQuat = quatToModel(
@@ -1570,7 +1645,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                     }
                 }
             }
-            if (detailed && handPose.thumbOpposition > 0.0f) {
+            if (handPose.thumbOpposition > 0.0f) {
                 const Quat opposition = quatToModel(math::fromAxisAngle(
                     {0.0f, 0.0f, 1.0f}, handPose.thumbOpposition * 0.34f *
                                             (sd == 0 ? -1.0f : 1.0f)));
@@ -1606,7 +1681,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     // Collision-aware refinement of the finished arm pose. It only touches arm
     // bones, so it cannot disturb the stage-space foot targets solved below.
     if (options.armCollision) {
-        impl_->refineArms(locals, globals, options.armClearanceMargin, out.stats);
+        impl_->refineArms(locals, globals, options, out.stats);
     }
 
     // --- root and stage-space foot targets ---------------------------------
@@ -1668,9 +1743,22 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         }
     }
 
+    // Limits per leg: a planted foot (contact >= 0.5) keeps the hard reach and is never
+    // softened; a free foot takes the soft band and the flexion window.
+    const float contacts[2] = {pose.foot[0].contact, pose.foot[1].contact};
+    TwoBoneLimits legLimits[2];
+    for (int f = 0; f < 2; ++f) {
+        const LegRig& leg = impl_->legs[f];
+        legLimits[f] = limbLimits(options.softIK, leg.upperLength + leg.lowerLength,
+                                  options.legSoftReach, options.kneeFlexMin, options.kneeFlexMax,
+                                  freeWeightOf(contacts[f]));
+    }
+
     if (options.footIK && options.legCollision) {
-        const float contacts[2] = {pose.foot[0].contact, pose.foot[1].contact};
-        impl_->refineLegs(globals, targets, poles, contacts, options.legClearanceMargin, out.stats);
+        // With soft IK the shin and foot capsules end at the solved ankle, where the solve
+        // really places it. Without it they keep BG Motion 3.2's requested-target geometry.
+        impl_->refineLegs(globals, targets, poles, contacts, legLimits, options.softIK,
+                          options.legClearanceMargin, out.stats);
     }
 
     float footError = 0.0f;
@@ -1679,7 +1767,8 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
     if (options.footIK) {
         for (int f = 0; f < 2; ++f) {
             impl_->solveLeg(impl_->legs[f], globals, locals, targets[f], poles[f],
-                            footError, lowest, reachable[f], footDelta[f]);
+                            footError, lowest, reachable[f], legLimits[f],
+                            freeWeightOf(contacts[f]) <= 0.0f, out.stats, footDelta[f]);
         }
     }
     // Heel / toe roll: rotate the toe bone after the ankle IK so the sole does

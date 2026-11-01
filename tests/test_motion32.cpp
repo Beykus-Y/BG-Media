@@ -8,6 +8,7 @@
 #include "bgmedia/motion3/ProceduralChoreography.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,11 +52,20 @@ bool finiteQuat(const math::Quat& q) {
            std::isfinite(q.w);
 }
 
+// Angle between the bone rotations. Measured from the chord |p - q| rather than acos(dot):
+// acos turns float rounding of identical rotations into ~7e-4 rad near 1.
 float poseDistance(const motion::ClipPose& a, const motion::ClipPose& b) {
     float worst = 0.0f;
     for (std::size_t i = 0; i < vrm::kHumanoidBoneCount; ++i) {
-        const float d = std::abs(math::dot(a.bone[i], b.bone[i]));
-        worst = std::max(worst, 2.0f * std::acos(std::clamp(d, 0.0f, 1.0f)));
+        const math::Quat& p = a.bone[i];
+        const math::Quat& q = b.bone[i];
+        const float sign = math::dot(p, q) < 0.0f ? -1.0f : 1.0f;
+        const float dx = p.x - sign * q.x;
+        const float dy = p.y - sign * q.y;
+        const float dz = p.z - sign * q.z;
+        const float dw = p.w - sign * q.w;
+        const float chord = std::sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
+        worst = std::max(worst, 2.0f * std::asin(std::min(1.0f, 0.5f * chord)));
     }
     return worst;
 }
@@ -271,6 +281,74 @@ TEST_CASE(motion32.composition_never_moves_a_planted_foot) {
     CHECK_NEAR(composed.pose.foot[0].position.y, 0.0, 1e-6);
 }
 
+TEST_CASE(motion32.foot_overlay_fades_with_contact_instead_of_popping) {
+    // The foot lift follows the foot's contact continuously (BG Motion 3.3, A6). A hard
+    // planted/swing threshold switched the full lift on in one step.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    double previous = 0.0;
+    double worstStep = 0.0;
+    double liftAtSwing = 0.0;
+    for (int i = 0; i <= 100; ++i) {
+        const float contact = static_cast<float>(i) / 100.0f;
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = contact >= 0.5f ? motion::FootPhase::Stance : motion::FootPhase::Swing;
+        base.foot[0].contact = contact;
+        base.foot[0].position = {0.0f, 0.0f, 0.0f};
+        base.foot[1].phase = motion::FootPhase::Stance;
+        base.foot[1].contact = 1.0f;
+        base.foot[1].position = {0.0f, 0.0f, 0.0f};
+        const motion::ComposedPose composed =
+            motion::composeMotion(base, cues, 0.25, 4.0, true);
+        const double y = composed.pose.foot[0].position.y;
+        CHECK(std::isfinite(y));
+        if (i == 0) {
+            liftAtSwing = y;
+        } else {
+            worstStep = std::max(worstStep, std::abs(y - previous));
+        }
+        previous = y;
+    }
+    CHECK(std::abs(liftAtSwing) > 1e-3);   // a swinging foot is lifted
+    CHECK(worstStep < 0.005);              // no step over a 0.01 change of contact
+    CHECK_NEAR(previous, 0.0, 1e-6);       // a planted foot is never lifted
+}
+
+TEST_CASE(motion32.contact_start_is_swinging_not_planted) {
+    // The first sample of a contact segment has contact 0 and phase Plant. Zero contact is a
+    // real value: the foot is swinging there, exactly as it is one sample earlier. Only a
+    // stance without any contact data (a hand-built pose) counts as planted by its phase.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    const auto liftAt = [&](float contact, motion::FootPhase phase) {
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = phase;
+        base.foot[0].contact = contact;
+        base.foot[0].position = {0.0f, 0.0f, 0.0f};
+        base.foot[1].phase = motion::FootPhase::Stance;
+        base.foot[1].contact = 1.0f;
+        base.foot[1].position = {0.0f, 0.0f, 0.0f};
+        return motion::composeMotion(base, cues, 0.25, 4.0, true).pose.foot[0].position.y;
+    };
+    const double atStart = liftAt(0.0f, motion::FootPhase::Plant);
+    const double justAfter = liftAt(1.0e-5f, motion::FootPhase::Plant);
+    CHECK(std::abs(atStart) > 1e-3);              // swinging: lifted
+    CHECK(std::abs(atStart - justAfter) < 0.005); // no step at the contact start
+    CHECK(std::abs(liftAt(0.0f, motion::FootPhase::Stance)) < 1e-6);  // hand-built stance: planted
+}
+
 TEST_CASE(motion32.arm_and_hand_layers_compose_without_conflict) {
     motion::ClipPose base = motion::neutralClipPose();
     base.foot[0].phase = motion::FootPhase::Stance;
@@ -410,6 +488,42 @@ TEST_CASE(motion32.detailed_hand_pose_moves_finger_bones) {
         }
     }
     CHECK(moved > 0.002f);
+}
+
+TEST_CASE(motion32.scalar_curl_and_relaxed_detailed_hand_pose_the_same_fingers) {
+    // A clip without detailed hands and the same clip with the relaxed detailed pose of its
+    // curl must pose every finger identically (BG Motion 3.3, A7). They differed before, so
+    // turning detailedHands on popped the fingers. Needs a model with finger bones.
+    const std::filesystem::path path = model1Path();
+    if (!std::filesystem::exists(path)) {
+        return;
+    }
+    Rig rig = makeRig(path);
+    REQUIRE(rig.ok());
+    for (const float curl : {0.0f, 0.4f, 1.0f}) {
+        motion::ClipPose scalar = motion::neutralClipPose();
+        scalar.hand[0] = curl;
+        scalar.hand[1] = curl;
+        motion::ClipPose detailed = scalar;
+        detailed.detailedHands = true;
+        detailed.handPose[0] = motion::relaxedHandPose(curl);
+        detailed.handPose[1] = motion::relaxedHandPose(curl);
+        const animation::RetargetedPose a = rig.rig->applyClip(scalar, 0.0);
+        const animation::RetargetedPose b = rig.rig->applyClip(detailed, 0.0);
+        for (int side = 0; side < 2; ++side) {
+            for (int finger = 0; finger < 5; ++finger) {
+                for (int joint = 0; joint < 3; ++joint) {
+                    const int node = rig.loaded.model->fingerNode(side, finger, joint);
+                    REQUIRE(node >= 0);
+                    const auto qa =
+                        a.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                    const auto qb =
+                        b.nodeGlobals[static_cast<std::size_t>(node)].rotationQuat();
+                    CHECK(std::abs(math::dot(qa, qb)) > 0.99999f);
+                }
+            }
+        }
+    }
 }
 
 TEST_CASE(motion32.finger_fallback_is_honest) {
@@ -767,4 +881,459 @@ TEST_CASE(motion32.seek_and_rebase_keep_generated_dance_finite) {
             CHECK(finiteQuat(q));
         }
     }
+}
+
+// BG Motion 3.2 suite (registered in CTest), #8: the opt-in inertial transition keeps upper-body poses continuous
+// at both ends of a segment fade, is a pure function of media time (seek equals playback),
+// and leaves the default blend untouched.
+TEST_CASE(motion32.inertial_transition_is_continuous_and_seek_stable) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+
+    const auto makeSchedule = [&](bool inertial) {
+        motion::DanceSchedule schedule;
+        schedule.setInertialTransitions(inertial);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const auto poseAt = [&](const motion::DanceSchedule& schedule, double t) {
+        return schedule.sample(t, clock, timeline, off).pose;
+    };
+
+    const motion::DanceSchedule inertial = makeSchedule(true);
+    const motion::DanceSchedule blend = makeSchedule(false);
+
+    // Start of the fade: the outgoing pose is held exactly, as in the blend.
+    const motion::ClipPose outgoingAtStart = poseAt(inertial, t0 - 1.0e-4);
+    const motion::ClipPose atStart = poseAt(inertial, t0);
+    CHECK_NEAR(poseDistance(outgoingAtStart, atStart), 0.0, 1e-2);
+
+    // Fade end: the inertial pose must hand over to the incoming clip without a step.
+    const double edge = 1.0e-4;
+    const motion::ClipPose beforeEnd = poseAt(inertial, t0 + fade - edge);
+    const motion::ClipPose afterEnd = poseAt(inertial, t0 + fade + edge);
+    CHECK_NEAR(poseDistance(beforeEnd, afterEnd), 0.0, 1e-2);
+
+    // Seek equals playback: a schedule sampled only at one time gives the same pose.
+    const motion::DanceSchedule fresh = makeSchedule(true);
+    CHECK_NEAR(poseDistance(poseAt(inertial, t0 + 0.3), poseAt(fresh, t0 + 0.3)), 0.0, 1e-6);
+
+    // Default off: the blend path is what existed before the flag.
+    CHECK(!motion::DanceSchedule{}.inertialTransitions());
+    CHECK(!blend.inertialTransitions());
+    CHECK(inertial.inertialTransitions());
+}
+
+// BG Motion 3.3 (A8): the inertial transition carries the outgoing upper-body velocity through
+// the fade start. The review found it only C0 (its offset started at zero velocity). Here the
+// one-sided angular velocities either side of the fade start must agree: the jump is the
+// step in velocity, which for a C1 hand-over is only the acceleration times the sampling step.
+TEST_CASE(motion32.inertial_transition_carries_velocity_through_the_fade_start) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+    const double h = 1.0 / 240.0;
+
+    const auto makeSchedule = [&](bool inertial) {
+        motion::DanceSchedule schedule;
+        schedule.setInertialTransitions(inertial);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const auto poseAt = [&](const motion::DanceSchedule& schedule, double t) {
+        return schedule.sample(t, clock, timeline, off).pose;
+    };
+    // Upper body only: the inertial transition does not touch hips and legs.
+    const auto upperBody = [](std::size_t bone) {
+        using B = vrm::HumanoidBone;
+        const auto at = [](B value) { return static_cast<std::size_t>(value); };
+        return (bone >= at(B::Spine) && bone <= at(B::Head)) ||
+               (bone >= at(B::LeftShoulder) && bone <= at(B::LeftHand)) ||
+               (bone >= at(B::RightShoulder) && bone <= at(B::RightHand));
+    };
+    // Angular velocity (world frame, rad/s) of one bone between two samples. The angle is
+    // taken from the chord-free form 2 atan2(|xyz|, |w|), which is exact for small steps.
+    using Velocity = std::array<double, 3>;
+    const auto velocity = [&](const motion::ClipPose& from, const motion::ClipPose& to,
+                              std::size_t bone) {
+        const math::Quat d = (to.bone[bone] * conjugate(from.bone[bone])).normalized();
+        const double sign = d.w < 0.0f ? -1.0 : 1.0;
+        const double x = sign * d.x;
+        const double y = sign * d.y;
+        const double z = sign * d.z;
+        const double s = std::sqrt(x * x + y * y + z * z);
+        const double k = s > 1.0e-12 ? 2.0 * std::atan2(s, sign * d.w) / s / h : 2.0 / h;
+        return Velocity{k * x, k * y, k * z};
+    };
+    // Velocity step across the fade start for each upper-body bone: the left derivative
+    // (outgoing side) against the right derivative (incoming side).
+    struct Jump {
+        double step = 0.0;
+        double outgoing = 0.0;
+    };
+    const auto jumpAt = [&](const motion::DanceSchedule& schedule, double time) {
+        const motion::ClipPose before1 = poseAt(schedule, time - h);
+        const motion::ClipPose at = poseAt(schedule, time);
+        const motion::ClipPose after1 = poseAt(schedule, time + h);
+        Jump worst;
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            if (!upperBody(bone)) {
+                continue;
+            }
+            const Velocity left = velocity(before1, at, bone);
+            const Velocity right = velocity(at, after1, bone);
+            const double step = std::sqrt((right[0] - left[0]) * (right[0] - left[0]) +
+                                          (right[1] - left[1]) * (right[1] - left[1]) +
+                                          (right[2] - left[2]) * (right[2] - left[2]));
+            const double outgoing = std::sqrt(left[0] * left[0] + left[1] * left[1] +
+                                              left[2] * left[2]);
+            if (step > worst.step) {
+                worst.step = step;
+                worst.outgoing = outgoing;
+            }
+        }
+        return worst;
+    };
+    const Jump inertial = jumpAt(makeSchedule(true), t0);
+    const Jump blend = jumpAt(makeSchedule(false), t0);
+    CHECK(std::isfinite(inertial.step));
+    // Carrying the offset velocity removes most of the step the zero-velocity offset left
+    // (about the outgoing speed itself).
+    CHECK(inertial.step < 0.5 * std::max(inertial.outgoing, 0.5));
+    // The blend already hands over smoothly at the start (smootherstep), so the carried
+    // velocity does not beat it there; DanceSchedule keeps the blend as its default.
+    CHECK(blend.step < 0.25 * std::max(inertial.outgoing, 0.5));
+    // Fade end: the offset reaches zero with zero velocity, so the hand-over to the incoming
+    // clip has no velocity step either (only the acceleration times the sampling step).
+    const Jump atEnd = jumpAt(makeSchedule(true), t0 + fade);
+    CHECK(atEnd.step < 0.05);
+}
+
+// Angle (radians) between two bone rotations: the rotation angle of conj(p) * q, taken from the
+// vector part so that it stays accurate near identity.
+namespace {
+
+float rotationAngle(const math::Quat& p, const math::Quat& q) {
+    const math::Quat r = p.conjugate() * q;
+    const float vector = std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    return 2.0f * std::atan2(vector, std::abs(r.w));
+}
+
+} // namespace
+
+// BG Motion 3.3 (#9) follow-through, WP-E. The table lags the upper body along the chain. Every
+// listed bone stays inside its own angle cap, nothing else changes (hips, spine, legs, feet,
+// toes and eyes are bit-identical), the result is deterministic in media time (fresh schedule
+// and reverse order agree with a sequential pass), and it is off by default on the schedule.
+TEST_CASE(motion32.follow_through_is_bounded_deterministic_and_limited_to_upper_body_chain) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+
+    const auto makeSchedule = [&](bool follow) {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(follow);
+        motion::ScheduleSegment seg;
+        seg.clip = &a.clip;
+        seg.fadeSeconds = 0.6;
+        schedule.append(seg);
+        return schedule;
+    };
+    CHECK(!motion::DanceSchedule{}.followThrough());
+
+    // The table is the intended set: upper body only, each bone once, parents before children.
+    using B = vrm::HumanoidBone;
+    const auto& table = motion::DanceSchedule::followThroughBones();
+    std::array<float, vrm::kHumanoidBoneCount> capRadians{};
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        const std::size_t bone = static_cast<std::size_t>(table[i].bone);
+        CHECK(capRadians[bone] == 0.0f);
+        capRadians[bone] = table[i].capDegrees * 3.14159265f / 180.0f;
+        CHECK(table[i].weight > 0.0f && table[i].weight <= 1.0f);
+        CHECK(table[i].capDegrees > 0.0f && table[i].capDegrees <= 30.0f);
+    }
+    for (const B listed : {B::Chest, B::UpperChest, B::Neck, B::Head, B::LeftShoulder,
+                           B::LeftUpperArm, B::LeftLowerArm, B::LeftHand, B::RightShoulder,
+                           B::RightUpperArm, B::RightLowerArm, B::RightHand}) {
+        CHECK(capRadians[static_cast<std::size_t>(listed)] > 0.0f);
+    }
+    for (const B unlisted : {B::Hips, B::Spine, B::LeftUpperLeg, B::LeftLowerLeg, B::LeftFoot,
+                             B::LeftToes, B::RightUpperLeg, B::RightLowerLeg, B::RightFoot,
+                             B::RightToes, B::LeftEye, B::RightEye}) {
+        CHECK(capRadians[static_cast<std::size_t>(unlisted)] == 0.0f);
+    }
+
+    const motion::DanceSchedule plain = makeSchedule(false);
+    const motion::DanceSchedule lagged = makeSchedule(true);
+    const motion::DanceSchedule reverse = makeSchedule(true);
+    const std::vector<double> times{1.0, 2.25, 3.5, 4.75};
+    std::vector<motion::ClipPose> sequentialPoses;
+    float largestLag = 0.0f;  // the test must see the follow-through move something
+    for (const double t : times) {
+        const motion::ClipPose p0 = plain.sample(t, clock, timeline, off).pose;
+        const motion::ClipPose p1 = lagged.sample(t, clock, timeline, off).pose;
+        sequentialPoses.push_back(p1);
+        for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
+            CHECK(finiteQuat(p1.bone[bone]));
+            if (capRadians[bone] > 0.0f) {
+                // Bounded: the offset from the bone's own motion is inside its cap.
+                CHECK(rotationAngle(p0.bone[bone], p1.bone[bone]) <= capRadians[bone] + 1e-5f);
+                largestLag = std::max(largestLag, rotationAngle(p0.bone[bone], p1.bone[bone]));
+            } else {
+                // Untouched: identical to the plain pose, not merely close.
+                CHECK_NEAR(rotationAngle(p0.bone[bone], p1.bone[bone]), 0.0f, 1e-7f);
+            }
+        }
+        CHECK(p0.hips.x == p1.hips.x && p0.hips.y == p1.hips.y && p0.hips.z == p1.hips.z);
+        for (std::size_t f = 0; f < 2; ++f) {
+            CHECK(p0.foot[f].position.x == p1.foot[f].position.x);
+            CHECK(p0.foot[f].position.y == p1.foot[f].position.y);
+            CHECK(p0.foot[f].position.z == p1.foot[f].position.z);
+            CHECK(p0.foot[f].yaw == p1.foot[f].yaw);
+        }
+    }
+    CHECK(largestLag > 0.5f * 3.14159265f / 180.0f);
+    // Deterministic: the same media times from a fresh schedule, in reverse order, match.
+    for (std::size_t i = times.size(); i-- > 0;) {
+        const motion::ClipPose again = reverse.sample(times[i], clock, timeline, off).pose;
+        CHECK_NEAR(poseDistance(again, sequentialPoses[i]), 0.0f, 1e-6f);
+    }
+}
+
+// BG Motion 3.3 (#9): follow-through is a measurable phase lag. A sudden 60 degree swing of the
+// left upper arm with every other track in bind pose: the hand has no motion of its own, so its
+// swing can only come from the chain. The displayed hand must reach half of the swing later
+// than the displayed upper arm, and the plain schedule must show no lag at all.
+TEST_CASE(motion32.follow_through_shows_hand_lagging_a_sudden_arm_move) {
+    motion::HumanoidClip clip;
+    clip.id = "suddenArm";
+    clip.bpm = 120.0;
+    clip.beats = 8.0f;
+    clip.keysPerBeat = 16;
+    clip.keyCount = 8 * 16 + 1;
+    clip.loop = false;
+    clip.seamless = false;
+    std::vector<math::Quat>& arm = clip.bones[static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm)];
+    arm.resize(static_cast<std::size_t>(clip.keyCount));
+    for (int k = 0; k < clip.keyCount; ++k) {
+        // Smootherstep from beat 2 to beat 2.25 (0.125 s at 120 BPM): fast, but continuous.
+        const float u = std::clamp((static_cast<float>(k) / 16.0f - 2.0f) / 0.25f, 0.0f, 1.0f);
+        const float s = u * u * u * (u * (u * 6.0f - 15.0f) + 10.0f);
+        arm[static_cast<std::size_t>(k)] =
+            math::fromAxisAngle(math::Vec3{0.0f, 0.0f, 1.0f}, s * 60.0f * 3.14159265f / 180.0f);
+    }
+    const motion::BeatClock clock = motion::BeatClock::constant(120.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+
+    const auto makeSchedule = [&](bool follow) {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(follow);
+        motion::ScheduleSegment seg;
+        seg.clip = &clip;
+        seg.fadeSeconds = 0.0;
+        schedule.append(seg);
+        return schedule;
+    };
+    const auto identity = math::Quat::identity();
+    // World rotation of the chain shoulder (bind) -> upper arm -> lower arm -> hand, as the
+    // retargeter composes it, and of the upper arm alone.
+    const auto chainAt = [&](const motion::DanceSchedule& schedule, double t, bool hand) {
+        const motion::ClipPose pose = schedule.sample(t, clock, timeline, off).pose;
+        const std::size_t ua = static_cast<std::size_t>(vrm::HumanoidBone::LeftUpperArm);
+        const std::size_t la = static_cast<std::size_t>(vrm::HumanoidBone::LeftLowerArm);
+        const std::size_t h = static_cast<std::size_t>(vrm::HumanoidBone::LeftHand);
+        const math::Quat upper = pose.bone[ua];
+        return hand ? upper * pose.bone[la] * pose.bone[h] : upper;
+    };
+    // First time the swing reaches half of its final angle.
+    const auto halfTime = [&](const motion::DanceSchedule& schedule, bool hand) {
+        const double dt = 1.0 / 480.0;
+        const float final = rotationAngle(identity, chainAt(schedule, 1.6, hand));
+        double half = -1.0;
+        for (double t = 0.9; t <= 1.6; t += dt) {
+            if (rotationAngle(identity, chainAt(schedule, t, hand)) >= 0.5f * final) {
+                half = t;
+                break;
+            }
+        }
+        return half;
+    };
+
+    const motion::DanceSchedule plain = makeSchedule(false);
+    const motion::DanceSchedule lagged = makeSchedule(true);
+    const double plainUpper = halfTime(plain, false);
+    const double plainHand = halfTime(plain, true);
+    const double laggedUpper = halfTime(lagged, false);
+    const double laggedHand = halfTime(lagged, true);
+    CHECK(plainUpper > 0.9 && plainHand > 0.9);
+    CHECK(laggedUpper > 0.9 && laggedHand > 0.9);
+    // Without follow-through the hand is the upper arm: no lag at all.
+    CHECK_NEAR(plainHand - plainUpper, 0.0, 1e-9);
+    // With it, the hand trails the upper arm by a clear margin (lag share of the chain).
+    CHECK(laggedHand - laggedUpper > 0.03);
+    // The upper arm itself also trails its own motion, but only by its small share.
+    CHECK(laggedUpper >= plainUpper - 1e-9);
+}
+
+// BG Motion 3.3 (#9): the follow-through is continuous across a crossfade, the fade end and a loop
+// seam, and a seek lands on the same pose as playback.
+TEST_CASE(motion32.follow_through_is_continuous_across_fades_and_loop_seams) {
+    const motion::GeneratedDance a = motion::ProceduralChoreography::generate(request(7));
+    const motion::GeneratedDance b = motion::ProceduralChoreography::generate(request(23));
+    const motion::BeatClock clock = motion::BeatClock::constant(104.0, 0.0, 4);
+    const motion::MusicalTimeline timeline = motion::MusicalTimeline::fromClock(clock, true);
+    motion::WarpProfile off;
+    off.expression = motion::MotionExpression::Off;
+    const double t0 = 4.0;
+    const double fade = 0.6;
+    const double seam = static_cast<double>(a.clip.beats) * 60.0 / 104.0;
+
+    const auto makeSchedule = [&] {
+        motion::DanceSchedule schedule;
+        schedule.setFollowThrough(true);
+        motion::ScheduleSegment first;
+        first.clip = &a.clip;
+        first.fadeSeconds = fade;
+        motion::ScheduleSegment second;
+        second.clip = &b.clip;
+        second.startTime = t0;
+        second.alignTime = t0;
+        second.fadeSeconds = fade;
+        schedule.append(first);
+        schedule.append(second);
+        return schedule;
+    };
+    const motion::DanceSchedule schedule = makeSchedule();
+    const auto poseAt = [&](double t) { return schedule.sample(t, clock, timeline, off).pose; };
+    const double edge = 1.0e-4;
+    for (const double t : {t0, t0 + fade, seam}) {
+        CHECK_NEAR(poseDistance(poseAt(t - edge), poseAt(t + edge)), 0.0f, 1e-2f);
+    }
+    // Seek equals playback at a time inside the fade.
+    CHECK_NEAR(poseDistance(poseAt(t0 + 0.3), makeSchedule().sample(t0 + 0.3, clock, timeline, off).pose),
+               0.0f, 1e-6f);
+}
+
+// BG Motion 3.3 (#10): the phrase head look is an opt-in choice. With it off the head
+// keeps the beat nod only, and the rest of the generated clip is unchanged.
+TEST_CASE(motion32.head_phrase_look_is_optional) {
+    motion::ChoreographyRequest on = request(11);
+    motion::ChoreographyRequest off = request(11);
+    off.headLookAtPhrases = false;
+    const motion::HumanoidClip withLook = motion::ProceduralChoreography::generate(on).clip;
+    const motion::HumanoidClip withoutLook = motion::ProceduralChoreography::generate(off).clip;
+    CHECK(motion::ProceduralChoreography::generate(on).clip.keyCount == withLook.keyCount);
+    const std::size_t head = static_cast<std::size_t>(vrm::HumanoidBone::Head);
+    // The phrase look turns the head at the first phrase boundary.
+    const motion::ClipPose a = motion::sampleClip(withLook, 0.0);
+    const motion::ClipPose b = motion::sampleClip(withoutLook, 0.0);
+    const float diff = std::abs(a.bone[head].x - b.bone[head].x) +
+                       std::abs(a.bone[head].y - b.bone[head].y) +
+                       std::abs(a.bone[head].z - b.bone[head].z);
+    CHECK(diff > 0.01f);
+    // Music-facing parts are untouched: the feet and contacts are identical.
+    CHECK(withLook.contacts.size() == withoutLook.contacts.size());
+}
+
+TEST_CASE(motion32.gated_cue_yields_arbitration_with_its_gate) {
+    // A contact-gated cue that has almost faded out must also stop suppressing the cues
+    // it overlaps; otherwise they reappear in one frame when it is finally rejected.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    motion::PrimitiveCue sway;
+    sway.kind = motion::PrimitiveKind::HipSway;
+    sway.beat = 0.0f;
+    sway.durationBeats = 1.0f;
+    sway.intensity = 1.0f;
+    cues.push_back(sway);
+    double previous = 0.0;
+    double worstStep = 0.0;
+    for (int i = 0; i <= 2000; ++i) {
+        const float contact = static_cast<float>(i) / 2000.0f;
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = motion::FootPhase::Plant;
+        base.foot[0].contact = contact;
+        base.foot[1].phase = motion::FootPhase::Stance;
+        base.foot[1].contact = 1.0f;
+        const motion::ComposedPose composed = motion::composeMotion(base, cues, 0.25, 4.0, true);
+        const double x = composed.pose.hips.x;
+        CHECK(std::isfinite(x));
+        if (i > 0) {
+            worstStep = std::max(worstStep, std::abs(x - previous));
+        }
+        previous = x;
+    }
+    // 0.0005 of contact per sample: the hips move continuously, no 0.01 jump.
+    CHECK(worstStep < 0.001);
+}
+
+TEST_CASE(motion32.foot_lift_fades_with_the_support_gate) {
+    // A step needs a supporting foot. As that support goes, the swinging foot's lift must
+    // fade with it, not stay at full height until the cue is rejected.
+    std::vector<motion::PrimitiveCue> cues;
+    motion::PrimitiveCue step;
+    step.kind = motion::PrimitiveKind::SideStep;
+    step.beat = 0.0f;
+    step.durationBeats = 1.0f;
+    step.intensity = 1.0f;
+    step.side = 0;
+    cues.push_back(step);
+    double previous = 0.0;
+    double worstStep = 0.0;
+    for (int i = 0; i <= 2000; ++i) {
+        const float support = static_cast<float>(i) / 2000.0f;
+        motion::ClipPose base = motion::neutralClipPose();
+        base.foot[0].phase = motion::FootPhase::Swing;
+        base.foot[0].contact = 0.0f;
+        base.foot[1].phase = motion::FootPhase::Plant;
+        base.foot[1].contact = support;
+        const motion::ComposedPose composed = motion::composeMotion(base, cues, 0.25, 4.0, true);
+        const double y = composed.pose.foot[0].position.y;
+        CHECK(std::isfinite(y));
+        if (i > 0) {
+            worstStep = std::max(worstStep, std::abs(y - previous));
+        }
+        previous = y;
+    }
+    CHECK(worstStep < 0.001);  // no 0.039 jump at the rejection threshold
+    CHECK(previous > 0.01);    // full support: the step lifts the foot
 }

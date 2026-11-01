@@ -26,8 +26,8 @@ struct SilenceAnalysis {
     const SpectralFeatures& features, const std::vector<SilenceRegion>& silence,
     const std::vector<Beat>& beats, double duration, const AnalysisConfig& config);
 
-// Conservative energy-based section boundaries. Confidence stays low unless
-// there is a clear, sustained level change.
+// Conservative multiscale energy/spectral-novelty section boundaries.
+// Confidence stays low: section labels remain heuristics, not verse/chorus truth.
 [[nodiscard]] std::vector<Section> detectSections(const SpectralFeatures& features,
                                                   double duration,
                                                   const AnalysisConfig& config);

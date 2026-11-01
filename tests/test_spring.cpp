@@ -8,6 +8,7 @@
 #include "bgmedia/animation/SecondaryDynamics.hpp"
 #include "bgmedia/motion3/DanceClip.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "bgmedia/vrm/ThighColliders.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
 
 #include <algorithm>
@@ -518,4 +519,451 @@ TEST_CASE(spring.dance_trajectories_agree_between_60_and_120_fps) {
     CHECK(mean / static_cast<double>(count) < 0.005);
     CHECK(static_cast<double>(over) < 0.005 * static_cast<double>(count));
     CHECK(worst <= 0.0501f);  // never beyond the authored displacement cap
+}
+
+// --------------------------------------------------------------------------
+// BG Motion 3.3 (issue #11): opt-in thigh/hip colliders for lower-body chains
+// --------------------------------------------------------------------------
+namespace {
+
+// Appends a node below `parent`, composing the bind pose the way the loader does.
+int appendNode(vrm::VrmModel& model, int parent, math::Vec3 translation) {
+    vrm::Node node;
+    node.name = "Synthetic" + std::to_string(model.nodes.size());
+    node.parent = parent;
+    node.translation = translation;
+    node.rotation = math::Quat::identity();
+    node.local = math::Mat4::translation(translation);
+    const int index = static_cast<int>(model.nodes.size());
+    const auto p = static_cast<std::size_t>(parent);
+    model.nodes[p].children.push_back(index);
+    model.bindGlobals.push_back(model.bindGlobals[p] * node.local);
+    model.bindGlobalRotations.push_back((model.bindGlobalRotations[p] * node.rotation).normalized());
+    model.nodes.push_back(std::move(node));
+    return index;
+}
+
+// A skirt-like chain: three new nodes hanging from the hips, the first one
+// offset to (x, -0.05, z). Returns the index of the chain in springChains.
+int appendHangingChain(vrm::VrmModel& model, float x, float z) {
+    vrm::SpringBoneChain chain;
+    chain.stiffness = 0.5f;
+    chain.gravityPower = 1.0f;
+    chain.dragForce = 0.4f;
+    chain.hitRadius = 0.02f;
+    int parent = model.nodeFor(HumanoidBone::Hips);
+    for (int i = 0; i < 3; ++i) {
+        const math::Vec3 offset = i == 0 ? math::Vec3{x, -0.05f, z} : math::Vec3{0.0f, -0.2f, 0.0f};
+        parent = appendNode(model, parent, offset);
+        chain.nodes.push_back(parent);
+    }
+    model.springChains.push_back(chain);
+    return static_cast<int>(model.springChains.size()) - 1;
+}
+
+// Hair under the neck (Neck -> Head -> eyes) plus a skirt hanging from the hips.
+std::unique_ptr<vrm::VrmModel> hairAndSkirtModel(float skirtZ = 0.07f) {
+    auto model = loadSynthetic(
+        R"("boneGroups":[{"comment":"hair","stiffiness":0.5,"gravityPower":1,"dragForce":0.4,)"
+        R"("center":-1,"hitRadius":0.02,"bones":[3],"colliderGroups":[]}])");
+    if (model) {
+        appendHangingChain(*model, 0.08f, skirtZ);
+    }
+    return model;
+}
+
+motion::ClipPose hipSwayPose(double t) {
+    auto pose = headBobPose(t);
+    pose.bone[static_cast<std::size_t>(HumanoidBone::Hips)] =
+        math::fromAxisAngle({0.0f, 0.0f, 1.0f}, 0.25f * static_cast<float>(std::sin(t * 4.0)));
+    return pose;
+}
+
+vrm::ThighColliderOptions thighOn() {
+    vrm::ThighColliderOptions options;
+    options.enabled = true;
+    return options;
+}
+
+}  // namespace
+
+TEST_CASE(spring.thigh_colliders_are_off_by_default) {
+    auto model = hairAndSkirtModel();
+    REQUIRE(model != nullptr);
+    const auto report = vrm::synthesizeThighColliders(*model);
+    CHECK(!report.applied);
+    CHECK(report.skipReason == "disabled");
+    CHECK(model->springColliderGroups.empty());
+    CHECK(model->springChains.back().colliderGroups.empty());
+}
+
+TEST_CASE(spring.thigh_colliders_leave_models_with_leg_or_hips_colliders_unchanged) {
+    // Upper-leg colliders are authored: nothing is added and nothing re-pointed.
+    auto legs = loadSynthetic(
+        R"("colliderGroups":[{"node":11,"colliders":[{"offset":{"x":0,"y":0,"z":0},"radius":0.08}]},)"
+        R"({"node":15,"colliders":[{"offset":{"x":0,"y":0,"z":0},"radius":0.08}]}])");
+    REQUIRE(legs != nullptr);
+    appendHangingChain(*legs, 0.08f, 0.07f);
+    auto report = vrm::synthesizeThighColliders(*legs, thighOn());
+    CHECK(!report.applied);
+    CHECK(report.skipReason.find("already has") != std::string::npos);
+    CHECK(legs->springColliderGroups.size() == 2);
+    CHECK(legs->springChains.back().colliderGroups.empty());
+
+    // A collider on the hips counts as an existing collider too.
+    auto hips = loadSynthetic(
+        R"("colliderGroups":[{"node":0,"colliders":[{"offset":{"x":0,"y":0,"z":0},"radius":0.2}]}])");
+    REQUIRE(hips != nullptr);
+    appendHangingChain(*hips, 0.08f, 0.07f);
+    report = vrm::synthesizeThighColliders(*hips, thighOn());
+    CHECK(!report.applied);
+    CHECK(hips->springColliderGroups.size() == 1);
+    CHECK(hips->springChains.back().colliderGroups.empty());
+}
+
+TEST_CASE(spring.thigh_colliders_attach_to_a_skirt_and_never_to_hair) {
+    auto model = hairAndSkirtModel();
+    REQUIRE(model != nullptr);
+    const auto report = vrm::synthesizeThighColliders(*model, thighOn());
+    REQUIRE(report.applied);
+    CHECK(report.groupsAdded == 2);
+    CHECK(report.spheresAdded == 6);
+    CHECK(report.chainsTouched == 1);
+    CHECK(report.chainsExcluded == 2);  // the hair chain and its eye branch
+    REQUIRE(model->springColliderGroups.size() == 2);
+    CHECK(model->springColliderGroups[0].node == model->nodeFor(HumanoidBone::LeftUpperLeg));
+    CHECK(model->springColliderGroups[1].node == model->nodeFor(HumanoidBone::RightUpperLeg));
+    CHECK(model->springColliderGroups[0].colliders.size() == 3);
+    // Fallback radius (no skinned mesh): 4.5 % of model height.
+    CHECK(!report.leftRadiusFromMesh);
+    CHECK_NEAR(report.leftRadius, 0.045f * model->height, 1e-6);
+    CHECK_NEAR(model->springColliderGroups[0].colliders[0].radius, report.leftRadius, 1e-6);
+
+    // The sphere centres sit on the thigh axis (hip joint -> knee joint).
+    const math::Mat4 hip = model->bindGlobals[static_cast<std::size_t>(model->nodeFor(HumanoidBone::LeftUpperLeg))];
+    const math::Vec3 a = hip.translationPart();
+    const math::Vec3 b = model->bindGlobals[static_cast<std::size_t>(model->nodeFor(HumanoidBone::LeftLowerLeg))].translationPart();
+    const float fractions[3] = {0.2f, 0.5f, 0.8f};
+    for (int k = 0; k < 3; ++k) {
+        const math::Vec3 world = hip.transformPoint(
+            model->springColliderGroups[0].colliders[static_cast<std::size_t>(k)].offset);
+        CHECK((world - (a + (b - a) * fractions[k])).length() < 1.0e-4f);
+    }
+
+    // Hair (chains 0 and 1, rooted under the neck) never references the new groups.
+    CHECK(model->springChains[0].colliderGroups.empty());
+    CHECK(model->springChains[1].colliderGroups.empty());
+    CHECK((model->springChains[2].colliderGroups == std::vector<int>{0, 1}));
+}
+
+TEST_CASE(spring.thigh_colliders_never_move_hair_at_runtime) {
+    // Two identical models, one with the synthesis applied. Hair is not
+    // referenced by the new groups, so its simulated pose must be identical.
+    auto plain = hairAndSkirtModel();
+    auto synthesized = hairAndSkirtModel();
+    REQUIRE(plain != nullptr && synthesized != nullptr);
+    REQUIRE(vrm::synthesizeThighColliders(*synthesized, thighOn()).applied);
+
+    animation::HumanoidRetargeter rigPlain(*plain);
+    animation::HumanoidRetargeter rigSynth(*synthesized);
+    animation::SecondaryDynamics dynPlain(*plain);
+    animation::SecondaryDynamics dynSynth(*synthesized);
+    animation::SecondarySettings settings;
+    const double dt = 1.0 / 60.0;
+    const std::vector<int> hair = {3, 4, 19, 20};
+    float worstHair = 0.0f;
+    float worstSkirt = 0.0f;
+    for (int i = 0; i < 300; ++i) {
+        const double t = i * dt;
+        auto a = rigPlain.applyClip(hipSwayPose(t), t);
+        auto b = rigSynth.applyClip(hipSwayPose(t), t);
+        dynPlain.update(a, i == 0 ? 0.0 : dt, settings);
+        dynSynth.update(b, i == 0 ? 0.0 : dt, settings);
+        for (int n : hair) {
+            const auto index = static_cast<std::size_t>(n);
+            worstHair = std::max(worstHair, (a.nodeGlobals[index].translationPart() -
+                                             b.nodeGlobals[index].translationPart()).length());
+        }
+        for (int n = 22; n <= 24; ++n) {
+            const auto index = static_cast<std::size_t>(n);
+            worstSkirt = std::max(worstSkirt, (a.nodeGlobals[index].translationPart() -
+                                               b.nodeGlobals[index].translationPart()).length());
+        }
+    }
+    std::cout << std::fixed << std::setprecision(6)
+              << "\n            hair difference with/without thigh colliders: " << worstHair
+              << " m, skirt difference: " << worstSkirt << " m";
+    CHECK(worstHair < 1.0e-6f);
+    CHECK(!dynSynth.stats().nonFinite);
+}
+
+TEST_CASE(spring.thigh_colliders_are_idempotent) {
+    auto model = hairAndSkirtModel();
+    REQUIRE(model != nullptr);
+    REQUIRE(vrm::synthesizeThighColliders(*model, thighOn()).applied);
+    const auto groupsAfterFirst = model->springColliderGroups.size();
+    const auto refsAfterFirst = model->springChains.back().colliderGroups;
+    const auto second = vrm::synthesizeThighColliders(*model, thighOn());
+    CHECK(!second.applied);
+    CHECK(model->springColliderGroups.size() == groupsAfterFirst);
+    CHECK(model->springChains.back().colliderGroups == refsAfterFirst);
+}
+
+TEST_CASE(spring.thigh_colliders_keep_existing_groups_and_references) {
+    // Group 0 is an invalid placeholder; group 1 is an authored chest collider
+    // that the hair references. The generated thigh groups must come after them.
+    auto model = loadSynthetic(
+        R"("colliderGroups":[{"node":9999,"colliders":[]},)"
+        R"({"node":2,"colliders":[{"offset":{"x":0,"y":0,"z":0},"radius":0.1}]}],)"
+        R"("boneGroups":[{"comment":"hair","stiffiness":0.5,"gravityPower":1,"dragForce":0.4,)"
+        R"("center":-1,"hitRadius":0.02,"bones":[3],"colliderGroups":[1]}])");
+    REQUIRE(model != nullptr);
+    const auto originalGroup = model->springColliderGroups[1];
+    appendHangingChain(*model, 0.08f, 0.07f);
+    model->springChains.back().colliderGroups = {1};  // an authored reference that must survive
+    REQUIRE(vrm::synthesizeThighColliders(*model, thighOn()).applied);
+    REQUIRE(model->springColliderGroups.size() == 4);
+    CHECK(model->springColliderGroups[0].colliders.empty());
+    CHECK(model->springColliderGroups[0].node == -1);  // placeholder, not re-pointed
+    CHECK(model->springColliderGroups[1].node == originalGroup.node);
+    CHECK(model->springColliderGroups[1].colliders.size() == originalGroup.colliders.size());
+    CHECK(model->springColliderGroups[2].node == model->nodeFor(HumanoidBone::LeftUpperLeg));
+    CHECK(model->springColliderGroups[3].node == model->nodeFor(HumanoidBone::RightUpperLeg));
+    CHECK((model->springChains.back().colliderGroups == std::vector<int>{1, 2, 3}));
+    // The hair chains keep exactly their authored reference.
+    CHECK((model->springChains[0].colliderGroups == std::vector<int>{1}));
+    CHECK((model->springChains[1].colliderGroups == std::vector<int>{1}));
+    // The simulator still builds on the result: 0 + 1 + 3 + 3 spheres.
+    animation::SecondaryDynamics dynamics(*model);
+    CHECK(dynamics.available());
+    CHECK(dynamics.colliderCount() == 0 + 1 + 3 + 3);
+}
+
+TEST_CASE(spring.thigh_colliders_are_a_safe_no_op_on_broken_input) {
+    // Missing upper-leg bone.
+    auto noLegs = hairAndSkirtModel();
+    REQUIRE(noLegs != nullptr);
+    noLegs->humanoidNodes[static_cast<std::size_t>(HumanoidBone::LeftUpperLeg)] = -1;
+    auto report = vrm::synthesizeThighColliders(*noLegs, thighOn());
+    CHECK(!report.applied);
+    CHECK(report.skipReason == "missing hips or leg bones");
+    CHECK(noLegs->springColliderGroups.empty());
+
+    // A model whose only chain points at nodes that do not exist: no lower-body chain.
+    auto badChain = hairAndSkirtModel();
+    REQUIRE(badChain != nullptr);
+    vrm::SpringBoneChain broken;
+    broken.nodes = {9999, 10000};
+    badChain->springChains.clear();
+    badChain->springChains.push_back(broken);
+    report = vrm::synthesizeThighColliders(*badChain, thighOn());
+    CHECK(!report.applied);
+    CHECK(badChain->springColliderGroups.empty());
+
+    // Out-of-range or negative references in an authored chain are left alone,
+    // and the simulator tolerates them alongside the new groups.
+    auto refs = hairAndSkirtModel();
+    REQUIRE(refs != nullptr);
+    refs->springChains.back().colliderGroups = {99, -4};
+    report = vrm::synthesizeThighColliders(*refs, thighOn());
+    REQUIRE(report.applied);
+    CHECK((refs->springChains.back().colliderGroups == std::vector<int>{99, -4, 0, 1}));
+    animation::SecondaryDynamics dynamics(*refs);
+    CHECK(dynamics.available());
+}
+
+TEST_CASE(spring.thigh_colliders_fit_the_radius_from_the_skin) {
+    // A skinned primitive whose vertices all sit 5 cm from the left thigh axis,
+    // weighted to the left upper leg, drives the mesh-fitted radius.
+    auto model = hairAndSkirtModel();
+    REQUIRE(model != nullptr);
+    const int upper = model->nodeFor(HumanoidBone::LeftUpperLeg);
+    const int lower = model->nodeFor(HumanoidBone::LeftLowerLeg);
+    const math::Vec3 mid =
+        (model->bindGlobals[static_cast<std::size_t>(upper)].translationPart() +
+         model->bindGlobals[static_cast<std::size_t>(lower)].translationPart()) * 0.5f;
+    const math::Mat4 inverse = model->bindGlobals[static_cast<std::size_t>(upper)].inverseAffine();
+    vrm::Primitive primitive;
+    primitive.skinned = true;
+    for (int i = 0; i < 64; ++i) {
+        const float angle = 6.2831853f * static_cast<float>(i) / 64.0f;
+        const math::Vec3 world = mid + math::Vec3{0.05f * std::cos(angle), 0.0f, 0.05f * std::sin(angle)};
+        vrm::Vertex vertex;
+        vertex.position = inverse.transformPoint(world);
+        vertex.joints = {0, 0, 0, 0};
+        vertex.weights = {1.0f, 0.0f, 0.0f, 0.0f};
+        primitive.vertices.push_back(vertex);
+    }
+    vrm::Skin skin;
+    skin.joints = {upper};
+    skin.inverseBindMatrices = {math::Mat4::identity()};
+    model->skins.push_back(skin);
+    vrm::Mesh mesh;
+    mesh.name = "thigh";
+    mesh.primitives.push_back(primitive);
+    model->meshes.push_back(mesh);
+    const int host = appendNode(*model, 0, {0.0f, 0.0f, 0.0f});
+    model->nodes[static_cast<std::size_t>(host)].skin = 0;
+    model->meshInstances.push_back({host, static_cast<int>(model->meshes.size()) - 1});
+
+    const auto report = vrm::synthesizeThighColliders(*model, thighOn());
+    REQUIRE(report.applied);
+    CHECK(report.leftRadiusFromMesh);
+    CHECK(!report.rightRadiusFromMesh);
+    CHECK_NEAR(report.leftRadius, 0.05f, 1.0e-3);
+    // The fitted radius stays within the 2 %..9 % of height bounds.
+    CHECK(report.leftRadius >= 0.02f * model->height - 1.0e-6f);
+    CHECK(report.leftRadius <= 0.09f * model->height + 1.0e-6f);
+}
+
+TEST_CASE(spring.thigh_colliders_stay_stable_at_30_60_and_120_fps) {
+    // The skirt runs along the thigh (z = 0) so the spheres are actually hit while the hips sway.
+    auto model = hairAndSkirtModel(0.0f);
+    REQUIRE(model != nullptr);
+    REQUIRE(vrm::synthesizeThighColliders(*model, thighOn()).applied);
+    animation::HumanoidRetargeter rig(*model);
+    const int tip = 24;
+    std::vector<math::Vec3> tips;
+    for (double fps : {30.0, 60.0, 120.0}) {
+        animation::SecondaryDynamics dynamics(*model);
+        animation::SecondarySettings settings;
+        math::Vec3 last{};
+        const int frames = static_cast<int>(4.0 * fps);
+        for (int i = 0; i <= frames; ++i) {
+            const double t = i / fps;
+            auto pose = rig.applyClip(hipSwayPose(t), t);
+            dynamics.update(pose, i == 0 ? 0.0 : 1.0 / fps, settings);
+            CHECK(!dynamics.stats().nonFinite);
+            CHECK(dynamics.stats().maxStretch < 0.05f);
+            CHECK(dynamics.stats().maxDisplacement <= settings.maxDisplacement + 1.0e-4f);
+            last = animation::HumanoidRetargeter::stagePosition(pose, tip);
+        }
+        tips.push_back(last);
+    }
+    float spread = 0.0f;
+    for (const auto& a : tips) {
+        for (const auto& b : tips) spread = std::max(spread, (a - b).length());
+    }
+    std::cout << std::fixed << std::setprecision(5)
+              << "\n            skirt tip spread across 30/60/120 FPS with thigh colliders: " << spread << " m";
+    CHECK(spread < 0.02f);
+}
+
+TEST_CASE(spring.thigh_colliders_push_a_skirt_out_of_the_thigh) {
+    // The skirt starts on the right thigh axis, i.e. inside the leg. Without the
+    // colliders it stays there; with them the hanging points are pushed out.
+    const auto clearanceFromThigh = [](bool synthesize) {
+        auto model = loadSynthetic(
+            R"("boneGroups":[{"comment":"hair","stiffiness":0.5,"gravityPower":1,"dragForce":0.4,)"
+            R"("center":-1,"hitRadius":0.02,"bones":[3],"colliderGroups":[]}])");
+        REQUIRE(model != nullptr);
+        // A skirt chain on the right thigh axis (nodes 22..24).
+        appendHangingChain(*model, 0.08f, 0.0f);
+        if (synthesize) {
+            REQUIRE(vrm::synthesizeThighColliders(*model, thighOn()).applied);
+        }
+        animation::HumanoidRetargeter rig(*model);
+        animation::SecondaryDynamics dynamics(*model);
+        animation::SecondarySettings settings;
+        const double dt = 1.0 / 60.0;
+        const int thigh = model->nodeFor(HumanoidBone::RightUpperLeg);
+        const int knee = model->nodeFor(HumanoidBone::RightLowerLeg);
+        float clearance = 1.0e9f;
+        for (int i = 0; i < 120; ++i) {
+            auto pose = rig.applyClip(motion::neutralClipPose(), i * dt);
+            dynamics.update(pose, i == 0 ? 0.0 : dt, settings);
+            if (i < 100) {
+                continue;
+            }
+            const math::Vec3 a = pose.nodeGlobals[static_cast<std::size_t>(thigh)].translationPart();
+            const math::Vec3 b = pose.nodeGlobals[static_cast<std::size_t>(knee)].translationPart();
+            for (int n = 23; n <= 24; ++n) {
+                const math::Vec3 p = pose.nodeGlobals[static_cast<std::size_t>(n)].translationPart();
+                const math::Vec3 ab = b - a;
+                const float t = std::clamp(math::dot(p - a, ab) / ab.lengthSquared(), 0.0f, 1.0f);
+                clearance = std::min(clearance, (p - (a + ab * t)).length());
+            }
+        }
+        return clearance;
+    };
+    const float without = clearanceFromThigh(false);
+    const float with = clearanceFromThigh(true);
+    std::cout << std::fixed << std::setprecision(4) << "\n            skirt clearance from the right thigh axis: without="
+              << without << " m, with thigh colliders=" << with << " m";
+    CHECK(with > without + 0.03f);  // the colliders push it out to about radius + hitRadius
+}
+
+// --------------------------------------------------------------------------
+// Render interpolation: a steadily moving chain must not trail
+// --------------------------------------------------------------------------
+TEST_CASE(spring.render_interpolation_adds_no_trailing_for_a_steady_glide) {
+    // A stiff, gravity-free chain (neck -> head -> eye). The body glides at a steady
+    // speed by a root shift only, so the spring settles into a constant offset from
+    // its animated target. That offset must not depend on the frame rate: at 50 and
+    // 90 FPS the frames fall between the 120 Hz steps, and an interpolation that mixes
+    // absolute positions and then subtracts this frame's target adds a step of lag
+    // (0.5 m/s * 1/120 s = 4 mm here) on top of the spring's own offset.
+    auto model = loadSynthetic(
+        R"("boneGroups":[{"comment":"glide","stiffiness":1.0,"gravityPower":0,"dragForce":0.4,)"
+        R"("center":-1,"hitRadius":0.02,"bones":[3],"colliderGroups":[]}])");
+    REQUIRE(model != nullptr);
+    animation::HumanoidRetargeter rig(*model);
+    REQUIRE(rig.valid());
+    constexpr int kHeadNode = 4;           // chain 0 is 3 -> 4 -> 19; point 1 is node 4
+    constexpr float kSpeed = 0.5f;         // metres per second
+    const float height = model->height;
+    // The animated stage position of the head at a given time (rigid glide).
+    const auto animatedAt = [&](double time) {
+        motion::ClipPose base = motion::neutralClipPose();
+        base.rootX = static_cast<float>(kSpeed * time / height);
+        const auto pose = rig.applyClip(base, time);
+        return animation::HumanoidRetargeter::stagePosition(pose, kHeadNode);
+    };
+    // Worst deviation, from t = 2 s on, of the rendered head from the expected one:
+    //   expected = (simulated point after the last fixed step) + (animated(now) - animated(step)).
+    // The fixed step count is replayed with the same arithmetic as the solver, so the
+    // "last step" time is exact, not estimated.
+    const auto worstError = [&](double fps) {
+        constexpr double kStep = 1.0 / 120.0;  // the solver's fixed step
+        animation::SecondaryDynamics dynamics(*model);
+        animation::SecondarySettings settings;
+        const int frames = static_cast<int>(std::lround(3.0 * fps));
+        double accumulator = 0.0;
+        long long stepsDone = 0;
+        float worst = 0.0f;
+        for (int i = 0; i <= frames; ++i) {
+            const double t = i / fps;
+            const double dt = i == 0 ? 0.0 : 1.0 / fps;
+            if (dt > 0.0) {
+                accumulator += dt;
+                while (accumulator >= kStep) {
+                    accumulator -= kStep;
+                    ++stepsDone;
+                }
+            }
+            motion::ClipPose base = motion::neutralClipPose();
+            base.rootX = static_cast<float>(kSpeed * t / height);
+            auto pose = rig.applyClip(base, t);
+            dynamics.update(pose, dt, settings);
+            if (t >= 2.0) {
+                const double lastStep = static_cast<double>(stepsDone) * kStep;
+                const math::Vec3 expected =
+                    dynamics.chainPoint(0, 1) + (animatedAt(t) - animatedAt(lastStep));
+                const math::Vec3 rendered =
+                    animation::HumanoidRetargeter::stagePosition(pose, kHeadNode);
+                worst = std::max(worst, (rendered - expected).length());
+            }
+        }
+        return worst;
+    };
+    const float err120 = worstError(120.0);
+    const float err90 = worstError(90.0);
+    const float err50 = worstError(50.0);
+    std::cout << std::fixed << std::setprecision(6)
+              << "\n            steady glide at 0.5 m/s, rendered vs expected: 120 FPS=" << err120
+              << " m, 90 FPS=" << err90 << " m, 50 FPS=" << err50 << " m";
+    // A one-step lag at this speed is 4.2 mm; the bound is far below it.
+    CHECK(err120 < 2.0e-4f);
+    CHECK(err90 < 2.0e-4f);
+    CHECK(err50 < 2.0e-4f);
 }

@@ -497,6 +497,12 @@ ClipPose sampleClip(const HumanoidClip& clip, double clipBeat) {
     return pose;
 }
 
+float footContactAt(const HumanoidClip& clip, int foot, double clipBeat) {
+    float contact = 0.0f;
+    footPhaseAt(clip, foot, clipBeat, contact);
+    return contact;
+}
+
 float clipAccentStrength(const HumanoidClip& clip, double clipBeat) {
     return accentEnvelope(clip, clipBeat);
 }
@@ -1190,19 +1196,198 @@ void validateClip(const HumanoidClip& clip, const std::string& sourceName,
     }
 }
 
+// --- BG Motion 3.4 variety ----------------------------------------------------
+
+namespace {
+
+// Quintic smootherstep: C2 at both ends of a seam window, so the blended choice has no
+// visible kink where the window starts or ends.
+float smootherstepUnit(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+Quat mirrorQuat(const Quat& q) {
+    return {q.x, -q.y, -q.z, q.w};
+}
+
+Vec3 mirrorLateral(const Vec3& v) {
+    return {-v.x, v.y, v.z};
+}
+
+std::string toggleSuffix(const std::string& text, const std::string& suffix) {
+    if (text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return text.substr(0, text.size() - suffix.size());
+    }
+    return text + suffix;
+}
+
+// True for an id that names a mirror (base id + kMirrorSuffix). The library never stores such
+// an id: find() would resolve it to the mirror of a base clip instead.
+bool endsWithMirrorSuffix(const std::string& id) {
+    const std::string suffix = kMirrorSuffix;
+    return id.size() > suffix.size() &&
+           id.compare(id.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+}  // namespace
+
+vrm::HumanoidBone mirroredBone(vrm::HumanoidBone bone) {
+    using B = vrm::HumanoidBone;
+    static constexpr std::array<std::pair<B, B>, 9> kPairs = {{
+        {B::LeftShoulder, B::RightShoulder},
+        {B::LeftUpperArm, B::RightUpperArm},
+        {B::LeftLowerArm, B::RightLowerArm},
+        {B::LeftHand, B::RightHand},
+        {B::LeftUpperLeg, B::RightUpperLeg},
+        {B::LeftLowerLeg, B::RightLowerLeg},
+        {B::LeftFoot, B::RightFoot},
+        {B::LeftToes, B::RightToes},
+        {B::LeftEye, B::RightEye},
+    }};
+    for (const auto& [left, right] : kPairs) {
+        if (bone == left) return right;
+        if (bone == right) return left;
+    }
+    return bone;
+}
+
+HumanoidClip mirrorClip(const HumanoidClip& clip) {
+    HumanoidClip out = clip;
+    out.id = toggleSuffix(clip.id, kMirrorSuffix);
+    out.name = toggleSuffix(clip.name, " (mirrored)");
+
+    for (std::size_t b = 0; b < vrm::kHumanoidBoneCount; ++b) {
+        const auto bone = static_cast<vrm::HumanoidBone>(b);
+        const std::vector<Quat>& source = clip.bones[b];
+        std::vector<Quat>& target = out.bones[static_cast<std::size_t>(mirroredBone(bone))];
+        target.resize(source.size());
+        for (std::size_t k = 0; k < source.size(); ++k) {
+            target[k] = mirrorQuat(source[k]);
+        }
+    }
+    for (Vec3& v : out.hips) {
+        v = mirrorLateral(v);
+    }
+    for (Vec3& r : out.root) {
+        // root: x (left), z (forward) stored in y, yaw (turns) stored in z
+        r = {-r.x, r.y, -r.z};
+    }
+
+    // Feet: the track of each side moves to the other side; lateral position and yaw flip.
+    std::swap(out.feet[0], out.feet[1]);
+    for (FootTrack& track : out.feet) {
+        for (Vec3& p : track.position) {
+            p = mirrorLateral(p);
+        }
+        for (float& yaw : track.yaw) {
+            yaw = -yaw;
+        }
+        // toe roll is a pitch about the lateral axis: unchanged
+    }
+    for (ContactSegment& seg : out.contacts) {
+        seg.foot = 1 - seg.foot;
+    }
+
+    std::swap(out.hands[0], out.hands[1]);
+    std::swap(out.handPoses[0], out.handPoses[1]);
+    for (auto& track : out.handPoses) {
+        for (HandPose& pose : track) {
+            // wrist: pitch (flexion about the lateral axis) stays, yaw and roll flip
+            pose.wrist[1] = -pose.wrist[1];
+            pose.wrist[2] = -pose.wrist[2];
+            // finger curl and thumb opposition are sided by the hand, not by the body: unchanged
+        }
+    }
+    return out;
+}
+
+LoopBlend loopBlendAt(double clipBeat, double loopBeats, double windowBeats) {
+    LoopBlend blend;
+    if (!(loopBeats > 1e-9) || !std::isfinite(clipBeat)) {
+        return blend;
+    }
+    const double loopPos = clipBeat / loopBeats;
+    // The next seam at or after clipBeat, and the beats left until it.
+    const double seam = std::ceil(loopPos);
+    const double untilSeam = (seam - loopPos) * loopBeats;
+    const double window = std::min(std::max(windowBeats, 0.0), loopBeats);
+    // Loops start at 0. The time before beat 0 (a fade-in) is the first pass, so no blend ever
+    // reaches a negative loop: the first pass is the authored choreography, bit for bit.
+    const auto loopIndex = [](double index) {
+        return static_cast<std::int64_t>(std::max(0.0, index));
+    };
+    if (window <= 1e-9 || untilSeam <= 0.0 || untilSeam > window) {
+        blend.from = blend.to = loopIndex(std::floor(loopPos));
+        return blend;
+    }
+    blend.from = loopIndex(seam - 1.0);
+    blend.to = loopIndex(seam);
+    if (blend.from == blend.to) {
+        return blend;  // the seam is the clip origin: no loop before it to blend from
+    }
+    // The window ends at the seam: the choice is `from` at its start and `to` from the seam on,
+    // so the seam itself is a pure `to` and the blend leaves no step at the seam.
+    blend.w = smootherstepUnit(static_cast<float>(1.0 - untilSeam / window));
+    return blend;
+}
+
+std::uint64_t variationMix(std::uint64_t value) {
+    // splitmix64 finaliser
+    value += 0x9E3779B97F4A7C15ull;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+
+std::uint64_t variationHash(const std::string& text) {
+    // FNV-1a, 64 bit
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const char c : text) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 // --- library ---------------------------------------------------------------
 
 bool DanceLibrary::replace(const HumanoidClip& clip) {
+    if (endsWithMirrorSuffix(clip.id)) {
+        return false;  // never stored, see add()
+    }
     for (HumanoidClip& existing : clips_) {
         if (existing.id == clip.id) {
             existing = clip;
+            if (const auto mirror = mirrorIndex_.find(clip.id); mirror != mirrorIndex_.end()) {
+                mirrors_[mirror->second] = mirrorClip(clip);
+            }
             return true;
         }
     }
     return false;
 }
 
+const HumanoidClip* DanceLibrary::mirrorOf(const HumanoidClip& clip) const {
+    const auto found = mirrorIndex_.find(clip.id);
+    if (found != mirrorIndex_.end()) {
+        return &mirrors_[found->second];
+    }
+    mirrors_.push_back(mirrorClip(clip));
+    mirrorIndex_.emplace(clip.id, mirrors_.size() - 1);
+    return &mirrors_.back();
+}
+
 bool DanceLibrary::add(HumanoidClip clip) {
+    if (endsWithMirrorSuffix(clip.id)) {
+        // "<base>~m" is the mirror of "<base>" in find(); a stored clip with that id would be
+        // shadowed by it, so the clip is refused and must be renamed.
+        diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,
+                                "clip id '" + clip.id + "' ends with the mirror suffix '" +
+                                    kMirrorSuffix + "'; rename the clip"});
+        return false;
+    }
     if (find(clip.id)) {
         diagnostics_.push_back({ClipDiagnostic::Severity::Error, clip.id,
                                 "duplicate clip id '" + clip.id + "'"});
@@ -1237,9 +1422,23 @@ void DanceLibrary::loadDirectory(const std::filesystem::path& directory) {
     }
 }
 
-const HumanoidClip* DanceLibrary::find(const std::string& id) const {
+const HumanoidClip* DanceLibrary::findOriginal(const std::string& id) const {
     for (const HumanoidClip& clip : clips_) {
         if (clip.id == id) return &clip;
+    }
+    return nullptr;
+}
+
+const HumanoidClip* DanceLibrary::find(const std::string& id) const {
+    if (const HumanoidClip* clip = findOriginal(id)) {
+        return clip;
+    }
+    if (endsWithMirrorSuffix(id)) {
+        const std::string suffix = kMirrorSuffix;
+        if (const HumanoidClip* original = findOriginal(id.substr(0, id.size() - suffix.size()))) {
+            const HumanoidClip* mirror = mirrorOf(*original);
+            return mirror->id == id ? mirror : nullptr;
+        }
     }
     return nullptr;
 }

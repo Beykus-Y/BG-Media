@@ -12,11 +12,13 @@
 #include "bgmedia/motion3/MotionPrimitive.hpp"
 #include "bgmedia/motion3/ProceduralChoreography.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -74,8 +76,16 @@ public:
     // footwork; Light = torso/head/hands; HandsOnly = hand layer; Off = base.
     void setOverlayMode(OverlayMode mode);
     [[nodiscard]] OverlayMode overlayMode() const { return overlayMode_; }
-    void setOverlaySeed(std::uint32_t seed) { overlaySeed_ = seed; }
+    void setOverlaySeed(std::uint32_t seed) {
+        overlaySeed_ = seed;
+        overlays_.clear();  // cached cue sets were planned from the old seed
+    }
     [[nodiscard]] std::uint32_t overlaySeed() const { return overlaySeed_; }
+    // Overlay cues of one clip for one loop (loop = floor(clipBeat / beats)). Authored clips get
+    // their own cue set per loop, planned from (seed, clip id, loop), so repeated loops do not
+    // repeat the same gestures. Generated dances keep their generator's cues.
+    [[nodiscard]] const std::vector<PrimitiveCue>& overlaysFor(const std::string& clipId,
+                                                               std::int64_t loop);
     [[nodiscard]] const std::vector<PrimitiveCue>& overlaysFor(const std::string& clipId);
     [[nodiscard]] const std::vector<GeneratedDance>& generatedDances() const {
         return generated_;
@@ -122,6 +132,39 @@ public:
 
 private:
     void replanAuthored();
+    // Stateful hand-over from the last output pose (BG Motion 3.3, A3/A4). The schedule
+    // stays a pure function of media time; only this blend remembers where it started.
+    // Its progress is media time travelled, so it works for a paused or scrubbed host too.
+    void armBlend(double seconds, bool carryFeet = false);
+    void armIfMoved(const BeatClock& before, const BeatClock& after, double now);
+    void advanceBlend(double travelled);
+    [[nodiscard]] DanceFrame sampleFrame(double mediaTime);
+    void applyBlend(DanceFrame& frame);
+    void advanceFootCarry(double travelled);
+    void applyFootCarry(DanceFrame& frame);
+
+    struct PoseBlend {
+        bool active = false;
+        bool hold = false;     // armed since the last frame: that frame shows the outgoing pose
+        ClipPose from;
+        double progress = 0.0; // media seconds travelled since the blend was armed
+        double seconds = 0.0;
+    };
+    PoseBlend blend_;
+    // A plan or grid blend must not slide planted feet: their offset from the new
+    // schedule is carried and paid off while the schedule swings that foot (plus a slow
+    // fallback while it stays planted), not over the body blend.
+    struct FootCarry {
+        bool pending = false;  // capture the offset on the next applied frame
+        std::array<Vec3, 2> offset{};
+        std::array<float, 2> yaw{};
+        std::array<double, 2> remaining{0.0, 0.0};
+        std::array<float, 2> contact{1.0f, 1.0f};  // schedule contact of the last frame
+    };
+    FootCarry carry_;
+    bool haveLastPose_ = false;
+    bool lastJump_ = false;
+    ClipPose lastPose_;
 
     DanceLibrary library_;
     std::vector<HumanoidClip> authored_;
@@ -138,7 +181,9 @@ private:
     OverlayMode overlayMode_ = OverlayMode::Full;
     std::uint32_t overlaySeed_ = 3u;
     std::vector<GeneratedDance> generated_;
-    std::unordered_map<std::string, std::vector<PrimitiveCue>> overlays_;
+    // Per-(clip, loop) overlay plans: a pure memo of planPrimitiveOverlays, bounded in size.
+    std::map<std::pair<std::string, std::int64_t>, std::vector<PrimitiveCue>> overlays_;
+    std::unordered_map<std::string, std::vector<PrimitiveCue>> generatedOverlays_;
 };
 
 } // namespace bgmedia::motion

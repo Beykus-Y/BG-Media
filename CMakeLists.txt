@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.24)
 
 project(BGMedia
     VERSION 0.3.2
@@ -65,6 +65,18 @@ add_library(bgmedia_core STATIC
     src/cache/AnalysisCache.cpp
     src/sync/PlaybackClock.cpp
     src/choreography/Choreography.cpp
+    src/mix/MixTypes.cpp
+    src/mix/PcmTrack.cpp
+    src/mix/MixFeatureMap.cpp
+    src/mix/MixFeatureCache.cpp
+    src/mix/VocalDetector.cpp
+    src/mix/HarmonicAnalyzer.cpp
+    src/mix/TimeStretch.cpp
+    src/mix/SpectralEq.cpp
+    src/mix/MixPlanner.cpp
+    src/mix/MixEngine.cpp
+    src/mix/MixSession.cpp
+    src/mix/MixSync.cpp
 )
 add_library(BGMedia::Core ALIAS bgmedia_core)
 target_include_directories(bgmedia_core
@@ -78,6 +90,8 @@ target_compile_features(bgmedia_core PUBLIC cxx_std_20)
 target_compile_options(bgmedia_core PRIVATE ${BGMEDIA_WARNING_FLAGS})
 target_include_directories(bgmedia_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
 target_sources(bgmedia_core PRIVATE $<TARGET_OBJECTS:bgmedia_kissfft>)
+find_package(Threads REQUIRED)
+target_link_libraries(bgmedia_core PUBLIC Threads::Threads)
 if(MSVC)
     target_compile_definitions(bgmedia_core PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
@@ -89,6 +103,7 @@ endif()
 add_library(bgmedia_vrm STATIC
     src/vrm/VrmModel.cpp
     src/vrm/VrmLoader.cpp
+    src/vrm/ThighColliders.cpp
     src/vrm/CgltfImpl.cpp
     src/vrm/StbImageImpl.cpp
 )
@@ -109,16 +124,21 @@ endif()
 
 add_library(bgmedia_rig STATIC
     src/animation/HumanoidRetargeter.cpp
+    src/animation/TwoBoneSolver.cpp
     src/animation/SecondaryDynamics.cpp
     src/motion3/BeatClock.cpp
     src/motion3/MusicalTimeline.cpp
     src/motion3/MusicalTimeWarp.cpp
     src/motion3/DanceClip.cpp
+    src/motion3/AliveLayer.cpp
     src/motion3/ClipFootwork.cpp
     src/motion3/MotionPrimitive.cpp
     src/motion3/ProceduralChoreography.cpp
     src/motion3/DanceDirector.cpp
     src/motion3/DancePlayer.cpp
+    src/motion3/TaskSpaceIntent.cpp
+    src/motion3/WristPlanner.cpp
+    src/motion3/ElbowSolver.cpp
 )
 add_library(BGMedia::Rig ALIAS bgmedia_rig)
 target_include_directories(bgmedia_rig
@@ -138,6 +158,23 @@ target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
 # ---------------------------------------------------------------------------
 if(BGMEDIA_BUILD_MINIAUDIO)
     add_subdirectory(adapters/miniaudio)
+endif()
+
+# ---------------------------------------------------------------------------
+# Deterministic synthetic signals shared by the tools and the unit tests. This
+# target must exist whenever the tests are built too, otherwise an ASan or
+# core-only configuration (BGMEDIA_BUILD_TOOLS=OFF) cannot compile the tests
+# that include "support/SyntheticSignals.hpp".
+# ---------------------------------------------------------------------------
+if(BGMEDIA_BUILD_TOOLS OR (BGMEDIA_BUILD_TESTS AND BUILD_TESTING))
+    add_library(bgmedia_test_signals STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/support/SyntheticSignals.cpp
+    )
+    target_link_libraries(bgmedia_test_signals PUBLIC bgmedia_core)
+    target_include_directories(bgmedia_test_signals PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    target_compile_features(bgmedia_test_signals PUBLIC cxx_std_20)
+    target_compile_options(bgmedia_test_signals PRIVATE ${BGMEDIA_WARNING_FLAGS})
 endif()
 
 # ---------------------------------------------------------------------------

@@ -19,8 +19,11 @@ using motion::HumanoidClip;
 using vrm::HumanoidBone;
 
 inline double angleBetween(const math::Quat& a, const math::Quat& b) {
-    const float d = std::abs(math::dot(a.normalized(), b.normalized()));
-    return 2.0 * std::acos(std::clamp(d, 0.0f, 1.0f)) * 180.0 / 3.14159265358979;
+    // atan2 of the relative rotation: acos(|dot|) turns float rounding of two identical
+    // rotations into ~0.04 deg, which drowns sub-millidegree checks.
+    const math::Quat r = b.normalized() * a.normalized().conjugate();
+    const double s = std::sqrt(double(r.x) * r.x + double(r.y) * r.y + double(r.z) * r.z);
+    return 2.0 * std::atan2(s, std::abs(double(r.w))) * 180.0 / 3.14159265358979;
 }
 
 // Angular velocity vector (deg/s) taking a to b over dt, world axes.
@@ -252,6 +255,109 @@ inline JumpReport measureWindow(const motion::DanceDirector& director, double t0
         previous = current;
     }
     return report;
+}
+
+// Uniform Catmull-Rom segment between p1 and p2, u in [0, 1].
+inline math::Vec3 catmullRom(math::Vec3 p0, math::Vec3 p1, math::Vec3 p2, math::Vec3 p3, float u) {
+    const float u2 = u * u;
+    const float u3 = u2 * u;
+    return (p1 * 2.0f + (p2 - p0) * u + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * u2 +
+            (p1 * 3.0f - p0 - p2 * 3.0f + p3) * u3) * 0.5f;
+}
+
+// One ankle sample on a media-time axis. `planted` and `targetY` come from the
+// contact schedule of the same frame; `ankle` is stage space, in metres.
+struct FootSample {
+    double t = 0.0;
+    math::Vec3 ankle;
+    float targetY = 0.0f;   // foot target height, model-height units
+    bool planted = false;
+};
+
+// Ground drag: horizontal ankle travel while the foot is not planted, its target
+// is below `liftLimit` (model-height units) and it moves faster than `speedLimit`
+// (m/s). The integral is taken on a fixed reference grid, so the answer does not
+// depend on the sampling rate of the caller. The speed gate uses a +-2 grid-step
+// central difference (about 8 ms), which keeps the gate from flickering on
+// per-frame noise.
+struct GroundDrag {
+    double distance = 0.0;  // metres
+    double seconds = 0.0;   // time spent dragging
+};
+
+inline GroundDrag measureGroundDrag(const std::vector<FootSample>& samples, float liftLimit,
+                                    double speedLimit, double referenceHz = 240.0) {
+    GroundDrag out;
+    if (samples.size() < 2) {
+        return out;
+    }
+    const double t0 = samples.front().t;
+    const int count = static_cast<int>(std::floor((samples.back().t - t0) * referenceHz + 1e-9)) + 1;
+    std::vector<math::Vec3> ankle(static_cast<std::size_t>(count));
+    std::vector<float> targetY(static_cast<std::size_t>(count));
+    std::vector<char> planted(static_cast<std::size_t>(count));
+    std::size_t k = 0;
+    for (int i = 0; i < count; ++i) {
+        const double t = t0 + i / referenceHz;
+        while (k + 1 < samples.size() && samples[k + 1].t <= t) {
+            ++k;
+        }
+        const FootSample& a = samples[k];
+        const auto idx = static_cast<std::size_t>(i);
+        planted[idx] = a.planted;
+        if (k + 1 < samples.size() && samples[k + 1].t > a.t) {
+            // Catmull-Rom through the neighbours: a straight line would turn every
+            // sample into a constant-speed chord, which biases the speed gate at low rates.
+            const FootSample& b = samples[k + 1];
+            const float w = static_cast<float>(std::clamp((t - a.t) / (b.t - a.t), 0.0, 1.0));
+            const math::Vec3& before = samples[k > 0 ? k - 1 : k].ankle;
+            const math::Vec3& after = samples[std::min(k + 2, samples.size() - 1)].ankle;
+            ankle[idx] = catmullRom(before, a.ankle, b.ankle, after, w);
+            targetY[idx] = a.targetY + (b.targetY - a.targetY) * w;
+        } else {
+            ankle[idx] = a.ankle;
+            targetY[idx] = a.targetY;
+        }
+    }
+    const double dt = 1.0 / referenceHz;
+    for (int i = 1; i < count; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        if (planted[idx] || targetY[idx] >= liftLimit) {
+            continue;
+        }
+        const int j0 = std::max(0, i - 2);
+        const int j1 = std::min(count - 1, i + 2);
+        const math::Vec3 window = ankle[static_cast<std::size_t>(j1)] - ankle[static_cast<std::size_t>(j0)];
+        const double speed = std::hypot(window.x, window.z) / ((j1 - j0) * dt);
+        if (speed <= speedLimit) {
+            continue;
+        }
+        const math::Vec3 step = ankle[idx] - ankle[idx - 1];
+        out.distance += std::hypot(step.x, step.z);
+        out.seconds += dt;
+    }
+    return out;
+}
+
+// The per-sample formula the QA reports used before the reference-grid metric.
+// It gates each sample on its own chord speed, so its result depends on the
+// sampling rate. Kept only to show that difference in the matrix output.
+inline GroundDrag measureGroundDragPerSample(const std::vector<FootSample>& samples, float liftLimit,
+                                             double speedLimit) {
+    GroundDrag out;
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        const double dt = samples[i].t - samples[i - 1].t;
+        if (dt <= 0.0 || samples[i].planted || samples[i].targetY >= liftLimit) {
+            continue;
+        }
+        const math::Vec3 step = samples[i].ankle - samples[i - 1].ankle;
+        const double horizontal = std::hypot(step.x, step.z);
+        if (horizontal / dt > speedLimit) {
+            out.distance += horizontal;
+            out.seconds += dt;
+        }
+    }
+    return out;
 }
 
 } // namespace bgmedia::qa

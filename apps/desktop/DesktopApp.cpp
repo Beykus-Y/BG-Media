@@ -1,14 +1,21 @@
-﻿#include "DesktopApp.hpp"
+#include "DesktopApp.hpp"
 
 #include "MiniaudioPlayer.hpp"
 #include "TextRenderer.hpp"
 #include "Theme.hpp"
 #include "Ui.hpp"
+#include "UiMetrics.hpp"
 #include "VrmScene.hpp"
 #include "bgmedia/analysis/Analyzer.hpp"
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
+#include "bgmedia/audio/MiniaudioMixDevice.hpp"
+#include "bgmedia/audio/MiniaudioMixLoader.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/choreography/Choreography.hpp"
+#include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixSession.hpp"
+#include "bgmedia/mix/MixSync.hpp"
+#include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
 #include "bgmedia/version.hpp"
 #include "bgmedia/vrm/VrmModel.hpp"
@@ -25,6 +32,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -48,7 +56,17 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using ui::Rect;
 
+// Personality of the idle life layer (breathing phase, look-around rhythm).
+constexpr std::uint32_t kAliveSeed = 0x6d61736cU;
+
 constexpr float kPi = 3.14159265358979323846f;
+
+// Render-to-display latency compensation for the dance pose (about 15 to 30 ms
+// between sampling a frame and it reaching the screen). The dancer is sampled
+// this far ahead of the media clock so it lands on the beat the viewer hears.
+// Applies to the 3D character only: audio, the transport and UI cursors keep
+// the media time.
+constexpr double kDanceVisualLeadSeconds = 0.020;
 
 std::string toUtf8(const std::filesystem::path& path) {
     const std::u8string value = path.u8string();
@@ -221,23 +239,23 @@ struct CompletedLoad {
 };
 
 struct Layout {
-    Rect header{0, 0, 1440, 64};
-    Rect toolbar{24, 76, 1392, 44};
-    Rect timelineCard{24, 124, 1004, 408};
-    Rect choreoCard{24, 544, 1004, 296};
-    Rect right1{1044, 124, 372, 190};
-    Rect right2{1044, 326, 372, 188};
-    Rect right3{1044, 526, 372, 142};
-    Rect right4{1044, 680, 372, 160};
-    Rect footer{0, 856, 1440, 44};
-    Rect empty{24, 124, 1392, 716};
+    Rect header{};
+    Rect toolbar{};
+    Rect timelineCard{};
+    Rect choreoCard{};
+    Rect right1{};
+    Rect right2{};
+    Rect right3{};
+    Rect right4{};
+    Rect footer{};
+    Rect empty{};
 
-    Rect loadButton{24, 80, 116, 40};
-    Rect playButton{148, 80, 44, 40};
-    Rect stopButton{200, 80, 40, 40};
-    Rect rateButton{248, 80, 72, 40};
-    Rect syncMinus{1244, 88, 28, 24};
-    Rect syncPlus{1352, 88, 28, 24};
+    Rect loadButton{};
+    Rect playButton{};
+    Rect stopButton{};
+    Rect rateButton{};
+    Rect syncMinus{};
+    Rect syncPlus{};
     Rect emptyLoad{};
 
     Rect motionSmooth{};
@@ -287,6 +305,65 @@ struct Layout {
     Rect plot{};
 };
 
+// BG Mix screen geometry. It is rebuilt every frame from the logical canvas,
+// so it follows window size, aspect ratio and UI scale.
+struct MixLayout {
+    Rect queueCard{};
+    Rect deckA{};
+    Rect deckB{};
+    Rect planCard{};
+    Rect controlCard{};
+    Rect addButton{};
+    Rect clearButton{};
+    Rect playButton{};
+    Rect stopButton{};
+    Rect nextButton{};
+    Rect cancelButton{};
+    Rect previewButton{};
+    Rect openDeckA{};
+    Rect openDeckB{};
+    Rect adaptiveChip{};
+    Rect tempoRampChip{};
+    Rect autoQueueChip{};
+    Rect typePrev{};
+    Rect typeNext{};
+    Rect durationMinus{};
+    Rect durationPlus{};
+    Rect modePrev{};
+    Rect modeNext{};
+    Rect rampModePrev{};
+    Rect rampModeNext{};
+    Rect rampBarsPrev{};
+    Rect rampBarsNext{};
+    Rect curvePrev{};
+    Rect curveNext{};
+    Rect maxDeltaPrev{};
+    Rect maxDeltaNext{};
+    Rect rampMinus{};
+    Rect rampPlus{};
+    Rect pitchChip{};
+    Rect bassChip{};
+    Rect qualityStretchChip{};
+    Rect timeline{};
+    Rect monitor{};
+    Rect uiScaleChip{};
+    Rect qualityChip{};
+    Rect fullscreenChip{};
+    Rect deckGainMinus[2]{};
+    Rect deckGainPlus[2]{};
+    Rect deckWave[2]{};
+    Rect jumpTransitionButton{};
+    Rect queueRow[8]{};
+    Rect queueRemove[8]{};
+};
+
+enum class Module {
+    Beat,
+    Motion,
+    Vrm,
+    Mix
+};
+
 enum class AppState {
     Empty,
     Loading,
@@ -301,7 +378,8 @@ enum class CharacterView {
 
 enum class DialogKind {
     Audio,
-    Vrm
+    Vrm,
+    Mix
 };
 
 std::vector<WaveformPeak> buildHiresWaveform(const PcmBuffer& pcm, double& peaksPerSecond) {
@@ -467,12 +545,52 @@ struct DesktopApp::Impl {
     // ---------------------------------------------------------------------
     DesktopOptions options;
     Layout layout;
+    MixLayout mixLayout;
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
     std::unique_ptr<TextRenderer> text;
     MiniaudioPlayer player;
     PlaybackClock clock;
     AnalysisConfig config;
+
+    // ---------------------------------------------------------------
+    // BG Mix 0.1
+    // ---------------------------------------------------------------
+    std::unique_ptr<mix::MixEngine> mixEngine;
+    std::unique_ptr<mix::MixSession> mixSession;
+    std::unique_ptr<MiniaudioMixDevice> mixDevice;
+    Module module = Module::Beat;
+    Rect modulePills[4]{};
+    std::string mixError;
+    bool mixPlanDetail = false;
+    float mixDeckGain[2] = {1.0f, 1.0f};
+    int mixScrubbingDeck = -1;
+    double mixScrubTime = 0.0;
+    std::vector<float> mixSilentPump;
+
+    // ---------------------------------------------------------------
+    // Display / high-DPI state
+    // ---------------------------------------------------------------
+    int outputWidth = 1440;
+    int outputHeight = 900;
+    float uiScale = 1.0f;
+    float autoUiScale = 1.0f;
+    float uiScaleSetting = 0.0f;   // 0 = automatic
+    float requestedUiScale = 1.0f;
+    bool uiScaleLimited = false;
+    float canvasW = 1440.0f;
+    float canvasH = 900.0f;
+    int vrmQuality = 100;          // percent of the stage size
+    bool maximized = false;
+    int windowedW = 0;
+    int windowedH = 0;
+    bool restoreWindowedOnLeave = false;
+    int savedWindowW = 0;
+    int savedWindowH = 0;
+    bool savedMaximized = false;
+    std::filesystem::path settingsPath;
+    bool settingsDirty = false;
+    double settingsSavedAt = 0.0;
 
     VrmScene vrm;
     CharacterView characterView = CharacterView::Robot2D;
@@ -552,11 +670,15 @@ struct DesktopApp::Impl {
 
     std::mutex dialogMutex;
     std::string dialogPath;
+    std::vector<std::string> dialogPaths;
     bool dialogPending = false;
     std::string dialogError;
 
     ~Impl() {
         stopWorker();
+        mixDevice.reset();
+        mixSession.reset();
+        mixEngine.reset();
         if (spectrogramTexture) {
             SDL_DestroyTexture(spectrogramTexture);
         }
@@ -573,6 +695,237 @@ struct DesktopApp::Impl {
     }
 
     // ---------------------------------------------------------------------
+    // Preferences, high-DPI metrics and module switching
+    // ---------------------------------------------------------------------
+    void loadSettings() {
+        if (settingsPath.empty()) {
+            return;
+        }
+        std::ifstream file(settingsPath);
+        if (!file) {
+            return;
+        }
+        std::string line;
+        while (std::getline(file, line)) {
+            const auto eq = line.find('=');
+            if (eq == std::string::npos) {
+                continue;
+            }
+            const std::string key = line.substr(0, eq);
+            const std::string value = line.substr(eq + 1);
+            try {
+                if (key == "window_w") {
+                    savedWindowW = std::max(320, std::stoi(value));
+                } else if (key == "window_h") {
+                    savedWindowH = std::max(240, std::stoi(value));
+                } else if (key == "maximized") {
+                    savedMaximized = std::stoi(value) != 0;
+                } else if (key == "fullscreen") {
+                    options.fullscreen = std::stoi(value) != 0;
+                } else if (key == "ui_scale") {
+                    const double v = std::stod(value);
+                    uiScaleSetting = v >= 1.0 ? static_cast<float>(v) : 0.0f;
+                } else if (key == "vrm_quality") {
+                    vrmQuality = std::clamp(std::stoi(value), 50, 100);
+                }
+            } catch (...) {
+                // A malformed preference must never stop the application.
+            }
+        }
+    }
+
+    void saveSettings() {
+        if (settingsPath.empty() || !window) {
+            return;
+        }
+        int w = 0;
+        int h = 0;
+        SDL_GetWindowSize(window, &w, &h);
+        if (fullscreen && windowedW > 0 && windowedH > 0) {
+            // Persist the windowed geometry, not the fullscreen display size;
+            // otherwise leaving fullscreen on the next run restores a
+            // screen-sized window.
+            w = windowedW;
+            h = windowedH;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(settingsPath.parent_path(), ec);
+        std::ofstream file(settingsPath, std::ios::trunc);
+        if (!file) {
+            return;
+        }
+        file << "window_w=" << w << "\n";
+        file << "window_h=" << h << "\n";
+        file << "maximized=" << (maximized ? 1 : 0) << "\n";
+        file << "fullscreen=" << (fullscreen ? 1 : 0) << "\n";
+        file << "ui_scale=" << (uiScaleSetting > 0.0f ? uiScaleSetting : 0.0f)
+             << "\n";
+        file << "vrm_quality=" << vrmQuality << "\n";
+        settingsDirty = false;
+        settingsSavedAt = animationTime;
+    }
+
+    // Reads the real drawable size, chooses a logical scale and applies it to
+    // both SDL_Renderer and the glyph atlas. Layout then works in canvas units.
+    void refreshRenderMetrics() {
+        if (!renderer || !window) {
+            return;
+        }
+        int w = 0;
+        int h = 0;
+        if (!SDL_GetRenderOutputSize(renderer, &w, &h) || w <= 0 || h <= 0) {
+            SDL_GetWindowSize(window, &w, &h);
+        }
+        w = std::max(320, w);
+        h = std::max(240, h);
+        float dpi = SDL_GetWindowDisplayScale(window);
+        if (!(dpi > 0.0f)) {
+            dpi = 1.0f;
+        }
+        const float resolutionScale =
+            std::min(static_cast<float>(w) / 1600.0f,
+                     static_cast<float>(h) / 1000.0f);
+        autoUiScale = std::clamp(std::max(dpi, resolutionScale), 1.0f, 2.5f);
+        const float requested =
+            uiScaleSetting > 0.0f ? uiScaleSetting : autoUiScale;
+        // Keep enough logical pixels for the widest layout (queue + decks +
+        // plan/transport). Without this clamp a 1280-point window at 200% would
+        // leave only 640 logical pixels and push the transport off-screen.
+        requestedUiScale = requested;
+        uiScale = effectiveUiScale(static_cast<float>(w), static_cast<float>(h),
+                                   requested);
+        uiScaleLimited = requested > uiScale + 0.005f;
+        outputWidth = w;
+        outputHeight = h;
+        canvasW = static_cast<float>(w) / uiScale;
+        canvasH = static_cast<float>(h) / uiScale;
+        SDL_SetRenderScale(renderer, uiScale, uiScale);
+        if (text) {
+            text->setScale(uiScale);
+        }
+        SDL_SetWindowMinimumSize(window, 1280, 860);
+        settingsDirty = true;
+    }
+
+    void toggleFullscreen(bool enabled) {
+        if (!window) {
+            return;
+        }
+        if (enabled && !fullscreen) {
+            int w = 0;
+            int h = 0;
+            SDL_GetWindowSize(window, &w, &h);
+            if (w > 0 && h > 0) {
+                windowedW = w;
+                windowedH = h;
+            }
+        }
+        const bool wasFullscreen = fullscreen;
+        fullscreen = enabled;
+        if (!SDL_SetWindowFullscreen(window, enabled)) {
+            fullscreen = wasFullscreen;
+            showToast(std::string("Fullscreen failed: ") + SDL_GetError());
+            return;
+        }
+        if (!enabled && wasFullscreen && windowedW > 0 && windowedH > 0) {
+            // SDL normally restores the previous geometry; enforce it so a
+            // display change while fullscreen cannot leave a tiny window. Some
+            // platforms apply the mode change asynchronously, so the leave
+            // event repeats this once the window is windowed again.
+            restoreWindowedOnLeave = true;
+            SDL_SetWindowSize(window, windowedW, windowedH);
+            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED,
+                                  SDL_WINDOWPOS_CENTERED);
+        }
+        refreshRenderMetrics();
+        computeLayout();
+        settingsDirty = true;
+        showToast(enabled ? "Fullscreen  ·  F11 or Esc for windowed"
+                          : "Windowed  ·  F11 for fullscreen");
+    }
+
+    void cycleUiScale() {
+        static constexpr float kChoices[] = {0.0f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+        int index = 0;
+        for (int i = 0; i < static_cast<int>(std::size(kChoices)); ++i) {
+            if (std::abs(kChoices[i] - uiScaleSetting) < 0.01f) {
+                index = i + 1;
+                break;
+            }
+        }
+        uiScaleSetting = kChoices[index % static_cast<int>(std::size(kChoices))];
+        refreshRenderMetrics();
+        computeLayout();
+        settingsDirty = true;
+        std::string message =
+            uiScaleSetting <= 0.0f
+                ? "UI scale: automatic"
+                : "UI scale: " + formatNumber(uiScaleSetting * 100.0, 0) + "%";
+        if (uiScaleLimited) {
+            message += " (limited to " + formatNumber(uiScale * 100.0, 0) +
+                       "% so the controls stay on screen)";
+        }
+        showToast(message);
+    }
+
+    [[nodiscard]] std::string uiScaleCaption() const {
+        const int effective =
+            static_cast<int>(std::lround(uiScale * 100.0f));
+        if (uiScaleSetting <= 0.0f) {
+            return uiScaleLimited ? "UI AUTO / " + std::to_string(effective) + "%"
+                                  : "UI AUTO";
+        }
+        std::string caption =
+            "UI " +
+            formatNumber(uiScaleSetting * 100.0, 0) + "%";
+        if (uiScaleLimited) {
+            caption += " / " + std::to_string(effective) + "%";
+        }
+        return caption;
+    }
+
+    void cycleVrmQuality() {
+        static constexpr int kChoices[] = {100, 75, 50};
+        int index = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (kChoices[i] == vrmQuality) {
+                index = (i + 1) % 3;
+                break;
+            }
+        }
+        vrmQuality = kChoices[index];
+        settingsDirty = true;
+        showToast("3D quality: " + std::to_string(vrmQuality) + "%");
+    }
+
+    void setModule(Module next) {
+        if (module == next) {
+            return;
+        }
+        if (module == Module::Mix && mixSession) {
+            mixSession->pause();
+        }
+        module = next;
+        switch (next) {
+        case Module::Beat:
+        case Module::Motion:
+            if (characterView == CharacterView::Vrm3D) {
+                setCharacterView(CharacterView::Robot2D, false);
+            }
+            break;
+        case Module::Vrm:
+            setCharacterView(CharacterView::Vrm3D, false);
+            break;
+        case Module::Mix:
+            if (playing()) {
+                player.pause();
+            }
+            break;
+        }
+        computeLayout();
+    }
+
+    // ---------------------------------------------------------------------
     // Setup
     // ---------------------------------------------------------------------
     bool initialize() {
@@ -580,13 +933,32 @@ struct DesktopApp::Impl {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
             return false;
         }
-        window = SDL_CreateWindow("BG Media", 1440, 900,
+
+        // Preferences live in the per-user SDL pref directory. They are read
+        // before the window so the previous size and fullscreen state restore
+        // without a visible jump.
+        {
+            char* pref = SDL_GetPrefPath("BGMedia", "BGMedia");
+            if (pref) {
+                settingsPath = fromUtf8(pref) / "desktop.ini";
+                SDL_free(pref);
+            }
+            loadSettings();
+        }
+
+        int windowW = options.windowWidth > 0 ? options.windowWidth
+                                              : (savedWindowW > 0 ? savedWindowW : 1440);
+        int windowH = options.windowHeight > 0 ? options.windowHeight
+                                               : (savedWindowH > 0 ? savedWindowH : 900);
+        windowW = std::max(1280, windowW);
+        windowH = std::max(860, windowH);
+        window = SDL_CreateWindow("BG Media", windowW, windowH,
                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (!window) {
             std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
             return false;
         }
-        SDL_SetWindowMinimumSize(window, 1100, 700);
+        SDL_SetWindowMinimumSize(window, 1280, 860);
         SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
         renderer = SDL_CreateRenderer(window, nullptr);
@@ -597,10 +969,19 @@ struct DesktopApp::Impl {
             std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
             return false;
         }
-        SDL_SetRenderLogicalPresentation(renderer, 1440, 900,
-                                         SDL_LOGICAL_PRESENTATION_LETTERBOX);
+        // No letterboxed logical presentation: the UI is laid out directly in
+        // logical canvas units and SDL_RenderScale maps them 1:1 onto the
+        // physical drawable. This is what keeps 2560x1440 and 3840x2160 sharp.
         SDL_SetRenderVSync(renderer, 1);
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+        if (options.uiScale > 0.0f) {
+            uiScaleSetting = std::clamp(options.uiScale, 1.0f, kUiScaleMax);
+        }
+        if (options.vrmQuality > 0) {
+            vrmQuality = std::clamp(options.vrmQuality, 50, 100);
+        }
+        refreshRenderMetrics();
 
         const char* base = SDL_GetBasePath();
         // SDL_GetBasePath() returns a cached internal string and must not be
@@ -615,6 +996,7 @@ struct DesktopApp::Impl {
             std::fprintf(stderr, "font setup failed: %s\n", fontError.c_str());
             return false;
         }
+        refreshRenderMetrics();
 
         if (!options.cacheDirectory.empty()) {
             cacheDirectory = options.cacheDirectory;
@@ -629,6 +1011,33 @@ struct DesktopApp::Impl {
         }
         std::error_code ec;
         std::filesystem::create_directories(cacheDirectory, ec);
+
+        // BG Mix 0.1: one prepared-audio engine, one session worker and one
+        // output device. The mixer stays silent until the BG MIX screen starts
+        // a track; the analysis player is a separate, untouched path.
+        mixEngine = std::make_unique<mix::MixEngine>(48000);
+        mix::MixPlanner planner;
+        mixSession = std::make_unique<mix::MixSession>(
+            *mixEngine,
+            [this](const std::filesystem::path& path, mix::PreparedMixTrack& out,
+                   std::string& error,
+                   std::function<void(float, std::string_view)> progress) {
+                MixTrackLoadOptions loadOptions;
+                loadOptions.cacheDirectory = cacheDirectory;
+                loadOptions.analysis = config;
+                loadOptions.useCache = !options.noCache;
+                loadOptions.targetSampleRate = 48000;
+                return prepareMixTrack(path, loadOptions, out, error, progress);
+            },
+            planner);
+        if (!options.noAudio) {
+            mixDevice = std::make_unique<MiniaudioMixDevice>(*mixEngine);
+            std::string mixDeviceError;
+            if (!mixDevice->open(48000, &mixDeviceError)) {
+                mixError = mixDeviceError;
+                mixDevice.reset();
+            }
+        }
 
         filters = {
             SDL_DialogFileFilter{"Audio files", "*.wav;*.mp3;*.flac"},
@@ -663,13 +1072,41 @@ struct DesktopApp::Impl {
                                  false);
             }
         }
+        if (options.startInMix) {
+            module = Module::Mix;
+        } else if (options.startIn3D && options.dance.empty() &&
+                   options.dancePlan.empty() && !options.vrmDemo &&
+                   options.motionLabBpm <= 0 && !options.presentation) {
+            // --vrm / --3d: the header selection must match the visible screen.
+            module = Module::Vrm;
+        }
 
         SDL_ShowWindow(window);
+        if (options.fullscreen) {
+            toggleFullscreen(true);
+        } else if (savedMaximized && options.windowWidth == 0) {
+            SDL_MaximizeWindow(window);
+            maximized = true;
+            refreshRenderMetrics();
+        } else if (options.captureFile.empty() && options.windowWidth == 0 &&
+                   savedWindowW == 0 && savedWindowH == 0) {
+            // First run without explicit geometry: start maximized so the
+            // layout fills the display instead of a small 1440x900 window.
+            SDL_MaximizeWindow(window);
+            maximized = true;
+            refreshRenderMetrics();
+        }
+        refreshRenderMetrics();
+        computeLayout();
         return true;
     }
 
     void shutdown() {
+        saveSettings();
         stopWorker();
+        mixDevice.reset();
+        mixSession.reset();
+        mixEngine.reset();
         player.close();
         vrm.shutdown();
         if (spectrogramTexture) {
@@ -1243,15 +1680,48 @@ struct DesktopApp::Impl {
         if (!vrm.ready()) {
             return;
         }
+        // Dynamic offscreen target: the stage's physical size times the 3D
+        // quality setting, capped at 3840x2160 so a 4K readback never exceeds
+        // one 4K frame. The renderer only reallocates when the size changes.
+        {
+            const float quality = static_cast<float>(vrmQuality) / 100.0f;
+            int targetW = std::clamp(
+                static_cast<int>(std::lround(layout.stage3D.w * uiScale * quality)),
+                256, 3840);
+            int targetH = std::clamp(
+                static_cast<int>(std::lround(layout.stage3D.h * uiScale * quality)),
+                256, 2160);
+            const double cap = 3840.0 * 2160.0;
+            if (static_cast<double>(targetW) * targetH > cap) {
+                const double factor = std::sqrt(cap / (static_cast<double>(targetW) * targetH));
+                targetW = std::max(256, static_cast<int>(targetW * factor));
+                targetH = std::max(256, static_cast<int>(targetH * factor));
+            }
+            vrm.setRenderSize(targetW, targetH);
+        }
         vrm.renderSettings().modelScale =
             std::clamp(vrm.renderSettings().modelScale, 0.25f, 3.0f);
         vrm.renderSettings().modelOffset.y =
             std::clamp(vrm.renderSettings().modelOffset.y, -0.5f, 0.5f);
         if (danceUi()) {
-            const double danceNow = danceTime();
+            const double danceNow = danceVisualTime();
             updateDance();
+            // The foot order of the pause hand-over is chosen once, from the pose the
+            // dancer stopped in, and kept until the blend is fully back to the dance.
+            const float idleMix = danceIdle.mix(animationTime);
+            // The Idle stance is anchored at the same pose's root, so on resume the
+            // advancing dance root does not drag the planted Idle feet along.
+            if (idleMix <= 0.0f) {
+                danceIdleFirstFoot = -1;
+            } else if (danceIdleFirstFoot < 0) {
+                danceIdleFirstFoot = motion::airborneFootFirst(danceFrame.pose);
+                danceIdleAnchor = danceFrame.pose;
+            }
+            const motion::ClipPose pose =
+                composeDancePose(danceFrame.pose, animationTime, idleMix,
+                                 danceFrame.idleWeight, danceIdleFirstFoot);
             std::string danceError;
-            if (!vrm.renderClip(danceFrame.pose, danceNow, vrmCamera, vrm.renderSettings(),
+            if (!vrm.renderClip(pose, danceNow, vrmCamera, vrm.renderSettings(),
                                 &danceError)) {
                 vrmFrameError = danceError;
             } else {
@@ -1275,8 +1745,16 @@ struct DesktopApp::Impl {
     // ---------------------------------------------------------------------
     motion::DancePlayer dance;
     motion::DanceFrame danceFrame;
+    // Dance <-> Idle crossfade for a stopped transport (wall-clock driven).
+    motion::IdleCrossfade danceIdle;
+    int danceIdleFirstFoot = -1;  // latched foot order of the pause hand-over
+    motion::ClipPose danceIdleAnchor;  // latched pose whose root places the Idle stance
     bool useClips = true;
     double danceLabTime = 0.0;
+    // Set once the user picks a dance mode or a style this session. Until then a
+    // loaded track starts in Auto (the out-of-box default), and the choice is not
+    // persisted, so every launch begins that way.
+    bool danceModeChosen = false;
     bool danceLabRunning = true;
     int danceLabBpm = 100;
     bool musicDebug = false;
@@ -1295,10 +1773,90 @@ struct DesktopApp::Impl {
     };
     std::deque<TrailPoint> footTrail[2];
     std::deque<std::pair<float, float>> rootTrail;
+    // Live-mix follow: the master deck id and tempo last installed into the
+    // dance grid, so a handover or a tempo ramp re-anchors exactly once.
+    std::uint64_t mixDanceTrackId = 0;
+    // DancePlayer keeps a raw analysis pointer, so the mix follow adapter must
+    // own the analysis for as long as it is installed.
+    std::shared_ptr<const AnalysisResult> mixDanceAnalysis;
 
     [[nodiscard]] bool danceUi() const { return useClips && dance.ready(); }
+    [[nodiscard]] mix::LiveMixTempo liveMixTempoNow() const {
+        return mixSession ? mix::liveMixTempo(mixSession->engine().snapshot())
+                          : mix::LiveMixTempo{};
+    }
+    [[nodiscard]] bool mixDrivesDance() const {
+        if (track) {
+            return false;
+        }
+        const mix::LiveMixTempo live = liveMixTempoNow();
+        return live.valid && live.playing;
+    }
     [[nodiscard]] double danceTime() const {
-        return track ? currentPosition() : danceLabTime;
+        if (track) {
+            return currentPosition();
+        }
+        if (mixSession) {
+            const mix::LiveMixTempo live = liveMixTempoNow();
+            if (live.valid && live.playing) {
+                // Follow the audible master position, not the raw deck cursor.
+                return live.positionSeconds;
+            }
+        }
+        return danceLabTime;
+    }
+    // Dance time for the character's pose on this frame: the media clock plus the
+    // render latency lead. Scheduling and the transport keep using danceTime(). A capture
+    // (still or offline render) shows the exact media time, so it takes no lead.
+    [[nodiscard]] double danceVisualTime() const {
+        return track && !captureMode ? danceTime() + kDanceVisualLeadSeconds : danceTime();
+    }
+
+    // Whether the dance transport is moving. Scrubbing and capture drive the dance
+    // from the position, so they never count as stopped.
+    [[nodiscard]] bool danceTransportRunning() const {
+        if (!track) {
+            // A live BG Mix drives the dance clock; otherwise the Motion Lab
+            // clock only advances while Motion Lab runs.
+            if (mixDrivesDance()) {
+                return true;
+            }
+            return captureMode || danceLabRunning;
+        }
+        return captureMode || scrubbing || playing();
+    }
+
+    // The pose the 3D character shows this frame. The dance is frozen while the
+    // transport is stopped; once it has been stopped for a moment the pose eases
+    // to the Idle clip, sampled on wall time. The alive layer (breathing, weight
+    // shift, head look-around) comes last, with its energy taken from the blended
+    // pose: full strength at idle, reduced while dancing.
+    // `scheduledIdle` is the Idle clip's share in the dance pose itself (Idle selected,
+    // a one-shot's return, an Auto silence segment): that pose already breathes too.
+    [[nodiscard]] motion::ClipPose composeDancePose(const motion::ClipPose& dancePose,
+                                                    double wallNow, float idleMix,
+                                                    float scheduledIdle,
+                                                    int firstFoot) const {
+        motion::ClipPose pose = dancePose;
+        float bodyWeight = 1.0f - std::clamp(scheduledIdle, 0.0f, 1.0f);
+        if (idleMix > 0.0f) {
+            const motion::HumanoidClip* idle =
+                dance.library().forStyle(motion::DanceStyle::Idle);
+            motion::ClipPose idlePose = motion::neutralClipPose();
+            if (idle && idle->bpm > 0.0) {
+                // Idle has a wall-clock time axis (tempoSync false): one beat per 60 / bpm s.
+                idlePose = motion::sampleClip(*idle, wallNow * idle->bpm / 60.0);
+            }
+            // The dancer keeps the dance root and the feet are handed over one at a
+            // time, so a travelled dancer does not glide back to the Idle origin.
+            pose = motion::blendToIdleKeepingFeet(dancePose, idlePose, idleMix, firstFoot,
+                                                  firstFoot >= 0 ? &danceIdleAnchor : nullptr);
+            // Idle already breathes and shifts its weight, so the alive layer's
+            // breathing and weight shift fade out as it takes over. The head look stays.
+            bodyWeight *= 1.0f - std::clamp(idleMix, 0.0f, 1.0f);
+        }
+        motion::applyAlive(pose, wallNow, pose.energy, kAliveSeed, 1.0f, bodyWeight, 1.0f);
+        return pose;
     }
 
     [[nodiscard]] motion::BeatClock danceGrid() const {
@@ -1307,6 +1865,28 @@ struct DesktopApp::Impl {
                 return motion::BeatClock::constant(motionLabBpm, 0.45, 4);
             }
             return motion::BeatClock::fromAnalysis(track->analysis);
+        }
+        // With no video track, a live BG Mix is the musical source. Build a
+        // constant grid from the master deck's audible tempo and phase; BG
+        // Motion 3.x itself is unchanged, it only receives a different clock.
+        if (mixSession) {
+            const mix::LiveMixTempo live = liveMixTempoNow();
+            if (live.valid && live.playing && live.bpm > 0.0) {
+                // The dance is sampled at the source-media position, so the
+                // analysed source-time grid stays correct at any deck rate
+                // and keeps the real beat offset/downbeats. Only fall back to
+                // a constant clock when no analysis is available yet.
+                if (mixDanceAnalysis && live.trackId == mixDanceTrackId) {
+                    return motion::BeatClock::fromAnalysis(*mixDanceAnalysis);
+                }
+                // The dance is sampled at the source-media position, so the
+                // clock must use the source-time beat period. The live BPM is
+                // sourceBpm * rate and would apply the rate twice.
+                const double period = live.beatPeriodSeconds;
+                const double firstBeat =
+                    live.positionSeconds - live.beatPhase * period;
+                return motion::BeatClock::constant(live.sourceBpm, firstBeat, 4);
+            }
         }
         return motion::BeatClock::constant(danceLabBpm, 0.0, 4);
     }
@@ -1320,6 +1900,11 @@ struct DesktopApp::Impl {
         // away the downbeat confidence and the real accent map.
         if (!track || motionLabBpm > 0) {
             dance.setGrid(danceGrid(), danceTime());
+        }
+        // Default to Auto for a track the user has not steered in this session.
+        // setMode(Auto) builds the plan from the analysis set above.
+        if (track && !danceModeChosen && danceUi() && dance.mode() != motion::DanceMode::Auto) {
+            dance.setMode(motion::DanceMode::Auto, danceTime());
         }
         if (dance.mode() == motion::DanceMode::Auto && track) {
             std::fprintf(stderr, "BG Motion Auto plan:\n%s",
@@ -1435,6 +2020,10 @@ struct DesktopApp::Impl {
         if (!useClips) {
             return;
         }
+        if (!options.dancePlan.empty() || !options.dance.empty()) {
+            // A dance named on the command line is an explicit choice.
+            danceModeChosen = true;
+        }
         if (!options.dancePlan.empty()) {
             std::vector<motion::DanceStyle> styles;
             std::stringstream list(options.dancePlan);
@@ -1466,6 +2055,7 @@ struct DesktopApp::Impl {
             return;
         }
         generatedDanceIndex = -1;
+        danceModeChosen = true;
         dance.select(style, danceTime());
         const motion::HumanoidClip* clip = dance.library().forStyle(style);
         showToast(std::string("Dance: ") + (clip ? clip->name : motion::styleName(style)) +
@@ -1497,6 +2087,7 @@ struct DesktopApp::Impl {
             showToast("No procedural dances generated");
             return;
         }
+        danceModeChosen = true;
         generatedDanceIndex =
             (generatedDanceIndex + 1) % static_cast<int>(generated.size() + 1);
         if (generatedDanceIndex == static_cast<int>(generated.size())) {
@@ -1559,6 +2150,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.setMode(mode, danceTime());
         if (mode == motion::DanceMode::Auto) {
             showToast(dance.autoNote().empty() ? "Auto dance" : dance.autoNote());
@@ -1586,6 +2178,7 @@ struct DesktopApp::Impl {
         if (!danceUi()) {
             return;
         }
+        danceModeChosen = true;
         dance.startTestDance(danceTime());
         showToast("TEST DANCE: Groove > Hip-Hop > Side Step > Energetic");
     }
@@ -1601,8 +2194,31 @@ struct DesktopApp::Impl {
         }
     }
 
+    void refreshMixDanceIfNeeded() {
+        if (track || !mixSession) {
+            return;
+        }
+        const mix::LiveMixTempo live = liveMixTempoNow();
+        if (!live.valid || !live.playing) {
+            return;
+        }
+        // Re-install only when the musical master changes, not when its live
+        // rate changes: the analysed source-time grid stays valid at any rate,
+        // and setAnalysis() rebuilds the Auto plan and restarts its blend.
+        if (live.trackId == mixDanceTrackId && mixDanceAnalysis) {
+            return;
+        }
+        mixDanceTrackId = live.trackId;
+        mixDanceAnalysis = mixSession->deckAnalysis(live.master);
+        if (mixDanceAnalysis) {
+            dance.setAnalysis(mixDanceAnalysis.get(), danceTime());
+        }
+        dance.setGrid(danceGrid(), danceTime());
+    }
+
     void updateDance() {
-        danceFrame = dance.update(danceTime());
+        refreshMixDanceIfNeeded();
+        danceFrame = dance.update(danceVisualTime());
     }
 
     void recordDanceTrails() {
@@ -1660,6 +2276,41 @@ struct DesktopApp::Impl {
                                false);
     }
 
+    void loadStartupMixTracks() {
+        if (!mixSession) {
+            return;
+        }
+        for (const auto& path : options.mixTracks) {
+            mixSession->addTrack(path);
+        }
+    }
+
+    // Headless captures and machines where the output device failed to open
+    // still need the engine clock to advance and snapshots to publish.
+    void pumpMixSilent(double seconds) {
+        if (!mixEngine) {
+            return;
+        }
+        const double clamped = std::clamp(seconds, 0.0, 0.05);
+        const int frames =
+            std::clamp(static_cast<int>(clamped * 48000.0), 64, 2048);
+        mixSilentPump.resize(static_cast<std::size_t>(frames) * 2, 0.0f);
+        mixEngine->render(mixSilentPump.data(), static_cast<std::size_t>(frames));
+    }
+
+    void openMixFileDialog() {
+        if (!window) {
+            return;
+        }
+        dialogKind = DialogKind::Mix;
+        dialogStartLocation = toUtf8(std::filesystem::current_path());
+        SDL_ShowOpenFileDialog(&Impl::dialogCallback, this, window, filters.data(),
+                               static_cast<int>(filters.size()),
+                               dialogStartLocation.empty() ? nullptr
+                                                           : dialogStartLocation.c_str(),
+                               true);
+    }
+
     void openVrmFileDialog() {
         if (!window) {
             return;
@@ -1681,7 +2332,11 @@ struct DesktopApp::Impl {
                                        int) {
         auto* self = static_cast<Impl*>(userdata);
         std::lock_guard lock(self->dialogMutex);
+        self->dialogPaths.clear();
         if (filelist && filelist[0]) {
+            for (int i = 0; filelist[i]; ++i) {
+                self->dialogPaths.emplace_back(filelist[i]);
+            }
             self->dialogPath = filelist[0];
             self->dialogPending = true;
         } else if (!filelist) {
@@ -1691,13 +2346,16 @@ struct DesktopApp::Impl {
 
     void pollDialog() {
         std::string path;
+        std::vector<std::string> paths;
         std::string error;
         {
             std::lock_guard lock(dialogMutex);
             if (dialogPending) {
                 path = std::move(dialogPath);
+                paths = std::move(dialogPaths);
                 dialogPending = false;
                 dialogPath.clear();
+                dialogPaths.clear();
             }
             if (!dialogError.empty()) {
                 error = std::move(dialogError);
@@ -1707,10 +2365,35 @@ struct DesktopApp::Impl {
         if (!error.empty()) {
             showToast("File dialog: " + error);
         }
-        if (!path.empty()) {
+        if (!paths.empty()) {
+            if (dialogKind == DialogKind::Vrm) {
+                if (loadVrmModel(fromUtf8(paths.front().c_str()), true)) {
+                    setCharacterView(CharacterView::Vrm3D, false);
+                }
+            } else if (dialogKind == DialogKind::Mix && mixSession) {
+                std::vector<std::filesystem::path> queue;
+                queue.reserve(paths.size());
+                for (const std::string& value : paths) {
+                    const std::filesystem::path file = fromUtf8(value.c_str());
+                    if (isAudioExtension(file)) {
+                        queue.push_back(file);
+                    }
+                }
+                if (!queue.empty()) {
+                    mixSession->addTracks(queue);
+                    showToast(std::to_string(queue.size()) + " track(s) queued");
+                }
+            } else if (!path.empty()) {
+                startLoad(fromUtf8(path.c_str()));
+            }
+        } else if (!path.empty()) {
             if (dialogKind == DialogKind::Vrm) {
                 if (loadVrmModel(fromUtf8(path.c_str()), true)) {
                     setCharacterView(CharacterView::Vrm3D, false);
+                }
+            } else if (dialogKind == DialogKind::Mix && mixSession) {
+                if (isAudioExtension(fromUtf8(path.c_str()))) {
+                    mixSession->addTrack(fromUtf8(path.c_str()));
                 }
             } else {
                 startLoad(fromUtf8(path.c_str()));
@@ -1886,6 +2569,24 @@ struct DesktopApp::Impl {
         (void)clock.update(player.snapshot());
     }
 
+    void toggleMixPlay() {
+        if (!mixSession) {
+            return;
+        }
+        const mix::MixSessionSnapshot snap = mixSession->snapshot();
+        const bool anyPlaying = snap.engine.decks[0].playing ||
+                                snap.engine.decks[1].playing;
+        if (!snap.engine.paused && anyPlaying) {
+            mixSession->pause();
+        } else {
+            if (!mixDevice && !options.noAudio) {
+                showToast(mixError.empty() ? "Mix audio device unavailable"
+                                           : mixError);
+            }
+            mixSession->play();
+        }
+    }
+
     void stopPlayback() {
         if (!track) {
             if (syntheticDemo) {
@@ -2026,6 +2727,44 @@ struct DesktopApp::Impl {
         case SDL_EVENT_QUIT:
             running = false;
             break;
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            refreshRenderMetrics();
+            computeLayout();
+            break;
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+            // The OS owns the transition; mirror its state instead of calling
+            // SDL_SetWindowFullscreen() again from the event handler.
+            fullscreen = true;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+            fullscreen = false;
+            if (restoreWindowedOnLeave && windowedW > 0 && windowedH > 0) {
+                SDL_SetWindowSize(window, windowedW, windowedH);
+                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED,
+                                      SDL_WINDOWPOS_CENTERED);
+                restoreWindowedOnLeave = false;
+            }
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+            maximized = true;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
+        case SDL_EVENT_WINDOW_RESTORED:
+            maximized = false;
+            refreshRenderMetrics();
+            computeLayout();
+            settingsDirty = true;
+            break;
         case SDL_EVENT_DROP_FILE:
             if (event.drop.data) {
                 const std::filesystem::path dropped = fromUtf8(event.drop.data);
@@ -2033,6 +2772,10 @@ struct DesktopApp::Impl {
                     if (loadVrmModel(dropped, true)) {
                         setCharacterView(CharacterView::Vrm3D, false);
                     }
+                } else if (module == Module::Mix && isAudioExtension(dropped) &&
+                           mixSession) {
+                    mixSession->addTrack(dropped);
+                    showToast("Queued " + toUtf8(dropped.filename()));
                 } else {
                     startLoad(dropped);
                 }
@@ -2059,6 +2802,27 @@ struct DesktopApp::Impl {
             }
             if (scrubbing) {
                 scrubPosition = xToTime(static_cast<float>(mouseX), layout.plot);
+            }
+            if (module == Module::Mix && mixScrubbingDeck >= 0 && mixSession) {
+                const auto snap = mixSession->snapshot();
+                if (snap.engine.phase == mix::TransitionPhase::Idle) {
+                    const int i = mixScrubbingDeck;
+                    const auto deckId = i == 0 ? mix::DeckId::A : mix::DeckId::B;
+                    const auto& dStatus = snap.engine.decks[i];
+                    if (dStatus.loaded && dStatus.durationSeconds > 0.0) {
+                        const float relX = std::clamp(
+                            (static_cast<float>(mouseX) - mixLayout.deckWave[i].x) /
+                                std::max(1.0f, mixLayout.deckWave[i].w),
+                            0.0f, 1.0f);
+                        const double targetSeconds =
+                            static_cast<double>(relX) * dStatus.durationSeconds;
+                        mixScrubTime = targetSeconds;
+                        mixSession->seekDeck(deckId, targetSeconds);
+                        if (deckId == snap.engine.master) {
+                            dance.setGrid(danceGrid(), danceTime());
+                        }
+                    }
+                }
             }
             if (panning) {
                 const double span = timelineSpan();
@@ -2131,6 +2895,52 @@ struct DesktopApp::Impl {
     void handleKey(const SDL_KeyboardEvent& key) {
         const bool shift = (key.mod & SDL_KMOD_SHIFT) != 0;
         const bool ctrl = (key.mod & SDL_KMOD_CTRL) != 0;
+        const bool alt = (key.mod & SDL_KMOD_ALT) != 0;
+        // Window management is global: F11 and Alt+Enter work on every screen.
+        if (key.key == SDLK_F11 ||
+            ((key.key == SDLK_RETURN || key.key == SDLK_KP_ENTER) && alt)) {
+            toggleFullscreen(!fullscreen);
+            return;
+        }
+        if (key.key == SDLK_ESCAPE && fullscreen) {
+            toggleFullscreen(false);
+            return;
+        }
+        if (module == Module::Mix && mixSession) {
+            switch (key.key) {
+            case SDLK_SPACE:
+                toggleMixPlay();
+                return;
+            case SDLK_N:
+                mixSession->next();
+                return;
+            case SDLK_X:
+                mixSession->cancelTransition();
+                return;
+            case SDLK_A:
+                mixSession->setAdaptive(!mixSession->adaptive());
+                showToast(mixSession->adaptive() ? "Adaptive planning on"
+                                                : "Adaptive planning off");
+                return;
+            case SDLK_T:
+                mixSession->setTempoRampEnabled(!mixSession->tempoRampEnabled());
+                showToast(mixSession->tempoRampEnabled()
+                              ? "Tempo Ramp armed (experimental)"
+                              : "Tempo Ramp disarmed");
+                return;
+            case SDLK_U:
+                cycleUiScale();
+                return;
+            case SDLK_L:
+                openMixFileDialog();
+                return;
+            case SDLK_M:
+                mixSession->setAutoQueue(!mixSession->autoQueue());
+                return;
+            default:
+                break;
+            }
+        }
         switch (key.key) {
         case SDLK_SPACE:
             togglePlay();
@@ -2309,17 +3119,15 @@ struct DesktopApp::Impl {
             adjustLatency(0.005);
             break;
         case SDLK_F:
-            fullscreen = !fullscreen;
-            (void)SDL_SetWindowFullscreen(window, fullscreen);
+            toggleFullscreen(!fullscreen);
+            break;
+        case SDLK_U:
+            cycleUiScale();
             break;
         case SDLK_ESCAPE:
             if (presentation) {
                 presentation = false;
                 break;
-            }
-            if (fullscreen) {
-                fullscreen = false;
-                (void)SDL_SetWindowFullscreen(window, false);
             }
             break;
         default:
@@ -2328,6 +3136,16 @@ struct DesktopApp::Impl {
     }
 
     void handleLeftDown(float x, float y, int clicks) {
+        for (int i = 0; i < 4; ++i) {
+            if (modulePills[i].w > 0.0f && modulePills[i].contains(x, y)) {
+                setModule(static_cast<Module>(i));
+                return;
+            }
+        }
+        if (module == Module::Mix) {
+            handleMixClick(x, y, clicks);
+            return;
+        }
         if (layout.mode2D.contains(x, y)) {
             setCharacterView(CharacterView::Robot2D, true);
             return;
@@ -2542,6 +3360,9 @@ struct DesktopApp::Impl {
             seekTo(xToTime(x, layout.plot), resume);
             resumeAfterScrub = false;
         }
+        if (mixScrubbingDeck >= 0) {
+            mixScrubbingDeck = -1;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2551,27 +3372,76 @@ struct DesktopApp::Impl {
         const Rect card = layout.timelineCard;
         const float x = card.x + 18.0f;
         const float w = card.w - 36.0f;
+        const float usable = std::max(120.0f, card.h - 60.0f);
+        const float waveH = std::clamp(usable * 0.26f, 58.0f, 112.0f);
+        const float specH = std::clamp(usable * 0.24f, 50.0f, 100.0f);
         layout.ruler = {x, card.y + 44.0f, w, 22.0f};
-        layout.wave = {x, card.y + 70.0f, w, 90.0f};
-        layout.spectrogram = {x, card.y + 168.0f, w, 88.0f};
-        layout.tempo = {x, card.y + 264.0f, w, 16.0f};
-        layout.events = {x, card.y + 288.0f, w, 78.0f};
+        layout.wave = {x, layout.ruler.bottom() + 4.0f, w, waveH};
+        layout.spectrogram = {x, layout.wave.bottom() + 8.0f, w, specH};
+        layout.tempo = {x, layout.spectrogram.bottom() + 8.0f, w, 16.0f};
+        const float eventsY = layout.tempo.bottom() + 8.0f;
+        layout.events = {x, eventsY, w,
+                         std::max(34.0f, card.bottom() - 16.0f - eventsY)};
         layout.plot = {x, layout.wave.y, w, layout.events.bottom() - layout.wave.y};
     }
 
     void computeLayout() {
+        const float W = canvasW;
+        const float H = canvasH;
+        const float margin = 24.0f;
+        const float gap = 16.0f;
+        const float contentY = 124.0f;
+        const float footerY = H - 44.0f;
+        const float contentBottom = footerY - 12.0f;
+        const float width = W - margin * 2.0f;
+        const float contentH = std::max(180.0f, contentBottom - contentY);
+
+        float rightW = std::clamp(W * 0.27f, 400.0f, 480.0f);
+        rightW = std::min(rightW, std::max(360.0f, width - gap - 540.0f));
+        const float leftW = width - gap - rightW;
+        const float rightX = margin + leftW + gap;
+
+        layout.header = {0.0f, 0.0f, W, 64.0f};
+        layout.toolbar = {margin, 76.0f, width, 44.0f};
+        layout.footer = {0.0f, footerY, W, 44.0f};
+        layout.empty = {margin, contentY, width, contentH};
+
+        const float timelineH = contentH * 0.575f - gap * 0.5f;
+        layout.timelineCard = {margin, contentY, leftW, timelineH};
+        layout.choreoCard = {margin, layout.timelineCard.bottom() + gap, leftW,
+                             contentBottom - layout.timelineCard.bottom() - gap};
+        layout.stage3D = {margin, contentY, leftW, contentH};
+
+        const float avail = contentH - gap * 3.0f;
+        const float h1 = avail * 0.279f;
+        const float h2 = avail * 0.276f;
+        const float h3 = avail * 0.207f;
+        layout.right1 = {rightX, contentY, rightW, h1};
+        layout.right2 = {rightX, layout.right1.bottom() + gap, rightW, h2};
+        layout.right3 = {rightX, layout.right2.bottom() + gap, rightW, h3};
+        layout.right4 = {rightX, layout.right3.bottom() + gap, rightW,
+                         contentBottom - layout.right3.bottom() - gap};
+
+        const float rightEdge = margin + width;
+        layout.loadButton = {margin, 80.0f, 116.0f, 40.0f};
+        layout.playButton = {margin + 124.0f, 80.0f, 44.0f, 40.0f};
+        layout.stopButton = {margin + 176.0f, 80.0f, 40.0f, 40.0f};
+        layout.rateButton = {margin + 224.0f, 80.0f, 72.0f, 40.0f};
+        layout.syncPlus = {rightEdge - 28.0f, 88.0f, 28.0f, 24.0f};
+        layout.syncMinus = {layout.syncPlus.x - 108.0f, 88.0f, 28.0f, 24.0f};
+        layout.vrmLoadButton = {layout.syncMinus.x - 92.0f, 80.0f, 68.0f, 40.0f};
+        layout.mode3D = {layout.vrmLoadButton.x - 60.0f, 80.0f, 54.0f, 40.0f};
+        layout.mode2D = {layout.mode3D.x - 60.0f, 80.0f, 54.0f, 40.0f};
+
         layout.emptyLoad = {layout.empty.centerX() - 86.0f,
-                            layout.empty.y + 380.0f, 172.0f, 44.0f};
+                            layout.empty.y + layout.empty.h * 0.53f, 172.0f, 44.0f};
+
         const Rect card = layout.choreoCard;
         layout.motionLab = {card.right() - 104.0f, card.y + 10.0f, 90.0f, 24.0f};
         layout.motionDebug = {layout.motionLab.x - 76.0f, card.y + 10.0f, 70.0f, 24.0f};
         layout.motionSmooth = {layout.motionDebug.x - 104.0f, card.y + 10.0f, 98.0f, 24.0f};
         updateTimelineLayout();
 
-        layout.mode2D = {1048.0f, 80.0f, 54.0f, 40.0f};
-        layout.mode3D = {1108.0f, 80.0f, 54.0f, 40.0f};
-        layout.vrmLoadButton = {1168.0f, 80.0f, 68.0f, 40.0f};
-        layout.stage3D = {24.0f, 124.0f, 1004.0f, 716.0f};
         layout.vrmLoadStage = {layout.stage3D.right() - 116.0f,
                                layout.stage3D.y + 16.0f, 96.0f, 28.0f};
         layout.vrmEmptyLoad = {layout.stage3D.centerX() - 78.0f,
@@ -2591,8 +3461,8 @@ struct DesktopApp::Impl {
         layout.danceLoop = {r1.x + 182.0f, r1.y + 38.0f, 78.0f, 26.0f};
         layout.danceTest = {r1.x + 264.0f, r1.y + 38.0f, 90.0f, 26.0f};
         for (int i = 0; i < 5; ++i) {
-            layout.danceStyle[i] = {r1.x + 18.0f + static_cast<float>(i) * 68.0f, r1.y + 72.0f,
-                                    64.0f, 28.0f};
+            layout.danceStyle[i] = {r1.x + 18.0f + static_cast<float>(i) * 68.0f,
+                                    r1.y + 72.0f, 64.0f, 28.0f};
         }
         layout.danceBpmMinus = {r1.x + 110.0f, r1.y + 110.0f, 26.0f, 24.0f};
         layout.danceBpmPlus = {r1.x + 140.0f, r1.y + 110.0f, 26.0f, 24.0f};
@@ -2608,6 +3478,8 @@ struct DesktopApp::Impl {
         layout.springPlusBtn = {r3.x + 66.0f, r3.y + 62.0f, 44.0f, 18.0f};
         layout.springDampBtn = {r3.x + 114.0f, r3.y + 62.0f, 92.0f, 18.0f};
         layout.springResetBtn = {r3.x + 210.0f, r3.y + 62.0f, 144.0f, 18.0f};
+
+        computeMixLayout();
     }
 
     // ---------------------------------------------------------------------
@@ -2624,6 +3496,17 @@ struct DesktopApp::Impl {
     void drawChoreography();
     void drawFooter();
     void drawOverlays();
+
+    // BG Mix 0.1 screen
+    void computeMixLayout();
+    void drawMixScreen();
+    void drawMixDeck(const Rect& card, mix::DeckId deck, bool incoming);
+    void drawMixQueue(const Rect& card, const mix::MixSessionSnapshot& snap);
+    void drawMixPlan(const Rect& card, const mix::MixSessionSnapshot& snap);
+    void drawMixControls(const Rect& card, const mix::MixSessionSnapshot& snap);
+    void handleMixClick(float x, float y, int clicks);
+    void drawMixButton(const Rect& rect, std::string_view caption, bool active,
+                       SDL_Color color, int icon = -1);
     void drawDancer(const Rect& stage, const CharacterPose& pose);
     void drawBpmPanel(const Rect& rect);
     void drawTempoPanel(const Rect& rect);
@@ -2674,20 +3557,22 @@ struct DesktopApp::Impl {
 // Rendering: background, header, toolbar
 // -------------------------------------------------------------------------
 void DesktopApp::Impl::drawBackground() {
-    ui::fillRect(renderer, {0, 0, 1440, 900}, theme::background);
-    ui::verticalGradient(renderer, {0, 0, 1440, 900}, SDL_Color{11, 15, 23, 255},
-                         SDL_Color{5, 7, 11, 255});
+    ui::fillRect(renderer, {0, 0, canvasW, canvasH}, theme::background);
+    ui::verticalGradient(renderer, {0, 0, canvasW, canvasH},
+                         SDL_Color{11, 15, 23, 255}, SDL_Color{5, 7, 11, 255});
     // A restrained technical grid.
-    for (float x = 0; x < 1440; x += 72) {
+    for (float x = 0; x < canvasW; x += 72) {
         SDL_SetRenderDrawColor(renderer, 44, 58, 78, 18);
-        SDL_RenderLine(renderer, x, 0, x, 900);
+        SDL_RenderLine(renderer, x, 0, x, canvasH);
     }
-    for (float y = 0; y < 900; y += 72) {
+    for (float y = 0; y < canvasH; y += 72) {
         SDL_SetRenderDrawColor(renderer, 44, 58, 78, 14);
-        SDL_RenderLine(renderer, 0, y, 1440, y);
+        SDL_RenderLine(renderer, 0, y, canvasW, y);
     }
-    ui::fillCircle(renderer, 1300, 40, 420, theme::alpha(theme::accent, 0.025f));
-    ui::fillCircle(renderer, 90, 850, 330, theme::alpha(theme::violet, 0.035f));
+    ui::fillCircle(renderer, canvasW - 140.0f, 40.0f, 420,
+                   theme::alpha(theme::accent, 0.025f));
+    ui::fillCircle(renderer, 90, canvasH - 50.0f, 330,
+                   theme::alpha(theme::violet, 0.035f));
 }
 
 void DesktopApp::Impl::drawIcon(int icon, float cx, float cy, float size, SDL_Color color) {
@@ -2752,47 +3637,71 @@ void DesktopApp::Impl::drawHeader() {
 }
 
 void DesktopApp::Impl::drawPills() {
-    const float right = 1416.0f;
-    // Module pills, intentionally compact.
+    const float right = canvasW - 24.0f;
     struct Pill {
-        std::string name;
+        const char* name;
         SDL_Color color;
         float width;
+        Module module;
     };
     const Pill pills[] = {
-        {"BG BEAT", theme::violet, 72.0f},
-        {"BG MOTION", theme::accent, 82.0f},
-        {"BG VRM", theme::pink, 68.0f},
+        {"BG BEAT", theme::violet, 72.0f, Module::Beat},
+        {"BG MOTION", theme::accent, 82.0f, Module::Motion},
+        {"BG VRM", theme::pink, 68.0f, Module::Vrm},
+        {"BG MIX", theme::amber, 68.0f, Module::Mix},
     };
     float x = right;
     for (int i = static_cast<int>(std::size(pills)) - 1; i >= 0; --i) {
         const Pill& pill = pills[i];
         const Rect rect{x - pill.width, 18, pill.width, 26};
-        ui::fillRoundedRect(renderer, rect, 13.0f, theme::alpha(pill.color, 0.09f));
-        ui::strokeRoundedRect(renderer, rect, 13.0f, theme::alpha(pill.color, 0.30f), 1.0f);
-        text->drawCentered(pill.name, rect.centerX(), rect.y + 7, 9, FontWeight::SemiBold,
-                           theme::alpha(pill.color, 0.9f));
+        modulePills[i] = rect;
+        const bool active = module == pill.module;
+        ui::fillRoundedRect(renderer, rect, 13.0f,
+                            theme::alpha(pill.color, active ? 0.18f : 0.09f));
+        ui::strokeRoundedRect(renderer, rect, 13.0f,
+                              theme::alpha(pill.color, active ? 0.62f : 0.30f),
+                              active ? 1.5f : 1.0f);
+        text->drawCentered(pill.name, rect.centerX(), rect.y + 7, 9,
+                           FontWeight::SemiBold,
+                           theme::alpha(pill.color, active ? 1.0f : 0.9f));
         x -= pill.width + 8.0f;
     }
 
-    const std::string status = state == AppState::Loading
-                                   ? "ANALYSING"
-                                   : (state == AppState::Error
-                                          ? "ERROR"
-                                          : (state == AppState::Ready ? "READY" : "NO TRACK"));
-    const SDL_Color statusColor = state == AppState::Error
-                                      ? theme::red
-                                      : (state == AppState::Loading ? theme::amber
-                                                                    : theme::accent);
+    std::string status;
+    SDL_Color statusColor = theme::accent;
+    if (module == Module::Mix) {
+        const mix::MixSessionSnapshot mixSnap =
+            mixSession ? mixSession->snapshot() : mix::MixSessionSnapshot{};
+        const bool bothDecks = mixSnap.engine.decks[0].loaded &&
+                               mixSnap.engine.decks[1].loaded;
+        status = bothDecks ? "2 DECKS"
+                           : (mixSnap.queue.empty() ? "NO TRACK" : "MIX QUEUE");
+        statusColor = mixSnap.queue.empty() ? theme::accent : theme::amber;
+    } else if (state == AppState::Loading) {
+        status = "ANALYSING";
+        statusColor = theme::amber;
+    } else if (state == AppState::Error) {
+        status = "ERROR";
+        statusColor = theme::red;
+    } else if (state == AppState::Ready) {
+        status = "READY";
+        statusColor = theme::accent;
+    } else {
+        status = "NO TRACK";
+        statusColor = theme::accent;
+    }
     const float statusWidth = 92.0f;
     const Rect statusRect{x - statusWidth - 10.0f, 18, statusWidth, 26};
-    ui::fillRoundedRect(renderer, statusRect, 13.0f, theme::alpha(statusColor, 0.08f));
-    ui::strokeRoundedRect(renderer, statusRect, 13.0f, theme::alpha(statusColor, 0.28f),
-                          1.0f);
-    ui::fillCircle(renderer, statusRect.x + 12.0f, statusRect.centerY(), 3.0f,
-                  statusColor);
-    text->draw(status, statusRect.x + 21.0f, statusRect.y + 7, 9, FontWeight::SemiBold,
-               statusColor);
+    if (statusRect.x > 420.0f) {
+        ui::fillRoundedRect(renderer, statusRect, 13.0f,
+                            theme::alpha(statusColor, 0.08f));
+        ui::strokeRoundedRect(renderer, statusRect, 13.0f,
+                              theme::alpha(statusColor, 0.28f), 1.0f);
+        ui::fillCircle(renderer, statusRect.x + 12.0f, statusRect.centerY(), 3.0f,
+                       statusColor);
+        text->draw(status, statusRect.x + 21.0f, statusRect.y + 7, 9,
+                   FontWeight::SemiBold, statusColor);
+    }
 }
 
 void DesktopApp::Impl::drawButton(const Rect& rect, std::string_view labelText,
@@ -2836,24 +3745,31 @@ void DesktopApp::Impl::drawToolbar() {
                formatNumber(player.snapshot().rate, 2) + "x", false,
                std::abs(player.snapshot().rate - 1.0) > 0.01, 4);
 
+    const float margin = layout.loadButton.x;
     const double pos = currentPosition();
     const double dur = duration();
-    text->draw(formatTime(pos, true), 342, 82, 26, FontWeight::SemiBold, theme::text);
-    text->draw("/ " + formatTime(dur), 470, 92, 11, FontWeight::Regular, theme::muted);
-    label("MEDIA TIME", 343, 111, 8, theme::dim, 1.4f);
+    text->draw(formatTime(pos, true), margin + 318, 82, 26, FontWeight::SemiBold,
+               theme::text);
+    text->draw("/ " + formatTime(dur), margin + 446, 92, 11, FontWeight::Regular,
+               theme::muted);
+    label("MEDIA TIME", margin + 319, 111, 8, theme::dim, 1.4f);
 
+    const float infoX = margin + 566.0f;
+    const float infoRight = layout.mode2D.x - 22.0f;
+    const float infoWidth = std::max(120.0f, infoRight - infoX);
     if (track) {
-        const std::string name = ellipsize(*text, track->displayName, 380.0f, 15,
+        const std::string name = ellipsize(*text, track->displayName, infoWidth, 15,
                                            FontWeight::SemiBold);
-        body(name, 590, 82, 15, theme::text, FontWeight::SemiBold);
-        const std::string path = ellipsize(*text, track->displayPath, 370.0f, 10,
-                                           FontWeight::Regular);
-        body(path, 590, 102, 10, theme::muted);
-        label("CACHE " + cacheName(track->cacheStatus, track->fromCache), 975, 90,
-              9, track->fromCache ? theme::accent : theme::dim, 1.1f);
+        body(name, infoX, 82, 15, theme::text, FontWeight::SemiBold);
+        const std::string path = ellipsize(*text, track->displayPath, infoWidth - 10.0f,
+                                           10, FontWeight::Regular);
+        body(path, infoX, 102, 10, theme::muted);
+        label("CACHE " + cacheName(track->cacheStatus, track->fromCache),
+              infoX + 385.0f, 90, 9,
+              track->fromCache ? theme::accent : theme::dim, 1.1f);
     } else {
-        body("No track loaded", 590, 87, 14, theme::muted);
-        label("DROP WAV / MP3 / FLAC ANYWHERE", 590, 104, 9, theme::dim, 1.2f);
+        body("No track loaded", infoX, 87, 14, theme::muted);
+        label("DROP WAV / MP3 / FLAC ANYWHERE", infoX, 104, 9, theme::dim, 1.2f);
     }
 
     drawModeChip(layout.mode2D, "2D", characterView == CharacterView::Robot2D,
@@ -2863,7 +3779,7 @@ void DesktopApp::Impl::drawToolbar() {
     drawButton(layout.vrmLoadButton, "VRM", false, vrm.ready(), 0);
 
     // Sync trim.
-    label("SYNC TRIM", 1244, 72, 8, theme::dim, 1.4f);
+    label("SYNC TRIM", layout.syncMinus.x, 72, 8, theme::dim, 1.4f);
     ui::fillRoundedRect(renderer, layout.syncMinus, 6.0f,
                         hover(layout.syncMinus) ? theme::panelHover : theme::panelRaised);
     ui::fillRoundedRect(renderer, layout.syncPlus, 6.0f,
@@ -3281,7 +4197,7 @@ void DesktopApp::Impl::drawTimeline() {
 
     // Legend.
     float legendX = card.x + 18.0f;
-    const float legendY = card.y + 378.0f;
+    const float legendY = card.bottom() - 26.0f;
     auto legendItem = [&](SDL_Color color, const char* label, float width) {
         ui::fillCircle(renderer, legendX + 3.0f, legendY + 5.0f, 2.5f, color);
         body(label, legendX + 10.0f, legendY - 1.0f, 9, theme::dim);
@@ -4491,14 +5407,1296 @@ void DesktopApp::Impl::draw3DRightPanels() {
     }
 }
 
+// -------------------------------------------------------------------------
+// BG MIX 0.1 screen
+// -------------------------------------------------------------------------
+void DesktopApp::Impl::computeMixLayout() {
+    const float margin = 24.0f;
+    const float gap = 16.0f;
+    const float top = 76.0f;
+    const float footerY = canvasH - 44.0f;
+    const float bottom = footerY - 12.0f;
+    const float contentH = std::max(220.0f, bottom - top);
+
+    const MixColumns columns = computeMixColumns(canvasW);
+    float queueW = columns.queueW;
+    float rightW = columns.rightW;
+    float centerW = columns.centerW;
+
+    const Rect queue{ margin, top, queueW, contentH };
+    const Rect deckA{ margin + queueW + gap, top, centerW,
+                      (contentH - gap) * 0.5f };
+    const Rect deckB{ deckA.x, deckA.bottom() + gap, centerW,
+                      (contentH - gap) * 0.5f };
+    const float rightX = deckA.right() + gap;
+    const float planH = std::clamp(contentH * 0.40f, 190.0f, 330.0f);
+    const Rect plan{ rightX, top, rightW, planH };
+    const Rect control{ rightX, plan.bottom() + gap, rightW,
+                        std::max(180.0f, bottom - plan.bottom() - gap) };
+
+    mixLayout.queueCard = queue;
+    mixLayout.deckA = deckA;
+    mixLayout.deckB = deckB;
+    mixLayout.planCard = plan;
+    mixLayout.controlCard = control;
+
+    mixLayout.addButton = { queue.right() - 128.0f, queue.y + 13.0f, 56.0f, 26.0f };
+    mixLayout.clearButton = { queue.right() - 66.0f, queue.y + 13.0f, 56.0f, 26.0f };
+
+    const float rowsTop = queue.y + 72.0f;
+    const float rowsBottom = queue.bottom() - 12.0f;
+    const float rowH = std::clamp((rowsBottom - rowsTop) / 8.0f, 30.0f, 58.0f);
+    for (int i = 0; i < 8; ++i) {
+        const Rect row{ queue.x + 10.0f, rowsTop + static_cast<float>(i) * rowH,
+                        queue.w - 20.0f, rowH - 4.0f };
+        mixLayout.queueRow[i] = row;
+        mixLayout.queueRemove[i] = { row.right() - 24.0f, row.y + 8.0f, 20.0f, 20.0f };
+    }
+
+    const Rect decks[2] = { deckA, deckB };
+    for (int i = 0; i < 2; ++i) {
+        const Rect& card = decks[i];
+        mixLayout.deckWave[i] = { card.x + 16.0f, card.y + 88.0f,
+                                  card.w - 32.0f,
+                                  std::max(40.0f, card.h - 88.0f - 48.0f) };
+        mixLayout.deckGainMinus[i] = { card.x + 70.0f, card.bottom() - 36.0f,
+                                       24.0f, 24.0f };
+        mixLayout.deckGainPlus[i] = { card.x + 100.0f, card.bottom() - 36.0f,
+                                      24.0f, 24.0f };
+    }
+    mixLayout.openDeckA = { deckA.right() - 98.0f, deckA.bottom() - 36.0f,
+                            82.0f, 26.0f };
+    mixLayout.openDeckB = { deckB.right() - 98.0f, deckB.bottom() - 36.0f,
+                            82.0f, 26.0f };
+
+    const float innerX = control.x + 16.0f;
+    const float innerW = control.w - 32.0f;
+    const float available = control.h - 56.0f - 46.0f;
+    // Eleven rows: transport, seven value rows, two chip rows, preview.
+    const float rowGap = std::clamp((available - 298.0f) / 10.0f, 2.0f, 9.0f);
+    mixLayout.monitor = { innerX, control.y + 32.0f, innerW, 16.0f };
+    float y = control.y + 54.0f;
+    const float bw = (innerW - 18.0f) / 4.0f;
+    mixLayout.playButton = { innerX, y, bw, 30.0f };
+    mixLayout.nextButton = { innerX + bw + 6.0f, y, bw, 30.0f };
+    mixLayout.stopButton = { innerX + (bw + 6.0f) * 2.0f, y, bw, 30.0f };
+    mixLayout.cancelButton = { innerX + (bw + 6.0f) * 3.0f, y, bw, 30.0f };
+    y += 30.0f + rowGap;
+
+    auto valueRow = [&](Rect& prev, Rect& next) {
+        prev = { innerX + innerW - 58.0f, y, 26.0f, 26.0f };
+        next = { innerX + innerW - 26.0f, y, 26.0f, 26.0f };
+        y += 26.0f + rowGap;
+    };
+    valueRow(mixLayout.typePrev, mixLayout.typeNext);
+    valueRow(mixLayout.durationMinus, mixLayout.durationPlus);
+    valueRow(mixLayout.modePrev, mixLayout.modeNext);
+    valueRow(mixLayout.rampModePrev, mixLayout.rampModeNext);
+    valueRow(mixLayout.rampBarsPrev, mixLayout.rampBarsNext);
+    valueRow(mixLayout.curvePrev, mixLayout.curveNext);
+    valueRow(mixLayout.maxDeltaPrev, mixLayout.maxDeltaNext);
+
+    const float chipW = (innerW - 12.0f) / 3.0f;
+    mixLayout.pitchChip = { innerX, y, chipW, 28.0f };
+    mixLayout.bassChip = { innerX + chipW + 6.0f, y, chipW, 28.0f };
+    mixLayout.adaptiveChip = { innerX + (chipW + 6.0f) * 2.0f, y, chipW, 28.0f };
+    y += 28.0f + rowGap;
+    mixLayout.tempoRampChip = { innerX, y, chipW, 28.0f };
+    mixLayout.autoQueueChip = { innerX + chipW + 6.0f, y, chipW, 28.0f };
+    mixLayout.qualityStretchChip = { innerX + (chipW + 6.0f) * 2.0f, y, chipW,
+                                     28.0f };
+    y += 28.0f + rowGap;
+
+    mixLayout.previewButton = { innerX, y, innerW, 30.0f };
+
+    mixLayout.timeline = { plan.x + 16.0f, plan.y + 90.0f, plan.w - 32.0f,
+                           std::clamp(plan.h * 0.16f, 40.0f, 58.0f) };
+    mixLayout.jumpTransitionButton = { plan.right() - 176.0f, plan.y + 11.0f, 160.0f, 22.0f };
+
+    const float displayY = control.bottom() - 42.0f;
+    const float displayW = (innerW - 12.0f) / 3.0f;
+    mixLayout.uiScaleChip = { innerX, displayY, displayW, 28.0f };
+    mixLayout.qualityChip = { innerX + displayW + 6.0f, displayY, displayW, 28.0f };
+    mixLayout.fullscreenChip = { innerX + (displayW + 6.0f) * 2.0f, displayY,
+                                 displayW, 28.0f };
+}
+
+void DesktopApp::Impl::drawMixButton(const Rect& rect, std::string_view caption,
+                                     bool active, SDL_Color color, int icon) {
+    const bool isHover = hover(rect);
+    const SDL_Color fill = active
+                               ? theme::alpha(color, isHover ? 0.30f : 0.19f)
+                               : (isHover ? theme::panelHover : theme::panelRaised);
+    ui::fillRoundedRect(renderer, rect, 8.0f, fill);
+    ui::strokeRoundedRect(renderer, rect, 8.0f,
+                          active ? theme::alpha(color, 0.68f) : theme::border, 1.0f);
+    const SDL_Color content = active ? color : theme::text;
+    float textX = rect.x;
+    float textW = rect.w;
+    if (icon >= 0) {
+        drawIcon(icon, rect.x + 15.0f, rect.centerY(), 13.0f, content);
+        textX += 22.0f;
+        textW -= 22.0f;
+    }
+    if (!caption.empty()) {
+        text->drawCentered(caption, textX + textW * 0.5f,
+                           rect.y + (rect.h - 15.0f) * 0.5f - 1.0f, 9,
+                           FontWeight::SemiBold, content);
+    }
+}
+
+void DesktopApp::Impl::drawMixQueue(const Rect& card,
+                                    const mix::MixSessionSnapshot& snap) {
+    ui::fillRoundedRect(renderer, card, 12.0f, theme::panel);
+    ui::strokeRoundedRect(renderer, card, 12.0f, theme::border, 1.0f);
+    text->draw("QUEUE", card.x + 16.0f, card.y + 14.0f, 13,
+               FontWeight::SemiBold, theme::text);
+    label(std::to_string(snap.queue.size()) + " TRACKS", card.x + 16.0f,
+          card.y + 38.0f, 8, theme::dim, 1.2f);
+
+    drawMixButton(mixLayout.addButton, "ADD", false, theme::accent);
+    drawMixButton(mixLayout.clearButton, "CLEAR", false, theme::red);
+
+    if (snap.preparingNext) {
+        const Rect bar{ card.x + 16.0f, card.y + 56.0f, card.w - 32.0f, 3.0f };
+        ui::fillRoundedRect(renderer, bar, 1.5f,
+                            theme::alpha(theme::white, 0.06f));
+        ui::fillRoundedRect(renderer, { bar.x, bar.y,
+                                       bar.w * std::clamp(snap.preparingProgress, 0.0f, 1.0f),
+                                       bar.h }, 1.5f, theme::amber);
+    }
+
+    if (snap.queue.empty()) {
+        body("Drop audio files here", card.x + 16.0f, card.y + 92.0f, 12,
+             theme::muted);
+        label("WAV / MP3 / FLAC", card.x + 16.0f, card.y + 112.0f, 8,
+              theme::dim, 1.2f);
+        return;
+    }
+
+    auto stateColor = [](mix::QueueState state) {
+        switch (state) {
+        case mix::QueueState::Pending: return theme::dim;
+        case mix::QueueState::Preparing: return theme::amber;
+        case mix::QueueState::Ready: return theme::accent;
+        case mix::QueueState::Failed: return theme::red;
+        case mix::QueueState::Playing: return theme::accent;
+        case mix::QueueState::Played: return theme::dim;
+        }
+        return theme::dim;
+    };
+    auto stateName = [](mix::QueueState state) {
+        switch (state) {
+        case mix::QueueState::Pending: return "PENDING";
+        case mix::QueueState::Preparing: return "PREPARING";
+        case mix::QueueState::Ready: return "READY";
+        case mix::QueueState::Failed: return "FAILED";
+        case mix::QueueState::Playing: return "LIVE";
+        case mix::QueueState::Played: return "PLAYED";
+        }
+        return "";
+    };
+
+    const int count = std::min<int>(8, static_cast<int>(snap.queue.size()));
+    for (int i = 0; i < count; ++i) {
+        const mix::QueueItemStatus& item = snap.queue[static_cast<std::size_t>(i)];
+        const Rect row = mixLayout.queueRow[i];
+        const bool onDeck = item.id == snap.engine.decks[0].trackId ||
+                            item.id == snap.engine.decks[1].trackId;
+        if (onDeck) {
+            ui::fillRoundedRect(renderer, row, 7.0f,
+                                theme::alpha(theme::accent, 0.075f));
+            ui::strokeRoundedRect(renderer, row, 7.0f,
+                                  theme::alpha(theme::accent, 0.22f), 1.0f);
+        } else if (hover(row)) {
+            ui::fillRoundedRect(renderer, row, 7.0f, theme::panelRaised);
+        }
+        const SDL_Color dot = stateColor(item.state);
+        ui::fillCircle(renderer, row.x + 10.0f, row.centerY(), 3.0f, dot);
+        const std::string name = ellipsize(
+            *text, item.displayName, row.w - 84.0f, 10, FontWeight::SemiBold);
+        body(name, row.x + 20.0f, row.y + 6.0f, 10, theme::text,
+             FontWeight::SemiBold);
+        std::string sub = stateName(item.state);
+        if (item.bpm > 0.0) {
+            sub += "  ·  " + formatNumber(item.bpm, 1) + " BPM";
+        }
+        if (item.durationSeconds > 0.0) {
+            sub += "  ·  " + formatTime(item.durationSeconds);
+        }
+        label(sub, row.x + 20.0f, row.y + 21.0f, 8, dot, 0.7f);
+        if (item.state == mix::QueueState::Preparing) {
+            const Rect bar{ row.x + 20.0f, row.bottom() - 5.0f, row.w - 58.0f, 2.0f };
+            ui::fillRoundedRect(renderer, bar, 1.0f,
+                                theme::alpha(theme::white, 0.06f));
+            ui::fillRoundedRect(renderer, { bar.x, bar.y,
+                                           bar.w * std::clamp(item.progress, 0.0f, 1.0f),
+                                           bar.h }, 1.0f, theme::amber);
+        }
+        drawMixButton(mixLayout.queueRemove[i], "X", false, theme::red);
+    }
+    if (static_cast<int>(snap.queue.size()) > count) {
+        labelRight("+" + std::to_string(snap.queue.size() - count) + " MORE",
+                   card.right() - 16.0f, card.bottom() - 22.0f, 8, theme::dim,
+                   0.8f);
+    }
+}
+
+void DesktopApp::Impl::drawMixDeck(const Rect& card, mix::DeckId deck,
+                                   bool incoming) {
+    const int idx = mix::deckIndex(deck);
+    const mix::MixSessionSnapshot snap = mixSession->snapshot();
+    const mix::DeckStatus& status = snap.engine.decks[idx];
+    const bool master = snap.engine.master == deck;
+    const SDL_Color tint = incoming ? theme::violet
+                                    : (master ? theme::accent : theme::muted);
+
+    ui::fillRoundedRect(renderer, card, 12.0f, theme::panel);
+    ui::strokeRoundedRect(renderer, card, 12.0f,
+                          master ? theme::alpha(theme::accent, 0.42f)
+                                 : theme::border,
+                          master ? 1.4f : 1.0f);
+
+    label(std::string("DECK ") + (deck == mix::DeckId::A ? "A" : "B"),
+          card.x + 16.0f, card.y + 14.0f, 9, theme::dim, 1.6f);
+    const std::string role = master ? "MASTER" : (incoming ? "INCOMING" : "STANDBY");
+    const Rect roleRect{ card.x + 88.0f, card.y + 10.0f, 78.0f, 20.0f };
+    ui::fillRoundedRect(renderer, roleRect, 10.0f, theme::alpha(tint, 0.12f));
+    ui::strokeRoundedRect(renderer, roleRect, 10.0f, theme::alpha(tint, 0.38f),
+                          1.0f);
+    text->drawCentered(role, roleRect.centerX(), roleRect.y + 5.0f, 8,
+                       FontWeight::SemiBold, tint);
+
+    const std::string deckName = mixSession->deckName(deck);
+    const std::string name = deckName.empty()
+                                 ? "NO TRACK"
+                                 : ellipsize(*text, deckName,
+                                             card.w - 32.0f, 15,
+                                             FontWeight::SemiBold);
+    body(name, card.x + 16.0f, card.y + 36.0f, 15,
+         deckName.empty() ? theme::muted : theme::text, FontWeight::SemiBold);
+
+    std::string info;
+    if (status.loaded) {
+        info = formatNumber(status.bpm, 1) + " BPM  ·  " +
+               formatTime(status.positionSeconds, true) + " / " +
+               formatTime(status.durationSeconds) + "  ·  " +
+               formatNumber(status.rate * 100.0, 1) + "%";
+        if (const auto feat = mixSession->deckFeatures(deck)) {
+            if (!feat->harmony.camelotCode.empty()) {
+                info += "  ·  " + feat->harmony.camelotCode;
+            }
+            if (feat->loudness.gatedValid) {
+                info += "  ·  " + formatNumber(feat->loudness.integratedLufs, 1) + " LUFS";
+            }
+        }
+        if (status.ended) {
+            info += "  ·  END";
+        }
+    } else {
+        info = "deck is empty";
+    }
+    label(info, card.x + 16.0f, card.y + 62.0f, 8,
+          status.loaded ? theme::muted : theme::dim, 0.8f);
+
+    const Rect wave = mixLayout.deckWave[idx];
+    ui::fillRoundedRect(renderer, wave, 8.0f, theme::backgroundSoft);
+    ui::strokeRoundedRect(renderer, wave, 8.0f, theme::border, 1.0f);
+
+    const std::shared_ptr<const AnalysisResult> analysis =
+        mixSession->deckAnalysis(deck);
+    const bool hasWave = analysis && !analysis->waveform.empty() &&
+                         analysis->waveformPeaksPerSecond > 0.0f;
+    if (hasWave) {
+        const double duration = std::max(0.01, analysis->info.duration);
+        // Highlight the planned transition region first.
+        if (snap.preview.valid) {
+            double fromTime = -1.0;
+            double toTime = -1.0;
+            if (snap.preview.from == deck) {
+                fromTime = snap.preview.transitionStartA;
+                toTime = snap.preview.transitionEndA;
+            } else if (snap.preview.to == deck) {
+                fromTime = snap.preview.startB;
+                toTime = snap.preview.endB;
+            }
+            if (toTime > fromTime && fromTime >= 0.0) {
+                const float x0 = wave.x + static_cast<float>(
+                    std::clamp(fromTime / duration, 0.0, 1.0)) * wave.w;
+                const float x1 = wave.x + static_cast<float>(
+                    std::clamp(toTime / duration, 0.0, 1.0)) * wave.w;
+                ui::fillRect(renderer, {x0, wave.y, std::max(2.0f, x1 - x0),
+                                        wave.h},
+                             theme::alpha(tint, 0.13f));
+            }
+        }
+        const float mid = wave.centerY();
+        const float amp = wave.h * 0.45f;
+        const float step = 2.0f;
+        const float pps = analysis->waveformPeaksPerSecond;
+        const int peakCount = static_cast<int>(analysis->waveform.size());
+        for (float x = wave.x + 2.0f; x < wave.right() - 2.0f; x += step) {
+            const double t = (x - wave.x) / std::max(1.0f, wave.w) * duration;
+            const int index = std::clamp(static_cast<int>(t * pps), 0,
+                                         std::max(0, peakCount - 1));
+            float lo = analysis->waveform[static_cast<std::size_t>(index)].minValue;
+            float hi = analysis->waveform[static_cast<std::size_t>(index)].maxValue;
+            if (amp * (hi - lo) < 1.0f) {
+                lo = -0.02f;
+                hi = 0.02f;
+            }
+            const float y0 = mid - std::clamp(hi, -1.0f, 1.0f) * amp;
+            const float y1 = mid - std::clamp(lo, -1.0f, 1.0f) * amp;
+            ui::thickLine(renderer, x, y0, x, y1, 1.2f,
+                          theme::alpha(tint, 0.78f), false);
+        }
+        // Draw cue markers and transition bands
+        if (snap.preview.valid) {
+            if (snap.preview.from == deck) {
+                // Outgoing deck: tempo ramp start and mix-out cues
+                if (snap.preview.tempoRampStartA >= 0.0 &&
+                    snap.preview.tempoRampStartA < snap.preview.transitionStartA) {
+                    const float rx = wave.x + static_cast<float>(
+                        std::clamp(snap.preview.tempoRampStartA / duration, 0.0, 1.0)) * wave.w;
+                    const float mx = wave.x + static_cast<float>(
+                        std::clamp(snap.preview.transitionStartA / duration, 0.0, 1.0)) * wave.w;
+                    ui::fillRect(renderer, { rx, wave.y, std::max(2.0f, mx - rx), wave.h },
+                                 theme::alpha(theme::amber, 0.14f));
+                    ui::thickLine(renderer, rx, wave.y + 2.0f, rx, wave.bottom() - 2.0f,
+                                  1.4f, theme::amber, false);
+                    label("RAMP", rx + 3.0f, wave.y + 4.0f, 7, theme::amber, 0.8f);
+                }
+                const float x0 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.transitionStartA / duration, 0.0, 1.0)) * wave.w;
+                const float x1 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.transitionEndA / duration, 0.0, 1.0)) * wave.w;
+                ui::thickLine(renderer, x0, wave.y + 2.0f, x0, wave.bottom() - 2.0f,
+                              1.8f, theme::accent, false);
+                label("MIX OUT", x0 + 3.0f, wave.y + 4.0f, 7, theme::accent, 0.9f);
+                ui::thickLine(renderer, x1, wave.y + 2.0f, x1, wave.bottom() - 2.0f,
+                              1.2f, theme::alpha(theme::accent, 0.6f), false);
+                label("END", std::max(wave.x + 4.0f, x1 - 22.0f), wave.bottom() - 14.0f,
+                      6, theme::dim, 0.6f);
+            } else if (snap.preview.to == deck) {
+                // Incoming deck: mix-in cue marker
+                const float bx0 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.startB / duration, 0.0, 1.0)) * wave.w;
+                const float bx1 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.endB / duration, 0.0, 1.0)) * wave.w;
+                ui::thickLine(renderer, bx0, wave.y + 2.0f, bx0, wave.bottom() - 2.0f,
+                              1.8f, theme::violet, false);
+                label("MIX IN", bx0 + 3.0f, wave.y + 4.0f, 7, theme::violet, 0.9f);
+                ui::thickLine(renderer, bx1, wave.y + 2.0f, bx1, wave.bottom() - 2.0f,
+                              1.2f, theme::alpha(theme::violet, 0.6f), false);
+            }
+        }
+
+        // Bottom progress track
+        const float trackH = 3.0f;
+        const Rect progTrack{ wave.x + 2.0f, wave.bottom() - 5.0f, wave.w - 4.0f, trackH };
+        ui::fillRoundedRect(renderer, progTrack, 1.5f, theme::alpha(theme::white, 0.08f));
+
+        if (status.loaded && status.durationSeconds > 0.0) {
+            const double curPos = (mixScrubbingDeck == idx) ? mixScrubTime : status.positionSeconds;
+            const float px = wave.x + static_cast<float>(
+                std::clamp(curPos / status.durationSeconds, 0.0, 1.0)) * wave.w;
+            // Progress fill
+            ui::fillRoundedRect(renderer,
+                                { progTrack.x, progTrack.y,
+                                  std::max(0.0f, px - progTrack.x), trackH },
+                                1.5f, theme::alpha(tint, 0.70f));
+            // Interactive Playhead
+            ui::thickLine(renderer, px, wave.y + 1.0f, px, wave.bottom() - 1.0f,
+                          2.0f, theme::white, false);
+            ui::fillCircle(renderer, px, wave.y + 4.0f, 3.5f, theme::white);
+            ui::fillCircle(renderer, px, wave.bottom() - 4.0f, 3.5f, theme::white);
+
+            // Time badge on hover or scrub
+            if (hover(wave) || mixScrubbingDeck == idx) {
+                const float hx = (mixScrubbingDeck == idx) ? px : static_cast<float>(mouseX);
+                const double hoverSec = (mixScrubbingDeck == idx)
+                    ? curPos
+                    : static_cast<double>(std::clamp((hx - wave.x) / std::max(1.0f, wave.w),
+                                                    0.0f, 1.0f)) * status.durationSeconds;
+                const std::string badge = formatTime(hoverSec, true);
+                const float badgeW = 48.0f;
+                const float badgeX = std::clamp(hx - badgeW * 0.5f, wave.x + 4.0f,
+                                               wave.right() - badgeW - 4.0f);
+                const Rect badgeRect{ badgeX, wave.y + 18.0f, badgeW, 16.0f };
+                ui::fillRoundedRect(renderer, badgeRect, 4.0f, theme::panel);
+                ui::strokeRoundedRect(renderer, badgeRect, 4.0f, theme::border, 1.0f);
+                text->drawCentered(badge, badgeRect.centerX(), badgeRect.y + 3.0f, 8,
+                                   FontWeight::SemiBold, theme::text);
+            }
+        }
+    } else {
+        text->drawCentered("NO WAVEFORM", wave.centerX(),
+                           wave.centerY() - 8.0f, 9, FontWeight::SemiBold,
+                           theme::dim);
+        labelRight("PREPARED PCM + BG BEAT", wave.right() - 8.0f,
+                   wave.bottom() - 16.0f, 7, theme::dim, 0.6f);
+    }
+
+    // Gain, tempo and load controls.
+    label("GAIN", card.x + 16.0f, card.bottom() - 30.0f, 8, theme::dim, 1.2f);
+    drawMixButton(mixLayout.deckGainMinus[idx], "-", false, theme::accent);
+    drawMixButton(mixLayout.deckGainPlus[idx], "+", false, theme::accent);
+    body(formatNumber(mixDeckGain[idx] * 100.0, 0) + "%",
+         card.x + 130.0f, card.bottom() - 30.0f, 9, theme::muted);
+    if (status.loaded) {
+        label(formatNumber(status.peak, 2) + " PK", card.x + 190.0f,
+              card.bottom() - 30.0f, 8, theme::dim, 1.0f);
+    }
+    drawMixButton(idx == 0 ? mixLayout.openDeckA : mixLayout.openDeckB,
+                  "OPEN", false, tint, 0);
+}
+
+void DesktopApp::Impl::drawMixPlan(const Rect& card,
+                                   const mix::MixSessionSnapshot& snap) {
+    ui::fillRoundedRect(renderer, card, 12.0f, theme::panel);
+    ui::strokeRoundedRect(renderer, card, 12.0f, theme::border, 1.0f);
+    text->draw("TRANSITION PLAN", card.x + 16.0f, card.y + 13.0f, 12,
+               FontWeight::SemiBold, theme::text);
+
+    const mix::MixPlan& plan = snap.preview;
+    if (plan.valid) {
+        const bool activeTrans = snap.engine.phase != mix::TransitionPhase::Idle;
+        drawMixButton(mixLayout.jumpTransitionButton, ">> JUMP TO MIX (-7s)", false,
+                      activeTrans ? theme::dim : theme::accent);
+    }
+    if (!plan.valid) {
+        label("NO PLAN", card.x + 16.0f, card.y + 40.0f, 9, theme::amber, 1.4f);
+        body("Load two tracks and press play. The planner needs a prepared",
+             card.x + 16.0f, card.y + 60.0f, 10, theme::muted);
+        body("incoming deck before it can describe a transition.",
+             card.x + 16.0f, card.y + 76.0f, 10, theme::muted);
+        label("It never invents a plan: low confidence becomes a fallback.",
+              card.x + 16.0f, card.y + 100.0f, 8, theme::dim, 0.7f);
+        return;
+    }
+
+    const SDL_Color statusColor =
+        mix::transitionStatus(plan.type) == mix::ImplementationStatus::Working
+            ? theme::accent
+            : (mix::transitionStatus(plan.type) ==
+                       mix::ImplementationStatus::Experimental
+                   ? theme::amber
+                   : theme::red);
+    const std::string typeName = mix::transitionTypeName(plan.type);
+    body(ellipsize(*text, typeName, card.w - 130.0f, 15, FontWeight::SemiBold),
+         card.x + 16.0f, card.y + 34.0f, 15, theme::text,
+         FontWeight::SemiBold);
+    const Rect statusRect{ card.right() - 108.0f, card.y + 32.0f, 92.0f, 20.0f };
+    ui::fillRoundedRect(renderer, statusRect, 10.0f,
+                        theme::alpha(statusColor, 0.12f));
+    ui::strokeRoundedRect(renderer, statusRect, 10.0f,
+                          theme::alpha(statusColor, 0.38f), 1.0f);
+    text->drawCentered(mix::transitionStatusLabel(plan.type),
+                       statusRect.centerX(), statusRect.y + 5.0f, 7,
+                       FontWeight::SemiBold, statusColor);
+
+    std::string route = std::string("A ") +
+                        formatNumber(plan.from == mix::DeckId::A ? plan.bpmA
+                                                                : plan.bpmB, 1) +
+                        "  ->  B " +
+                        formatNumber(plan.to == mix::DeckId::B ? plan.bpmB
+                                                              : plan.bpmA, 1) +
+                        " BPM";
+    if (!plan.metricRelation.unison()) {
+        route += "  ·  " + std::to_string(plan.metricRelation.bBeats) + ":" +
+                 std::to_string(plan.metricRelation.aBeats);
+    }
+    if (plan.tempoMatchKind != mix::TempoMatchKind::None) {
+        route += " (" + std::string(mix::tempoMatchKindName(plan.tempoMatchKind)) + ")";
+    }
+    route += "  ·  " + formatNumber(plan.duration, 1) + " s  ·  " +
+             std::string(mix::mixStrategyKindShortName(plan.strategy)) + " (" +
+             formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%)";
+    label(route, card.x + 16.0f, card.y + 56.0f, 8, theme::muted, 0.8f);
+
+    std::string alignment;
+    if (plan.beatAligned) {
+        alignment = "BEAT ALIGNED  ·  snap " +
+                    formatNumber(plan.alignmentErrorMs, 1) + " ms";
+        if (plan.phaseMeasured) {
+            alignment += "  ·  phase RMS " +
+                         formatNumber(plan.phaseRmsMs, 1) + " ms (p95 " +
+                         formatNumber(plan.phaseP95Ms, 1) + " ms)";
+        }
+        if (plan.downbeatAligned) {
+            alignment += "  ·  downbeat";
+        }
+        if (plan.phraseBoundary) {
+            alignment += "  ·  phrase";
+        }
+    } else {
+        alignment = "NOT BEAT ALIGNED  ·  confidence " +
+                    formatNumber(plan.confidence * 100.0, 0) + "%";
+    }
+    label(alignment, card.x + 16.0f, card.y + 72.0f, 8,
+          plan.beatAligned ? theme::accent : theme::amber, 0.8f);
+    if (plan.experimental) {
+        labelRight("EXPERIMENTAL", card.right() - 16.0f, card.y + 72.0f, 8,
+                   theme::amber, 0.8f);
+    }
+
+    // Transition Timeline: pre-roll, crossfade, handover and live playhead.
+    const Rect timeline = mixLayout.timeline;
+    ui::fillRoundedRect(renderer, timeline, 7.0f, theme::backgroundSoft);
+    ui::strokeRoundedRect(renderer, timeline, 7.0f, theme::border, 1.0f);
+    const double total = std::max(0.001, plan.totalDuration());
+    const float preW = static_cast<float>(
+        std::clamp(plan.preTransitionSeconds / total, 0.0, 1.0)) * timeline.w;
+    const float fadeW = std::max(0.0f, timeline.w - preW);
+    if (preW > 0.5f) {
+        ui::fillRect(renderer, { timeline.x, timeline.y + 3.0f, preW,
+                                 timeline.h - 6.0f },
+                     theme::alpha(theme::amber, 0.16f));
+        label("PRE-ROLL", timeline.x + 5.0f, timeline.y + 4.0f, 7,
+              theme::amber, 0.6f);
+    }
+    ui::fillRect(renderer, { timeline.x + preW, timeline.y + 3.0f, fadeW,
+                             timeline.h - 6.0f },
+                 theme::alpha(theme::accent, 0.14f));
+    if (fadeW > 40.0f) {
+        label("CROSSFADE", timeline.x + preW + 5.0f, timeline.y + 4.0f, 7,
+              theme::accent, 0.6f);
+    }
+    const float handoverX = timeline.x + preW +
+                            fadeW * static_cast<float>(
+                                        std::clamp(plan.handoverProgress, 0.0, 1.0));
+    ui::thickLine(renderer, handoverX, timeline.y + 3.0f, handoverX,
+                  timeline.bottom() - 3.0f, 1.0f,
+                  theme::alpha(theme::white, 0.35f), false);
+    label("HANDOVER", std::min(handoverX + 3.0f, timeline.right() - 52.0f),
+          timeline.y + 4.0f, 6, theme::dim, 0.4f);
+    if (snap.engine.phase == mix::TransitionPhase::Running ||
+        snap.engine.phase == mix::TransitionPhase::Cancelling) {
+        const double elapsed = snap.engine.transitionElapsed;
+        const float playX = timeline.x + static_cast<float>(
+            std::clamp(elapsed / total, 0.0, 1.0)) * timeline.w;
+        ui::thickLine(renderer, playX, timeline.y + 1.0f, playX,
+                      timeline.bottom() - 1.0f, 2.0f, theme::text, false);
+    }
+    labelRight(formatNumber(plan.preTransitionSeconds, 1) + " + " +
+                   formatNumber(plan.duration, 1) + " s",
+               timeline.right() - 4.0f, timeline.bottom() - 13.0f, 7,
+               theme::muted, 0.5f);
+
+    // Gain and tempo curves from the actual plan.
+    const Rect curve{ card.x + 16.0f, timeline.bottom() + 8.0f,
+                      card.w - 32.0f,
+                      std::clamp(card.h * 0.18f, 38.0f, 58.0f) };
+    ui::fillRoundedRect(renderer, curve, 7.0f, theme::backgroundSoft);
+    ui::strokeRoundedRect(renderer, curve, 7.0f, theme::border, 1.0f);
+    auto plot = [&](const std::vector<mix::GainPoint>& points, SDL_Color color) {
+        if (points.size() < 2) {
+            return;
+        }
+        SDL_FPoint previous{};
+        bool first = true;
+        for (const mix::GainPoint& point : points) {
+            const float x = curve.x + static_cast<float>(std::clamp(
+                (plan.preTransitionSeconds + point.time) / total, 0.0, 1.0)) *
+                                        curve.w;
+            const float y = curve.bottom() - 4.0f -
+                            std::clamp(point.gain, 0.0f, 1.2f) * (curve.h - 8.0f);
+            if (!first) {
+                ui::thickLine(renderer, previous.x, previous.y, x, y, 1.4f,
+                              color, false);
+            }
+            previous = { x, y };
+            first = false;
+        }
+    };
+    plot(plan.gainCurveOut, theme::accent);
+    plot(plan.gainCurveIn, theme::violet);
+    if (!plan.tempoCurve.empty()) {
+        SDL_FPoint previous{};
+        bool first = true;
+        for (const mix::TempoPoint& point : plan.tempoCurve) {
+            const float x = curve.x + static_cast<float>(std::clamp(
+                (plan.preTransitionSeconds + point.time) / total, 0.0, 1.0)) *
+                                        curve.w;
+            const double deviation = std::clamp((point.rate - 1.0) / 0.15, -1.0, 1.0);
+            const float y = curve.centerY() -
+                            static_cast<float>(deviation) * (curve.h * 0.5f - 4.0f);
+            if (!first) {
+                ui::thickLine(renderer, previous.x, previous.y, x, y, 1.2f,
+                              theme::amber, false);
+            }
+            previous = { x, y };
+            first = false;
+        }
+        if (plan.pitchShiftWarning) {
+            label("TEMPO RAMP  ·  PITCH SHIFT BY DESIGN", curve.x + 6.0f,
+                  curve.y + 4.0f, 7, theme::amber, 0.5f);
+        } else if (plan.tempoRampActive) {
+            label("TEMPO RAMP  ·  PITCH LOCKED", curve.x + 6.0f,
+                  curve.y + 4.0f, 7, theme::accent, 0.5f);
+        }
+    }
+    label("OUT", curve.x + 6.0f, curve.bottom() - 13.0f, 7, theme::accent, 0.6f);
+    labelRight("IN", curve.right() - 6.0f, curve.bottom() - 13.0f, 7,
+               theme::violet, 0.6f);
+
+    float y = curve.bottom() + 8.0f;
+    int shown = 0;
+    for (const std::string& reason : plan.reasons) {
+        if (shown >= 3 || y > card.bottom() - 46.0f) {
+            break;
+        }
+        body(ellipsize(*text, reason, card.w - 32.0f, 9, FontWeight::Regular),
+             card.x + 16.0f, y, 9, theme::muted);
+        y += 13.0f;
+        ++shown;
+    }
+    if (!plan.fallbackReason.empty()) {
+        label("FALLBACK", card.x + 16.0f, card.bottom() - 36.0f, 8,
+              theme::amber, 1.0f);
+        body(ellipsize(*text, plan.fallbackReason, card.w - 96.0f, 8,
+                       FontWeight::Regular),
+             card.x + 82.0f, card.bottom() - 36.0f, 8, theme::amber);
+    } else if (plan.pitchShiftWarning) {
+        body("Linear time-stretch changes pitch. Choose Quality + Pitch Lock",
+             card.x + 16.0f, card.bottom() - 36.0f, 8, theme::amber);
+    } else {
+        label("TIMELINE + GAIN/TEMPO CURVES FROM BG BEAT", card.x + 16.0f,
+              card.bottom() - 36.0f, 7, theme::dim, 0.6f);
+    }
+
+    const float peakDb = snap.engine.outputPeak > 0.0001f
+                             ? 20.0f * std::log10(snap.engine.outputPeak)
+                             : -96.0f;
+    const std::string diagnostics =
+        "OUT " + formatNumber(peakDb, 1) + " dBFS  ·  LIM " +
+        formatNumber(snap.engine.limiterGain, 2) + "  ·  LAT " +
+        formatNumber(snap.engine.outputLatencySeconds * 1000.0, 1) + " ms  ·  " +
+        std::to_string(snap.engine.completedTransitions) + " MIXES";
+    labelRight(diagnostics, card.right() - 16.0f, card.bottom() - 18.0f, 7,
+               theme::dim, 0.5f);
+}
+
+void DesktopApp::Impl::drawMixControls(const Rect& card,
+                                       const mix::MixSessionSnapshot& snap) {
+    ui::fillRoundedRect(renderer, card, 12.0f, theme::panel);
+    ui::strokeRoundedRect(renderer, card, 12.0f, theme::border, 1.0f);
+    text->draw("MIX CONTROLS", card.x + 16.0f, card.y + 13.0f, 12,
+               FontWeight::SemiBold, theme::text);
+    labelRight("LIVE", card.right() - 16.0f, card.y + 16.0f, 7,
+               snap.engine.paused ? theme::amber : theme::accent, 1.0f);
+
+    const bool anyPlaying = snap.engine.decks[0].playing ||
+                            snap.engine.decks[1].playing;
+    const bool transportRunning = !snap.engine.paused && anyPlaying;
+    const bool mixing = snap.engine.phase == mix::TransitionPhase::Running ||
+                        snap.engine.phase == mix::TransitionPhase::Cancelling;
+
+    auto stageName = [](mix::TransitionStage stage) -> const char* {
+        switch (stage) {
+        case mix::TransitionStage::Preparing: return "PREPARING";
+        case mix::TransitionStage::TempoRamp: return "TEMPO RAMP";
+        case mix::TransitionStage::BeatAlign: return "BEAT ALIGN";
+        case mix::TransitionStage::Mixing: return "MIXING";
+        case mix::TransitionStage::Handover: return "HANDOVER";
+        case mix::TransitionStage::Complete: return "COMPLETE";
+        case mix::TransitionStage::Cancelled: return "CANCELLED";
+        case mix::TransitionStage::Idle: break;
+        }
+        return "IDLE";
+    };
+    // Live Transition Monitor: stage, both live rates, EQ, phase and the two
+    // audio-integrity flags. This is the same state BG Sync consumes.
+    std::string monitor;
+    if (mixing) {
+        const mix::MixSnapshot& e = snap.engine;
+        monitor = std::string(stageName(e.stage)) + "  ·  A " +
+                  formatNumber(e.tempoRatioA, 3) + "x  ·  B " +
+                  formatNumber(e.tempoRatioB, 3) + "x  ·  LOW " +
+                  formatNumber(e.eqLow[0], 2) + "/" +
+                  formatNumber(e.eqLow[1], 2) + "  ·  PHASE " +
+                  formatNumber(e.beatPhaseErrorMs, 1) + " ms";
+        if (e.pitchLock) {
+            monitor += "  ·  LOCK";
+        }
+        if (e.bassSwap) {
+            monitor += "  ·  BASS SWAP";
+        }
+    } else if (snap.preview.valid) {
+        monitor = std::string("NEXT  ·  ") +
+                  mix::transitionTypeName(snap.preview.type);
+        if (!snap.preview.metricRelation.unison()) {
+            monitor += " (" + std::to_string(snap.preview.metricRelation.bBeats) +
+                       ":" + std::to_string(snap.preview.metricRelation.aBeats) + ")";
+        }
+        monitor += "  ·  " +
+                  formatNumber(snap.preview.preTransitionSeconds, 1) + " + " +
+                  formatNumber(snap.preview.duration, 1) + " s  ·  " +
+                  formatNumber(snap.preview.confidence * 100.0, 0) + "%";
+    } else {
+        monitor = "IDLE  ·  load two tracks to arm a transition";
+    }
+    label(ellipsize(*text, monitor, card.w - 32.0f, 8, FontWeight::Regular),
+          card.x + 16.0f, mixLayout.monitor.y, 8,
+          mixing ? theme::accent : theme::dim, 0.4f);
+
+    drawMixButton(mixLayout.playButton, transportRunning ? "PAUSE" : "PLAY",
+                  transportRunning, theme::accent, transportRunning ? 2 : 1);
+    drawMixButton(mixLayout.nextButton, "NEXT", mixing, theme::violet);
+    drawMixButton(mixLayout.stopButton, "STOP", false, theme::muted, 3);
+    drawMixButton(mixLayout.cancelButton, "CANCEL", mixing, theme::red);
+
+    auto valueRow = [&](const Rect& prev, const Rect& next, const char* caption,
+                        const std::string& value) {
+        label(caption, card.x + 16.0f, prev.y + 8.0f, 8, theme::dim, 1.2f);
+        text->drawRight(ellipsize(*text, value, 200.0f, 10, FontWeight::SemiBold),
+                        prev.x - 8.0f, prev.y + 4.0f, 10, FontWeight::SemiBold,
+                        theme::text);
+        drawMixButton(prev, "<", false, theme::muted);
+        drawMixButton(next, ">", false, theme::muted);
+    };
+
+    const std::string typeName =
+        mix::transitionTypeName(mixSession->transitionType());
+    valueRow(mixLayout.typePrev, mixLayout.typeNext, "TYPE", typeName);
+
+    const double duration = mixSession->transitionDuration();
+    valueRow(mixLayout.durationMinus, mixLayout.durationPlus, "DURATION",
+             duration <= 0.0 ? "AUTO" : formatNumber(duration, 1) + " s");
+
+    const mix::MixMode mode = mixSession->mixMode();
+    const char* modeName = mode == mix::MixMode::Auto
+                               ? "AUTO"
+                               : (mode == mix::MixMode::Manual ? "MANUAL"
+                                                               : "PREVIEW");
+    valueRow(mixLayout.modePrev, mixLayout.modeNext, "MODE", modeName);
+
+    const mix::TempoRampMode rampMode = mixSession->tempoRampMode();
+    const char* rampModeName = rampMode == mix::TempoRampMode::Off
+                                   ? "OFF"
+                                   : (rampMode == mix::TempoRampMode::Auto
+                                          ? "AUTO"
+                                          : "MANUAL");
+    valueRow(mixLayout.rampModePrev, mixLayout.rampModeNext, "RAMP",
+             rampModeName);
+
+    const double bars = mixSession->tempoRampBars();
+    valueRow(mixLayout.rampBarsPrev, mixLayout.rampBarsNext, "RAMP BARS",
+             bars < 1.0 ? "AUTO" : formatNumber(bars, 0) + " bars");
+
+    const mix::TempoCurveKind curve = mixSession->tempoCurve();
+    valueRow(mixLayout.curvePrev, mixLayout.curveNext, "CURVE",
+             curve == mix::TempoCurveKind::Linear
+                 ? "LINEAR"
+                 : (curve == mix::TempoCurveKind::Smooth ? "SMOOTH"
+                                                        : "S-CURVE"));
+
+    valueRow(mixLayout.maxDeltaPrev, mixLayout.maxDeltaNext, "MAX DELTA",
+             formatNumber(mixSession->tempoRampMaxPercent(), 0) + " %");
+
+    drawMixButton(mixLayout.pitchChip, "PITCH LOCK",
+                  mixSession->pitchLock(), theme::accent);
+    drawMixButton(mixLayout.bassChip, "BASS SWAP", mixSession->bassSwap(),
+                  theme::violet);
+    drawMixButton(mixLayout.adaptiveChip, "ADAPTIVE",
+                  mixSession->adaptive(), theme::accent);
+
+    drawMixButton(mixLayout.tempoRampChip, "RAMP " +
+                      std::string(mixSession->tempoRampEnabled() ? "ON" : "OFF"),
+                  mixSession->tempoRampEnabled(), theme::amber);
+    drawMixButton(mixLayout.autoQueueChip, "AUTO QUEUE",
+                  mixSession->autoQueue(), theme::violet);
+    drawMixButton(mixLayout.qualityStretchChip,
+                  mixSession->quality() == mix::StretchQuality::Quality
+                      ? "STRETCH Q"
+                      : "STRETCH F",
+                  mixSession->quality() == mix::StretchQuality::Quality,
+                  theme::pink);
+
+    drawMixButton(mixLayout.previewButton, "PREVIEW PLAN", mixPlanDetail,
+                  theme::accent);
+
+    const std::string uiCaption = uiScaleCaption();
+    drawMixButton(mixLayout.uiScaleChip, uiCaption,
+                  uiScaleSetting > 0.0f, theme::violet);
+    drawMixButton(mixLayout.qualityChip,
+                  "3D " + std::to_string(vrmQuality) + "%", false, theme::pink);
+    drawMixButton(mixLayout.fullscreenChip,
+                  fullscreen ? "WINDOWED" : "FULLSCREEN", fullscreen,
+                  theme::accent);
+}
+
+void DesktopApp::Impl::drawMixScreen() {
+    if (!mixSession) {
+        return;
+    }
+    const mix::MixSessionSnapshot snap = mixSession->snapshot();
+
+    drawMixQueue(mixLayout.queueCard, snap);
+    const bool incomingA = snap.preview.valid &&
+                           snap.preview.to == mix::DeckId::A;
+    const bool incomingB = snap.preview.valid &&
+                           snap.preview.to == mix::DeckId::B;
+    drawMixDeck(mixLayout.deckA, mix::DeckId::A, incomingA);
+    drawMixDeck(mixLayout.deckB, mix::DeckId::B, incomingB);
+    drawMixPlan(mixLayout.planCard, snap);
+    drawMixControls(mixLayout.controlCard, snap);
+
+    if (mixPlanDetail) {
+        ui::fillRect(renderer, {0.0f, 64.0f, canvasW,
+                                std::max(0.0f, layout.footer.y - 64.0f)},
+                     SDL_Color{5, 7, 11, 210});
+        const float cardW = std::min(860.0f, canvasW - 80.0f);
+        const float cardH = std::min(520.0f, canvasH - 180.0f);
+        const Rect card{canvasW * 0.5f - cardW * 0.5f,
+                        canvasH * 0.5f - cardH * 0.5f, cardW, cardH};
+        ui::fillRoundedRect(renderer, card, 14.0f, theme::panel);
+        ui::strokeRoundedRect(renderer, card, 14.0f, theme::borderBright, 1.0f);
+        text->draw("PLAN PREVIEW", card.x + 22.0f, card.y + 18.0f, 16,
+                   FontWeight::SemiBold, theme::text);
+        label("DETERMINISTIC · NO AUDIO IS PLAYED BY THIS PANEL",
+              card.x + 22.0f, card.y + 42.0f, 8, theme::dim, 0.8f);
+        labelRight("CLICK ANYWHERE TO CLOSE", card.right() - 22.0f,
+                   card.y + 20.0f, 8, theme::muted, 0.8f);
+
+        const mix::MixPlan& plan = snap.preview;
+        if (!plan.valid) {
+            body("No valid plan yet. Add at least two tracks; both decks must",
+                 card.x + 22.0f, card.y + 76.0f, 12, theme::muted);
+            body("finish preparation before the planner can choose a point.",
+                 card.x + 22.0f, card.y + 96.0f, 12, theme::muted);
+            if (!snap.lastError.empty()) {
+                body(ellipsize(*text, snap.lastError, card.w - 44.0f, 11,
+                               FontWeight::Regular),
+                     card.x + 22.0f, card.y + 126.0f, 11, theme::amber);
+            }
+        } else {
+            std::string title = std::string(mix::transitionTypeName(plan.type));
+            if (!plan.metricRelation.unison()) {
+                title += " (" + std::to_string(plan.metricRelation.bBeats) + ":" +
+                         std::to_string(plan.metricRelation.aBeats) + ")";
+            }
+            title += "  ·  " + std::string(mix::mixStrategyKindName(plan.strategy)) +
+                     "  ·  " + formatNumber(plan.duration, 2) + " s  ·  score " +
+                     formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%";
+            body(title, card.x + 22.0f, card.y + 68.0f, 14, theme::text,
+                 FontWeight::SemiBold);
+            const Rect curve{ card.x + 22.0f, card.y + 96.0f, card.w - 44.0f,
+                              140.0f };
+            ui::fillRoundedRect(renderer, curve, 8.0f, theme::backgroundSoft);
+            ui::strokeRoundedRect(renderer, curve, 8.0f, theme::border, 1.0f);
+            ui::thickLine(renderer, curve.x + 6.0f, curve.centerY(),
+                          curve.right() - 6.0f, curve.centerY(), 1.0f,
+                          theme::alpha(theme::white, 0.10f), false);
+            const double span = std::max(0.001, plan.duration);
+            auto plot = [&](const std::vector<mix::GainPoint>& points,
+                            SDL_Color color) {
+                if (points.size() < 2) {
+                    return;
+                }
+                SDL_FPoint previous{};
+                bool first = true;
+                for (const mix::GainPoint& point : points) {
+                    const float x = curve.x + 6.0f + static_cast<float>(
+                        std::clamp(point.time / span, 0.0, 1.0)) *
+                        (curve.w - 12.0f);
+                    const float y = curve.bottom() - 8.0f -
+                                    std::clamp(point.gain, 0.0f, 1.2f) *
+                                    (curve.h - 16.0f);
+                    if (!first) {
+                        ui::thickLine(renderer, previous.x, previous.y, x, y,
+                                      2.0f, color, false);
+                    }
+                    previous = { x, y };
+                    first = false;
+                }
+            };
+            plot(plan.gainCurveOut, theme::accent);
+            plot(plan.gainCurveIn, theme::violet);
+            if (!plan.tempoCurve.empty()) {
+                SDL_FPoint previous{};
+                bool first = true;
+                for (const mix::TempoPoint& point : plan.tempoCurve) {
+                    const float x = curve.x + 6.0f + static_cast<float>(
+                        std::clamp(point.time / span, 0.0, 1.0)) *
+                        (curve.w - 12.0f);
+                    const double deviation = std::clamp((point.rate - 1.0) /
+                                                            0.15, -1.0, 1.0);
+                    const float y = curve.centerY() - static_cast<float>(deviation) *
+                                                        (curve.h * 0.5f - 8.0f);
+                    if (!first) {
+                        ui::thickLine(renderer, previous.x, previous.y, x, y,
+                                      1.8f, theme::amber, false);
+                    }
+                    previous = { x, y };
+                    first = false;
+                }
+                label("TEMPO (AMBER) · OUT GAIN (GREEN) · IN GAIN (VIOLET)",
+                      curve.x + 8.0f, curve.y + 5.0f, 7, theme::dim, 0.5f);
+            }
+            float y = curve.bottom() + 10.0f;
+            const std::string breakdownLine =
+                "SCORE BREAKDOWN  ·  PHRASE " +
+                formatNumber(plan.scoreBreakdown.phraseBoundaryScore * 100.0, 0) + "%  ·  RHYTHM " +
+                formatNumber(plan.scoreBreakdown.rhythmBeatScore * 100.0, 0) + "%  ·  VOCAL SAFETY " +
+                formatNumber(plan.scoreBreakdown.vocalSafetyScore * 100.0, 0) + "%  ·  HARMONIC " +
+                formatNumber(plan.scoreBreakdown.harmonicScore * 100.0, 0) + "%  ·  ENERGY " +
+                formatNumber(plan.scoreBreakdown.energyContinuityScore * 100.0, 0) + "%  ·  LUFS " +
+                formatNumber(plan.scoreBreakdown.loudnessBalanceScore * 100.0, 0) + "%";
+            label(ellipsize(*text, breakdownLine, card.w - 44.0f, 8, FontWeight::SemiBold),
+                  card.x + 22.0f, y, 8, theme::accent, 0.5f);
+            y += 16.0f;
+            int shown = 0;
+            for (const std::string& reason : plan.reasons) {
+                if (shown >= 5) {
+                    break;
+                }
+                body("- " + ellipsize(*text, reason, card.w - 68.0f, 10,
+                                      FontWeight::Regular),
+                     card.x + 22.0f, y, 10, theme::muted);
+                y += 16.0f;
+                ++shown;
+            }
+            if (!plan.alternatives.empty()) {
+                y += 4.0f;
+                label("RANKED CANDIDATES", card.x + 22.0f, y, 8, theme::violet, 0.8f);
+                y += 14.0f;
+                const std::size_t maxAlt = std::min<std::size_t>(3, plan.alternatives.size());
+                for (std::size_t i = 0; i < maxAlt; ++i) {
+                    const auto& alt = plan.alternatives[i];
+                    const std::string altLine =
+                        "#" + std::to_string(alt.rank) + " [" +
+                        std::string(mix::mixStrategyKindShortName(alt.strategy)) + "] A " +
+                        formatNumber(alt.transitionStartA, 1) + "->" +
+                        formatNumber(alt.transitionEndA, 1) + " s, B " +
+                        formatNumber(alt.startB, 1) + " s (" +
+                        formatNumber(alt.duration, 1) + " s) · score " +
+                        formatNumber(alt.score.totalScore * 100.0, 0) + "% · " +
+                        alt.rationale;
+                    body(ellipsize(*text, altLine, card.w - 44.0f, 9, FontWeight::Regular),
+                         card.x + 22.0f, y, 9, i == 0 ? theme::text : theme::dim);
+                    y += 14.0f;
+                }
+            }
+            if (!plan.fallbackReason.empty()) {
+                body("Fallback: " + plan.fallbackReason, card.x + 22.0f, y, 10,
+                     theme::amber);
+                y += 16.0f;
+            }
+            if (plan.pitchShiftWarning) {
+                body("Pitch warning: the planner asks the outgoing deck to change "
+                     "speed linearly.",
+                     card.x + 22.0f, y, 10, theme::amber);
+                y += 16.0f;
+                body("The 0.1 engine has no time-stretch; pitch follows tempo by "
+                     "design.",
+                     card.x + 22.0f, y, 10, theme::amber);
+            }
+            labelRight("FROM " + std::string(plan.from == mix::DeckId::A ? "A" : "B") +
+                           "  ->  TO " +
+                           std::string(plan.to == mix::DeckId::A ? "A" : "B"),
+                       card.right() - 22.0f, card.bottom() - 26.0f, 8,
+                       theme::dim, 0.8f);
+        }
+    }
+}
+
+void DesktopApp::Impl::handleMixClick(float x, float y, int clicks) {
+    (void)clicks;
+    if (mixPlanDetail) {
+        mixPlanDetail = false;
+        return;
+    }
+    if (!mixSession) {
+        return;
+    }
+    auto hit = [&](const Rect& rect) { return rect.w > 0.0f && rect.contains(x, y); };
+
+    if (hit(mixLayout.jumpTransitionButton)) {
+        const auto snap = mixSession->snapshot();
+        if (snap.engine.phase != mix::TransitionPhase::Idle) {
+            showToast("Seeking disabled during active transition");
+            return;
+        }
+        if (!snap.preview.valid) {
+            showToast("No transition plan preview available");
+            return;
+        }
+        if (mixSession->jumpToPlannedTransition(7.0)) {
+            dance.setGrid(danceGrid(), danceTime());
+            showToast("Jumped to transition (-7s)");
+        } else {
+            showToast("Cannot jump to planned transition");
+        }
+        return;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (hit(mixLayout.deckWave[i])) {
+            const auto snap = mixSession->snapshot();
+            if (snap.engine.phase != mix::TransitionPhase::Idle) {
+                showToast("Seeking disabled during active transition");
+                return;
+            }
+            const auto deckId = i == 0 ? mix::DeckId::A : mix::DeckId::B;
+            const auto& dStatus = snap.engine.decks[i];
+            if (!dStatus.loaded || dStatus.durationSeconds <= 0.0) {
+                return;
+            }
+            const float relX = std::clamp((x - mixLayout.deckWave[i].x) /
+                                              std::max(1.0f, mixLayout.deckWave[i].w),
+                                          0.0f, 1.0f);
+            const double targetSeconds = static_cast<double>(relX) * dStatus.durationSeconds;
+            mixScrubbingDeck = i;
+            mixScrubTime = targetSeconds;
+            mixSession->seekDeck(deckId, targetSeconds);
+            if (deckId == snap.engine.master) {
+                dance.setGrid(danceGrid(), danceTime());
+            }
+            return;
+        }
+    }
+
+    if (hit(mixLayout.addButton) || hit(mixLayout.openDeckA) ||
+        hit(mixLayout.openDeckB)) {
+        openMixFileDialog();
+        return;
+    }
+    if (hit(mixLayout.clearButton)) {
+        mixSession->clearQueue();
+        showToast("Mix queue cleared");
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (i < static_cast<int>(mixSession->snapshot().queue.size()) &&
+            hit(mixLayout.queueRemove[i])) {
+            const auto snap = mixSession->snapshot();
+            if (mixSession->removeTrack(
+                    snap.queue[static_cast<std::size_t>(i)].id)) {
+                showToast("Removed from queue");
+            }
+            return;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (hit(mixLayout.deckGainMinus[i])) {
+            mixDeckGain[i] = std::max(0.0f, mixDeckGain[i] - 0.05f);
+            mixSession->engine().setDeckGain(i == 0 ? mix::DeckId::A
+                                                    : mix::DeckId::B,
+                                             mixDeckGain[i]);
+            return;
+        }
+        if (hit(mixLayout.deckGainPlus[i])) {
+            mixDeckGain[i] = std::min(1.5f, mixDeckGain[i] + 0.05f);
+            mixSession->engine().setDeckGain(i == 0 ? mix::DeckId::A
+                                                    : mix::DeckId::B,
+                                             mixDeckGain[i]);
+            return;
+        }
+    }
+    if (hit(mixLayout.playButton)) {
+        toggleMixPlay();
+        return;
+    }
+    if (hit(mixLayout.stopButton)) {
+        mixSession->stopAll();
+        showToast("Mix stopped");
+        return;
+    }
+    if (hit(mixLayout.nextButton)) {
+        mixSession->next();
+        return;
+    }
+    if (hit(mixLayout.cancelButton)) {
+        mixSession->cancelTransition();
+        return;
+    }
+    if (hit(mixLayout.previewButton)) {
+        mixPlanDetail = true;
+        return;
+    }
+    if (hit(mixLayout.adaptiveChip)) {
+        mixSession->setAdaptive(!mixSession->adaptive());
+        showToast(mixSession->adaptive() ? "Adaptive planning on"
+                                        : "Adaptive planning off");
+        return;
+    }
+    if (hit(mixLayout.tempoRampChip)) {
+        mixSession->setTempoRampEnabled(!mixSession->tempoRampEnabled());
+        showToast(mixSession->tempoRampEnabled()
+                      ? "Tempo ramp armed (Auto)"
+                      : "Tempo ramp off");
+        return;
+    }
+    if (hit(mixLayout.autoQueueChip)) {
+        mixSession->setAutoQueue(!mixSession->autoQueue());
+        showToast(mixSession->autoQueue() ? "Auto queue on" : "Auto queue off");
+        return;
+    }
+    if (hit(mixLayout.uiScaleChip)) {
+        cycleUiScale();
+        return;
+    }
+    if (hit(mixLayout.qualityChip)) {
+        cycleVrmQuality();
+        return;
+    }
+    if (hit(mixLayout.fullscreenChip)) {
+        toggleFullscreen(!fullscreen);
+        return;
+    }
+
+    const std::vector<mix::TransitionType> types =
+        mix::selectableTransitionTypes();
+    if (hit(mixLayout.typePrev) || hit(mixLayout.typeNext)) {
+        const int direction = hit(mixLayout.typeNext) ? 1 : -1;
+        int index = 0;
+        for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+            if (types[static_cast<std::size_t>(i)] == mixSession->transitionType()) {
+                index = i;
+                break;
+            }
+        }
+        const int count = static_cast<int>(types.size());
+        index = (index + direction + count) % count;
+        mixSession->setTransitionType(types[static_cast<std::size_t>(index)]);
+        showToast(std::string("Transition: ") +
+                  mix::transitionTypeName(types[static_cast<std::size_t>(index)]) +
+                  " (" +
+                  mix::transitionStatusLabel(
+                      types[static_cast<std::size_t>(index)]) +
+                  ")");
+        return;
+    }
+    if (hit(mixLayout.durationPlus) || hit(mixLayout.durationMinus)) {
+        double value = mixSession->transitionDuration();
+        if (hit(mixLayout.durationPlus)) {
+            value = value <= 0.0 ? 8.0 : std::min(16.0, value + 1.0);
+        } else if (value > 0.0) {
+            value = value - 1.0 < 3.0 ? 0.0 : value - 1.0;
+        }
+        mixSession->setTransitionDuration(value);
+        showToast(value <= 0.0
+                      ? "Transition duration: automatic"
+                      : "Transition duration: " + formatNumber(value, 1) + " s");
+        return;
+    }
+    if (hit(mixLayout.modePrev) || hit(mixLayout.modeNext)) {
+        const int direction = hit(mixLayout.modeNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->mixMode());
+        const int next = (current + direction + 3) % 3;
+        const mix::MixMode mode = static_cast<mix::MixMode>(next);
+        mixSession->setMixMode(mode);
+        showToast(mode == mix::MixMode::Auto
+                      ? "Mode: Auto (adaptive, automatic scheduling)"
+                      : (mode == mix::MixMode::Manual
+                             ? "Mode: Manual (explicit type, manual start)"
+                             : "Mode: Preview (plans only, no auto-start)"));
+        return;
+    }
+    if (hit(mixLayout.rampModePrev) || hit(mixLayout.rampModeNext)) {
+        const int direction = hit(mixLayout.rampModeNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->tempoRampMode());
+        const int next = (current + direction + 3) % 3;
+        const mix::TempoRampMode mode = static_cast<mix::TempoRampMode>(next);
+        mixSession->setTempoRampMode(mode);
+        showToast(mode == mix::TempoRampMode::Off
+                      ? "Tempo ramp: Off"
+                      : (mode == mix::TempoRampMode::Auto
+                             ? "Tempo ramp: Auto"
+                             : "Tempo ramp: Manual"));
+        return;
+    }
+    if (hit(mixLayout.rampBarsPrev) || hit(mixLayout.rampBarsNext)) {
+        const double values[] = {0.0, 4.0, 8.0, 16.0};
+        int index = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (std::abs(values[i] - mixSession->tempoRampBars()) < 0.5) {
+                index = i;
+                break;
+            }
+        }
+        const int direction = hit(mixLayout.rampBarsNext) ? 1 : -1;
+        index = (index + direction + 4) % 4;
+        mixSession->setTempoRampBars(values[index]);
+        showToast(values[index] < 1.0 ? "Ramp length: Auto"
+                                      : "Ramp length: " +
+                                            formatNumber(values[index], 0) +
+                                            " bars");
+        return;
+    }
+    if (hit(mixLayout.curvePrev) || hit(mixLayout.curveNext)) {
+        const int direction = hit(mixLayout.curveNext) ? 1 : -1;
+        const int current = static_cast<int>(mixSession->tempoCurve());
+        const int next = (current + direction + 3) % 3;
+        mixSession->setTempoCurve(static_cast<mix::TempoCurveKind>(next));
+        showToast(std::string("Tempo curve: ") +
+                  (next == 0 ? "Linear" : (next == 1 ? "Smooth" : "S-Curve")));
+        return;
+    }
+    if (hit(mixLayout.maxDeltaPrev) || hit(mixLayout.maxDeltaNext)) {
+        const double delta = hit(mixLayout.maxDeltaNext) ? 1.0 : -1.0;
+        mixSession->setTempoRampMaxPercent(
+            std::clamp(mixSession->tempoRampMaxPercent() + delta, 1.0, 16.0));
+        showToast("Max tempo delta: " +
+                  formatNumber(mixSession->tempoRampMaxPercent(), 0) + "%");
+        return;
+    }
+    if (hit(mixLayout.pitchChip)) {
+        mixSession->setPitchLock(!mixSession->pitchLock());
+        showToast(mixSession->pitchLock()
+                      ? "Pitch lock on (WSOLA)"
+                      : "Pitch lock off (resampling changes pitch)");
+        return;
+    }
+    if (hit(mixLayout.bassChip)) {
+        mixSession->setBassSwap(!mixSession->bassSwap());
+        showToast(mixSession->bassSwap() ? "Bass swap on" : "Bass swap off");
+        return;
+    }
+    if (hit(mixLayout.qualityStretchChip)) {
+        const mix::StretchQuality next =
+            mixSession->quality() == mix::StretchQuality::Quality
+                ? mix::StretchQuality::Performance
+                : mix::StretchQuality::Quality;
+        mixSession->setQuality(next);
+        showToast(next == mix::StretchQuality::Quality
+                      ? "Time-stretch: Quality (WSOLA, pitch locked)"
+                      : "Time-stretch: Fast (linear, pitch follows tempo)");
+        return;
+    }
+}
+
 void DesktopApp::Impl::drawFooter() {
     const Rect bar = layout.footer;
     ui::fillRect(renderer, bar, SDL_Color{6, 8, 13, 255});
     SDL_SetRenderDrawColor(renderer, 31, 40, 55, 255);
-    SDL_RenderLine(renderer, 0, bar.y, 1440, bar.y);
+    SDL_RenderLine(renderer, 0, bar.y, canvasW, bar.y);
 
     SDL_Color dot = theme::dim;
     std::string status;
+    if (module == Module::Mix && mixSession) {
+        const mix::MixSessionSnapshot snap = mixSession->snapshot();
+        const bool paused = snap.engine.paused;
+        dot = paused ? theme::amber : theme::accent;
+        status = snap.status.empty() ? "BG MIX" : snap.status;
+        ui::fillCircle(renderer, 24.0f, bar.centerY(), 3.2f, dot);
+        label(status, 34.0f, bar.y + 15.0f, 8, theme::muted, 1.1f);
+        const std::string engineLine =
+            std::string("2 DECKS  ·  ") +
+            (snap.engine.decks[0].loaded ? "A" : "-") +
+            (snap.engine.decks[1].loaded ? "B" : "-") + "  ·  " +
+            formatNumber(snap.engine.outputLatencySeconds * 1000.0, 1) + " ms";
+        body(engineLine, 190.0f, bar.y + 13.0f, 9, theme::dim);
+        text->drawCentered(
+            "SPACE PLAY/PAUSE   N NEXT   X CANCEL   A ADAPTIVE   T TEMPO RAMP   "
+            "U UI SCALE",
+            canvasW * 0.5f, bar.y + 13.0f, 8, FontWeight::SemiBold,
+            theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
+        labelRight("BG MIX 0.2   ·   " BGMEDIA_VERSION_STRING, canvasW - 24.0f,
+                   bar.y + 15.0f, 8, theme::dim, 0.6f);
+        return;
+    }
+
     if (state == AppState::Loading) {
         dot = theme::amber;
         status = "ANALYSING IN BACKGROUND";
@@ -4521,18 +6719,18 @@ void DesktopApp::Impl::drawFooter() {
              190.0f, bar.y + 13.0f, 9, theme::dim);
     }
 
-    text->drawCentered("SPACE PLAY/PAUSE   в†ђ/в†’ 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
+    text->drawCentered("SPACE PLAY/PAUSE   LEFT/RIGHT 5s   WHEEL ZOOM   G 2D/3D   C CAMERA   D DEBUG   "
                        "V A/B   B LAB   R RATE",
-                       720.0f, bar.y + 13.0f, 8, FontWeight::SemiBold,
+                       canvasW * 0.5f, bar.y + 13.0f, 8, FontWeight::SemiBold,
                        theme::alpha(theme::muted, 0.75f), 1.0f, 0.2f);
     labelRight("BG MEDIA v" BGMEDIA_VERSION_STRING "   ·   OFFLINE / DETERMINISTIC",
-               1416.0f, bar.y + 15.0f, 8, theme::dim, 0.6f);
+                canvasW - 24.0f, bar.y + 15.0f, 8, theme::dim, 0.6f);
 }
 
 void DesktopApp::Impl::drawOverlays() {
     if (state == AppState::Loading) {
-        ui::fillRect(renderer, {0, 64, 1440, 792}, SDL_Color{5, 7, 11, 170});
-        const Rect card{440, 330, 560, 220};
+        ui::fillRect(renderer, {0, 64, canvasW, std::max(0.0f, layout.footer.y - 64.0f)}, SDL_Color{5, 7, 11, 170});
+        const Rect card{canvasW * 0.5f - 280.0f, canvasH * 0.5f - 110.0f, 560.0f, 220.0f};
         ui::fillRoundedRect(renderer, card, 14.0f, theme::panel);
         ui::strokeRoundedRect(renderer, card, 14.0f, theme::borderBright, 1.0f);
         // Spinner.
@@ -4569,8 +6767,8 @@ void DesktopApp::Impl::drawOverlays() {
     }
 
     if (state == AppState::Error) {
-        ui::fillRect(renderer, {0, 64, 1440, 792}, SDL_Color{5, 7, 11, 180});
-        const Rect card{390, 310, 660, 240};
+        ui::fillRect(renderer, {0, 64, canvasW, std::max(0.0f, layout.footer.y - 64.0f)}, SDL_Color{5, 7, 11, 180});
+        const Rect card{canvasW * 0.5f - 330.0f, canvasH * 0.5f - 120.0f, 660.0f, 240.0f};
         ui::fillRoundedRect(renderer, card, 14.0f, theme::panel);
         ui::strokeRoundedRect(renderer, card, 14.0f, theme::alpha(theme::red, 0.4f), 1.0f);
         ui::fillCircle(renderer, card.x + 46.0f, card.y + 46.0f, 15.0f,
@@ -4597,7 +6795,7 @@ void DesktopApp::Impl::drawOverlays() {
         const float alpha = static_cast<float>(
             std::clamp((toastUntil - animationTime) / 0.4, 0.0, 1.0));
         const float width = text->measure(toast, 11, FontWeight::SemiBold) + 34.0f;
-        const Rect pill{720.0f - width * 0.5f, 802.0f, width, 30.0f};
+        const Rect pill{canvasW * 0.5f - width * 0.5f, canvasH - 84.0f, width, 30.0f};
         ui::fillRoundedRect(renderer, pill, 15.0f,
                             theme::alpha(theme::panelRaised, alpha));
         ui::strokeRoundedRect(renderer, pill, 15.0f,
@@ -4612,6 +6810,14 @@ void DesktopApp::Impl::drawOverlays() {
 // -------------------------------------------------------------------------
 void DesktopApp::Impl::renderFrame() {
     computeLayout();
+    if (module == Module::Mix) {
+        drawBackground();
+        drawHeader();
+        drawMixScreen();
+        drawFooter();
+        drawOverlays();
+        return;
+    }
     if (characterView == CharacterView::Vrm3D) {
         updateVrmFrame();
     }
@@ -5021,32 +7227,32 @@ void DesktopApp::Impl::drawDanceDebug(const Rect& stage) {
 }
 
 void DesktopApp::Impl::drawPresentation() {
-    ui::fillRect(renderer, {0.0f, 0.0f, 1440.0f, 900.0f}, SDL_Color{5, 7, 12, 255});
-    const Rect full{0.0f, 0.0f, 1440.0f, 900.0f};
+    ui::fillRect(renderer, {0.0f, 0.0f, canvasW, canvasH}, SDL_Color{5, 7, 12, 255});
+    const Rect full{0.0f, 0.0f, canvasW, canvasH};
     std::string error;
     const bool ok = vrm.ready() && vrm.renderable() && vrm.draw(renderer, ui::fr(full), &error, true);
     if (!ok) {
         ui::verticalGradient(renderer, full, SDL_Color{16, 24, 38, 255}, SDL_Color{4, 6, 10, 255});
-        text->drawCentered("Load a VRM model to present", 720.0f, 430.0f, 16, FontWeight::SemiBold,
+        text->drawCentered("Load a VRM model to present", canvasW * 0.5f, canvasH * 0.5f - 20.0f, 16, FontWeight::SemiBold,
                            theme::muted);
     }
     // soft vignette so the picture sits on the screen without UI chrome
-    ui::verticalGradient(renderer, {0.0f, 0.0f, 1440.0f, 120.0f}, SDL_Color{5, 7, 12, 150},
+    ui::verticalGradient(renderer, {0.0f, 0.0f, canvasW, 120.0f}, SDL_Color{5, 7, 12, 150},
                          SDL_Color{5, 7, 12, 0});
-    ui::verticalGradient(renderer, {0.0f, 740.0f, 1440.0f, 160.0f}, SDL_Color{5, 7, 12, 0},
+    ui::verticalGradient(renderer, {0.0f, canvasH - 160.0f, canvasW, 160.0f}, SDL_Color{5, 7, 12, 0},
                          SDL_Color{5, 7, 12, 190});
     const std::string caption = clipTitle(danceFrame) + (track ? "" : "  ·  " + std::to_string(danceLabBpm) + " BPM");
-    text->drawCentered(caption, 720.0f, 842.0f, 18, FontWeight::SemiBold,
+    text->drawCentered(caption, canvasW * 0.5f, canvasH - 58.0f, 18, FontWeight::SemiBold,
                        theme::alpha(theme::text, 0.88f));
     const double since = animationTime - presentationSince;
     if (since < 4.0 && !captureMode) {
         const float a = static_cast<float>(std::clamp(1.0 - (since - 2.5) / 1.5, 0.0, 1.0));
-        text->drawCentered("P / ESC to leave presentation  ·  1-4 change dance", 720.0f, 872.0f, 10,
+        text->drawCentered("P / ESC to leave presentation  ·  1-4 change dance", canvasW * 0.5f, canvasH - 28.0f, 10,
                            FontWeight::Regular, theme::alpha(theme::muted, a));
     }
     if (!toast.empty() && animationTime < toastUntil) {
         const float alpha = static_cast<float>(std::clamp((toastUntil - animationTime) / 0.4, 0.0, 1.0));
-        text->drawCentered(toast, 720.0f, 40.0f, 11, FontWeight::SemiBold,
+        text->drawCentered(toast, canvasW * 0.5f, 40.0f, 11, FontWeight::SemiBold,
                            theme::alpha(theme::text, alpha * 0.8f));
     }
 }
@@ -5077,6 +7283,27 @@ void DesktopApp::Impl::saveCapture(const std::filesystem::path& path) {
 int DesktopApp::Impl::runCapture() {
     captureMode = true;
     options.noAudio = !options.audioSmoke;
+    loadStartupMixTracks();
+    if (options.startInMix && mixSession) {
+        // Wait for the queue worker to finish the first two decks so the
+        // captured BG Mix screen shows real names, BPM, waveforms and plan.
+        const Uint64 deadline = SDL_GetTicks() + 15000;
+        while (SDL_GetTicks() < deadline) {
+            mixSession->update();
+            if (!mixDevice) {
+                pumpMixSilent(0.02);
+            }
+            const mix::MixSnapshot snap = mixSession->snapshot().engine;
+            if (snap.decks[0].loaded && snap.decks[1].loaded) {
+                break;
+            }
+            SDL_Delay(30);
+        }
+        mixSession->update();
+        if (!mixDevice) {
+            pumpMixSilent(0.02);
+        }
+    }
     if (!options.captureFile.empty() && !options.initialFile.empty()) {
         std::string error;
         std::unique_ptr<LoadedTrack> loaded =
@@ -5182,6 +7409,11 @@ int DesktopApp::Impl::runCapture() {
 }
 
 int DesktopApp::Impl::run() {
+    if (!options.captureFile.empty()) {
+        // Captures are deterministic: no device, the mix engine is pumped from
+        // the capture loop instead of an audio callback.
+        options.noAudio = true;
+    }
     if (!initialize()) {
         return 1;
     }
@@ -5190,6 +7422,7 @@ int DesktopApp::Impl::run() {
         if (!options.initialFile.empty()) {
             startLoad(options.initialFile);
         }
+        loadStartupMixTracks();
         Uint64 previousFrame = SDL_GetTicksNS();
         while (running) {
             const Uint64 frameStart = SDL_GetTicksNS();
@@ -5205,9 +7438,19 @@ int DesktopApp::Impl::run() {
             }
             pollWorker();
             pollDialog();
+            if (mixSession) {
+                mixSession->update();
+            }
+            if (mixSession && !mixDevice) {
+                pumpMixSilent(deltaSeconds);
+            }
             updateDemo(deltaSeconds);
             updatePlayback();
             animationTime = static_cast<double>(frameStart) / 1e9;
+            danceIdle.update(danceTransportRunning(), animationTime);
+            if (settingsDirty && animationTime - settingsSavedAt > 1.5) {
+                saveSettings();
+            }
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
@@ -5245,3 +7488,6 @@ int DesktopApp::run(const DesktopOptions& options) {
 }
 
 } // namespace bgmedia::desktop
+
+
+

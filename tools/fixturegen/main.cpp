@@ -84,6 +84,21 @@ int main(int argc, char** argv) {
     options163.duration = 24.0;
     ok &= writeTrack(outputDirectory, "beat_163.wav", makeClickTrack(options163));
 
+    TrackOptions options060;
+    options060.bpm = 60.0;
+    options060.duration = 24.0;
+    ok &= writeTrack(outputDirectory, "beat_060.wav", makeClickTrack(options060));
+
+    TrackOptions options118;
+    options118.bpm = 118.0;
+    options118.duration = 24.0;
+    ok &= writeTrack(outputDirectory, "beat_118.wav", makeClickTrack(options118));
+
+    TrackOptions options120;
+    options120.bpm = 120.0;
+    options120.duration = 24.0;
+    ok &= writeTrack(outputDirectory, "beat_120.wav", makeClickTrack(options120));
+
     ok &= writeTrack(outputDirectory, "tempo_092_123.wav",
                      makeTempoChangeTrack(92.0, 123.0, 12.0, 24.0));
 
