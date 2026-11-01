@@ -59,11 +59,11 @@ struct MixFeatureConfig {
     int maxMixOutCandidates = 12;
     int maxMixInCandidates = 12;
 
-    // Optional lightweight spectral proxy or vocal/harmonic passes (PR 2).
-    VocalDetectorKind vocalDetector = VocalDetectorKind::None;
-    std::uint32_t vocalModelVersion = 0;
-    std::uint64_t vocalModelChecksum = 0;
-    std::uint32_t harmonicAnalyzeVersion = 0;
+    // Vocal & harmonic analysis passes (BG Mix 0.3).
+    VocalDetectorKind vocalDetector = VocalDetectorKind::MusicVocalModel;
+    std::uint32_t vocalModelVersion = 1;
+    std::uint64_t vocalModelChecksum = 0x4247564F434D444CULL; // "BGVOCMDL"
+    std::uint32_t harmonicAnalyzeVersion = 1;
 
     [[nodiscard]] std::uint64_t fingerprint() const noexcept;
 };
@@ -307,9 +307,12 @@ struct MixFeatureMap {
     [[nodiscard]] SectionKind sectionAt(double time, float* confidenceOut = nullptr) const noexcept;
 };
 
+class IVocalActivityDetector;
+
 class MixFeatureExtractor {
 public:
-    explicit MixFeatureExtractor(MixFeatureConfig config = {});
+    explicit MixFeatureExtractor(MixFeatureConfig config = {},
+                                 const IVocalActivityDetector* customVocalDetector = nullptr);
 
     [[nodiscard]] const MixFeatureConfig& config() const noexcept { return config_; }
 
@@ -331,10 +334,11 @@ public:
 
     // Extraction from mono PcmBuffer + BG Beat AnalysisResult.
     [[nodiscard]] MixFeatureMap extract(const PcmBuffer& pcm,
-                                        const AnalysisResult& analysis) const;
+                                        const AnalysisResult& analysis,
+                                        const PcmTrack* stereoTrack = nullptr) const;
 
     // Convenience overload for mixer PcmTrack (downmixes to mono for analysis
-    // while preserving contentHash from AnalysisResult when non-zero).
+    // while preserving stereo Mid/Side vocal cues and contentHash).
     [[nodiscard]] MixFeatureMap extractFromTrack(const PcmTrack& track,
                                                  const AnalysisResult& analysis) const;
 
@@ -345,6 +349,7 @@ public:
 
 private:
     MixFeatureConfig config_;
+    const IVocalActivityDetector* customVocalDetector_ = nullptr;
 };
 
 } // namespace bgmedia::mix

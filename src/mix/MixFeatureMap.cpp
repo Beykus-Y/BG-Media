@@ -1,6 +1,8 @@
 #include "bgmedia/mix/MixFeatureMap.hpp"
 
 #include "analysis/Dsp.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
+#include "bgmedia/mix/VocalDetector.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -668,6 +670,31 @@ void buildBarsPhrasesAndCues(MixFeatureMap& map,
         }
     }
 
+    // Add vocal phrase handoff candidates when vocal regions are detected.
+    if (map.vocal.available) {
+        for (const VocalRegion& reg : map.vocal.regions) {
+            if (reg.leadLikely && reg.end >= duration * 0.30 &&
+                map.audible.audibleEnd - reg.end >= minMixOutTail) {
+                addUniqueCandidate(
+                    map.mixOutCandidates,
+                    makeCandidate(reg.end, CueRole::MixOut, CueKind::PhraseBoundary,
+                                  reg.confidence, "vocal phrase end handoff cue"),
+                    minSep);
+            }
+            if (reg.leadLikely && reg.start >= map.audible.audibleStart + minSep &&
+                reg.start <= duration * 0.55) {
+                const double preVocal =
+                    std::max(map.audible.audibleStart,
+                             reg.start - std::min(8.0, reg.start - map.audible.audibleStart));
+                addUniqueCandidate(
+                    map.mixInCandidates,
+                    makeCandidate(preVocal, CueRole::MixIn, CueKind::PhraseBoundary,
+                                  reg.confidence, "instrumental lead-in before vocal entry"),
+                    minSep);
+            }
+        }
+    }
+
     auto sortAndTrim = [](std::vector<CuePointCandidate>& list, int maxCount) {
         std::sort(list.begin(), list.end(),
                   [](const CuePointCandidate& a, const CuePointCandidate& b) {
@@ -973,11 +1000,17 @@ WindowFeatureSummary MixFeatureMap::summarizeWindow(double start,
     return out;
 }
 
-MixFeatureExtractor::MixFeatureExtractor(MixFeatureConfig config)
-    : config_(std::move(config)) {
+MixFeatureExtractor::MixFeatureExtractor(
+    MixFeatureConfig config, const IVocalActivityDetector* customVocalDetector)
+    : config_(std::move(config)), customVocalDetector_(customVocalDetector) {
     config_.frameStepSeconds = std::clamp(config_.frameStepSeconds, 0.04, 0.50);
     config_.lowBandMaxHz = std::clamp(config_.lowBandMaxHz, 60.0, 400.0);
     config_.midBandMaxHz = std::clamp(config_.midBandMaxHz, 1200.0, 8000.0);
+    if (customVocalDetector_ != nullptr) {
+        config_.vocalDetector = customVocalDetector_->kind();
+        config_.vocalModelVersion = customVocalDetector_->modelVersion();
+        config_.vocalModelChecksum = customVocalDetector_->modelChecksum();
+    }
 }
 
 std::uint64_t MixFeatureExtractor::contentHashFor(
@@ -1006,7 +1039,15 @@ std::uint64_t MixFeatureExtractor::contentHashFor(
 }
 
 MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
-                                           const AnalysisResult& analysis) const {
+                                           const AnalysisResult& analysis,
+                                           const PcmTrack* stereoTrack) const {
+    if (stereoTrack != nullptr && stereoTrack->valid()) {
+        AudioData audio;
+        audio.sampleRate = stereoTrack->sampleRate;
+        audio.channels = stereoTrack->channels;
+        audio.samples = stereoTrack->samples;
+        return extract(audio, pcm, analysis);
+    }
     return extract(AudioData{}, pcm, analysis);
 }
 
@@ -1462,12 +1503,36 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     }
 
     computeAudibleBoundsAndActivity(map, analysis, config_);
-    buildBarsPhrasesAndCues(map, analysis, config_);
 
-    if (config_.vocalDetector == VocalDetectorKind::SpectralProxy) {
+    PcmTrack stereoView;
+    const PcmTrack* stereoTrack = nullptr;
+    if (audio.valid() && audio.channels >= 2 && audio.sampleRate == pcm.sampleRate) {
+        stereoView.sampleRate = audio.sampleRate;
+        stereoView.channels = audio.channels;
+        stereoView.samples = audio.samples;
+        stereoTrack = &stereoView;
+    }
+
+    if (customVocalDetector_ != nullptr) {
+        const VocalDetectionOutput voc = customVocalDetector_->detect(
+            pcm, stereoTrack, analysis, map.frames, actualStep);
+        applyVocalDetection(map, voc);
+    } else if (config_.vocalDetector == VocalDetectorKind::MusicVocalModel) {
+        MusicVocalDetector detector;
+        const VocalDetectionOutput voc =
+            detector.detect(pcm, stereoTrack, analysis, map.frames, actualStep);
+        applyVocalDetection(map, voc);
+    } else if (config_.vocalDetector == VocalDetectorKind::SpectralProxy) {
         map.vocal.available = true;
         map.vocal.detectorKind = VocalDetectorKind::SpectralProxy;
         map.vocal.meanConfidence = 0.30f;
+    }
+
+    buildBarsPhrasesAndCues(map, analysis, config_);
+
+    if (config_.harmonicAnalyzeVersion > 0) {
+        HarmonicAnalyzer harmonic;
+        harmonic.analyze(pcm, map);
     }
 
     return map;

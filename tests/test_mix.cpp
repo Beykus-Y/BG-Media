@@ -2,6 +2,7 @@
 
 #include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/mix/Crossfade.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
 #include "bgmedia/mix/MixFeatureCache.hpp"
 #include "bgmedia/mix/MixFeatureMap.hpp"
@@ -10,6 +11,7 @@
 #include "bgmedia/mix/MixSync.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
 #include "bgmedia/mix/SpectralEq.hpp"
+#include "bgmedia/mix/VocalDetector.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -3502,4 +3504,261 @@ TEST_CASE("mix.planner_and_session_use_feature_map") {
     CHECK(session.deckFeatures(DeckId::A)->valid());
     CHECK(session.deckFeatures(DeckId::B) != nullptr);
     CHECK(session.deckFeatures(DeckId::B)->valid());
+}
+
+// ---------------------------------------------------------------------------
+// BG Mix 0.3 PR 2: Vocal Activity Detection & Harmonic / Spectral Compatibility
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Synthesizes a multi-harmonic formant voice signal (F0 with gentle 5.5 Hz
+// vibrato + harmonics 1..6 shaped by F1=600 Hz and F2=1450 Hz) in [vocStart, vocEnd].
+std::shared_ptr<PcmTrack> makeVocalAndInstrumentalTrack(
+    double duration, double vocStart, double vocEnd, double bassHz = 110.0) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(frames * 2, 0.0f);
+
+    double phase = 0.0;
+    for (std::size_t f = 0; f < frames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        // Underlying bass sine wave in instrumental sections.
+        double sample = 0.18 * std::sin(2.0 * 3.14159265358979323846 * bassHz * t);
+
+        if (t >= vocStart && t <= vocEnd) {
+            const double vibrato = 1.0 + 0.008 * std::sin(2.0 * 3.14159265358979323846 * 5.5 * t);
+            const double f0 = 220.0 * vibrato;
+            phase += 2.0 * 3.14159265358979323846 * f0 / kRate;
+            // Multi-harmonic voice with strong formant emphasis in F1/F2/F3.
+            const double voice =
+                0.35 * std::sin(phase) +
+                0.45 * std::sin(2.0 * phase) +
+                0.55 * std::sin(3.0 * phase) +
+                0.40 * std::sin(4.0 * phase) +
+                0.30 * std::sin(5.0 * phase) +
+                0.22 * std::sin(6.0 * phase) +
+                0.15 * std::sin(7.0 * phase);
+            sample = 0.08 * sample + 0.32 * voice;
+        }
+        const float s = static_cast<float>(std::clamp(sample, -0.95, 0.95));
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+    return track;
+}
+
+std::shared_ptr<PcmTrack> makeTriadTrack(double duration,
+                                         double fRoot, double fThird, double fFifth) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(frames * 2, 0.0f);
+    for (std::size_t f = 0; f < frames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        const double w = 2.0 * 3.14159265358979323846 * t;
+        const double v =
+            0.26 * std::sin(w * fRoot) +
+            0.10 * std::sin(w * fRoot * 2.0) +
+            0.18 * std::sin(w * fThird) +
+            0.16 * std::sin(w * fFifth);
+        const float s = static_cast<float>(v);
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+    return track;
+}
+
+} // namespace
+
+TEST_CASE("mix.vocal_detector_distinguishes_voice_from_sine_and_drums") {
+    using bgmedia::mix::ExternalStemVocalDetector;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalDetectorKind;
+
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    // Track has pure bass in 0..3 s, singing voice in 3..8 s, and pure bass in 8..12 s.
+    const auto track = makeVocalAndInstrumentalTrack(duration, 3.0, 8.0, 95.0);
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    CHECK(map.vocal.available);
+    CHECK(map.vocal.detectorKind == VocalDetectorKind::MusicVocalModel);
+    CHECK(map.vocal.meanConfidence > 0.50f);
+    CHECK(!map.vocal.regions.empty());
+
+    const auto instStart = map.summarizeWindow(0.5, 2.5);
+    const auto vocalMid = map.summarizeWindow(4.0, 7.0);
+    const auto instEnd = map.summarizeWindow(9.0, 11.5);
+    CHECK(vocalMid.vocalScore > 0.55f);
+    CHECK(instStart.vocalScore < 0.22f);
+    CHECK(instEnd.vocalScore < 0.22f);
+
+    // Disabled vocal detector must honestly report available = false and confidence = 0.
+    MixFeatureConfig offCfg;
+    offCfg.vocalDetector = VocalDetectorKind::None;
+    MixFeatureExtractor offExtractor(offCfg);
+    const MixFeatureMap offMap = offExtractor.extractFromTrack(*track, analysis);
+    CHECK(!offMap.vocal.available);
+    CHECK_NEAR(offMap.vocal.meanConfidence, 0.0f, 1e-6);
+
+    // External stem vocal detector provides high-confidence ground truth.
+    bgmedia::PcmBuffer stemPcm;
+    stemPcm.sampleRate = kRate;
+    stemPcm.sourceChannels = 1;
+    stemPcm.samples.assign(static_cast<std::size_t>(duration * kRate), 0.0f);
+    for (std::size_t i = static_cast<std::size_t>(3.0 * kRate);
+         i < static_cast<std::size_t>(8.0 * kRate); ++i) {
+        stemPcm.samples[i] = 0.35f;
+    }
+    ExternalStemVocalDetector stemDet(stemPcm, 0xCAFEBABEULL);
+    MixFeatureExtractor stemExtractor({}, &stemDet);
+    const MixFeatureMap stemMap = stemExtractor.extractFromTrack(*track, analysis);
+    CHECK(stemMap.vocal.available);
+    CHECK(stemMap.vocal.detectorKind == VocalDetectorKind::ExternalStem);
+    CHECK(stemMap.vocal.meanConfidence >= 0.90f);
+    CHECK(stemMap.summarizeWindow(4.0, 7.0).vocalScore > 0.75f);
+    CHECK(stemMap.summarizeWindow(0.5, 2.5).vocalScore < 0.05f);
+}
+
+TEST_CASE("mix.vocal_overlap_clash_vs_clean_handoff") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalOverlapAssessment;
+    using bgmedia::mix::evaluateVocalOverlap;
+
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // Track A has lead vocals in 1..6 s and instrumental outro in 6..12 s.
+    // Track B has instrumental intro in 0..5 s and lead vocals in 5..11 s.
+    const auto trackA = makeVocalAndInstrumentalTrack(duration, 1.0, 6.0, 110.0);
+    const auto trackB = makeVocalAndInstrumentalTrack(duration, 5.0, 11.0, 110.0);
+    const MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysis);
+    const MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysis);
+
+    // 1. Clash case: overlap A [1.5..5.5] (vocals) with B [5.5..9.5] (vocals).
+    const VocalOverlapAssessment clash =
+        evaluateVocalOverlap(featA, 1.5, 1.0, featB, 5.5, 1.0, 4.0);
+    CHECK(clash.available);
+    CHECK(clash.vocalClashScore > 0.35f);
+    CHECK(clash.clashDurationSeconds > 1.5);
+    CHECK(!clash.cleanVocalHandoff);
+
+    // 2. Clean handoff case: overlap A [6.5..10.5] (instrumental outro) with B [3.5..7.5]
+    // (instrumental intro transitioning into B's vocal).
+    const VocalOverlapAssessment handoff =
+        evaluateVocalOverlap(featA, 6.5, 1.0, featB, 3.5, 1.0, 4.0);
+    CHECK(handoff.available);
+    CHECK(handoff.vocalClashScore < 0.15f);
+    CHECK(handoff.cleanVocalHandoff);
+}
+
+TEST_CASE("mix.harmonic_key_estimation_and_camelot_helper") {
+    using bgmedia::mix::HarmonicAnalyzer;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    const double duration = 8.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // A minor triad: A3 (220.00 Hz), C4 (261.63 Hz), E4 (329.63 Hz) -> 8A
+    const auto trackAm = makeTriadTrack(duration, 220.00, 261.63, 329.63);
+    const MixFeatureMap featAm = extractor.extractFromTrack(*trackAm, analysis);
+    CHECK(featAm.harmony.available);
+    CHECK(featAm.harmony.keyIndex == 9);
+    CHECK(featAm.harmony.isMinor);
+    CHECK(featAm.harmony.camelotCode == "8A");
+    CHECK(featAm.harmony.tonalness > 0.55f);
+    CHECK(featAm.harmony.keyConfidence > 0.35f);
+
+    // C major triad: C4 (261.63 Hz), E4 (329.63 Hz), G4 (392.00 Hz) -> 8B
+    const auto trackC = makeTriadTrack(duration, 261.63, 329.63, 392.00);
+    const MixFeatureMap featC = extractor.extractFromTrack(*trackC, analysis);
+    CHECK(featC.harmony.available);
+    CHECK(featC.harmony.keyIndex == 0);
+    CHECK(!featC.harmony.isMinor);
+    CHECK(featC.harmony.camelotCode == "8B");
+
+    // F# major triad: F#3 (185.00 Hz), A#3 (233.08 Hz), C#4 (277.18 Hz) -> 2B
+    const auto trackFs = makeTriadTrack(duration, 185.00, 233.08, 277.18);
+    const MixFeatureMap featFs = extractor.extractFromTrack(*trackFs, analysis);
+    CHECK(featFs.harmony.available);
+    CHECK(featFs.harmony.keyIndex == 6);
+    CHECK(!featFs.harmony.isMinor);
+    CHECK(featFs.harmony.camelotCode == "2B");
+}
+
+TEST_CASE("mix.harmonic_compatibility_pitch_shift_and_percussive_neutrality") {
+    using bgmedia::mix::HarmonicCompatibility;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::evaluateHarmonicCompatibility;
+
+    const double duration = 8.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    const auto trackAm = makeTriadTrack(duration, 220.00, 261.63, 329.63); // Am (8A)
+    const auto trackC = makeTriadTrack(duration, 261.63, 329.63, 392.00);  // C  (8B, relative major)
+    const auto trackFs = makeTriadTrack(duration, 185.00, 233.08, 277.18); // F# (2B, distant)
+    const auto trackGsm = makeTriadTrack(duration, 207.65, 246.94, 311.13); // G#m (1A, 1 semitone below Am)
+
+    const MixFeatureMap featAm = extractor.extractFromTrack(*trackAm, analysis);
+    const MixFeatureMap featC = extractor.extractFromTrack(*trackC, analysis);
+    const MixFeatureMap featFs = extractor.extractFromTrack(*trackFs, analysis);
+    const MixFeatureMap featGsm = extractor.extractFromTrack(*trackGsm, analysis);
+
+    // 1. Relative major (Am -> C) is much more compatible than distant tritone/semitone (Am -> F#).
+    const HarmonicCompatibility compatRel =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featC, 1.0, 1.0, 4.0, true);
+    const HarmonicCompatibility compatDist =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true);
+    CHECK(compatRel.available);
+    CHECK(compatRel.compatibilityScore > compatDist.compatibilityScore + 0.22f);
+    CHECK(compatRel.harmonicClashScore < compatDist.harmonicClashScore);
+
+    // 2. Pitch-shift awareness when pitchLock == false:
+    // G#m played at +1 semitone (rate = 2^(1/12) ≈ 1.05946) without pitch lock
+    // shifts into Am, matching featAm far better than at 1.0x!
+    const double plusOneSemitoneRate = std::pow(2.0, 1.0 / 12.0);
+    const HarmonicCompatibility gsmLocked =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featGsm, 1.0, plusOneSemitoneRate, 4.0, true);
+    const HarmonicCompatibility gsmShiftedToAm =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featGsm, 1.0, plusOneSemitoneRate, 4.0, false);
+    CHECK(gsmShiftedToAm.compatibilityScore > gsmLocked.compatibilityScore + 0.25f);
+
+    // Quarter-tone detune (+3% rate without pitch lock ≈ +0.51 semitone) between
+    // two identical Am tracks triggers detunePenalty.
+    const HarmonicCompatibility quarterToneDetuned =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featAm, 1.0, 1.03, 4.0, false);
+    CHECK(quarterToneDetuned.detunePenalty > 0.45f);
+
+    // 3. Percussive / atonal neutrality: broadband deterministic pseudo-noise
+    // has low tonalness (< 0.25) and sets percussiveNeutral = true.
+    auto drumNoise = std::make_shared<PcmTrack>();
+    drumNoise->sampleRate = kRate;
+    drumNoise->channels = 2;
+    drumNoise->samples.resize(static_cast<std::size_t>(duration * kRate) * 2, 0.0f);
+    std::uint32_t rng = 0x13579BDFU;
+    for (std::size_t i = 0; i < drumNoise->samples.size(); i += 2) {
+        rng = rng * 1664525U + 1013904223U;
+        const float white = (static_cast<float>((rng >> 8) & 0xFFFFU) / 32768.0f - 1.0f) * 0.25f;
+        drumNoise->samples[i] = white;
+        drumNoise->samples[i + 1] = white;
+    }
+    const MixFeatureMap featDrums = extractor.extractFromTrack(*drumNoise, analysis);
+    CHECK(featDrums.harmony.tonalness < 0.25f);
+    const HarmonicCompatibility drumVsFs =
+        evaluateHarmonicCompatibility(featDrums, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true);
+    CHECK(drumVsFs.percussiveNeutral);
+    CHECK(drumVsFs.harmonicClashScore < 0.20f);
 }

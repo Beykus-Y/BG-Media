@@ -1,6 +1,8 @@
 #include "bgmedia/mix/MixPlanner.hpp"
 
 #include "bgmedia/mix/Crossfade.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
+#include "bgmedia/mix/VocalDetector.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1667,6 +1669,25 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         plan.reasons.push_back(format(
             "Feature map: A %.1f LUFS (audible end %.2f s), B %.1f LUFS (audible start %.2f s)",
             lufsA, audEndA, lufsB, audStartB));
+        if (featuresA && featuresA->valid() && featuresB && featuresB->valid() &&
+            plan.duration > 0.05) {
+            const VocalOverlapAssessment voc = evaluateVocalOverlap(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+            if (!voc.summary.empty()) {
+                plan.reasons.push_back(voc.summary);
+            }
+            const HarmonicCompatibility harm = evaluateHarmonicCompatibility(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.pitchLock, plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+            if (!harm.summary.empty()) {
+                plan.reasons.push_back(harm.summary);
+            }
+        }
     }
     if (adaptiveChoice && plan.fallbackReason.empty()) {
         plan.reasons.push_back(

@@ -7,6 +7,7 @@
 
 #include "bgmedia/audio/MiniaudioMixDevice.hpp"
 #include "bgmedia/audio/MiniaudioMixLoader.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 
@@ -287,6 +288,24 @@ bool prepare(const Options& options, const std::filesystem::path& path,
             out.features->phrases.size(),
             out.features->mixInCandidates.size(),
             out.features->mixOutCandidates.size());
+        std::printf(
+            "    vocal/harmony: vocal=%s (avail=%d activeRatio=%.2f conf=%.2f regions=%zu), "
+            "key=%s (%s, avail=%d conf=%.2f tonalness=%.2f segments=%zu)\n",
+            bgmedia::mix::vocalDetectorKindName(out.features->vocal.detectorKind),
+            out.features->vocal.available ? 1 : 0,
+            static_cast<double>(out.features->vocal.activeRatio),
+            static_cast<double>(out.features->vocal.meanConfidence),
+            out.features->vocal.regions.size(),
+            bgmedia::mix::HarmonicAnalyzer::keyName(
+                out.features->harmony.keyIndex, out.features->harmony.isMinor)
+                .c_str(),
+            out.features->harmony.camelotCode.empty()
+                ? "-"
+                : out.features->harmony.camelotCode.c_str(),
+            out.features->harmony.available ? 1 : 0,
+            static_cast<double>(out.features->harmony.keyConfidence),
+            static_cast<double>(out.features->harmony.tonalness),
+            out.features->harmony.segments.size());
     }
     return true;
 }

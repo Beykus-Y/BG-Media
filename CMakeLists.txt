@@ -69,6 +69,8 @@ add_library(bgmedia_core STATIC
     src/mix/PcmTrack.cpp
     src/mix/MixFeatureMap.cpp
     src/mix/MixFeatureCache.cpp
+    src/mix/VocalDetector.cpp
+    src/mix/HarmonicAnalyzer.cpp
     src/mix/TimeStretch.cpp
     src/mix/SpectralEq.cpp
     src/mix/MixPlanner.cpp
