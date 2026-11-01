@@ -655,15 +655,20 @@ void MixSession::ensurePlanValid() {
     const DeckId to = otherDeck(from);
     const std::uint64_t fromId = snap.decks[deckIndex(from)].trackId;
     const std::uint64_t toId = snap.decks[deckIndex(to)].trackId;
+    const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
 
+    // Fast-path: both decks unchanged, configuration unchanged, plan not dirty,
+    // and live cursor has not passed the scheduled transition window.
     if (!planDirty_ && preview_.valid &&
         fromId == cachedFromId_ && toId == cachedToId_ &&
-        from == cachedMasterDeck_) {
+        from == cachedMasterDeck_ &&
+        livePosA < preview_.overallStartA() + 0.5) {
         return;
     }
     preview_ = {};
     if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
-        preview_ = buildPlan(from, to, snap, duration_, false);
+        const bool liveExpired = livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5;
+        preview_ = buildPlan(from, to, snap, duration_, liveExpired);
     }
     cachedFromId_ = fromId;
     cachedToId_ = toId;
@@ -754,6 +759,23 @@ void MixSession::executeScheduledTransition(const MixPlan& plannedPreview) {
     plan.to = to;
 
     const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
+    const double remainingA = std::max(0.0, snap.decks[deckIndex(from)].durationSeconds - livePosA);
+    if (livePosA > plan.overallStartA() + 0.5 && plan.duration > remainingA) {
+        // Replan from the live position when the scheduled window has expired
+        // so the fade fits the remaining audio.
+        MixPlan refitted;
+        {
+            std::lock_guard lock(mutex_);
+            refitted = buildPlan(from, to, snap, 0.0, true);
+        }
+        if (refitted.valid) {
+            plan = refitted;
+        } else {
+            plan.duration = std::max(0.05, remainingA);
+            plan.transitionStartA = livePosA;
+            plan.transitionEndA = livePosA + plan.duration;
+        }
+    }
     char reasonBuf[256];
     std::snprintf(reasonBuf, sizeof(reasonBuf),
                   "Executing planned transition at live A %.2f s (strategy %s, cues A %.2f -> B %.2f, dur %.1f s)",
@@ -877,7 +899,13 @@ void MixSession::update() {
     const double scheduleAt = preview.overallStartA();
     if (preview.valid && preview.from == from && schedulable &&
         deck.positionSeconds >= scheduleAt - lead) {
-        executeScheduledTransition(preview);
+        if (deck.positionSeconds > scheduleAt + 0.5) {
+            // Replan from the live position when the scheduled window has expired
+            // so the fade fits the remaining audio.
+            startPlannedTransition(0.0);
+        } else {
+            executeScheduledTransition(preview);
+        }
     }
 }
 

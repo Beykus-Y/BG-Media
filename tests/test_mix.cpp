@@ -4597,3 +4597,92 @@ TEST_CASE("mix.codex_finding3_echo_reverb_cancellation_declick") {
     CHECK(engine.snapshot().master == DeckId::A);
     CHECK(engine.snapshot().decks[0].playing);
 }
+
+
+TEST_CASE("mix.codex_mono_stereo_loudness_matching") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixPlan;
+    // Create identical 0.20 amplitude 440 Hz tones in mono and stereo
+    auto monoTrack = toneTrack(10.0, 440.0, 1);
+    auto stereoTrack = toneTrack(10.0, 440.0, 2);
+
+    AnalysisResult analysisMono;
+    analysisMono.info.duration = 10.0;
+    analysisMono.info.sampleRate = 48000;
+    analysisMono.info.sourceChannels = 1;
+    analysisMono.bpm = 120.0;
+
+    AnalysisResult analysisStereo;
+    analysisStereo.info.duration = 10.0;
+    analysisStereo.info.sampleRate = 48000;
+    analysisStereo.info.sourceChannels = 2;
+    analysisStereo.bpm = 120.0;
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featMono = extractor.extractFromTrack(*monoTrack, analysisMono);
+    const MixFeatureMap featStereo = extractor.extractFromTrack(*stereoTrack, analysisStereo);
+
+    CHECK(featMono.loudness.gatedValid);
+    CHECK(featStereo.loudness.gatedValid);
+
+    // Standard BS.1770 measures 1-ch mono 3.01 dB lower than 2-ch dual-mono:
+    CHECK_NEAR(featStereo.loudness.integratedLufs - featMono.loudness.integratedLufs, 3.01f, 0.15f);
+
+    MixPlanner planner;
+    MixPlan plan = planner.plan(analysisMono, analysisStereo, &featMono, &featStereo, {});
+
+    // Both mono and stereo tracks should receive equal trims and gains,
+    // preventing the previous 3.01 dB imbalance.
+    CHECK_NEAR(plan.loudnessTrimDbA, plan.loudnessTrimDbB, 0.05f);
+    CHECK_NEAR(plan.loudnessGainA, plan.loudnessGainB, 0.01f);
+}
+
+TEST_CASE("mix.codex_expired_preview_plan_revalidation") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto durA = engine.snapshot().decks[0].durationSeconds;
+    CHECK(durA > 5.0);
+
+    // Seek the master deck to 0.8 seconds before EOF (well past any scheduled preview start)
+    const double nearEnd = durA - 0.8;
+    CHECK(session.seekDeck(DeckId::A, nearEnd));
+
+    // First pump renders the seek
+    pump.once();
+    // Second pump triggers update() which detects that the live cursor is past the old schedule
+    // and replans from the live position to fit the remaining 0.8s
+    pump.once();
+
+    const auto snap = session.snapshot();
+    CHECK(snap.engine.phase == TransitionPhase::Running);
+    // Crucial check: transition duration was fitted to the remaining audio (<= 0.8s + tolerance)
+    // rather than retaining the original 8.0s crossfade that would overrun EOF
+    CHECK(snap.executed.duration <= 1.0);
+    CHECK(snap.executed.transitionStartA >= nearEnd - 0.2);
+
+    // Render until transition completes
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().master == DeckId::B);
+}

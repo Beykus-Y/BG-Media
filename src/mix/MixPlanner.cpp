@@ -980,8 +980,19 @@ void computeLoudnessBalance(const MixFeatureMap* featuresA,
         return;
     }
 
-    const float lufsA = featuresA->loudness.integratedLufs;
-    const float lufsB = featuresB->loudness.integratedLufs;
+    // Match loudness in the engine's stereo playback domain.
+    // Mono is duplicated into both Left and Right channels by MixEngine,
+    // which equals stereo playback power.
+    auto playbackLufs = [](const MixFeatureMap* feat) noexcept -> float {
+        if (!feat) return -70.0f;
+        float l = feat->loudness.integratedLufs;
+        if (feat->info.sourceChannels == 1) {
+            l += 3.0103f;
+        }
+        return l;
+    };
+    const float lufsA = playbackLufs(featuresA);
+    const float lufsB = playbackLufs(featuresB);
     const float targetLufs = std::clamp(0.5f * (lufsA + lufsB), -18.0f, -11.0f);
 
     float trimA = std::clamp(targetLufs - lufsA, -6.0f, 4.5f);
