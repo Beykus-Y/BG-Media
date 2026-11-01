@@ -3990,3 +3990,106 @@ TEST_CASE("mix.planner_smart_automix_multi_candidate_and_loudness") {
     CHECK(plan.loudnessGainB > 1.0f);
     CHECK(featB.loudness.samplePeakDbfs + plan.loudnessTrimDbB <= -0.5f + 1e-3f);
 }
+
+
+TEST_CASE("mix.engine_loudness_normalization_and_strategies") {
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::GainPoint;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixSnapshot;
+    using bgmedia::mix::MixStrategyKind;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+
+    auto trackA = toneTrack(12.0, 220.0, 2, kRate);
+    auto trackB = toneTrack(12.0, 330.0, 2, kRate);
+    AnalysisResult analysisA = analysisFor(120.0, 12.0);
+    AnalysisResult analysisB = analysisFor(120.0, 12.0);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = 2.0;
+
+    // 1. EchoReverbOut + Loudness normalization through MixEngine::render()
+    MixPlan echoPlan = planner.plan(analysisA, analysisB, req);
+    CHECK(echoPlan.valid);
+    echoPlan.strategy = MixStrategyKind::EchoReverbOut;
+    echoPlan.tailSendAmount = 0.50f;
+    echoPlan.tailDecaySeconds = 1.8;
+    echoPlan.loudnessGainA = 0.80f;
+    echoPlan.loudnessGainB = 1.25f;
+    echoPlan.gainCurveOut = {{0.0, 1.0f}, {2.8, 0.25f}, {3.1, 0.0f}, {4.0, 0.0f}};
+    echoPlan.gainCurveIn = {{0.0, 0.0f}, {2.0, 0.70f}, {4.0, 1.0f}};
+
+    MixEngine engine(kRate);
+    CHECK(engine.loadDeck(DeckId::A, trackA, 1, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, trackB, 2, 120.0));
+    engine.play(DeckId::A);
+    engine.setMaster(DeckId::A);
+
+    std::vector<float> block(512 * 2, 0.0f);
+    engine.seek(DeckId::A, echoPlan.overallStartA());
+    engine.render(block.data(), 512);
+    CHECK(engine.startTransition(echoPlan));
+
+    float maxTailWet = 0.0f;
+    float maxSampleStep = 0.0f;
+    float prevL = block[(512 - 1) * 2];
+    const int totalBlocks = static_cast<int>((echoPlan.totalDuration() + 0.5) * kRate / 512);
+    for (int b = 0; b < totalBlocks; ++b) {
+        engine.render(block.data(), 512);
+        const MixSnapshot snap = engine.snapshot();
+        if (snap.phase == TransitionPhase::Running) {
+            CHECK(snap.strategy == MixStrategyKind::EchoReverbOut);
+            maxTailWet = std::max(maxTailWet, snap.tailWetLevel);
+        }
+        for (std::size_t i = 0; i < 512; ++i) {
+            const float sL = block[i * 2];
+            CHECK(std::isfinite(sL));
+            maxSampleStep = std::max(maxSampleStep, std::abs(sL - prevL));
+            prevL = sL;
+        }
+    }
+    CHECK(maxTailWet > 0.01f);
+    CHECK(maxSampleStep < 0.35f);
+    const MixSnapshot afterEcho = engine.snapshot();
+    CHECK(afterEcho.phase == TransitionPhase::Idle);
+    CHECK(afterEcho.master == DeckId::B);
+    // Incoming deck B preserves its matched loudness gain after handover.
+    CHECK_NEAR(afterEcho.loudnessGain[1], 1.25f, 1e-4f);
+
+    // 2. VocalHandoff & DropImpactCut custom gain curves + cancel safety.
+    for (MixStrategyKind strat : {MixStrategyKind::VocalHandoff,
+                                  MixStrategyKind::DropImpactCut,
+                                  MixStrategyKind::EnergyBridge}) {
+        MixEngine eng(kRate);
+        CHECK(eng.loadDeck(DeckId::A, trackA, 1, 120.0));
+        CHECK(eng.loadDeck(DeckId::B, trackB, 2, 120.0));
+        eng.play(DeckId::A);
+        eng.setMaster(DeckId::A);
+        MixPlan p = planner.plan(analysisA, analysisB, req);
+        p.strategy = strat;
+        p.gainCurveOut = {{0.0, 1.0f}, {1.6, 0.86f}, {3.6, 0.05f}, {4.0, 0.0f}};
+        p.gainCurveIn = {{0.0, 0.0f}, {1.6, 0.48f}, {3.6, 0.96f}, {4.0, 1.0f}};
+        eng.seek(DeckId::A, p.overallStartA());
+        eng.render(block.data(), 512);
+        CHECK(eng.startTransition(p));
+        for (int b = 0; b < 30; ++b) {
+            eng.render(block.data(), 512);
+        }
+        const MixSnapshot mid = eng.snapshot();
+        CHECK(mid.phase == TransitionPhase::Running);
+        CHECK(mid.strategy == strat);
+        eng.cancelTransition();
+        for (int b = 0; b < 30; ++b) {
+            eng.render(block.data(), 512);
+        }
+        CHECK(eng.snapshot().phase == TransitionPhase::Idle);
+        CHECK(eng.snapshot().master == DeckId::A);
+    }
+}

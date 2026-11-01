@@ -382,6 +382,7 @@ struct MixSnapshot {
     TransitionPhase phase = TransitionPhase::Idle;
     TransitionStage stage = TransitionStage::Idle;
     TransitionType transitionType = TransitionType::Off;
+    MixStrategyKind strategy = MixStrategyKind::SmoothBlend;
     double transitionProgress = 0.0;
     double transitionDuration = 0.0;
     double transitionElapsed = 0.0;
@@ -396,6 +397,8 @@ struct MixSnapshot {
     float eqLow[2] = {1.0f, 1.0f};
     float eqMid[2] = {1.0f, 1.0f};
     float eqHigh[2] = {1.0f, 1.0f};
+    float loudnessGain[2] = {1.0f, 1.0f};
+    float tailWetLevel = 0.0f;
     std::uint64_t completedTransitions = 0;
     std::uint64_t outputFrames = 0;
     double sampleRate = 48000.0;

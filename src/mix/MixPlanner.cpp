@@ -890,6 +890,80 @@ void appendBassSwap(MixPlan& plan, double duration,
     }
 }
 
+void applyStrategyGainCurves(MixPlan& plan) {
+    if (plan.type == TransitionType::DirectCut || plan.duration <= 0.0) {
+        return;
+    }
+    if (plan.strategy == MixStrategyKind::SmoothBlend) {
+        return;
+    }
+    constexpr int kPoints = 17;
+    plan.gainCurveOut.clear();
+    plan.gainCurveIn.clear();
+    plan.gainCurveOut.reserve(kPoints);
+    plan.gainCurveIn.reserve(kPoints);
+
+    for (int i = 0; i < kPoints; ++i) {
+        const double t = static_cast<double>(i) / (kPoints - 1);
+        const double time = plan.duration * t;
+        float outGain = equalPowerOut(t);
+        float inGain = equalPowerIn(t);
+
+        switch (plan.strategy) {
+        case MixStrategyKind::VocalHandoff: {
+            // Hold outgoing vocal clear through the first 40%, while bringing in
+            // B's instrumental accompaniment bed gently, then execute a clean
+            // vocal handover around t = 0.42..0.88.
+            if (t <= 0.40) {
+                const double u = t / 0.40;
+                outGain = static_cast<float>(1.0 - 0.14 * smoothStep(u));
+                inGain = static_cast<float>(0.48 * smoothStep(u));
+            } else {
+                const double u = std::clamp((t - 0.40) / 0.60, 0.0, 1.0);
+                outGain = static_cast<float>(0.86 * (1.0 - smoothStep(u)));
+                inGain = static_cast<float>(0.48 + 0.52 * smoothStep(u));
+            }
+            break;
+        }
+        case MixStrategyKind::DropImpactCut: {
+            // Build incoming tension up to the impact point (t = 0.55), then
+            // drop the outgoing deck sharply as the incoming drop hits unity.
+            if (t <= 0.55) {
+                const double u = t / 0.55;
+                outGain = static_cast<float>(1.0 - 0.12 * smoothStep(u));
+                inGain = static_cast<float>(0.55 * smoothStep(u));
+            } else {
+                const double uOut = std::clamp((t - 0.55) / 0.30, 0.0, 1.0);
+                const double uIn = std::clamp((t - 0.55) / 0.18, 0.0, 1.0);
+                outGain = static_cast<float>(0.88 * (1.0 - smoothStep(uOut)));
+                inGain = static_cast<float>(0.55 + 0.45 * smoothStep(uIn));
+            }
+            break;
+        }
+        case MixStrategyKind::EnergyBridge: {
+            // Breakdown / low-energy bridge: lift the mid-transition plateau
+            // so total energy never dips into a hole between sparse sections.
+            outGain = (i == kPoints - 1) ? 0.0f : std::pow(equalPowerOut(t), 0.80f);
+            inGain = (i == 0) ? 0.0f : std::pow(equalPowerIn(t), 0.80f);
+            break;
+        }
+        case MixStrategyKind::EchoReverbOut: {
+            // Fade dry outgoing signal out by t = 0.78 while the engine's
+            // stereo feedback delay/reverb tail washes out across the remainder.
+            const double dryT = std::clamp(t / 0.78, 0.0, 1.0);
+            outGain = (i == kPoints - 1) ? 0.0f : equalPowerOut(dryT);
+            inGain = equalPowerIn(t);
+            break;
+        }
+        case MixStrategyKind::SmoothBlend:
+            break;
+        }
+
+        plan.gainCurveOut.push_back({time, std::clamp(outGain, 0.0f, 1.0f)});
+        plan.gainCurveIn.push_back({time, std::clamp(inGain, 0.0f, 1.0f)});
+    }
+}
+
 void computeLoudnessBalance(const MixFeatureMap* featuresA,
                             const MixFeatureMap* featuresB,
                             MixPlan& plan,
@@ -1909,6 +1983,23 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
         }
     } else {
         plan.strategy = MixStrategyKind::SmoothBlend;
+    }
+
+    if (plan.strategy != MixStrategyKind::SmoothBlend &&
+        plan.type != TransitionType::DirectCut && plan.duration > 0.05) {
+        applyStrategyGainCurves(plan);
+        if (featuresA && featuresA->valid() && featuresB && featuresB->valid()) {
+            voc = evaluateVocalOverlap(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+            harm = evaluateHarmonicCompatibility(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.pitchLock, plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+        }
     }
 
     // Multi-objective score breakdown.
