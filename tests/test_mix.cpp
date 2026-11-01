@@ -2653,3 +2653,24 @@ TEST_CASE("mix.metric_ambiguity_81_vs_121_is_not_forced") {
     CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
     CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
 }
+
+TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
+    // 60 -> 118 needs A to move to 59 BPM, but A (30 s) has no room for the
+    // ramp at 20 s plus an 8 s fade: the plan must not keep a tempo-synced
+    // type and a successful match classification at 1.0x rates.
+    const MixPlan plan = planMetric(60.0, 118.0, {},
+                                    TransitionType::SmartCrossfade, 30.0);
+    CHECK(plan.valid);
+    CHECK(!plan.tempoRampActive);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(!plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.unison());
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    // An exact 60 -> 120 pair needs no ramp and keeps its relation.
+    const MixPlan exact = planMetric(60.0, 120.0, {},
+                                     TransitionType::SmartCrossfade, 30.0);
+    CHECK(exact.metricRelation.bBeats == 2);
+    CHECK(exact.tempoMatchKind == TempoMatchKind::ExactMetric);
+}
