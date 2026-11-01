@@ -979,21 +979,24 @@ int main(int argc, char** argv) {
             }
             const MixPlan& plan = chosen.plan;
             std::printf(
-                "  A %.2f BPM -> B %.2f BPM, target %.2f, %s\n",
-                plan.bpmA, plan.bpmB, plan.targetBpm,
+                "  A %.2f BPM -> B %.2f BPM, relation %d:%d, target A %.2f / B %.2f, match: %s, %s\n",
+                plan.bpmA, plan.bpmB, plan.metricRelation.bBeats,
+                plan.metricRelation.aBeats, plan.targetBpmA, plan.targetBpm,
+                bgmedia::mix::tempoMatchKindName(plan.tempoMatchKind),
                 bgmedia::mix::transitionTypeName(plan.type));
             std::printf(
                 "  pre %.2f s + fade %.2f s = %.2f s, A cue %.2f -> %.2f, "
-                "B cue %.2f, ramp %.2f%%, ratioB %.3f\n",
+                "B cue %.2f, ramp %.2f%%, ratioA %.3f, ratioB %.3f\n",
                 plan.preTransitionSeconds, plan.duration,
                 plan.totalDuration(), plan.transitionStartA,
                 plan.transitionEndA, plan.startB, plan.tempoRampPercent,
-                plan.tempoRatioB);
+                plan.tempoRatioAEnd, plan.tempoRatioB);
             std::printf(
-                "  beat=%d down=%d snap=%.1f ms phase=%.1f ms phrase=%d "
+                "  beat=%d down=%d snap=%.1f ms phase=%.1f ms (p95=%.1f ms, drift=%.1f ms, pairs=%d) phrase=%d "
                 "(%.2f), bass=%d lock=%d\n",
                 plan.beatAligned ? 1 : 0, plan.downbeatAligned ? 1 : 0,
-                plan.alignmentErrorMs, plan.beatPhaseErrorMs,
+                plan.alignmentErrorMs, plan.beatPhaseErrorMs, plan.phaseP95Ms,
+                plan.phaseDriftMs, plan.phasePairs,
                 plan.phraseBoundary ? 1 : 0,
                 static_cast<double>(plan.phraseConfidence),
                 plan.bassSwap ? 1 : 0, plan.pitchLock ? 1 : 0);
@@ -1143,7 +1146,7 @@ int main(int argc, char** argv) {
     if (!options.diagnosticsOnly) {
         const std::filesystem::path manifest = options.outDir / "manifest.csv";
         std::ofstream csv(manifest);
-        csv << "index,from,to,from_bpm,to_bpm,target_bpm,type,pre_s,fade_s,"
+        csv << "index,from,to,from_bpm,to_bpm,target_bpm_a,target_bpm_b,relation,match_kind,type,pre_s,fade_s,"
                "total_s,a_cue_s,b_cue_s,ratio_a,ratio_b,pitch_lock,bass_swap,"
                "phrase,beat_aligned,downbeat,confidence,peak,clipped,nonfinite,"
                "file,fallback\n";
@@ -1151,7 +1154,10 @@ int main(int argc, char** argv) {
             const Entry& entry = entries[i];
             const MixPlan& plan = entry.plan;
             csv << (i + 1) << ',' << entry.from->name << ',' << entry.to->name
-                << ',' << plan.bpmA << ',' << plan.bpmB << ',' << plan.targetBpm
+                << ',' << plan.bpmA << ',' << plan.bpmB
+                << ',' << plan.targetBpmA << ',' << plan.targetBpm
+                << ',' << plan.metricRelation.bBeats << ':' << plan.metricRelation.aBeats
+                << ',' << bgmedia::mix::tempoMatchKindName(plan.tempoMatchKind)
                 << ',' << bgmedia::mix::transitionTypeName(plan.type) << ','
                 << plan.preTransitionSeconds << ',' << plan.duration << ','
                 << plan.totalDuration() << ',' << plan.transitionStartA << ','

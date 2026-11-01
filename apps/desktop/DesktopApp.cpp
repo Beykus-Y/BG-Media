@@ -5788,15 +5788,31 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
                         "  ->  B " +
                         formatNumber(plan.to == mix::DeckId::B ? plan.bpmB
                                                               : plan.bpmA, 1) +
-                        " BPM  ·  " + formatNumber(plan.duration, 1) + " s";
+                        " BPM";
+    if (!plan.metricRelation.unison()) {
+        route += "  ·  " + std::to_string(plan.metricRelation.bBeats) + ":" +
+                 std::to_string(plan.metricRelation.aBeats);
+    }
+    if (plan.tempoMatchKind != mix::TempoMatchKind::None) {
+        route += " (" + std::string(mix::tempoMatchKindName(plan.tempoMatchKind)) + ")";
+    }
+    route += "  ·  " + formatNumber(plan.duration, 1) + " s";
     label(route, card.x + 16.0f, card.y + 56.0f, 8, theme::muted, 0.8f);
 
     std::string alignment;
     if (plan.beatAligned) {
-        alignment = "BEAT ALIGNED  ·  grid snap " +
+        alignment = "BEAT ALIGNED  ·  snap " +
                     formatNumber(plan.alignmentErrorMs, 1) + " ms";
+        if (plan.phaseMeasured) {
+            alignment += "  ·  phase RMS " +
+                         formatNumber(plan.phaseRmsMs, 1) + " ms (p95 " +
+                         formatNumber(plan.phaseP95Ms, 1) + " ms)";
+        }
         if (plan.downbeatAligned) {
             alignment += "  ·  downbeat";
+        }
+        if (plan.phraseBoundary) {
+            alignment += "  ·  phrase";
         }
     } else {
         alignment = "NOT BEAT ALIGNED  ·  confidence " +
@@ -5993,7 +6009,12 @@ void DesktopApp::Impl::drawMixControls(const Rect& card,
         }
     } else if (snap.preview.valid) {
         monitor = std::string("NEXT  ·  ") +
-                  mix::transitionTypeName(snap.preview.type) + "  ·  " +
+                  mix::transitionTypeName(snap.preview.type);
+        if (!snap.preview.metricRelation.unison()) {
+            monitor += " (" + std::to_string(snap.preview.metricRelation.bBeats) +
+                       ":" + std::to_string(snap.preview.metricRelation.aBeats) + ")";
+        }
+        monitor += "  ·  " +
                   formatNumber(snap.preview.preTransitionSeconds, 1) + " + " +
                   formatNumber(snap.preview.duration, 1) + " s  ·  " +
                   formatNumber(snap.preview.confidence * 100.0, 0) + "%";
@@ -6135,10 +6156,14 @@ void DesktopApp::Impl::drawMixScreen() {
                      card.x + 22.0f, card.y + 126.0f, 11, theme::amber);
             }
         } else {
-            body(std::string(mix::transitionTypeName(plan.type)) + "  ·  " +
-                     formatNumber(plan.duration, 2) + " s  ·  " +
-                     formatNumber(plan.confidence * 100.0, 0) + "% confidence",
-                 card.x + 22.0f, card.y + 68.0f, 14, theme::text,
+            std::string title = std::string(mix::transitionTypeName(plan.type));
+            if (!plan.metricRelation.unison()) {
+                title += " (" + std::to_string(plan.metricRelation.bBeats) + ":" +
+                         std::to_string(plan.metricRelation.aBeats) + ")";
+            }
+            title += "  ·  " + formatNumber(plan.duration, 2) + " s  ·  " +
+                     formatNumber(plan.confidence * 100.0, 0) + "% confidence";
+            body(title, card.x + 22.0f, card.y + 68.0f, 14, theme::text,
                  FontWeight::SemiBold);
             const Rect curve{ card.x + 22.0f, card.y + 96.0f, card.w - 44.0f,
                               140.0f };
