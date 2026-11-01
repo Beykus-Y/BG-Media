@@ -290,6 +290,7 @@ void buildBarsPhrasesAndCues(MixFeatureMap& map,
     if (!analysis.beats.empty()) {
         struct BeatGroup {
             int barIndex = 0;
+            int sourceBarIndex = -1;
             std::size_t firstBeat = 0;
             std::size_t lastBeat = 0;
         };
@@ -298,15 +299,19 @@ void buildBarsPhrasesAndCues(MixFeatureMap& map,
             const Beat& b = analysis.beats[i];
             const bool startNew =
                 groups.empty() ||
-                (b.barIndex != groups.back().barIndex && b.barIndex >= 0) ||
+                (b.barIndex >= 0 && groups.back().sourceBarIndex >= 0 &&
+                 b.barIndex != groups.back().sourceBarIndex) ||
                 (b.downbeat && i > groups.back().firstBeat) ||
                 (static_cast<int>(i - groups.back().firstBeat) >= bpb);
             if (startNew) {
                 const int nextBarIdx =
                     groups.empty() ? std::max(0, b.barIndex) : (groups.back().barIndex + 1);
-                groups.push_back({nextBarIdx, i, i});
+                groups.push_back({nextBarIdx, b.barIndex, i, i});
             } else {
                 groups.back().lastBeat = i;
+                if (groups.back().sourceBarIndex < 0 && b.barIndex >= 0) {
+                    groups.back().sourceBarIndex = b.barIndex;
+                }
             }
         }
 
@@ -820,7 +825,7 @@ double MixFeatureMap::localBpmAt(double time, bool* stableOut) const noexcept {
     for (const TempoSegment& seg : tempoSegments) {
         if (time >= seg.start && time <= seg.end && seg.bpm > 0.0) {
             if (stableOut) {
-                *stableOut = tempoStable;
+                *stableOut = (seg.confidence <= 0.0f || seg.confidence >= 0.35f);
             }
             return seg.bpm;
         }
@@ -857,12 +862,18 @@ WindowFeatureSummary MixFeatureMap::summarizeWindow(double start,
     out.duration = out.end - out.start;
 
     const double step = std::max(1e-6, info.frameStepSeconds);
+    const double startProbe =
+        (out.end > out.start) ? std::min(out.end, out.start + 1e-7 * step) : out.start;
+    const double endProbe =
+        (out.end > out.start) ? std::max(out.start, out.end - 1e-7 * step) : out.end;
     const std::size_t i0 = std::min<std::size_t>(
         frames.size() - 1,
-        static_cast<std::size_t>(std::max(0.0, std::floor(out.start / step))));
-    const std::size_t i1 = std::min<std::size_t>(
-        frames.size() - 1,
-        static_cast<std::size_t>(std::max(0.0, std::floor(out.end / step))));
+        static_cast<std::size_t>(std::max(0.0, std::floor(startProbe / step))));
+    const std::size_t i1 = std::max<std::size_t>(
+        i0,
+        std::min<std::size_t>(
+            frames.size() - 1,
+            static_cast<std::size_t>(std::max(0.0, std::floor(endProbe / step)))));
 
     const std::size_t count = i1 - i0 + 1;
     double sumLufsPower = 0.0;
@@ -937,9 +948,20 @@ WindowFeatureSummary MixFeatureMap::summarizeWindow(double start,
     out.localBpm = localBpmAt(midTime, &stableMid);
     bool stableStart = true;
     bool stableEnd = true;
-    (void)localBpmAt(out.start, &stableStart);
-    (void)localBpmAt(out.end, &stableEnd);
-    out.tempoStable = stableMid && stableStart && stableEnd;
+    const double bpmStart = localBpmAt(out.start, &stableStart);
+    const double bpmEnd = localBpmAt(out.end, &stableEnd);
+    bool windowStable = stableMid && stableStart && stableEnd &&
+                        std::abs(bpmEnd - bpmStart) <= 1.0 &&
+                        std::abs(out.localBpm - bpmStart) <= 1.0;
+    if (windowStable) {
+        for (const TempoTransition& tr : tempoTransitions) {
+            if (tr.end > out.start + 1e-4 && tr.start < out.end - 1e-4) {
+                windowStable = false;
+                break;
+            }
+        }
+    }
+    out.tempoStable = windowStable;
 
     float secConf = 0.0f;
     out.dominantSection = sectionAt(midTime, &secConf);
@@ -959,6 +981,12 @@ MixFeatureExtractor::MixFeatureExtractor(MixFeatureConfig config)
 }
 
 MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
+                                           const AnalysisResult& analysis) const {
+    return extract(AudioData{}, pcm, analysis);
+}
+
+MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
+                                           const PcmBuffer& pcm,
                                            const AnalysisResult& analysis) const {
     if (!pcm.valid()) {
         return buildFromAnalysisOnly(analysis);
@@ -980,7 +1008,8 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
     map.info.harmonicAnalyzeVersion = config_.harmonicAnalyzeVersion;
     map.info.duration = pcm.duration();
     map.info.sampleRate = pcm.sampleRate;
-    map.info.sourceChannels = pcm.sourceChannels;
+    map.info.sourceChannels =
+        (audio.valid() && audio.channels > 0) ? audio.channels : pcm.sourceChannels;
     map.info.frameStepSeconds = config_.frameStepSeconds;
     map.info.fromPcm = true;
 
@@ -1004,9 +1033,25 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
     const int frameCount = std::max(1, static_cast<int>((totalSamples + stepSamples - 1) / stepSamples));
     map.frames.resize(static_cast<std::size_t>(frameCount));
 
-    // 1. Single pass over PCM for BS.1770-4 K-weighted energy, plain RMS, and sample peak.
-    Biquad stage1 = makeKWeightStage1(sr);
-    Biquad stage2 = makeKWeightStage2(sr);
+    // 1. Single pass over source channels (when available) or mono PCM for
+    // ITU-R BS.1770-4 K-weighted channel power sum, plain RMS, and sample peak.
+    const bool useMultiChannel =
+        audio.valid() && audio.sampleRate == pcm.sampleRate &&
+        audio.channels >= 1 && audio.frameCount() == totalSamples;
+    const std::size_t numChannels =
+        useMultiChannel ? static_cast<std::size_t>(audio.channels) : 1u;
+
+    std::vector<Biquad> stage1(numChannels, makeKWeightStage1(sr));
+    std::vector<Biquad> stage2(numChannels, makeKWeightStage2(sr));
+    auto bs1770ChannelWeight = [numChannels](std::size_t ch) noexcept -> double {
+        if (numChannels >= 6 && ch == 3) {
+            return 0.0; // LFE excluded in BS.1770-4
+        }
+        if (numChannels >= 5 && (ch == 4 || ch == 5)) {
+            return 1.4125375446227544; // +1.5 dB surround weighting
+        }
+        return 1.0;
+    };
 
     std::vector<double> frameKMeanSq(static_cast<std::size_t>(frameCount), 0.0);
     std::vector<double> prefixK(static_cast<std::size_t>(frameCount) + 1, 0.0);
@@ -1019,16 +1064,38 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
         const std::size_t count = std::max<std::size_t>(1, s1 - s0);
         double sumRawSq = 0.0;
         double sumKSq = 0.0;
-        for (std::size_t i = s0; i < s1; ++i) {
-            float v = pcm.samples[i];
-            if (!std::isfinite(v)) {
-                v = 0.0f;
+        if (useMultiChannel) {
+            const double invCh = 1.0 / static_cast<double>(numChannels);
+            for (std::size_t i = s0; i < s1; ++i) {
+                double frameRawSq = 0.0;
+                double frameKSq = 0.0;
+                const std::size_t base = i * numChannels;
+                for (std::size_t ch = 0; ch < numChannels; ++ch) {
+                    float v = audio.samples[base + ch];
+                    if (!std::isfinite(v)) {
+                        v = 0.0f;
+                    }
+                    samplePeak = std::max(samplePeak, std::abs(v));
+                    const double x = static_cast<double>(v);
+                    frameRawSq += x * x;
+                    const double y = stage2[ch].process(stage1[ch].process(x));
+                    frameKSq += bs1770ChannelWeight(ch) * (y * y);
+                }
+                sumRawSq += frameRawSq * invCh;
+                sumKSq += frameKSq;
             }
-            samplePeak = std::max(samplePeak, std::abs(v));
-            const double x = static_cast<double>(v);
-            sumRawSq += x * x;
-            const double y = stage2.process(stage1.process(x));
-            sumKSq += y * y;
+        } else {
+            for (std::size_t i = s0; i < s1; ++i) {
+                float v = pcm.samples[i];
+                if (!std::isfinite(v)) {
+                    v = 0.0f;
+                }
+                samplePeak = std::max(samplePeak, std::abs(v));
+                const double x = static_cast<double>(v);
+                sumRawSq += x * x;
+                const double y = stage2[0].process(stage1[0].process(x));
+                sumKSq += y * y;
+            }
         }
         totalRawSq += sumRawSq;
         const double rawRms = std::sqrt(sumRawSq / static_cast<double>(count));
@@ -1056,8 +1123,8 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
     float maxShortTerm = -70.0f;
     std::vector<double> gatingBlocks;
     gatingBlocks.reserve(static_cast<std::size_t>(frameCount));
-    std::vector<float> shortTermValidLufs;
-    shortTermValidLufs.reserve(static_cast<std::size_t>(frameCount));
+    std::vector<double> shortTermAbsBlocks;
+    shortTermAbsBlocks.reserve(static_cast<std::size_t>(frameCount));
 
     for (int f = 0; f < frameCount; ++f) {
         const double momMeanSq = windowKMeanSq(f - momFrames + 1, f + 1);
@@ -1073,7 +1140,7 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
             gatingBlocks.push_back(momMeanSq);
         }
         if ((f + 1 >= stFrames || frameCount < stFrames) && stLufs > -70.0f) {
-            shortTermValidLufs.push_back(stLufs);
+            shortTermAbsBlocks.push_back(stMeanSq);
         }
     }
 
@@ -1107,10 +1174,29 @@ MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
         }
     }
 
-    if (shortTermValidLufs.size() >= 4) {
-        const float p10 = dsp::percentile(shortTermValidLufs, 0.10);
-        const float p95 = dsp::percentile(shortTermValidLufs, 0.95);
-        map.loudness.loudnessRangeLu = std::max(0.0f, p95 - p10);
+    // EBU Tech 3342 loudness range (LRA): -70 LUFS absolute gate followed by
+    // -20 LU relative gate below the absolute-gated short-term power mean.
+    if (!shortTermAbsBlocks.empty()) {
+        double stAbsSum = 0.0;
+        for (double z : shortTermAbsBlocks) {
+            stAbsSum += z;
+        }
+        const double stAbsMean =
+            stAbsSum / static_cast<double>(shortTermAbsBlocks.size());
+        const float stRelGateLufs = powerToLufs(stAbsMean) - 20.0f;
+        std::vector<float> shortTermGatedLufs;
+        shortTermGatedLufs.reserve(shortTermAbsBlocks.size());
+        for (double z : shortTermAbsBlocks) {
+            const float l = powerToLufs(z);
+            if (l >= stRelGateLufs) {
+                shortTermGatedLufs.push_back(l);
+            }
+        }
+        if (shortTermGatedLufs.size() >= 4) {
+            const float p10 = dsp::percentile(shortTermGatedLufs, 0.10);
+            const float p95 = dsp::percentile(shortTermGatedLufs, 0.95);
+            map.loudness.loudnessRangeLu = std::max(0.0f, p95 - p10);
+        }
     }
 
     map.loudness.momentaryMaxLufs = maxMomentary;
@@ -1336,7 +1422,7 @@ MixFeatureMap MixFeatureExtractor::extractFromTrack(
     if (analysis.info.contentHash != 0) {
         pcm.contentHash = analysis.info.contentHash;
     }
-    return extract(pcm, analysis);
+    return extract(audio, pcm, analysis);
 }
 
 MixFeatureMap MixFeatureExtractor::buildFromAnalysisOnly(

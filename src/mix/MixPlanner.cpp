@@ -1296,18 +1296,17 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         }
         if (!bPhrase) {
             double aligned = 0.0;
-            if (minAudibleB > 0.05) {
-                if (nextGridPoint(b, minAudibleB, downbeats,
-                                  std::max(1.0, barSecondsB * 2.0), &aligned,
-                                  &bDownbeat, &bErrorMs) &&
-                    aligned < b.info.duration - 0.2) {
-                    startB = aligned;
-                }
-            } else if (findGridPoint(b, cue, downbeats, &aligned, &bDownbeat,
-                                     &bErrorMs)) {
-                if (aligned >= 0.0 && aligned < b.info.duration - 0.2) {
-                    startB = aligned;
-                }
+            if (findGridPoint(b, cue, downbeats, &aligned, &bDownbeat,
+                              &bErrorMs) &&
+                aligned >= std::max(0.0, minAudibleB - 0.15) &&
+                aligned < b.info.duration - 0.2) {
+                startB = aligned;
+            } else if (minAudibleB > 0.05 &&
+                       nextGridPoint(b, cue, downbeats,
+                                     std::max(1.0, barSecondsB * 2.0), &aligned,
+                                     &bDownbeat, &bErrorMs) &&
+                       aligned < b.info.duration - 0.2) {
+                startB = aligned;
             }
         }
         if (startB > cue + 0.01) {

@@ -313,7 +313,14 @@ public:
 
     [[nodiscard]] const MixFeatureConfig& config() const noexcept { return config_; }
 
-    // Full extraction from mono PcmBuffer + BG Beat AnalysisResult.
+    // Full extraction from multi-channel AudioData + mono PcmBuffer + BG Beat AnalysisResult.
+    // Preserves per-channel K-weighted powers for ITU-R BS.1770-4 loudness while using
+    // monoPcm for spectral and structural analysis.
+    [[nodiscard]] MixFeatureMap extract(const AudioData& audio,
+                                        const PcmBuffer& monoPcm,
+                                        const AnalysisResult& analysis) const;
+
+    // Extraction from mono PcmBuffer + BG Beat AnalysisResult.
     [[nodiscard]] MixFeatureMap extract(const PcmBuffer& pcm,
                                         const AnalysisResult& analysis) const;
 

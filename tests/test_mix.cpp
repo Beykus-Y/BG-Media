@@ -2963,13 +2963,33 @@ TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
     MixFeatureExtractor extractor;
     const AnalysisResult baseAnalysis = analysisFor(120.0, 8.0);
 
-    // 1. 1 kHz stereo sine at 0.4 amplitude: K-weighting gain at 1 kHz is ~0 dB,
-    // so BS.1770 integrated LUFS matches plain RMS dBFS closely.
+    // 1. 1 kHz mono sine vs dual-mono stereo sine at 0.4 amplitude:
+    // Mono LUFS matches plain RMS dBFS (~ -11.0 LUFS), while stereo dual-mono
+    // sums both channels' K-weighted powers (+3.01 LU, ~ -8.0 LUFS).
     const auto tone1k = toneTrack(8.0, 1000.0);
+    auto mono1k = std::make_shared<PcmTrack>();
+    mono1k->sampleRate = kRate;
+    mono1k->channels = 1;
+    mono1k->samples.resize(tone1k->frameCount(), 0.0f);
+    for (std::size_t i = 0; i < mono1k->samples.size(); ++i) {
+        mono1k->samples[i] = tone1k->samples[i * 2];
+    }
+    const MixFeatureMap mapMono1k = extractor.extractFromTrack(*mono1k, baseAnalysis);
     const MixFeatureMap map1k = extractor.extractFromTrack(*tone1k, baseAnalysis);
     CHECK(map1k.valid());
     CHECK(map1k.info.fromPcm);
-    CHECK_NEAR(map1k.loudness.integratedLufs, map1k.loudness.meanRmsDbfs, 0.35);
+    CHECK_NEAR(mapMono1k.loudness.integratedLufs, mapMono1k.loudness.meanRmsDbfs, 0.35);
+    CHECK_NEAR(map1k.loudness.integratedLufs - mapMono1k.loudness.integratedLufs, 3.01f, 0.15f);
+    CHECK_NEAR(map1k.loudness.integratedLufs, map1k.loudness.meanRmsDbfs + 3.01f, 0.35);
+
+    // Out-of-phase stereo (R = -L) preserves per-channel powers instead of
+    // cancelling out in a mono downmix before loudness measurement.
+    auto outOfPhase = toneTrack(8.0, 1000.0);
+    for (std::size_t f = 0; f < outOfPhase->frameCount(); ++f) {
+        outOfPhase->samples[f * 2 + 1] = -outOfPhase->samples[f * 2];
+    }
+    const MixFeatureMap mapOutOfPhase = extractor.extractFromTrack(*outOfPhase, baseAnalysis);
+    CHECK_NEAR(mapOutOfPhase.loudness.integratedLufs, map1k.loudness.integratedLufs, 0.10);
 
     // 2. 3 kHz stereo sine at the exact same 0.4 amplitude: plain RMS dBFS is
     // identical to 1 kHz, while BS.1770 Stage-1 high-shelf boosts 3 kHz by ~+3.6 LU.
@@ -2995,6 +3015,18 @@ TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
     const MixFeatureMap mapGated = extractor.extractFromTrack(*gatedTrack, baseAnalysis);
     CHECK(mapGated.loudness.meanRmsDbfs < map1k.loudness.meanRmsDbfs - 2.5f);
     CHECK_NEAR(mapGated.loudness.integratedLufs, map1k.loudness.integratedLufs, 0.25);
+
+    // 5. EBU Tech 3342 LRA relative gate (-20 LU): a 60 s constant tone whose
+    // second 30 s are attenuated by 40 dB (still above the -70 LUFS absolute gate)
+    // must exclude the -40 dB tail from LRA rather than reporting ~40 LU.
+    const AnalysisResult longAnalysis = analysisFor(120.0, 60.0);
+    auto lraTrack = toneTrack(60.0, 1000.0);
+    const std::size_t halfLraSamples = lraTrack->samples.size() / 2;
+    for (std::size_t i = halfLraSamples; i < lraTrack->samples.size(); ++i) {
+        lraTrack->samples[i] *= 0.01f; // -40 dB attenuation
+    }
+    const MixFeatureMap mapLra = extractor.extractFromTrack(*lraTrack, longAnalysis);
+    CHECK(mapLra.loudness.loudnessRangeLu < 1.5f);
 }
 
 TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {
@@ -3099,6 +3131,31 @@ TEST_CASE("mix.feature_map_spectral_bands_and_novelty") {
     }
     CHECK(boundaryNovelty > firstHalf.spectralNovelty + 0.25f);
     CHECK(boundaryNovelty > secondHalf.spectralNovelty + 0.25f);
+
+    // Window ending exactly at a frame boundary [0.4, 0.5] must not include the
+    // following frame [0.5, 0.6).
+    MixFeatureMap stepMap = map;
+    for (std::size_t i = 0; i < stepMap.frames.size(); ++i) {
+        stepMap.frames[i].energy = (i < 5) ? 0.10f : 0.90f;
+    }
+    const WindowFeatureSummary preStep = stepMap.summarizeWindow(0.4, 0.5);
+    CHECK_NEAR(preStep.meanEnergy, 0.10f, 1e-4f);
+
+    // Local tempo stability is determined from the matched TempoSegment rather
+    // than propagating a track-wide tempoStable == false into constant-tempo segments.
+    stepMap.tempoStable = false;
+    stepMap.tempoSegments = {
+        {0.0, 4.5, 120.0, 0.85f},
+        {5.5, 10.0, 128.0, 0.85f},
+    };
+    stepMap.tempoTransitions = {
+        {4.5, 5.5, 120.0, 128.0, 0.80f},
+    };
+    bool segStable = false;
+    CHECK_NEAR(stepMap.localBpmAt(2.0, &segStable), 120.0, 1e-4);
+    CHECK(segStable);
+    CHECK(stepMap.summarizeWindow(1.0, 4.0).tempoStable);
+    CHECK(!stepMap.summarizeWindow(4.0, 6.0).tempoStable);
 }
 
 TEST_CASE("mix.feature_map_phrases_and_cue_candidates") {
@@ -3141,6 +3198,34 @@ TEST_CASE("mix.feature_map_phrases_and_cue_candidates") {
     CHECK(!fallback.bars.empty());
     CHECK(!fallback.mixInCandidates.empty());
     CHECK(!fallback.mixOutCandidates.empty());
+
+    // Beat grid starting with a 2-beat pickup where BeatTracker assigns
+    // source barIndex = 0 to both the pickup and the first 4-beat bar.
+    AnalysisResult pickupAnalysis = analysisFor(120.0, 8.0);
+    pickupAnalysis.beatsPerBar = 4;
+    pickupAnalysis.beats.clear();
+    for (int i = 0; i < 12; ++i) {
+        bgmedia::Beat bt;
+        bt.time = 0.5 * static_cast<double>(i);
+        bt.confidence = 0.9f;
+        if (i < 2) {
+            bt.downbeat = false;
+            bt.barIndex = 0;
+            bt.beatInBar = i + 2;
+        } else {
+            const int fullIdx = i - 2;
+            bt.downbeat = (fullIdx % 4 == 0);
+            bt.barIndex = fullIdx / 4;
+            bt.beatInBar = fullIdx % 4;
+        }
+        pickupAnalysis.beats.push_back(bt);
+    }
+    const MixFeatureMap pickupMap = extractor.buildFromAnalysisOnly(pickupAnalysis);
+    REQUIRE(pickupMap.bars.size() == 4);
+    CHECK(pickupMap.bars[0].beatCount == 2);
+    CHECK(pickupMap.bars[1].beatCount == 4);
+    CHECK(pickupMap.bars[2].beatCount == 4);
+    CHECK(pickupMap.bars[3].beatCount == 2);
 }
 
 TEST_CASE("mix.feature_cache_roundtrip_and_invalidation") {
@@ -3283,6 +3368,23 @@ TEST_CASE("mix.planner_and_session_use_feature_map") {
     CHECK(plan.valid);
     CHECK(plan.transitionEndA <= duration - 4.5);
     CHECK(plan.startB >= 1.8);
+
+    // When preferPhraseBoundaries is disabled and B has an Intro cue later than
+    // audibleStart (e.g. Intro starts at 8.0 s while audibleStart is 2.2 s),
+    // grid alignment must align around the selected cue (~8.0 s) rather than
+    // jumping back to audibleStart.
+    AnalysisResult bWithIntro = analysisFor(120.0, duration);
+    bWithIntro.sections = {
+        {8.0, 16.0, SectionKind::Intro, 0.4f, 0.9f},
+        {16.0, duration, SectionKind::Main, 0.8f, 0.9f},
+    };
+    PlannerConfig noPhraseCfg;
+    noPhraseCfg.preferPhraseBoundaries = false;
+    MixPlanner noPhrasePlanner(noPhraseCfg);
+    const MixPlan cueAlignedPlan =
+        noPhrasePlanner.plan(a, bWithIntro, &featA, &featB, request);
+    CHECK(cueAlignedPlan.valid);
+    CHECK_NEAR(cueAlignedPlan.startB, 8.0, 0.6);
 
     // Session populates deckFeatures(DeckId) on worker completion.
     MixEngine engine(kRate);
