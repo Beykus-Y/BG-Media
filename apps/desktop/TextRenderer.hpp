@@ -30,6 +30,13 @@ public:
                             const std::filesystem::path& assetsDirectory,
                             std::string* error = nullptr);
 
+    // Physical pixels per logical unit. Glyphs are baked at size * scale so a
+    // glyph is always drawn 1:1 into the final framebuffer, while layout keeps
+    // using logical coordinates. Call before drawing; existing atlases stay
+    // valid because the cache key includes the baked pixel size.
+    void setScale(float scale);
+    [[nodiscard]] float scale() const;
+
     void draw(std::string_view text, float x, float y, int size,
               FontWeight weight, SDL_Color color, float alpha = 1.0f,
               float letterSpacing = 0.0f);

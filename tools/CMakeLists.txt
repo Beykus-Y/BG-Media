@@ -1,11 +1,3 @@
-add_library(bgmedia_test_signals STATIC
-    support/SyntheticSignals.cpp
-)
-target_link_libraries(bgmedia_test_signals PUBLIC bgmedia_core)
-target_include_directories(bgmedia_test_signals PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(bgmedia_test_signals PUBLIC cxx_std_20)
-target_compile_options(bgmedia_test_signals PRIVATE ${BGMEDIA_WARNING_FLAGS})
-
 add_executable(bgmedia_fixturegen
     fixturegen/main.cpp
 )
@@ -33,6 +25,26 @@ if(BGMEDIA_BUILD_MINIAUDIO)
     target_compile_options(bgmedia_analyze PRIVATE ${BGMEDIA_WARNING_FLAGS})
     if(WIN32)
         target_link_libraries(bgmedia_analyze PRIVATE shell32)
+    endif()
+
+    # Real-track BG Mix transition measurement (offline + optional device).
+    add_executable(bgmedia_mix_qa
+        mix_qa/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_qa PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_qa PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_qa PRIVATE shell32)
+    endif()
+
+    # Batch listening-test renderer: real BG Beat + planner + engine, WAV out.
+    add_executable(bgmedia_mix_listening
+        mix_listening/main.cpp
+    )
+    target_link_libraries(bgmedia_mix_listening PRIVATE bgmedia_miniaudio)
+    target_compile_options(bgmedia_mix_listening PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(WIN32)
+        target_link_libraries(bgmedia_mix_listening PRIVATE shell32)
     endif()
 endif()
 

@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace bgmedia::desktop {
 
@@ -17,6 +18,10 @@ struct DesktopOptions {
     bool audioSmoke = false;
     bool autoplay = false;
 
+    // BG Mix screen options (also used by headless captures).
+    bool startInMix = false;
+    std::vector<std::filesystem::path> mixTracks;
+
     // BG Motion lab/demo options. They affect only choreography rendering,
     // not the analyzer or the cache.
     int motionLabBpm = 0;
@@ -28,6 +33,14 @@ struct DesktopOptions {
     bool vrmDemo = false;
     float vrmScale = 1.0f;
     float vrmOffsetY = 0.0f;
+
+    // Display / high-DPI options. Zero means "use the saved preference or the
+    // automatic choice" (window size) and "automatic" (UI scale).
+    int windowWidth = 0;
+    int windowHeight = 0;
+    float uiScale = 0.0f;       // 0 = automatic; 1.0 - 2.0 = manual
+    int vrmQuality = 0;         // 0 = default; 50 / 75 / 100 percent of the stage
+    bool fullscreen = false;
 
     // BG Motion 3.0.
     std::filesystem::path dancesDirectory;  // default: <assets>/dances

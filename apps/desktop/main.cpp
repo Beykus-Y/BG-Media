@@ -1,6 +1,7 @@
 #include "DesktopApp.hpp"
 #include "bgmedia/version.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -44,6 +45,8 @@ void printUsage() {
         << "Usage: bgmedia_desktop [options]\n\n"
         << "Options:\n"
         << "  --file <path>          open an audio file on startup\n"
+        << "  --mix                  start on the BG Mix screen\n"
+        << "  --mix-track <path>     add a track to the BG Mix queue (repeatable)\n"
         << "  --cache-dir <dir>      analysis cache directory\n"
         << "  --no-cache             disable reading/writing analysis cache\n"
         << "  --no-audio             do not initialise an audio output device\n"
@@ -57,6 +60,10 @@ void printUsage() {
         << "  --vrm-demo             synthetic 123 BPM test dance (no music needed)\n"
         << "  --vrm-scale <value>    initial model scale (default 1.0)\n"
         << "  --vrm-offset-y <m>     initial model vertical offset\n"
+        << "  --window-size <WxH>    initial window size in screen points (e.g. 1920x1080)\n"
+        << "  --ui-scale <auto|100-250>  logical UI scale percentage\n"
+        << "  --fullscreen           start fullscreen (SDL borderless fullscreen)\n"
+        << "  --vrm-quality <50|75|100>  3D offscreen target as a share of the stage\n"
 
         << "  --motion-debug         show joints, trails and keyframe diagnostics\n"
         << "  --motion-stepped       use the legacy stepped sampler (A/B compare)\n"
@@ -92,6 +99,11 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
         }
         if (arg == "--file" && i + 1 < argc) {
             options.initialFile = pathFromUtf8(argv[++i]);
+        } else if (arg == "--mix") {
+            options.startInMix = true;
+        } else if (arg == "--mix-track" && i + 1 < argc) {
+            options.startInMix = true;
+            options.mixTracks.push_back(pathFromUtf8(argv[++i]));
         } else if (arg == "--cache-dir" && i + 1 < argc) {
             options.cacheDirectory = pathFromUtf8(argv[++i]);
         } else if (arg == "--no-cache") {
@@ -132,6 +144,54 @@ bool parseArgs(int argc, char** argv, bgmedia::desktop::DesktopOptions& options)
                 options.vrmOffsetY = std::stof(argv[++i]);
             } catch (...) {
                 std::cerr << "invalid --vrm-offset-y value\n";
+                return false;
+            }
+        } else if (arg == "--window-size" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            const auto separator = value.find_first_of("xX");
+            if (separator == std::string::npos) {
+                std::cerr << "invalid --window-size (expected WxH)\n";
+                return false;
+            }
+            try {
+                options.windowWidth = std::stoi(value.substr(0, separator));
+                options.windowHeight = std::stoi(value.substr(separator + 1));
+            } catch (...) {
+                std::cerr << "invalid --window-size (expected WxH)\n";
+                return false;
+            }
+            if (options.windowWidth < 320 || options.windowHeight < 240) {
+                std::cerr << "--window-size is too small\n";
+                return false;
+            }
+        } else if (arg == "--ui-scale" && i + 1 < argc) {
+            std::string value = argv[++i];
+            if (value == "auto") {
+                options.uiScale = 0.0f;
+            } else {
+                try {
+                    double scale = std::stod(value);
+                    if (scale > 10.0) {
+                        scale /= 100.0;  // accept "150" as 150 percent
+                    }
+                    options.uiScale = static_cast<float>(
+                        std::clamp(scale, 1.0, 2.5));
+                } catch (...) {
+                    std::cerr << "invalid --ui-scale value\n";
+                    return false;
+                }
+            }
+        } else if (arg == "--fullscreen") {
+            options.fullscreen = true;
+        } else if (arg == "--vrm-quality" && i + 1 < argc) {
+            try {
+                options.vrmQuality = std::stoi(argv[++i]);
+            } catch (...) {
+                std::cerr << "invalid --vrm-quality value\n";
+                return false;
+            }
+            if (options.vrmQuality < 50 || options.vrmQuality > 100) {
+                std::cerr << "--vrm-quality must be 50..100\n";
                 return false;
             }
         } else if (arg == "--dance" && i + 1 < argc) {
