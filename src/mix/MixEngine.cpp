@@ -439,6 +439,8 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     runtime_.to = plan.to;
     runtime_.startB = plan.startB;
     runtime_.handoverProgress = std::clamp(plan.handoverProgress, 0.0, 1.0);
+    runtime_.rateReleaseProgress =
+        std::clamp(plan.rateReleaseProgress, 0.0, 1.0);
     runtime_.directCut = plan.type == TransitionType::DirectCut;
     runtime_.bassSwap = plan.bassSwap;
     runtime_.pitchLock = plan.pitchLock;
@@ -815,15 +817,16 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                 rateFrom0 = planRate(elapsed0);
                 rateFrom1 = planRate(elapsed1);
             }
-            // The incoming deck holds the matched tempo until the handover,
-            // then returns to natural speed across the tail of the fade so the
-            // end of the transition has no rate step.
+            // The incoming deck holds the matched tempo while both decks are
+            // audible (so the beat grids stay locked), then returns to natural
+            // speed across the very tail of the fade so the end of the
+            // transition has no rate step.
             double ratioB = runtime_.tempoRatioB;
-            if (progress0 >= runtime_.handoverProgress && progress0 < 1.0) {
+            if (progress0 >= runtime_.rateReleaseProgress && progress0 < 1.0) {
                 const double span =
-                    std::max(1e-9, 1.0 - runtime_.handoverProgress);
+                    std::max(1e-9, 1.0 - runtime_.rateReleaseProgress);
                 const double t = std::clamp(
-                    (progress0 - runtime_.handoverProgress) / span, 0.0, 1.0);
+                    (progress0 - runtime_.rateReleaseProgress) / span, 0.0, 1.0);
                 ratioB = runtime_.tempoRatioB +
                          (1.0 - runtime_.tempoRatioB) * t;
             }

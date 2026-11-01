@@ -185,6 +185,19 @@ struct MixPlan {
     double alignmentErrorMs = 0.0;      // grid snap error at the cue
     double beatPhaseErrorMs = 0.0;      // residual B-vs-A phase after matching
     double handoverProgress = 0.5;  // where the musical master moves to B
+    // Where the incoming deck starts returning from its matched rate to 1.0x.
+    // Kept late so both decks stay phase-locked while both are audible; the
+    // outgoing deck is already well below -12 dB by then.
+    double rateReleaseProgress = 0.85;
+
+    // Measured two-track beat-phase residual over the audible overlap, from
+    // the real detected beats of both tracks mapped through the actual deck
+    // rates. `phaseMeasured` is false when too few beats exist to judge.
+    bool phaseMeasured = false;
+    int phasePairs = 0;
+    double phaseRmsMs = 0.0;
+    double phaseP95Ms = 0.0;
+    double phaseDriftMs = 0.0;  // |mean error last third - first third|
 
     bool tempoRampActive = false;
     bool pitchLock = true;
@@ -240,6 +253,10 @@ struct PlannerConfig {
     bool pitchLock = true;
     Aggressiveness aggressiveness = Aggressiveness::Balanced;
     int phraseBars = 4;  // musical phrase length in bars (4 or 8 typical)
+    // Residual beat-phase limits for tempo-synced transitions. Exceeding the
+    // p95 limit makes the planner fall back to a plain crossfade instead of
+    // pretending the decks are aligned.
+    double maxPhaseP95Ms = 60.0;
     // Octave-related metric levels (2:1 / 1:2) may be beatmatched at 1.0x when
     // 1:1 is out of range. Needs trustworthy level/phase confidence.
     bool allowMetricRelations = true;
