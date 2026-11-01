@@ -3027,6 +3027,48 @@ TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
     }
     const MixFeatureMap mapLra = extractor.extractFromTrack(*lraTrack, longAnalysis);
     CHECK(mapLra.loudness.loudnessRangeLu < 1.5f);
+
+    // 6. Startup transient windows: a 100 ms tone at t = 0 must report the same
+    // momentaryMaxLufs and shortTermMaxLufs as the identical 100 ms tone at t = 5 s.
+    auto burstStart = std::make_shared<PcmTrack>();
+    auto burstMid = std::make_shared<PcmTrack>();
+    burstStart->sampleRate = burstMid->sampleRate = kRate;
+    burstStart->channels = burstMid->channels = 1;
+    burstStart->samples.assign(8 * kRate, 0.0f);
+    burstMid->samples.assign(8 * kRate, 0.0f);
+    const std::size_t burstFrames = kRate / 10; // 100 ms
+    const std::size_t midOffset = 5 * kRate;
+    for (std::size_t i = 0; i < burstFrames; ++i) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / kRate));
+        burstStart->samples[i] = s;
+        burstMid->samples[midOffset + i] = s;
+    }
+    const MixFeatureMap mapBurstStart = extractor.extractFromTrack(*burstStart, baseAnalysis);
+    const MixFeatureMap mapBurstMid = extractor.extractFromTrack(*burstMid, baseAnalysis);
+    CHECK_NEAR(mapBurstStart.loudness.momentaryMaxLufs,
+               mapBurstMid.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapBurstStart.loudness.shortTermMaxLufs,
+               mapBurstMid.loudness.shortTermMaxLufs, 0.05f);
+
+    // 7. 5-channel surround layout: channels 3 (BL) and 4 (BR) both receive
+    // the +1.5 dB surround weight and report identical integrated loudness.
+    auto surBL = std::make_shared<PcmTrack>();
+    auto surBR = std::make_shared<PcmTrack>();
+    surBL->sampleRate = surBR->sampleRate = kRate;
+    surBL->channels = surBR->channels = 5;
+    surBL->samples.assign(4 * kRate * 5, 0.0f);
+    surBR->samples.assign(4 * kRate * 5, 0.0f);
+    for (std::size_t f = 0; f < 4 * kRate; ++f) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(f) / kRate));
+        surBL->samples[f * 5 + 3] = s;
+        surBR->samples[f * 5 + 4] = s;
+    }
+    const AnalysisResult surAnalysis = analysisFor(120.0, 4.0);
+    const MixFeatureMap mapSurBL = extractor.extractFromTrack(*surBL, surAnalysis);
+    const MixFeatureMap mapSurBR = extractor.extractFromTrack(*surBR, surAnalysis);
+    CHECK_NEAR(mapSurBL.loudness.integratedLufs, mapSurBR.loudness.integratedLufs, 0.05f);
 }
 
 TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {
@@ -3328,6 +3370,31 @@ TEST_CASE("mix.feature_cache_roundtrip_and_invalidation") {
         featureCache.load(monoPcm, analysis, featCfg);
     CHECK(!corruptRes.hit());
     CHECK(corruptRes.status == FeatureCacheStatus::Corrupt);
+
+    // Two stereo sources with identical mono downmixes (s, s) vs (2s, 0) but
+    // different channel powers must have distinct feature-cache keys.
+    auto dualMono = toneTrack(8.0, 1000.0, 2, kRate);
+    auto leftOnly = toneTrack(8.0, 1000.0, 2, kRate);
+    for (std::size_t f = 0; f < dualMono->frameCount(); ++f) {
+        dualMono->samples[f * 2] *= 0.5f;
+        dualMono->samples[f * 2 + 1] *= 0.5f;
+        leftOnly->samples[f * 2] *= 1.0f;
+        leftOnly->samples[f * 2 + 1] = 0.0f;
+    }
+    AnalysisResult stereoAnalysis = analysisFor(120.0, 8.0);
+    const MixFeatureMap mapDual = extractor.extractFromTrack(*dualMono, stereoAnalysis);
+    const MixFeatureMap mapLeft = extractor.extractFromTrack(*leftOnly, stereoAnalysis);
+    CHECK(mapDual.info.contentHash != mapLeft.info.contentHash);
+    CHECK(featureCache.store(mapDual, featCfg, &error));
+    CHECK(!featureCache.load(*leftOnly, stereoAnalysis, featCfg).hit());
+    CHECK(featureCache.store(mapLeft, featCfg, &error));
+    const auto loadedDual = featureCache.load(*dualMono, stereoAnalysis, featCfg);
+    const auto loadedLeft = featureCache.load(*leftOnly, stereoAnalysis, featCfg);
+    CHECK(loadedDual.hit());
+    CHECK(loadedLeft.hit());
+    CHECK_NEAR(loadedLeft.features.loudness.integratedLufs -
+                   loadedDual.features.loudness.integratedLufs,
+               3.01f, 0.15f);
 
     std::filesystem::remove_all(dir, ec);
 }

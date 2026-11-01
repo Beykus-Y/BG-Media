@@ -46,6 +46,17 @@ public:
         double expectedDuration) const;
 
     [[nodiscard]] FeatureCacheLoadResult load(
+        const AudioData& audio,
+        const PcmBuffer& pcm,
+        const AnalysisResult& analysis,
+        const MixFeatureConfig& config) const;
+
+    [[nodiscard]] FeatureCacheLoadResult load(
+        const PcmTrack& track,
+        const AnalysisResult& analysis,
+        const MixFeatureConfig& config) const;
+
+    [[nodiscard]] FeatureCacheLoadResult load(
         const PcmBuffer& pcm,
         const AnalysisResult& analysis,
         const MixFeatureConfig& config) const;

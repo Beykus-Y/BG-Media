@@ -618,6 +618,40 @@ std::string MixFeatureCache::fileNameFor(std::uint64_t contentHash,
 }
 
 FeatureCacheLoadResult MixFeatureCache::load(
+    const AudioData& audio,
+    const PcmBuffer& pcm,
+    const AnalysisResult& analysis,
+    const MixFeatureConfig& config) const {
+    if (!pcm.valid()) {
+        FeatureCacheLoadResult res;
+        res.status = FeatureCacheStatus::Error;
+        res.message = "cannot load feature cache for an invalid PCM buffer";
+        return res;
+    }
+    const std::uint64_t contentHash =
+        MixFeatureExtractor::contentHashFor(audio, pcm, analysis);
+    const std::uint32_t expectedChannels =
+        (audio.valid() && audio.channels > 0) ? audio.channels : pcm.sourceChannels;
+    return load(contentHash, analysis.info.configHash, config,
+                pcm.sampleRate, expectedChannels, pcm.duration());
+}
+
+FeatureCacheLoadResult MixFeatureCache::load(
+    const PcmTrack& track,
+    const AnalysisResult& analysis,
+    const MixFeatureConfig& config) const {
+    AudioData audio;
+    audio.sampleRate = track.sampleRate;
+    audio.channels = track.channels;
+    audio.samples = track.samples;
+    PcmBuffer pcm = PcmBuffer::fromAudio(audio);
+    if (analysis.info.contentHash != 0) {
+        pcm.contentHash = analysis.info.contentHash;
+    }
+    return load(audio, pcm, analysis, config);
+}
+
+FeatureCacheLoadResult MixFeatureCache::load(
     const PcmBuffer& pcm,
     const AnalysisResult& analysis,
     const MixFeatureConfig& config) const {

@@ -313,6 +313,15 @@ public:
 
     [[nodiscard]] const MixFeatureConfig& config() const noexcept { return config_; }
 
+    // Computes the feature-cache content identity. When multi-channel `audio` is
+    // provided, mixes the original interleaved channel samples into the hash so
+    // stereo/multi-channel sources with identical mono downmixes but different
+    // channel powers (e.g. (s, s) vs (2s, 0)) never collide in the .bgf cache.
+    [[nodiscard]] static std::uint64_t contentHashFor(
+        const AudioData& audio,
+        const PcmBuffer& monoPcm,
+        const AnalysisResult& analysis) noexcept;
+
     // Full extraction from multi-channel AudioData + mono PcmBuffer + BG Beat AnalysisResult.
     // Preserves per-channel K-weighted powers for ITU-R BS.1770-4 loudness while using
     // monoPcm for spectral and structural analysis.

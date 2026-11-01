@@ -980,6 +980,31 @@ MixFeatureExtractor::MixFeatureExtractor(MixFeatureConfig config)
     config_.midBandMaxHz = std::clamp(config_.midBandMaxHz, 1200.0, 8000.0);
 }
 
+std::uint64_t MixFeatureExtractor::contentHashFor(
+    const AudioData& audio,
+    const PcmBuffer& monoPcm,
+    const AnalysisResult& analysis) noexcept {
+    const std::uint64_t baseHash =
+        monoPcm.contentHash != 0 ? monoPcm.contentHash : analysis.info.contentHash;
+    if (!audio.valid() || audio.channels <= 1) {
+        return baseHash;
+    }
+    std::uint64_t h = baseHash != 0 ? baseHash : kFnvOffset;
+    hashMixU64(h, static_cast<std::uint64_t>(audio.sampleRate));
+    hashMixU64(h, static_cast<std::uint64_t>(audio.channels));
+    hashMixU64(h, static_cast<std::uint64_t>(audio.samples.size()));
+    for (float sample : audio.samples) {
+        if (!std::isfinite(sample) || sample == 0.0f) {
+            sample = 0.0f;
+        }
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &sample, sizeof(bits));
+        h ^= static_cast<std::uint64_t>(bits);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
 MixFeatureMap MixFeatureExtractor::extract(const PcmBuffer& pcm,
                                            const AnalysisResult& analysis) const {
     return extract(AudioData{}, pcm, analysis);
@@ -998,8 +1023,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     map.info.analyzerVersion = analysis.info.analyzerVersion > 0
                                    ? analysis.info.analyzerVersion
                                    : kAnalyzerVersion;
-    map.info.contentHash = pcm.contentHash != 0 ? pcm.contentHash
-                                                : analysis.info.contentHash;
+    map.info.contentHash = contentHashFor(audio, pcm, analysis);
     map.info.analysisConfigHash = analysis.info.configHash;
     map.info.featureConfigHash = config_.fingerprint();
     map.info.vocalDetectorKind = config_.vocalDetector;
@@ -1044,11 +1068,20 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     std::vector<Biquad> stage1(numChannels, makeKWeightStage1(sr));
     std::vector<Biquad> stage2(numChannels, makeKWeightStage2(sr));
     auto bs1770ChannelWeight = [numChannels](std::size_t ch) noexcept -> double {
-        if (numChannels >= 6 && ch == 3) {
-            return 0.0; // LFE excluded in BS.1770-4
+        constexpr double kSurroundWeight = 1.4125375446227544; // +1.5 dB surround weighting
+        if (numChannels == 4) {
+            return (ch == 3) ? kSurroundWeight : 1.0;
         }
-        if (numChannels >= 5 && (ch == 4 || ch == 5)) {
-            return 1.4125375446227544; // +1.5 dB surround weighting
+        if (numChannels == 5) {
+            return (ch == 3 || ch == 4) ? kSurroundWeight : 1.0;
+        }
+        if (numChannels >= 6) {
+            if (ch == 3) {
+                return 0.0; // LFE excluded in BS.1770-4
+            }
+            if (ch >= 4) {
+                return kSurroundWeight;
+            }
         }
         return 1.0;
     };
@@ -1133,14 +1166,16 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
         const float stLufs = powerToLufs(stMeanSq);
         map.frames[static_cast<std::size_t>(f)].momentaryLufs = momLufs;
         map.frames[static_cast<std::size_t>(f)].shortTermLufs = stLufs;
-        maxMomentary = std::max(maxMomentary, momLufs);
-        maxShortTerm = std::max(maxShortTerm, stLufs);
 
         if (f + 1 >= momFrames || frameCount < momFrames) {
+            maxMomentary = std::max(maxMomentary, momLufs);
             gatingBlocks.push_back(momMeanSq);
         }
-        if ((f + 1 >= stFrames || frameCount < stFrames) && stLufs > -70.0f) {
-            shortTermAbsBlocks.push_back(stMeanSq);
+        if (f + 1 >= stFrames || frameCount < stFrames) {
+            maxShortTerm = std::max(maxShortTerm, stLufs);
+            if (stLufs > -70.0f) {
+                shortTermAbsBlocks.push_back(stMeanSq);
+            }
         }
     }
 

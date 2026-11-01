@@ -107,7 +107,7 @@ bool prepareMixTrack(const std::filesystem::path& path,
     if (options.useCache && !options.cacheDirectory.empty()) {
         mix::MixFeatureCache featureCache(options.cacheDirectory);
         mix::FeatureCacheLoadResult loadedFeatures =
-            featureCache.load(pcm, *analysis, options.features);
+            featureCache.load(decoded.audio, pcm, *analysis, options.features);
         if (loadedFeatures.hit()) {
             cachedFeatures = std::move(loadedFeatures.features);
         }
