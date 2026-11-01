@@ -1151,11 +1151,21 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             "beatmatching needs tempo sync but the tempo ramp cannot run here; "
             "using a plain crossfade";
     }
-    if (type == TransitionType::PhraseAware && (!grids || lowConfidence)) {
-        type = TransitionType::Crossfade;
-        plan.fallbackReason =
-            "phrase alignment needs a confident beat grid; using a plain "
-            "crossfade";
+    if (type == TransitionType::PhraseAware) {
+        if (!grids || lowConfidence) {
+            type = TransitionType::Crossfade;
+            plan.fallbackReason =
+                "phrase alignment needs a confident beat grid; using a plain "
+                "crossfade";
+        } else if (a.downbeatConfidence < config_.minConfidence ||
+                   b.downbeatConfidence < config_.minConfidence ||
+                   a.meterConfidence < config_.minConfidence ||
+                   b.meterConfidence < config_.minConfidence) {
+            type = TransitionType::Crossfade;
+            plan.fallbackReason =
+                "phrase alignment needs confident downbeats and meter; using "
+                "a safe crossfade";
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1173,9 +1183,17 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     if (grids && plan.confidence >= config_.minConfidence) {
         const double barSecondsB = static_cast<double>(bpbB) * 60.0 /
                                    std::max(1.0, b.bpm);
+        const double barSecondsA = static_cast<double>(bpbA) * 60.0 / localBpmA;
+        const double phraseDurationA = phraseBars * barSecondsA;
+        // In the incoming track, the corresponding musical phrase covers
+        // phraseBars * (bBeats / aBeats) bars (adjusted for meter).
+        const int phraseBarsB = std::clamp(
+            static_cast<int>(std::llround(phraseDurationA /
+                                          std::max(1e-3, barSecondsB))),
+            2, 32);
         if (config_.preferPhraseBoundaries) {
             const PhraseCue phraseCue =
-                findPhraseCue(b, cue, phraseBars, std::max(1.0, barSecondsB * 2.0));
+                findPhraseCue(b, cue, phraseBarsB, std::max(1.0, barSecondsB * 2.0));
             if (phraseCue.found) {
                 startB = phraseCue.time;
                 bDownbeat = phraseCue.downbeat;
@@ -1228,15 +1246,27 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         double error = 0.0;
         bool snapped = false;
         bool snappedDownbeat = false;
-        // Prefer a downbeat, but only when it is genuinely close. At slow
-        // tempos the nearest downbeat can be most of a bar away; in that case
-        // align to the beat instead of delaying the mix by half a bar.
-        if (downbeats &&
+        bool snappedPhrase = false;
+        float aPhraseConfidence = 0.0f;
+        if (config_.preferPhraseBoundaries && downbeats) {
+            const PhraseCue phraseCue =
+                findPhraseCue(a, crossfadeStartA, phraseBars, tolerance);
+            if (phraseCue.found && phraseCue.phrase) {
+                snapped = true;
+                snappedDownbeat = true;
+                snappedPhrase = true;
+                aligned = phraseCue.time;
+                error = (aligned - crossfadeStartA) * 1000.0;
+                aPhraseConfidence = phraseCue.confidence;
+            }
+        }
+        if (!snapped && downbeats &&
             findGridPoint(a, crossfadeStartA, true, &aligned, nullptr, &error) &&
             std::abs(aligned - crossfadeStartA) <= tolerance) {
             snapped = true;
             snappedDownbeat = true;
-        } else if (findGridPoint(a, crossfadeStartA, false, &aligned, nullptr,
+        } else if (!snapped &&
+                   findGridPoint(a, crossfadeStartA, false, &aligned, nullptr,
                                  &error) &&
                    std::abs(aligned - crossfadeStartA) <= tolerance) {
             snapped = true;
@@ -1264,6 +1294,11 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 plan.downbeatAligned || snappedDownbeat;
             plan.alignmentErrorMs = std::max(plan.alignmentErrorMs,
                                              std::abs(error));
+            if (snappedPhrase && bPhrase) {
+                plan.phraseBoundary = true;
+                plan.phraseConfidence =
+                    0.5f * (bPhraseConfidence + aPhraseConfidence);
+            }
         }
     }
 

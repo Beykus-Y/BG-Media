@@ -2824,3 +2824,32 @@ TEST_CASE("mix.phase_measure_survives_missing_incoming_beat") {
     CHECK(plan.fallbackReason.empty());
     CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
 }
+
+TEST_CASE("mix.phrase_aligned_across_metric_levels") {
+    // 60 -> 120 (2:1). 4 bars of A = 16 seconds; 8 bars of B = 16 seconds.
+    // Both tracks should align on a musical phrase boundary.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::PhraseAware;
+    request.requestedDuration = 16.0;
+    request.currentPositionA = 16.0;  // exact 4-bar boundary at 60 BPM
+    AnalysisResult a = analysisFor(60.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::PhraseAware);
+    CHECK(plan.phraseBoundary);
+    CHECK(plan.phraseConfidence > 0.0f);
+    CHECK(plan.downbeatAligned);
+    CHECK(plan.metricRelation.bBeats == 2 && plan.metricRelation.aBeats == 1);
+    CHECK_NEAR(plan.startB, 0.0, 0.05);
+
+    // If downbeat or meter confidence is low, phrase alignment must honestly
+    // fall back to a safe crossfade.
+    b.downbeatConfidence = 0.2f;
+    const MixPlan unconfident = planner.plan(a, b, request);
+    CHECK(unconfident.valid);
+    CHECK(unconfident.type == TransitionType::Crossfade);
+    CHECK(unconfident.fallbackReason.find("downbeats and meter") !=
+          std::string::npos);
+}
