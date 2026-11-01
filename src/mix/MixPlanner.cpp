@@ -2216,31 +2216,39 @@ std::vector<MixPlan> evaluateCandidatePlans(
     const float baseHarm = baseline.scoreBreakdown.harmonicScore;
     const float basePhrase = baseline.scoreBreakdown.phraseBoundaryScore;
 
-    std::stable_sort(plans.begin(), plans.end(), [&](const MixPlan& lhs, const MixPlan& rhs) {
-        const bool lhsIsBase =
-            std::abs(lhs.transitionStartA - baseline.transitionStartA) < 0.20 &&
-            std::abs(lhs.startB - baseline.startB) < 0.20 &&
-            std::abs(lhs.duration - baseline.duration) < 0.25;
-        const bool rhsIsBase =
-            std::abs(rhs.transitionStartA - baseline.transitionStartA) < 0.20 &&
-            std::abs(rhs.startB - baseline.startB) < 0.20 &&
-            std::abs(rhs.duration - baseline.duration) < 0.25;
-        if (lhsIsBase != rhsIsBase) {
-            const MixPlan& alt = lhsIsBase ? rhs : lhs;
-            const bool meaningfulGain =
-                (alt.scoreBreakdown.totalScore > baseTotal + 0.025f) ||
-                (alt.scoreBreakdown.vocalSafetyScore > baseVoc + 0.06f &&
-                 alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
-                (alt.scoreBreakdown.harmonicScore > baseHarm + 0.06f &&
-                 alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
-                (alt.scoreBreakdown.phraseBoundaryScore > basePhrase + 0.08f &&
-                 alt.scoreBreakdown.totalScore >= baseTotal);
-            if (!meaningfulGain) {
-                return lhsIsBase;
-            }
-        }
+    std::stable_sort(plans.begin(), plans.end(), [](const MixPlan& lhs, const MixPlan& rhs) {
         return lhs.scoreBreakdown.totalScore > rhs.scoreBreakdown.totalScore;
     });
+
+    auto isBasePlan = [&](const MixPlan& p) {
+        return std::abs(p.transitionStartA - baseline.transitionStartA) < 0.20 &&
+               std::abs(p.startB - baseline.startB) < 0.20 &&
+               std::abs(p.duration - baseline.duration) < 0.25;
+    };
+    auto hasMeaningfulGain = [&](const MixPlan& alt) {
+        return (alt.scoreBreakdown.totalScore > baseTotal + 0.025f) ||
+               (alt.scoreBreakdown.vocalSafetyScore > baseVoc + 0.06f &&
+                alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
+               (alt.scoreBreakdown.harmonicScore > baseHarm + 0.06f &&
+                alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
+               (alt.scoreBreakdown.phraseBoundaryScore > basePhrase + 0.08f &&
+                alt.scoreBreakdown.totalScore >= baseTotal);
+    };
+    if (!plans.empty() && !isBasePlan(plans.front()) && !hasMeaningfulGain(plans.front())) {
+        // Check if any candidate with meaningful gain exists; if so, promote the
+        // highest-scoring one, otherwise retain the baseline plan as winner.
+        auto bestAltIt = std::find_if(plans.begin(), plans.end(), [&](const MixPlan& p) {
+            return !isBasePlan(p) && hasMeaningfulGain(p);
+        });
+        if (bestAltIt != plans.end()) {
+            std::rotate(plans.begin(), bestAltIt, bestAltIt + 1);
+        } else {
+            auto baseIt = std::find_if(plans.begin(), plans.end(), isBasePlan);
+            if (baseIt != plans.end() && baseIt != plans.begin()) {
+                std::rotate(plans.begin(), baseIt, baseIt + 1);
+            }
+        }
+    }
 
     if (plans.size() > 6) {
         plans.resize(6);
