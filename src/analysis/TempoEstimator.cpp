@@ -230,12 +230,18 @@ LowEvidence bestLowPhase(const std::vector<OnsetPeak>& peaks,
         }
     };
     if (std::isfinite(hintPhase)) {
+        // Evaluate low-band pulse near the beat phase and near the syncopated
+        // 8th-note offbeat (hintPhase + 0.5 * lag). This supports both onbeat
+        // kicks and syncopated bass without letting an unrelated phase promote
+        // an incorrect metric subharmonic.
         for (int i = -4; i <= 4; ++i) {
             tryPhase(hintPhase + static_cast<double>(i) * lag / 32.0);
+            tryPhase(hintPhase + 0.5 * lag + static_cast<double>(i) * lag / 32.0);
         }
-    }
-    for (int step = 0; step < steps; ++step) {
-        tryPhase(static_cast<double>(step) * lag / static_cast<double>(steps));
+    } else {
+        for (int step = 0; step < steps; ++step) {
+            tryPhase(static_cast<double>(step) * lag / static_cast<double>(steps));
+        }
     }
     return best;
 }
@@ -633,23 +639,15 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         }
         phase = refineWithRegression(peaks, env, phase, lag, fps,
                                      toleranceFrames, totalPeakStrength);
-        double refinedBpm = phase.fittedLag > 1.0
-                                ? 60.0 * fps / phase.fittedLag
-                                : bpm;
-        // Regression may leave a caller's narrow BPM window (e.g. 190..200).
-        // Never return an out-of-range period even if the fit scores better
-        // than the nearby constrained candidates.
-        if (!std::isfinite(refinedBpm) || refinedBpm < minBpm || refinedBpm > maxBpm) {
-            refinedBpm = bpm;
-            phase = bestPhase(peaks, env, lag, toleranceFrames, totalPeakStrength);
-        }
+        double refinedBpm = bpm;
         if (phase.beatCount >= 2 && phase.phase >= 0.0) {
-            // Search around the fitted slope when regression succeeded,
-            // rather than silently discarding the measured period.
-            double bestLocalBpm = refinedBpm;
+            // Regression is reflected only through phase; recover the fitted
+            // slope from the best phase beat count is not possible here, so
+            // use a local BPM refinement around the candidate.
+            double bestLocalBpm = bpm;
             double bestLocalScore = phase.grid;
             for (int step = -5; step <= 5; ++step) {
-                const double testBpm = refinedBpm * (1.0 + 0.002 * step);
+                const double testBpm = bpm * (1.0 + 0.002 * step);
                 if (testBpm < minBpm || testBpm > maxBpm) {
                     continue;
                 }
@@ -668,20 +666,10 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         const double refinedLag = 60.0 * fps / refinedBpm;
         const double acScore = std::clamp(acAtLag(ac, refinedLag), 0.0, 1.2);
         const double lowTolerance = std::max(2.0, 0.035 * fps);
-        // Score the low-frequency pulse against the SAME beat phase as the
-        // broadband grid. An independent low-band phase can explain unrelated
-        // offbeat bass and incorrectly promote a metric-relative BPM.
-        LowEvidence low = scoreLowPhase(lowPeaks, lowReference, phase.phase, refinedLag,
-                                        lowTolerance, totalLowPeakStrength);
-        LowEvidence freeLow = bestLowPhase(lowPeaks, lowReference, refinedLag, lowTolerance,
-                                           totalLowPeakStrength, phase.phase);
-        const double phaseDistance =
-            std::abs(std::remainder(freeLow.phase - phase.phase, refinedLag)) / refinedLag;
-        const double coherence =
-            std::clamp((0.28 - phaseDistance) / 0.20, 0.0, 1.0);
-        const double freePulse = freeLow.valid
-                                     ? 0.70 * freeLow.hitRate + 0.30 * freeLow.contrast
-                                     : 0.0;
+        // Search for low-frequency pulse aligned to the broadband beat phase or to
+        // syncopated 8th-note offbeats (phase.phase + 0.5 * refinedLag).
+        LowEvidence low = bestLowPhase(lowPeaks, lowReference, refinedLag, lowTolerance,
+                                       totalLowPeakStrength, phase.phase);
         const double prior = std::exp(
             -0.5 * std::pow(std::log2(refinedBpm / std::max(20.0, config.preferredBpm)) /
                                0.90,
@@ -706,13 +694,9 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         // they rise mechanically with a denser grid, which was the root cause
         // of selecting a tatum instead of the musical pulse.
         const double broadband = 0.75 * precisionAdjusted + 0.25 * contrast;
-        const double alignedPulse = low.valid
-                                        ? 0.70 * low.hitRate + 0.30 * low.contrast
-                                        : 0.0;
-        // Retain some evidence for syncopated bass, but do not treat an
-        // unrelated phase as proof of the selected beat grid.
-        const double pulse = std::max(alignedPulse,
-                                      freePulse * (0.35 + 0.65 * coherence));
+        const double pulse = low.valid
+                                 ? 0.70 * low.hitRate + 0.30 * low.contrast
+                                 : 0.0;
         const double evidence = 0.35 * broadband + 0.65 * pulse;
 
         double continuityFactor = 1.0;
@@ -743,8 +727,10 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         candidate.prior = prior;
         candidate.score = (0.55 * evidence + 0.45 * std::clamp(acScore, 0.0, 1.0)) *
                           (0.90 + 0.10 * prior) * continuityFactor;
+
         evaluated.push_back(candidate);
     }
+
 
     if (evaluated.empty()) {
         return result;

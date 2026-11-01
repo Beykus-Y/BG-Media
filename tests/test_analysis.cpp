@@ -681,3 +681,28 @@ TEST_CASE(analysis.periodic_120_bpm_envelope_has_no_phantom_sections) {
     const auto sections = detectSections(features, 30.0, {});
     CHECK(sections.size() <= 2);
 }
+
+TEST_CASE(analysis.issue_40_tempo_regressions_fixed) {
+    using namespace bgmedia;
+    // 1. Fast four-on-the-floor (180 BPM) should estimate ~180 BPM, not subharmonic ~90 BPM
+    {
+        test::TrackOptions options;
+        options.bpm = 180.0;
+        options.duration = 20.0;
+        const auto run = analyzeTrack(test::makeClickTrack(options));
+        CHECK_NEAR(run.result.bpm, 180.0, 2.0);
+        CHECK(run.result.bpm > 140.0);
+    }
+    // 2. Syncopated bassline at 100 BPM should estimate ~100 BPM, not ~66.8 BPM
+    {
+        const auto run = analyzeTrack(test::makeSyncopatedBassTrack(100.0, 18.0));
+        CHECK_NEAR(run.result.bpm, 100.0, 2.0);
+        CHECK(run.result.bpm > 85.0);
+    }
+    // 3. Offbeat track at 120 BPM should estimate ~120 BPM, not subharmonic ~60 BPM
+    {
+        const auto run = analyzeTrack(test::makeOffbeatTrack(120.0, 18.0));
+        CHECK_NEAR(run.result.bpm, 120.0, 2.0);
+        CHECK(run.result.bpm > 100.0);
+    }
+}
