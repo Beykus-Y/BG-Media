@@ -309,6 +309,15 @@ std::shared_ptr<const AnalysisResult> MixSession::deckAnalysis(
                                   : std::shared_ptr<const AnalysisResult>{};
 }
 
+std::shared_ptr<const MixFeatureMap> MixSession::deckFeatures(
+    DeckId deck) const {
+    const std::uint64_t id = loadedId(deck);
+    std::lock_guard lock(mutex_);
+    const Item* item = findItem(id);
+    return item && item->features ? item->features
+                                  : std::shared_ptr<const MixFeatureMap>{};
+}
+
 std::string MixSession::deckName(DeckId deck) const {
     const std::uint64_t id = loadedId(deck);
     std::lock_guard lock(mutex_);
@@ -379,6 +388,11 @@ void MixSession::workerLoop() {
                     preparingStage_ = std::string(stage);
                 }
             });
+        if (ok && prepared.audio && prepared.analysis && !prepared.features) {
+            MixFeatureExtractor extractor;
+            prepared.features = std::make_shared<const MixFeatureMap>(
+                extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+        }
         {
             std::lock_guard lock(mutex_);
             completed_.push_back({id, ok, std::move(prepared), std::move(error)});
@@ -405,6 +419,7 @@ void MixSession::collectCompleted() {
         if (job.ok && job.prepared.audio && job.prepared.analysis) {
             item->audio = std::move(job.prepared.audio);
             item->analysis = std::move(job.prepared.analysis);
+            item->features = std::move(job.prepared.features);
             item->state = QueueState::Ready;
             item->progress = 1.0f;
             status_ = "Ready: " + item->name;
@@ -574,7 +589,8 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
         execution ? snap.decks[deckIndex(from)].positionSeconds : -1.0;
     request.autoStart = execution;
     request.trackNameB = b->name;
-    MixPlan plan = planner.plan(*a->analysis, *b->analysis, request);
+    MixPlan plan = planner.plan(*a->analysis, *b->analysis,
+                                a->features.get(), b->features.get(), request);
     plan.from = from;
     plan.to = to;
     return plan;
