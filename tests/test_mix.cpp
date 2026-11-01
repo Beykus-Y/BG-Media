@@ -2853,3 +2853,23 @@ TEST_CASE("mix.phrase_aligned_across_metric_levels") {
     CHECK(unconfident.fallbackReason.find("downbeats and meter") !=
           std::string::npos);
 }
+
+TEST_CASE("mix.phrase_fallback_disables_prepared_ramp") {
+    // A at 120, B at 124 (would otherwise ramp A). Low downbeat confidence
+    // forces fallback to Crossfade: the prepared ramp must not leak into A.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::PhraseAware;
+    request.requestedDuration = 8.0;
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(124.0, 120.0);
+    b.downbeatConfidence = 0.2f;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(!plan.tempoRampActive);
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK_NEAR(plan.preTransitionSeconds, 0.0, 1e-9);
+    CHECK(!plan.fallbackReason.empty());
+}
