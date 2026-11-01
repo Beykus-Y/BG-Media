@@ -6,6 +6,7 @@
 
 #include "bgmedia/analysis/AnalysisResult.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 #include "bgmedia/mix/MixTypes.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
@@ -27,6 +28,7 @@ namespace bgmedia::mix {
 struct PreparedMixTrack {
     std::shared_ptr<const PcmTrack> audio;
     std::shared_ptr<const AnalysisResult> analysis;
+    std::shared_ptr<const MixFeatureMap> features;
 };
 
 // Returns false with `error` set on failure. The progress callback may be
@@ -106,6 +108,8 @@ public:
     [[nodiscard]] MixSessionSnapshot snapshot() const;
     [[nodiscard]] std::shared_ptr<const AnalysisResult> deckAnalysis(
         DeckId deck) const;
+    [[nodiscard]] std::shared_ptr<const MixFeatureMap> deckFeatures(
+        DeckId deck) const;
     [[nodiscard]] std::string deckName(DeckId deck) const;
     [[nodiscard]] MixEngine& engine() noexcept { return engine_; }
 
@@ -118,6 +122,7 @@ private:
         float progress = 0.0f;
         std::shared_ptr<const PcmTrack> audio;
         std::shared_ptr<const AnalysisResult> analysis;
+        std::shared_ptr<const MixFeatureMap> features;
         std::string error;
     };
 

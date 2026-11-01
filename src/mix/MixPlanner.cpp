@@ -232,13 +232,21 @@ double outroStart(const AnalysisResult& analysis) {
     return analysis.info.duration;
 }
 
-double musicalEnd(const AnalysisResult& analysis) {
+double musicalEnd(const AnalysisResult& analysis,
+                  const MixFeatureMap* features = nullptr) {
     double end = analysis.info.duration;
     for (const SilenceRegion& silence : analysis.silences) {
         if (silence.end >= analysis.info.duration - 0.35 &&
             silence.start >= analysis.info.duration - 8.0) {
             end = std::min(end, silence.start + 0.20);
         }
+    }
+    if (features && features->valid() && features->info.fromPcm &&
+        features->audible.audibleEnd > 0.5 &&
+        features->audible.audibleEnd < analysis.info.duration - 0.25) {
+        end = std::min(end,
+                       std::min(analysis.info.duration,
+                                features->audible.audibleEnd + 0.20));
     }
     return end;
 }
@@ -858,6 +866,13 @@ double MixPlanner::suggestDuration(const AnalysisResult& a,
 
 MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                          const PlanRequest& request) const {
+    return plan(a, b, nullptr, nullptr, request);
+}
+
+MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
+                         const MixFeatureMap* featuresA,
+                         const MixFeatureMap* featuresB,
+                         const PlanRequest& request) const {
     MixPlan plan;
     plan.requestedType = request.type;
     plan.type = request.type;
@@ -1094,7 +1109,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         // no grid correction below, so clamp it here for every plan.
         endA = std::min(endA, a.info.duration);
     } else {
-        endA = musicalEnd(a);
+        endA = musicalEnd(a, featuresA);
         crossfadeStartA = std::max(0.0, endA - duration * ratioA);
         if (grids && plan.confidence >= config_.minConfidence) {
             double aligned = 0.0;
@@ -1245,6 +1260,13 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     const double intro = sectionCue(b, SectionKind::Intro,
                                     b.beats.empty() ? 0.2 : b.beats.front().time);
     double cue = std::clamp(intro, 0.0, std::max(0.0, b.info.duration - 0.5));
+    double minAudibleB = 0.0;
+    if (featuresB && featuresB->valid() && featuresB->info.fromPcm &&
+        featuresB->audible.audibleStart > 0.05 &&
+        featuresB->audible.audibleStart < b.info.duration - 0.5) {
+        minAudibleB = featuresB->audible.audibleStart;
+        cue = std::max(cue, minAudibleB);
+    }
     double startB = cue;
     bool bDownbeat = false;
     double bErrorMs = 0.0;
@@ -1265,7 +1287,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         if (config_.preferPhraseBoundaries) {
             const PhraseCue phraseCue =
                 findPhraseCue(b, cue, phraseBarsB, std::max(1.0, barSecondsB * 2.0));
-            if (phraseCue.found) {
+            if (phraseCue.found && phraseCue.time >= minAudibleB - 0.15) {
                 startB = phraseCue.time;
                 bDownbeat = phraseCue.downbeat;
                 bPhrase = phraseCue.phrase;
@@ -1274,8 +1296,15 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         }
         if (!bPhrase) {
             double aligned = 0.0;
-            if (findGridPoint(b, cue, downbeats, &aligned, &bDownbeat,
-                              &bErrorMs)) {
+            if (minAudibleB > 0.05) {
+                if (nextGridPoint(b, minAudibleB, downbeats,
+                                  std::max(1.0, barSecondsB * 2.0), &aligned,
+                                  &bDownbeat, &bErrorMs) &&
+                    aligned < b.info.duration - 0.2) {
+                    startB = aligned;
+                }
+            } else if (findGridPoint(b, cue, downbeats, &aligned, &bDownbeat,
+                                     &bErrorMs)) {
                 if (aligned >= 0.0 && aligned < b.info.duration - 0.2) {
                     startB = aligned;
                 }
@@ -1631,6 +1660,15 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         plan.gainCurveIn.push_back({time, equalPowerIn(t)});
     }
 
+    if ((featuresA && featuresA->valid()) || (featuresB && featuresB->valid())) {
+        const double lufsA = featuresA ? featuresA->loudness.integratedLufs : 0.0;
+        const double lufsB = featuresB ? featuresB->loudness.integratedLufs : 0.0;
+        const double audEndA = featuresA ? featuresA->audible.audibleEnd : a.info.duration;
+        const double audStartB = featuresB ? featuresB->audible.audibleStart : 0.0;
+        plan.reasons.push_back(format(
+            "Feature map: A %.1f LUFS (audible end %.2f s), B %.1f LUFS (audible start %.2f s)",
+            lufsA, audEndA, lufsB, audStartB));
+    }
     if (adaptiveChoice && plan.fallbackReason.empty()) {
         plan.reasons.push_back(
             "Adaptive: chose " + std::string(transitionTypeName(plan.type)));

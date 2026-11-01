@@ -268,6 +268,26 @@ bool prepare(const Options& options, const std::filesystem::path& path,
     std::printf("  prepared %s in %.0f ms (%.1f s, %.1f BPM, conf %.2f)\n",
                 label, ms, out.audio->duration(), out.analysis->bpm,
                 static_cast<double>(out.analysis->bpmConfidence));
+    if (out.features && out.features->valid()) {
+        std::printf(
+            "    features: %.1f LUFS (plain RMS %.1f dBFS, LRA %.1f LU), "
+            "audible %.2f..%.2f s (body %.2f..%.2f s, fadeIn=%d fadeOut=%d reverbTail=%d), "
+            "bars=%zu phrases=%zu mixInCues=%zu mixOutCues=%zu\n",
+            static_cast<double>(out.features->loudness.integratedLufs),
+            static_cast<double>(out.features->loudness.meanRmsDbfs),
+            static_cast<double>(out.features->loudness.loudnessRangeLu),
+            out.features->audible.audibleStart,
+            out.features->audible.audibleEnd,
+            out.features->audible.fullBodyStart,
+            out.features->audible.tailStart,
+            out.features->audible.hasFadeIn ? 1 : 0,
+            out.features->audible.hasFadeOut ? 1 : 0,
+            out.features->audible.hasReverbTail ? 1 : 0,
+            out.features->bars.size(),
+            out.features->phrases.size(),
+            out.features->mixInCandidates.size(),
+            out.features->mixOutCandidates.size());
+    }
     return true;
 }
 
@@ -301,7 +321,8 @@ MixPlan planTransition(const Options& options, const PreparedMixTrack& a,
     request.currentPositionA = snap.decks[0].positionSeconds;
     request.autoStart = true;
     request.trackNameB = b.audio ? "B" : "";
-    return planner.plan(*a.analysis, *b.analysis, request);
+    return planner.plan(*a.analysis, *b.analysis,
+                        a.features.get(), b.features.get(), request);
 }
 
 void printPlan(const MixPlan& plan) {

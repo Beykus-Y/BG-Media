@@ -1,7 +1,10 @@
 #include "framework.hpp"
 
+#include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/mix/Crossfade.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixFeatureCache.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 #include "bgmedia/mix/MixSession.hpp"
 #include "bgmedia/mix/MixSync.hpp"
@@ -14,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -2946,4 +2950,349 @@ TEST_CASE("mix.sync_clock_active_during_cancellation") {
     // When the deck itself stops playing, the clock reports stopped.
     snap.decks[0].playing = false;
     CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
+}
+
+// ---------------------------------------------------------------------------
+// BG Mix 0.3 PR 1: Musical Feature Map, BS.1770 LUFS, Adaptive Bounds, Cache
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const AnalysisResult baseAnalysis = analysisFor(120.0, 8.0);
+
+    // 1. 1 kHz stereo sine at 0.4 amplitude: K-weighting gain at 1 kHz is ~0 dB,
+    // so BS.1770 integrated LUFS matches plain RMS dBFS closely.
+    const auto tone1k = toneTrack(8.0, 1000.0);
+    const MixFeatureMap map1k = extractor.extractFromTrack(*tone1k, baseAnalysis);
+    CHECK(map1k.valid());
+    CHECK(map1k.info.fromPcm);
+    CHECK_NEAR(map1k.loudness.integratedLufs, map1k.loudness.meanRmsDbfs, 0.35);
+
+    // 2. 3 kHz stereo sine at the exact same 0.4 amplitude: plain RMS dBFS is
+    // identical to 1 kHz, while BS.1770 Stage-1 high-shelf boosts 3 kHz by ~+3.6 LU.
+    const auto tone3k = toneTrack(8.0, 3000.0);
+    const MixFeatureMap map3k = extractor.extractFromTrack(*tone3k, baseAnalysis);
+    CHECK_NEAR(map3k.loudness.meanRmsDbfs, map1k.loudness.meanRmsDbfs, 0.05);
+    CHECK(map3k.loudness.integratedLufs > map1k.loudness.integratedLufs + 3.0f);
+    CHECK(map3k.loudness.integratedLufs < map1k.loudness.integratedLufs + 4.3f);
+
+    // 3. 30 Hz sub-bass sine at the exact same 0.4 amplitude: plain RMS dBFS is
+    // identical to 1 kHz, while BS.1770 Stage-2 RLB high-pass attenuates 30 Hz.
+    const auto tone30 = toneTrack(8.0, 30.0);
+    const MixFeatureMap map30 = extractor.extractFromTrack(*tone30, baseAnalysis);
+    CHECK_NEAR(map30.loudness.meanRmsDbfs, map1k.loudness.meanRmsDbfs, 0.10);
+    CHECK(map30.loudness.integratedLufs < map1k.loudness.integratedLufs - 3.5f);
+
+    // 4. BS.1770 gating: half 1 kHz tone + half digital silence reduces plain
+    // RMS by ~3 dB, while gated integrated LUFS stays within 0.25 LU of the full tone.
+    auto gatedTrack = toneTrack(8.0, 1000.0);
+    const std::size_t halfSamples = gatedTrack->samples.size() / 2;
+    std::fill(gatedTrack->samples.begin() + static_cast<std::ptrdiff_t>(halfSamples),
+              gatedTrack->samples.end(), 0.0f);
+    const MixFeatureMap mapGated = extractor.extractFromTrack(*gatedTrack, baseAnalysis);
+    CHECK(mapGated.loudness.meanRmsDbfs < map1k.loudness.meanRmsDbfs - 2.5f);
+    CHECK_NEAR(mapGated.loudness.integratedLufs, map1k.loudness.integratedLufs, 0.25);
+}
+
+TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+
+    // Quiet master at -54 dBFS (amplitude ~0.0020, RMS ~0.00141 = -57 dBFS),
+    // which would be wiped out by a hard -55 dBFS threshold, surrounded by
+    // 1.5 s lead-in and 2.0 s lead-out at -88 dBFS noise floor.
+    auto quiet = std::make_shared<PcmTrack>();
+    quiet->sampleRate = kRate;
+    quiet->channels = 2;
+    const std::size_t totalFrames = static_cast<std::size_t>(duration * kRate);
+    quiet->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        const bool inBody = (t >= 1.5 && t <= duration - 2.0);
+        const double amp = inBody ? 0.0020 : 0.00004; // -54 dBFS peak (-57 dBFS RMS) vs -88 dBFS
+        const float s = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t));
+        quiet->samples[f * 2] = s;
+        quiet->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap quietMap = extractor.extractFromTrack(*quiet, analysis);
+    CHECK(quietMap.valid());
+    CHECK(quietMap.loudness.meanRmsDbfs < -55.0f);
+    CHECK(quietMap.audible.enterThresholdDbfs < -65.0f);
+    CHECK_NEAR(quietMap.audible.audibleStart, 1.5, 0.25);
+    CHECK_NEAR(quietMap.audible.audibleEnd, duration - 2.0, 0.25);
+    CHECK(quietMap.sampleAt(5.0).active);
+    CHECK(!quietMap.sampleAt(0.5).active);
+    CHECK(!quietMap.sampleAt(11.2).active);
+
+    // Track with a 2.4 s fade-in and a 2.4 s smooth reverb-like decay tail.
+    auto shaped = std::make_shared<PcmTrack>();
+    shaped->sampleRate = kRate;
+    shaped->channels = 2;
+    shaped->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        double env = 0.0;
+        if (t >= 0.5 && t < 3.0) {
+            const double u = (t - 0.5) / 2.5;
+            env = 0.02 * std::pow(20.0, u); // exponential dB ramp from -34 dB to -8 dB
+        } else if (t >= 3.0 && t < 8.5) {
+            env = 0.40;
+        } else if (t >= 8.5 && t < 11.2) {
+            const double u = (t - 8.5) / 2.7;
+            env = 0.40 * std::pow(0.03, u); // smooth exponential decay tail
+        }
+        const float s = static_cast<float>(env * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t));
+        shaped->samples[f * 2] = s;
+        shaped->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap shapedMap = extractor.extractFromTrack(*shaped, analysis);
+    CHECK(shapedMap.audible.hasFadeIn);
+    CHECK(shapedMap.audible.fullBodyStart > shapedMap.audible.audibleStart + 1.2);
+    CHECK(shapedMap.audible.tailStart < shapedMap.audible.audibleEnd - 1.0);
+    CHECK(shapedMap.audible.hasFadeOut || shapedMap.audible.hasReverbTail);
+}
+
+TEST_CASE("mix.feature_map_spectral_bands_and_novelty") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::WindowFeatureSummary;
+
+    MixFeatureExtractor extractor;
+    const double duration = 10.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t totalFrames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        // First 5 s: 75 Hz bass; second 5 s: 6000 Hz treble (above 3.5 kHz mid cutoff).
+        const double hz = (t < 5.0) ? 75.0 : 6000.0;
+        const float s = static_cast<float>(0.35 * std::sin(2.0 * 3.14159265358979323846 * hz * t));
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    const WindowFeatureSummary firstHalf = map.summarizeWindow(1.0, 4.0);
+    const WindowFeatureSummary secondHalf = map.summarizeWindow(6.0, 9.0);
+    CHECK(firstHalf.lowShare > 0.65f);
+    CHECK(firstHalf.bassDominance > 0.65f);
+    CHECK(secondHalf.highShare > 0.65f);
+    CHECK(secondHalf.bassDominance < 0.25f);
+
+    // Spectral novelty must peak around the 5.0 s spectral transition.
+    float boundaryNovelty = 0.0f;
+    for (double t = 4.7; t <= 5.3; t += 0.1) {
+        boundaryNovelty = std::max(boundaryNovelty, map.sampleAt(t).spectralNovelty);
+    }
+    CHECK(boundaryNovelty > firstHalf.spectralNovelty + 0.25f);
+    CHECK(boundaryNovelty > secondHalf.spectralNovelty + 0.25f);
+}
+
+TEST_CASE("mix.feature_map_phrases_and_cue_candidates") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const double duration = 32.0;
+    AnalysisResult analysis = analysisFor(120.0, duration);
+    // Test 3/4 meter awareness as well as section preservation (never relabelling Main).
+    analysis.beatsPerBar = 3;
+    for (std::size_t i = 0; i < analysis.beats.size(); ++i) {
+        analysis.beats[i].downbeat = (i % 3 == 0);
+        analysis.beats[i].barIndex = static_cast<int>(i / 3);
+        analysis.beats[i].beatInBar = static_cast<int>(i % 3);
+    }
+
+    const auto track = toneTrack(duration, 220.0);
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    CHECK(map.valid());
+    CHECK(!map.bars.empty());
+    CHECK(!map.phrases.empty());
+    CHECK(!map.mixInCandidates.empty());
+    CHECK(!map.mixOutCandidates.empty());
+
+    for (const auto& bar : map.bars) {
+        CHECK(bar.beatCount <= 3);
+    }
+    for (const auto& phrase : map.phrases) {
+        CHECK(phrase.end > phrase.start);
+        CHECK(phrase.barCount >= 1);
+    }
+    CHECK(map.mixInCandidates.front().priorScore >= map.mixInCandidates.back().priorScore);
+    CHECK(map.mixOutCandidates.front().priorScore >= map.mixOutCandidates.back().priorScore);
+
+    // Downgrade fallback when PCM is unavailable.
+    const MixFeatureMap fallback = extractor.buildFromAnalysisOnly(analysis);
+    CHECK(fallback.valid());
+    CHECK(!fallback.info.fromPcm);
+    CHECK(!fallback.bars.empty());
+    CHECK(!fallback.mixInCandidates.empty());
+    CHECK(!fallback.mixOutCandidates.empty());
+}
+
+TEST_CASE("mix.feature_cache_roundtrip_and_invalidation") {
+    using bgmedia::AnalysisCache;
+    using bgmedia::AnalysisConfig;
+    using bgmedia::mix::FeatureCacheLoadResult;
+    using bgmedia::mix::FeatureCacheStatus;
+    using bgmedia::mix::MixFeatureCache;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "bgmedia_mix_feature_cache_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    MixFeatureExtractor extractor;
+    AnalysisResult analysis = analysisFor(124.0, 12.0);
+    analysis.info.contentHash = 0x123456789ABCDEF0ULL;
+    analysis.info.configHash = AnalysisConfig{}.fingerprint();
+    analysis.info.sampleRate = kRate;
+    analysis.info.sourceChannels = 2;
+    const auto track = toneTrack(12.0, 440.0);
+
+    bgmedia::PcmBuffer monoPcm;
+    monoPcm.sampleRate = kRate;
+    monoPcm.sourceChannels = 2;
+    monoPcm.samples.resize(track->frameCount(), 0.0f);
+    for (std::size_t i = 0; i < monoPcm.samples.size(); ++i) {
+        monoPcm.samples[i] = track->samples[i * 2];
+    }
+    monoPcm.contentHash = 0x123456789ABCDEF0ULL;
+    analysis.info.contentHash = monoPcm.contentHash;
+
+    MixFeatureMap original = extractor.extract(monoPcm, analysis);
+    original.vocal.available = true;
+    original.vocal.meanConfidence = 0.85f;
+    original.vocal.activeRatio = 0.42f;
+    original.harmony.available = true;
+    original.harmony.keyIndex = 9;
+    original.harmony.isMinor = true;
+    original.harmony.camelotCode = "8A";
+    original.harmony.keyConfidence = 0.78f;
+
+    // Coexistence with BG Beat AnalysisCache (.bgm) in the same directory.
+    AnalysisCache beatCache(dir);
+    AnalysisConfig beatCfg;
+    std::string error;
+    CHECK(beatCache.store(analysis, monoPcm, beatCfg, &error));
+
+    MixFeatureCache featureCache(dir);
+    MixFeatureConfig featCfg;
+    CHECK(featureCache.store(original, featCfg, &error));
+
+    const FeatureCacheLoadResult loadedRes =
+        featureCache.load(monoPcm, analysis, featCfg);
+    CHECK(loadedRes.hit());
+    const MixFeatureMap& loaded = loadedRes.features;
+    CHECK(loaded.valid());
+    CHECK(loaded.frames.size() == original.frames.size());
+    CHECK(loaded.bars.size() == original.bars.size());
+    CHECK(loaded.phrases.size() == original.phrases.size());
+    CHECK(loaded.mixInCandidates.size() == original.mixInCandidates.size());
+    CHECK(loaded.mixOutCandidates.size() == original.mixOutCandidates.size());
+    CHECK_NEAR(loaded.loudness.integratedLufs, original.loudness.integratedLufs, 1e-4);
+    CHECK_NEAR(loaded.audible.audibleStart, original.audible.audibleStart, 1e-6);
+    CHECK_NEAR(loaded.audible.audibleEnd, original.audible.audibleEnd, 1e-6);
+    CHECK(loaded.vocal.available);
+    CHECK_NEAR(loaded.vocal.meanConfidence, 0.85f, 1e-5);
+    CHECK_NEAR(loaded.vocal.activeRatio, 0.42f, 1e-5);
+    CHECK(loaded.harmony.available);
+    CHECK(loaded.harmony.keyIndex == 9);
+    CHECK(loaded.harmony.isMinor);
+    CHECK(loaded.harmony.camelotCode == "8A");
+
+    // Beat cache (.bgm) is still readable alongside (.bgf).
+    const auto loadedBeat = beatCache.load(monoPcm, beatCfg);
+    CHECK(loadedBeat.hit());
+    CHECK_NEAR(loadedBeat.result.bpm, 124.0, 1e-6);
+
+    // Model checksum / config change invalidates the cache.
+    MixFeatureConfig changedCfg = featCfg;
+    changedCfg.vocalModelChecksum = featCfg.vocalModelChecksum + 1;
+    CHECK(!featureCache.load(monoPcm, analysis, changedCfg).hit());
+
+    // Payload corruption is caught by the FNV-1a checksum.
+    const std::filesystem::path bgfPath =
+        dir / MixFeatureCache::fileNameFor(original.info.contentHash,
+                                           original.info.analysisConfigHash,
+                                           featCfg.fingerprint());
+    {
+        std::fstream file(bgfPath, std::ios::binary | std::ios::in | std::ios::out);
+        CHECK(static_cast<bool>(file));
+        file.seekp(-4, std::ios::end);
+        const char bad = static_cast<char>(0xFF);
+        file.write(&bad, 1);
+    }
+    const FeatureCacheLoadResult corruptRes =
+        featureCache.load(monoPcm, analysis, featCfg);
+    CHECK(!corruptRes.hit());
+    CHECK(corruptRes.status == FeatureCacheStatus::Corrupt);
+
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("mix.planner_and_session_use_feature_map") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    // Outgoing track has 5 s of trailing PCM silence that was NOT listed in
+    // analysis.silences; incoming track has 2.2 s of leading PCM silence.
+    const double duration = 24.0;
+    AnalysisResult a = analysisFor(120.0, duration);
+    AnalysisResult b = analysisFor(120.0, duration);
+    b.sections.clear(); // no Intro section cue, so B would start at 0.0 without features
+
+    auto pcmA = toneTrack(duration, 220.0);
+    const std::size_t cutFrameA = static_cast<std::size_t>((duration - 5.0) * kRate);
+    std::fill(pcmA->samples.begin() + static_cast<std::ptrdiff_t>(cutFrameA * 2),
+              pcmA->samples.end(), 0.0f);
+
+    auto pcmB = toneTrack(duration, 330.0);
+    const std::size_t startFrameB = static_cast<std::size_t>(2.2 * kRate);
+    std::fill(pcmB->samples.begin(),
+              pcmB->samples.begin() + static_cast<std::ptrdiff_t>(startFrameB * 2),
+              0.0f);
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featA = extractor.extractFromTrack(*pcmA, a);
+    const MixFeatureMap featB = extractor.extractFromTrack(*pcmB, b);
+    CHECK_NEAR(featA.audible.audibleEnd, duration - 5.0, 0.25);
+    CHECK_NEAR(featB.audible.audibleStart, 2.2, 0.25);
+
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 4.0;
+    const MixPlan plan = planner.plan(a, b, &featA, &featB, request);
+    CHECK(plan.valid);
+    CHECK(plan.transitionEndA <= duration - 4.5);
+    CHECK(plan.startB >= 1.8);
+
+    // Session populates deckFeatures(DeckId) on worker completion.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("alpha.wav");
+    session.addTrack("beta.wav");
+    CHECK(pump.waitForDecks(2));
+    CHECK(session.deckFeatures(DeckId::A) != nullptr);
+    CHECK(session.deckFeatures(DeckId::A)->valid());
+    CHECK(session.deckFeatures(DeckId::B) != nullptr);
+    CHECK(session.deckFeatures(DeckId::B)->valid());
 }

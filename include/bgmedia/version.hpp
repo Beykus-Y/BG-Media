@@ -20,4 +20,11 @@ inline constexpr std::uint32_t kAnalysisSchemaVersion = 2;
 inline constexpr std::uint32_t kAnalyzerVersion = 4;
 inline constexpr std::uint32_t kCacheFormatVersion = 2;
 
+// BG Mix 0.3 musical feature map versions. Kept independent from BG Beat's
+// kAnalysisSchemaVersion / kCacheFormatVersion so existing .bgm caches remain
+// readable while feature maps (.bgf) evolve with vocal/harmonic extractors.
+inline constexpr std::uint32_t kMixFeatureSchemaVersion = 1;
+inline constexpr std::uint32_t kMixFeatureExtractorVersion = 1;
+inline constexpr std::uint32_t kMixFeatureCacheFormatVersion = 1;
+
 } // namespace bgmedia

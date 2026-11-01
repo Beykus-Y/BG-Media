@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.24)
 
 project(BGMedia
     VERSION 0.3.2
@@ -67,6 +67,8 @@ add_library(bgmedia_core STATIC
     src/choreography/Choreography.cpp
     src/mix/MixTypes.cpp
     src/mix/PcmTrack.cpp
+    src/mix/MixFeatureMap.cpp
+    src/mix/MixFeatureCache.cpp
     src/mix/TimeStretch.cpp
     src/mix/SpectralEq.cpp
     src/mix/MixPlanner.cpp
