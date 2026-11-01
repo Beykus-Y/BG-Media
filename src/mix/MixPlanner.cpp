@@ -596,7 +596,7 @@ PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
                                   double rateA, double startB, double rateB,
                                   double duration, double release,
                                   const MetricRelation& relation,
-                                  double periodA) {
+                                  double periodA, double periodB) {
     PhaseMeasurement result;
     if (duration <= 0.5 || rateA <= 1e-6 || a.beats.empty() ||
         b.beats.empty()) {
@@ -663,6 +663,13 @@ PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
             if (std::abs(bt - t) < std::abs(nearest - t)) {
                 nearest = bt;
             }
+        }
+        // With every incoming beat present the nearest one is never farther
+        // than half a beat period away. A larger distance means the incoming
+        // detection is missing there (silence, dropped beat): that pair is
+        // unavailable, not evidence of misalignment.
+        if (periodB > 1e-3 && std::abs(nearest - t) > 0.5 * periodB) {
+            continue;
         }
         errors.push_back((nearest - t) * 1000.0);
     }
@@ -1307,7 +1314,8 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         const PhaseMeasurement phase = measureBeatPhase(
             a, b, plan.transitionStartA, ramp ? ratioA : 1.0, startB,
             syncB ? tempo.ratioB : 1.0, plan.duration, rateRelease,
-            tempo.relation, 60.0 / std::max(1.0, localBpmA));
+            tempo.relation, 60.0 / std::max(1.0, localBpmA),
+            60.0 / (std::max(1.0, b.bpm) * (syncB ? tempo.ratioB : 1.0)));
         if (phase.measured) {
             plan.phaseMeasured = true;
             plan.phasePairs = phase.pairs;

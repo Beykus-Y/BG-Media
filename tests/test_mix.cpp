@@ -2800,3 +2800,27 @@ TEST_CASE("mix.phase_measure_survives_missing_beat") {
     CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
     CHECK(plan.fallbackReason.empty());
 }
+
+TEST_CASE("mix.phase_measure_survives_missing_incoming_beat") {
+    // Exact 120 -> 60 (1:2) with one incoming detection removed (e.g. inside
+    // a silence region): that pair is unavailable, not a 1000 ms error.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(60.0, 120.0);
+    for (auto it = b.beats.begin(); it != b.beats.end(); ++it) {
+        if (std::abs(it->time - 3.0) < 1e-6) {
+            b.beats.erase(it);
+            break;
+        }
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phaseP95Ms <= 40.0);
+    CHECK(plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
+}
