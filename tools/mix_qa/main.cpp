@@ -379,6 +379,36 @@ void printPlan(const MixPlan& plan) {
                     plan.tempoCurve.size(), plan.tempoCurve.front().rate,
                     plan.tempoCurve.back().rate);
     }
+    std::printf(
+        "    smart: strategy=%s bassSwapPos=%.2f vocalCarve=%d loudnessTrim=(A %+.2f dB, B %+.2f dB) "
+        "score=%.3f (phrase=%.2f rhythm=%.2f vocal=%.2f harm=%.2f energy=%.2f loud=%.2f dur=%.2f)\n",
+        bgmedia::mix::mixStrategyKindName(plan.strategy),
+        plan.bassSwapProgress,
+        plan.vocalEqCarve ? 1 : 0,
+        static_cast<double>(plan.loudnessTrimDbA),
+        static_cast<double>(plan.loudnessTrimDbB),
+        static_cast<double>(plan.scoreBreakdown.totalScore),
+        static_cast<double>(plan.scoreBreakdown.phraseBoundaryScore),
+        static_cast<double>(plan.scoreBreakdown.rhythmBeatScore),
+        static_cast<double>(plan.scoreBreakdown.vocalSafetyScore),
+        static_cast<double>(plan.scoreBreakdown.harmonicScore),
+        static_cast<double>(plan.scoreBreakdown.energyContinuityScore),
+        static_cast<double>(plan.scoreBreakdown.loudnessBalanceScore),
+        static_cast<double>(plan.scoreBreakdown.durationFitScore));
+    if (!plan.alternatives.empty()) {
+        std::printf("    candidates (%zu ranked):\n", plan.alternatives.size());
+        const std::size_t limit = std::min<std::size_t>(3, plan.alternatives.size());
+        for (std::size_t i = 0; i < limit; ++i) {
+            const auto& cand = plan.alternatives[i];
+            std::printf(
+                "      #%d [%s / %s] A %.2f->%.2f B %.2f (%.1f s) score=%.3f - %s\n",
+                cand.rank, bgmedia::mix::transitionTypeName(cand.type),
+                bgmedia::mix::mixStrategyKindShortName(cand.strategy),
+                cand.transitionStartA, cand.transitionEndA, cand.startB, cand.duration,
+                static_cast<double>(cand.score.totalScore),
+                cand.rationale.c_str());
+        }
+    }
 }
 
 bool writeWav(const std::filesystem::path& path,

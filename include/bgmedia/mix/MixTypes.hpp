@@ -122,6 +122,58 @@ enum class TempoMatchKind : std::uint8_t {
 
 [[nodiscard]] const char* tempoMatchKindName(TempoMatchKind kind) noexcept;
 
+// BG Mix 0.3 high-level musical transition strategy selected by the planner.
+enum class MixStrategyKind : std::uint8_t {
+    SmoothBlend = 0,   // Phrase/beat-aligned smooth blend with adaptive bass swap
+    VocalHandoff,      // Clean vocal handoff / mid-EQ vocal carving
+    DropImpactCut,     // Short impact cut at a strong accent/drop boundary
+    EnergyBridge,      // Low-energy / breakdown bridge between tracks
+    EchoReverbOut      // Outgoing tail / phrase ending with echo/reverb wash-out
+};
+
+[[nodiscard]] const char* mixStrategyKindName(MixStrategyKind kind) noexcept;
+[[nodiscard]] const char* mixStrategyKindShortName(MixStrategyKind kind) noexcept;
+
+// Transparent multi-objective score breakdown for a transition candidate.
+struct MixCandidateScore {
+    float totalScore = 0.0f;           // 0..1 weighted overall score
+    float phraseBoundaryScore = 0.0f;  // 0..1 phrase/bar/section alignment
+    float rhythmBeatScore = 0.0f;      // 0..1 tempo compatibility + beat phase
+    float vocalSafetyScore = 0.0f;     // 0..1 freedom from double-vocal clash + clean handoff
+    float harmonicScore = 0.0f;        // 0..1 chroma/key compatibility + low spectral crowding
+    float energyContinuityScore = 0.0f;// 0..1 energy continuity across handover
+    float loudnessBalanceScore = 0.0f; // 0..1 LUFS balance + headroom safety
+    float durationFitScore = 0.0f;     // 0..1 structural duration fit
+
+    float vocalClashRisk = 0.0f;
+    float harmonicClashRisk = 0.0f;
+    float spectralCrowding = 0.0f;
+    bool cutsVocalPhraseA = false;
+    bool entersVocalPhraseB = false;
+    bool cleanVocalHandoff = false;
+    std::string summary;
+};
+
+// Ranked candidate evaluated by the BG Mix 0.3 multi-candidate transition planner.
+struct MixCandidate {
+    int rank = 0; // 1 = selected winner, 2..N = alternatives
+    TransitionType type = TransitionType::SmartCrossfade;
+    MixStrategyKind strategy = MixStrategyKind::SmoothBlend;
+    double transitionStartA = 0.0;
+    double transitionEndA = 0.0;
+    double tempoRampStartA = -1.0;
+    double startB = 0.0;
+    double endB = 0.0;
+    double duration = 0.0;
+    int durationBars = 0;
+    double bassSwapProgress = 0.35;
+    bool vocalEqCarve = false;
+    float loudnessTrimDbA = 0.0f;
+    float loudnessTrimDbB = 0.0f;
+    MixCandidateScore score;
+    std::string rationale;
+};
+
 struct TempoPoint {
     // Seconds from the crossfade start. Negative points belong to the
     // pre-transition tempo ramp, which is exactly the 0.2 behaviour: the
@@ -202,9 +254,22 @@ struct MixPlan {
     bool tempoRampActive = false;
     bool pitchLock = true;
     bool bassSwap = false;
+    double bassSwapProgress = 0.35; // 0..1 normalized crossfade progress for bass handover
+    bool vocalEqCarve = false;      // mid-band vocal carving active during vocal overlap
     int phraseBars = 0;
     bool phraseBoundary = false;
     float phraseConfidence = 0.0f;
+
+    // BG Mix 0.3 strategy, loudness normalization, tail processor, and candidate scores.
+    MixStrategyKind strategy = MixStrategyKind::SmoothBlend;
+    float loudnessTrimDbA = 0.0f;   // dB gain trim applied to outgoing deck A
+    float loudnessTrimDbB = 0.0f;   // dB gain trim applied to incoming deck B
+    float loudnessGainA = 1.0f;     // linear gain multiplier for deck A (headroom-clamped)
+    float loudnessGainB = 1.0f;     // linear gain multiplier for deck B (headroom-clamped)
+    float tailSendAmount = 0.0f;    // 0..1 echo/reverb tail send for EchoReverbOut
+    double tailDecaySeconds = 0.0;  // tail decay length in seconds
+    MixCandidateScore scoreBreakdown;
+    std::vector<MixCandidate> alternatives;
 
     std::vector<TempoPoint> tempoCurve;
     std::vector<GainPoint> gainCurveOut;

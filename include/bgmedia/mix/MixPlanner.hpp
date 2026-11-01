@@ -43,6 +43,14 @@ public:
                                const MixFeatureMap* featuresB,
                                const PlanRequest& request) const;
 
+    // Evaluates and ranks multiple (Mix-Out, Mix-In, duration, strategy)
+    // transition candidates using the musical feature maps of both tracks.
+    [[nodiscard]] std::vector<MixCandidate> planCandidates(
+        const AnalysisResult& a, const AnalysisResult& b,
+        const MixFeatureMap* featuresA,
+        const MixFeatureMap* featuresB,
+        const PlanRequest& request) const;
+
     // Chooses the default crossfade length from BG Beat sections/confidence.
     [[nodiscard]] double suggestDuration(const AnalysisResult& a,
                                          const AnalysisResult& b) const;

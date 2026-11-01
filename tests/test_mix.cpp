@@ -3863,3 +3863,130 @@ TEST_CASE("mix.feature_cache_audio_and_track_hash_equivalence") {
     const auto infMap = extractor.extractFromTrack(*infStereo, analysisFor(120.0, 3.0));
     CHECK(infMap.valid());
 }
+
+TEST_CASE("mix.planner_smart_automix_multi_candidate_and_loudness") {
+    using bgmedia::Section;
+    using bgmedia::SectionKind;
+    using bgmedia::mix::CueKind;
+    using bgmedia::mix::CuePointCandidate;
+    using bgmedia::mix::CueRole;
+    using bgmedia::mix::MixCandidate;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixStrategyKind;
+    using bgmedia::mix::VocalDetectorKind;
+    using bgmedia::mix::VocalRegion;
+
+    AnalysisResult analysisA = analysisFor(120.0, 32.0);
+    AnalysisResult analysisB = analysisFor(120.0, 32.0);
+    analysisA.sections = {
+        {0.0, 16.0, SectionKind::Main, 1.0f, 0.85f},
+        {16.0, 24.0, SectionKind::Outro, 0.55f, 0.90f},
+        {24.0, 32.0, SectionKind::Main, 0.95f, 0.90f}
+    };
+    analysisB.sections = {
+        {0.0, 8.0, SectionKind::Main, 0.95f, 0.90f},
+        {8.0, 16.0, SectionKind::Intro, 0.55f, 0.90f},
+        {16.0, 32.0, SectionKind::Main, 1.0f, 0.90f}
+    };
+
+    auto trackA = toneTrack(32.0, 220.0, 2, kRate);
+    auto trackB = toneTrack(32.0, 220.0, 2, kRate);
+    // Make A louder (0.75 amplitude) and B quieter (0.18 amplitude) to test LUFS balancing.
+    for (float& s : trackA->samples) {
+        s *= 1.5f;
+    }
+    for (float& s : trackB->samples) {
+        s *= 0.36f;
+    }
+
+    MixFeatureConfig featCfg;
+    featCfg.vocalDetector = VocalDetectorKind::MusicVocalModel;
+    MixFeatureExtractor extractor(featCfg);
+    MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysisA);
+    MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysisB);
+
+    // Inject dense lead vocal on A's late tail (24..32 s) and B's very start (0..8 s),
+    // while A's earlier outro phrase (16..24 s) and B's phrase at (8..16 s) are vocal-free.
+    for (auto& f : featA.frames) {
+        if (f.time >= 24.0) {
+            f.vocalScore = 0.92f;
+            f.vocalConfidence = 0.90f;
+        } else {
+            f.vocalScore = 0.02f;
+            f.vocalConfidence = 0.90f;
+        }
+    }
+    featA.vocal.available = true;
+    featA.vocal.meanConfidence = 0.90f;
+    featA.vocal.regions = {{24.0, 32.0, 0.92f, 0.90f, true}};
+    for (auto& c : featA.mixOutCandidates) {
+        if (c.time >= 23.5) {
+            c.vocalAfter = 0.92f;
+            c.vocalConfidence = 0.90f;
+            c.priorScore = 0.35f;
+        } else if (std::abs(c.time - 16.0) < 0.5) {
+            c.vocalAfter = 0.02f;
+            c.vocalConfidence = 0.90f;
+            c.priorScore = 0.92f;
+        }
+    }
+
+    for (auto& f : featB.frames) {
+        if (f.time < 8.0) {
+            f.vocalScore = 0.92f;
+            f.vocalConfidence = 0.90f;
+        } else {
+            f.vocalScore = 0.02f;
+            f.vocalConfidence = 0.90f;
+        }
+    }
+    featB.vocal.available = true;
+    featB.vocal.meanConfidence = 0.90f;
+    featB.vocal.regions = {{0.0, 8.0, 0.92f, 0.90f, true}};
+    CuePointCandidate cleanMixInB;
+    cleanMixInB.time = 8.0;
+    cleanMixInB.barIndex = 4;
+    cleanMixInB.beatIndex = 16;
+    cleanMixInB.role = CueRole::MixIn;
+    cleanMixInB.kind = CueKind::PhraseBoundary;
+    cleanMixInB.sectionKind = SectionKind::Intro;
+    cleanMixInB.boundaryStrength = 0.90f;
+    cleanMixInB.rhythmConfidence = 0.90f;
+    cleanMixInB.phraseConfidence = 0.90f;
+    cleanMixInB.availableWindowSeconds = 24.0;
+    cleanMixInB.vocalAfter = 0.02f;
+    cleanMixInB.vocalConfidence = 0.90f;
+    cleanMixInB.harmonicStability = 0.90f;
+    cleanMixInB.priorScore = 0.94f;
+    cleanMixInB.reason = "clean instrumental intro phrase";
+    featB.mixInCandidates.insert(featB.mixInCandidates.begin(), cleanMixInB);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 0.0; // Auto mode
+    req.currentPositionA = 8.0;
+
+    const std::vector<MixCandidate> ranked =
+        planner.planCandidates(analysisA, analysisB, &featA, &featB, req);
+    CHECK(ranked.size() >= 2);
+    CHECK(ranked.front().rank == 1);
+    CHECK(ranked.front().score.totalScore >= ranked.back().score.totalScore);
+
+    const MixPlan plan = planner.plan(analysisA, analysisB, &featA, &featB, req);
+    CHECK(plan.valid);
+    CHECK(!plan.alternatives.empty());
+    // Must avoid the vocal-clashing 24..32s + 0..8s combination.
+    CHECK(plan.scoreBreakdown.vocalSafetyScore > 0.70f);
+    CHECK(plan.scoreBreakdown.totalScore > 0.65f);
+
+    // Loudness matching: A is louder than B, so A is trimmed down and B is boosted
+    // while respecting the -0.5 dBFS peak headroom ceiling.
+    CHECK(plan.loudnessTrimDbA < 0.0f);
+    CHECK(plan.loudnessTrimDbB > 0.0f);
+    CHECK(plan.loudnessGainA < 1.0f);
+    CHECK(plan.loudnessGainB > 1.0f);
+    CHECK(featB.loudness.samplePeakDbfs + plan.loudnessTrimDbB <= -0.5f + 1e-3f);
+}
