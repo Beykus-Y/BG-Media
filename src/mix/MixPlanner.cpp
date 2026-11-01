@@ -243,7 +243,7 @@ double musicalEnd(const AnalysisResult& analysis,
             end = std::min(end, silence.start + 0.20);
         }
     }
-    if (features && features->valid() && features->info.fromPcm &&
+    if (features && features->valid() &&
         features->audible.audibleEnd > 0.5 &&
         features->audible.audibleEnd < analysis.info.duration - 0.25) {
         end = std::min(end,
@@ -1402,11 +1402,13 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
             }
         }
         // Even without a ramp (or after the ramp was shortened), the window
-        // must never run past the outgoing track. The low-confidence path has
-        // no grid correction below, so clamp it here for every plan.
-        endA = std::min(endA, a.info.duration);
+        // must never run past the outgoing track. Clamp to musicalEnd when feasible.
+        const double liveMusicalEndA = musicalEnd(a, featuresA);
+        const double maxLimitA = (liveMusicalEndA > crossfadeStartA + 0.5) ? liveMusicalEndA : a.info.duration;
+        endA = std::min(endA, maxLimitA);
     } else {
-        endA = musicalEnd(a, featuresA);
+        const double mEndA = musicalEnd(a, featuresA);
+        endA = mEndA;
         crossfadeStartA = (overrideSpec.active && overrideSpec.targetStartA >= 0.0)
                               ? std::clamp(overrideSpec.targetStartA, 0.0,
                                            std::max(0.0, endA - 0.5))
@@ -1420,9 +1422,10 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
                 crossfadeStartA = aligned;
             }
         }
-        endA = std::min(a.info.duration, crossfadeStartA + duration * ratioA);
+        endA = std::min(mEndA, crossfadeStartA + duration * ratioA);
         overallStartA = std::max(0.0, crossfadeStartA -
                                           (ramp ? rampMediaSeconds : 0.0));
+
         if (ramp && crossfadeStartA - overallStartA <
                         rampMediaSeconds - 1e-6) {
             // Not enough outgoing material for the full ramp: shorten it in

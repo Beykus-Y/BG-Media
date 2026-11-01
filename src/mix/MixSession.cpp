@@ -665,10 +665,17 @@ void MixSession::ensurePlanValid() {
         livePosA < preview_.overallStartA() + 0.5) {
         return;
     }
-    preview_ = {};
     if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
-        const bool liveExpired = livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5;
-        preview_ = buildPlan(from, to, snap, duration_, liveExpired);
+        // Build the planned ending transition first
+        preview_ = buildPlan(from, to, snap, duration_, false);
+
+        // Only if the live playback cursor has already passed the planned window,
+        // re-plan from the live cursor so the transition fits the remaining audio.
+        if (preview_.valid && livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5) {
+            preview_ = buildPlan(from, to, snap, duration_, true);
+        }
+    } else {
+        preview_ = {};
     }
     cachedFromId_ = fromId;
     cachedToId_ = toId;

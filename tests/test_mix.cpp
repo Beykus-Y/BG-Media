@@ -4686,3 +4686,99 @@ TEST_CASE("mix.codex_expired_preview_plan_revalidation") {
     CHECK(engine.snapshot().phase == TransitionPhase::Idle);
     CHECK(engine.snapshot().master == DeckId::B);
 }
+
+
+TEST_CASE("mix.codex_finding_preview_expiration_on_load") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    CHECK(pump.waitForDecks(1));
+
+    session.play();
+    pump.forSeconds(4.0);
+    const double posA = engine.snapshot().decks[0].positionSeconds;
+    CHECK(posA >= 2.0);
+
+    // Track B finishes preparing while deck A is already 4.0s into playback
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    pump.once();
+
+    const auto snap = session.snapshot();
+    // Engine must not prematurely trigger transition at live position
+    CHECK(snap.engine.phase == TransitionPhase::Idle);
+    CHECK(snap.preview.valid);
+    // Crossfade remains scheduled at the track ending (~21.5s), well past posA
+    CHECK(snap.preview.transitionStartA > posA + 10.0);
+}
+
+TEST_CASE("mix.codex_finding_candidate_overlap_fit_to_musical_end") {
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::CuePointCandidate;
+    using bgmedia::mix::CueRole;
+    using bgmedia::mix::CueKind;
+
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+
+    // Track A: 120s tone with trailing silence between 100.0s and 120.0s
+    auto trackA = toneTrack(120.0, 440.0);
+    const std::size_t silenceStart = static_cast<std::size_t>(100.0 * kRate * 2);
+    for (std::size_t i = silenceStart; i < trackA->samples.size(); ++i) {
+        trackA->samples[i] = 0.0f;
+    }
+    auto trackB = toneTrack(120.0, 440.0);
+
+    MixFeatureExtractor extractor;
+    MixFeatureMap featA = extractor.extractFromTrack(*trackA, a);
+    MixFeatureMap featB = extractor.extractFromTrack(*trackB, b);
+
+    CHECK(featA.valid());
+    CHECK(featB.valid());
+    CHECK(featA.audible.audibleEnd <= 100.5);
+
+    // High priority mix-out cue at 96 seconds
+    CuePointCandidate cue;
+    cue.time = 96.0;
+    cue.role = CueRole::MixOut;
+    cue.kind = CueKind::PhraseBoundary;
+    cue.priorScore = 0.95f;
+    cue.phraseConfidence = 0.90f;
+    cue.rhythmConfidence = 0.90f;
+    featA.mixOutCandidates.push_back(cue);
+
+    MixPlanner planner;
+    bgmedia::mix::PlanRequest req;
+    req.requestedDuration = 8.0;
+    req.type = bgmedia::mix::TransitionType::SmartCrossfade;
+
+    const auto candidates = planner.planCandidates(a, b, &featA, &featB, req);
+    CHECK(!candidates.empty());
+
+    // Every candidate overlap must fit within the musical end (<= 100.25s)
+    // and never overrun into trailing silence.
+    for (const auto& cand : candidates) {
+        CHECK(cand.transitionEndA <= 100.25);
+    }
+
+    const auto plan = planner.plan(a, b, &featA, &featB, req);
+    CHECK(plan.valid);
+    CHECK(plan.transitionEndA <= 100.25);
+    // If the 96s candidate was selected, its duration must be fitted to <= 4.25s
+    if (std::abs(plan.transitionStartA - 96.0) < 0.5) {
+        CHECK(plan.duration <= 4.25);
+    }
+}
