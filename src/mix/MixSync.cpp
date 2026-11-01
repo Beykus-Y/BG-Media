@@ -11,7 +11,7 @@ LiveMixTempo liveMixTempo(const MixSnapshot& snapshot) noexcept {
     state.outputLatencySeconds = snapshot.outputLatencySeconds;
     const DeckStatus& deck = snapshot.decks[deckIndex(snapshot.master)];
     state.trackId = deck.trackId;
-    state.playing = deck.playing && snapshot.phase != TransitionPhase::Cancelling;
+    state.playing = deck.playing;
     state.rate = deck.rate;
     state.analysedBpm = deck.analysedBpm;
     state.bpm = deck.bpm > 0.0 ? deck.bpm : deck.analysedBpm * deck.rate;

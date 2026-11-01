@@ -1968,9 +1968,11 @@ TEST_CASE("mix.live_tempo_follows_master") {
     CHECK(after.trackId == 78);
     CHECK_NEAR(after.bpm, 126.0, 1e-6);
 
-    // Cancelling freezes the follow state so the dancer does not chase a
-    // reverse fade.
+    // During transition cancellation before handover, the master deck is still
+    // playing throughout the reverse fade, so the mix clock remains active.
     snap.phase = TransitionPhase::Cancelling;
+    CHECK(bgmedia::mix::liveMixTempo(snap).playing);
+    snap.decks[0].playing = false;
     CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
     std::printf("live tempo: master=%d bpm=%.1f phase=%.3f\n",
                 static_cast<int>(live.master), live.bpm, live.beatPhase);
@@ -2908,4 +2910,40 @@ TEST_CASE("mix.fade_window_fits_outgoing_ramped_playback_rate") {
     CHECK(plan.transitionEndA <= a.info.duration + 1e-6);
     CHECK(plan.transitionStartA + plan.duration * plan.tempoRatioAEnd <=
           a.info.duration + 1e-6);
+}
+
+
+TEST_CASE("mix.metric_compromise_preserves_incoming_correction") {
+    // 100 -> 212.5 BPM (2:1). With A staying at 100 BPM (ratioA = 1.0),
+    // B must slow down to 200 BPM (ratioB = 200 / 212.5 ≈ 0.9412).
+    // The incoming correction must not be discarded.
+    const MixPlan plan = planMetric(100.0, 212.5, {}, TransitionType::Beatmatched);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::Beatmatched);
+    CHECK(plan.metricRelation.bBeats == 2 && plan.metricRelation.aBeats == 1);
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-4);
+    CHECK_NEAR(plan.tempoRatioB, 200.0 / 212.5, 1e-4);
+    CHECK(plan.beatAligned);
+    CHECK_NEAR(plan.beatPhaseErrorMs, 0.0, 1.0);
+}
+
+TEST_CASE("mix.sync_clock_active_during_cancellation") {
+    // Verifies that liveMixTempo keeps reporting playing while the master deck
+    // is playing audio, even when snapshot.phase is TransitionPhase::Cancelling.
+    bgmedia::mix::MixSnapshot snap;
+    snap.master = DeckId::A;
+    snap.phase = TransitionPhase::Cancelling;
+    snap.decks[0].loaded = true;
+    snap.decks[0].playing = true;
+    snap.decks[0].bpm = 120.0;
+    snap.decks[0].analysedBpm = 120.0;
+    snap.decks[0].positionSeconds = 1.5;
+    const bgmedia::mix::LiveMixTempo live = bgmedia::mix::liveMixTempo(snap);
+    CHECK(live.valid);
+    CHECK(live.playing);
+    CHECK_NEAR(live.positionSeconds, 1.5, 1e-6);
+
+    // When the deck itself stops playing, the clock reports stopped.
+    snap.decks[0].playing = false;
+    CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
 }

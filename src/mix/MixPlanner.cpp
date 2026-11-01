@@ -562,13 +562,23 @@ TempoMatch matchTempo(const AnalysisResult& a, const AnalysisResult& b,
         best.reason += note;
         return best;
     }
-    if (chosen.deltaPercent <= 0.20) {
+    const bool negligibleA = std::abs(chosen.ratioA - 1.0) <= 0.0020;
+    const bool negligibleB = std::abs(chosen.ratioB - 1.0) <= 0.0020;
+    if (negligibleA && negligibleB) {
         chosen.ratioA = 1.0;
         chosen.ratioB = 1.0;
         chosen.targetBpm = b.bpm;
         chosen.targetBpmA = localBpmA;
         chosen.matched = false;
     } else {
+        if (negligibleA) {
+            chosen.ratioA = 1.0;
+            chosen.deltaPercent = 0.0;
+        }
+        if (negligibleB) {
+            chosen.ratioB = 1.0;
+            chosen.targetBpm = b.bpm;
+        }
         chosen.targetBpmA = chosen.targetBpm * chosen.relation.aBeats /
                             static_cast<double>(chosen.relation.bBeats);
         chosen.matched = std::abs(chosen.ratioA - 1.0) > 1e-4 ||
