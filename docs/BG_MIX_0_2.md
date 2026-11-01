@@ -386,3 +386,40 @@ Representative run (real fixtures, 123.2 → 162.8 BPM, octave candidate at
   through `setTimeStretch()` / `MixSession::setQuality(StretchQuality::Performance)`.
 * `TransitionStage` and the monitor fields are additive; existing snapshot
   consumers keep working.
+
+---
+
+## 9. Metric-relative beatmatching and two-track phase alignment
+
+Added in BG Mix 0.2 (Issue #36): beatmatches musically compatible metric levels without forcing their BPM numbers to be equal.
+
+### 9.1 Metric relationships vs. playback rates
+
+A 60 BPM track and a 120 BPM track are beatmatched at **1.0x / 1.0x playback rate**, playing 2 incoming beats for every 1 outgoing beat (2:1). The beat-rate relationship (`MetricRelation`: `bBeats : aBeats`) is conceptually and numerically independent from the playback-rate corrections (`tempoRatioAStart/End`, `tempoRatioB`).
+
+| Pair | Source BPM A / B | Metric Relation | Playback Rates (A / B) | Result |
+| --- | --- | --- | --- | --- |
+| 60 → 120 | 60.0 / 120.0 | 2:1 | 1.000 / 1.000 | Exact metric match, 0% time-stretch |
+| 120 → 60 | 120.0 / 60.0 | 1:2 | 1.000 / 1.000 | Exact metric match, 0% time-stretch |
+| 80 → 160 | 80.0 / 160.0 | 2:1 | 1.000 / 1.000 | Exact metric match, 0% time-stretch |
+| 60 → 118 | 60.0 / 118.0 | 2:1 | 0.983 / 1.000 | 2:1 match + bounded residual (~1.7% ramp), WSOLA pitch lock |
+| 123 → 125 | 123.0 / 125.0 | 1:1 | bounded ramp | Standard 1:1 bounded tempo match (preserved) |
+| 100 → 150 | 100.0 / 150.0 | 3:2 | 1.000 / 1.000 | Experimental polyrhythm; opt-in only (`allowPolyrhythm = true`) |
+
+`bpmCandidates` from BG Beat are treated as metric-level alternatives, never as a request to resample at `candidate / bpm`. No artificial 2x or 0.5x time-stretch is ever applied.
+
+### 9.2 Measured two-grid phase residual
+
+Rather than assuming zero error when cues snap independently to beat grids, `MixPlanner` measures the actual cross-deck beat phase over the audible overlap:
+* Real detected beats of both tracks are projected to output time through the deck playback rates.
+* Every $aBeats$-th outgoing beat (indexed musically from the cue beat) is compared with the nearest incoming beat. Missing detections inside silence regions are preserved rather than penalized.
+* The plan reports `phaseRmsMs`, `phaseP95Ms`, `phaseDriftMs`, and `phasePairs`.
+* If `phaseP95Ms` exceeds `PlannerConfig::maxPhaseP95Ms` (default 60 ms), the planner refuses to claim beat alignment and honestly falls back to an equal-power crossfade, explaining the measured drift in `fallbackReason`.
+
+### 9.3 Engine rate hold
+
+During crossfades with incoming tempo matching, the incoming deck holds its matched rate across the entire audible overlap (`rateReleaseProgress = 0.85`), returning smoothly to 1.0x only in the final 15% where outgoing audio is below -16 dB. This prevents phase drift between the decks while both remain audible.
+
+### 9.4 Metric phrase alignment
+
+Musical phrases scale across metric levels: an A phrase of $K$ bars corresponds to $K \times \frac{bBeats}{aBeats} \times \frac{bpbA}{bpbB}$ bars in B. For 60 → 120 BPM in 4/4, 4 bars of A (16 s) align with 8 bars of B (16 s). When `preferPhraseBoundaries` is active and meter/downbeat confidence is verified, both tracks snap to their respective phrase boundaries.

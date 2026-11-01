@@ -306,10 +306,12 @@ MixPlan planTransition(const Options& options, const PreparedMixTrack& a,
 
 void printPlan(const MixPlan& plan) {
     std::printf(
-        "  plan: %s (%s) %.2f s, confidence %.2f, beatAligned=%d "
+        "  plan: %s (%s) %.2f s, relation %d:%d, %s, confidence %.2f, beatAligned=%d "
         "error=%.1f ms\n",
         bgmedia::mix::transitionTypeName(plan.type),
         bgmedia::mix::transitionStatusLabel(plan.type), plan.duration,
+        plan.metricRelation.bBeats, plan.metricRelation.aBeats,
+        bgmedia::mix::tempoMatchKindName(plan.tempoMatchKind),
         static_cast<double>(plan.confidence), plan.beatAligned ? 1 : 0,
         plan.alignmentErrorMs);
     for (const std::string& reason : plan.reasons) {
@@ -324,10 +326,11 @@ void printPlan(const MixPlan& plan) {
         plan.preTransitionSeconds, plan.duration, plan.transitionStartA,
         plan.transitionEndA, plan.startB, plan.tempoRampPercent);
     std::printf(
-        "    align: beat=%d downbeat=%d snap=%.1f ms phase=%.1f ms, "
+        "    align: beat=%d downbeat=%d snap=%.1f ms phase=%.1f ms (p95=%.1f ms, drift=%.1f ms, pairs=%d), "
         "phrase=%d (%.2f), bassSwap=%d pitchLock=%d\n",
         plan.beatAligned ? 1 : 0, plan.downbeatAligned ? 1 : 0,
-        plan.alignmentErrorMs, plan.beatPhaseErrorMs,
+        plan.alignmentErrorMs, plan.beatPhaseErrorMs, plan.phaseP95Ms,
+        plan.phaseDriftMs, plan.phasePairs,
         plan.phraseBoundary ? 1 : 0,
         static_cast<double>(plan.phraseConfidence), plan.bassSwap ? 1 : 0,
         plan.pitchLock ? 1 : 0);
