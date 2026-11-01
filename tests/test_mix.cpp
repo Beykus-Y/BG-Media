@@ -3821,3 +3821,39 @@ TEST_CASE("mix.harmonic_compatibility_pitch_shift_and_percussive_neutrality") {
     CHECK(drumVsFs.percussiveNeutral);
     CHECK(drumVsFs.harmonicClashScore < 0.20f);
 }
+
+
+TEST_CASE("mix.feature_cache_audio_and_track_hash_equivalence") {
+    using bgmedia::AudioData;
+    using bgmedia::PcmBuffer;
+    using bgmedia::mix::FeatureCacheStatus;
+    using bgmedia::mix::MixFeatureCache;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+
+    auto track = toneTrack(2.0, 440.0, 1, kRate);
+    AudioData audio;
+    audio.sampleRate = track->sampleRate;
+    audio.channels = track->channels;
+    audio.samples = track->samples;
+    const PcmBuffer pcm = PcmBuffer::fromAudio(audio);
+
+    AnalysisResult analysis = analysisFor(120.0, 2.0);
+    analysis.info.contentHash = 0; // force fallback to PCM hash
+
+    MixFeatureConfig cfg;
+    MixFeatureExtractor extractor(cfg);
+    const auto mapFromAudio = extractor.extract(audio, pcm, analysis);
+    const auto mapFromTrack = extractor.extractFromTrack(*track, analysis);
+    CHECK(mapFromAudio.info.contentHash == mapFromTrack.info.contentHash);
+
+    const auto cacheDir =
+        std::filesystem::temp_directory_path() / "bgmedia_test_audio_track_cache_equiv";
+    std::error_code ec;
+    std::filesystem::remove_all(cacheDir, ec);
+    MixFeatureCache cache(cacheDir);
+    CHECK(cache.store(mapFromAudio, cfg));
+    const auto loadedViaTrack = cache.load(*track, analysis, cfg);
+    CHECK(loadedViaTrack.status == FeatureCacheStatus::Hit);
+    std::filesystem::remove_all(cacheDir, ec);
+}

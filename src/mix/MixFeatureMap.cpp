@@ -21,6 +21,13 @@ namespace {
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 
+void hashMixU32(std::uint64_t& h, std::uint32_t v) noexcept {
+    for (int i = 0; i < 4; ++i) {
+        h ^= static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        h *= kFnvPrime;
+    }
+}
+
 void hashMixU64(std::uint64_t& h, std::uint64_t v) noexcept {
     for (int i = 0; i < 8; ++i) {
         h ^= static_cast<std::uint8_t>((v >> (i * 8)) & 0xFF);
@@ -1065,12 +1072,8 @@ PcmBuffer MixFeatureExtractor::downmixViewToMono(
             sum += value;
             channelPower[ch] += static_cast<double>(value) * value;
         }
-        float m = static_cast<float>(sum * invChannels);
-        if (!std::isfinite(m) || m == 0.0f) {
-            m = 0.0f;
-        }
-        out.samples[frame] = m;
-        monoPower += static_cast<double>(m) * m;
+        out.samples[frame] = static_cast<float>(sum * invChannels);
+        monoPower += static_cast<double>(out.samples[frame]) * out.samples[frame];
     }
 
     if (channels == 2) {
@@ -1080,20 +1083,17 @@ PcmBuffer MixFeatureExtractor::downmixViewToMono(
             const std::size_t channel =
                 static_cast<std::size_t>(loudest - channelPower.begin());
             for (std::size_t frame = 0; frame < frames; ++frame) {
-                float value = source.samples[frame * channels + channel];
-                if (!std::isfinite(value) || value == 0.0f) {
-                    value = 0.0f;
-                }
-                out.samples[frame] = value;
+                const float value = source.samples[frame * channels + channel];
+                out.samples[frame] = std::isfinite(value) ? value : 0.0f;
             }
         }
     }
 
-    if (analysis.info.contentHash != 0) {
-        out.contentHash = analysis.info.contentHash;
-    } else {
-        out.contentHash = contentHashOf(out.samples);
-    }
+    std::uint64_t h = contentHashOf(out.samples);
+    hashMixU32(h, out.sampleRate);
+    hashMixU32(h, out.sourceChannels);
+    hashMixU64(h, static_cast<std::uint64_t>(out.samples.size()));
+    out.contentHash = (h != 0) ? h : analysis.info.contentHash;
     return out;
 }
 
