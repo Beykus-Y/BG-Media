@@ -226,11 +226,13 @@ VocalDetectionOutput MusicVocalDetector::detect(
                 s = monoPcm.samples[static_cast<std::size_t>(idx)];
                 if (!std::isfinite(s)) s = 0.0f;
                 if (hasStereo) {
-                    const float l = stereoAudio.samples[static_cast<std::size_t>(idx) *
-                                                        stereoAudio.channels];
-                    const float r = stereoAudio.samples[static_cast<std::size_t>(idx) *
-                                                            stereoAudio.channels +
-                                                        1];
+                    float l = stereoAudio.samples[static_cast<std::size_t>(idx) *
+                                                  stereoAudio.channels];
+                    float r = stereoAudio.samples[static_cast<std::size_t>(idx) *
+                                                      stereoAudio.channels +
+                                                  1];
+                    if (!std::isfinite(l)) l = 0.0f;
+                    if (!std::isfinite(r)) r = 0.0f;
                     const double m = 0.5 * (static_cast<double>(l) + r);
                     const double side = 0.5 * (static_cast<double>(l) - r);
                     midSq += m * m;

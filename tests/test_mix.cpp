@@ -3856,4 +3856,10 @@ TEST_CASE("mix.feature_cache_audio_and_track_hash_equivalence") {
     const auto loadedViaTrack = cache.load(*track, analysis, cfg);
     CHECK(loadedViaTrack.status == FeatureCacheStatus::Hit);
     std::filesystem::remove_all(cacheDir, ec);
+
+    // Stereo track with a non-finite sample must still produce a finite, valid map.
+    auto infStereo = toneTrack(3.0, 440.0, 2, kRate);
+    infStereo->samples[static_cast<std::size_t>(0.55 * kRate) * 2] = std::numeric_limits<float>::infinity();
+    const auto infMap = extractor.extractFromTrack(*infStereo, analysisFor(120.0, 3.0));
+    CHECK(infMap.valid());
 }
