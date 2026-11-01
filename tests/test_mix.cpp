@@ -2733,6 +2733,8 @@ TEST_CASE("mix.engine_holds_incoming_rate_while_both_audible") {
     CHECK_NEAR(end, expected, 0.06);
     std::printf("rate hold: B early=%.3f (%.3f) end=%.3f (%.3f)\n", early,
                 2.0 + 1.1 * 3.4, end, expected);
+}
+
 TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
     // 60 -> 118 needs A to move to 59 BPM, but A (30 s) has no room for the
     // ramp at 20 s plus an 8 s fade: the plan must not keep a tempo-synced
