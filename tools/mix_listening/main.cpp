@@ -799,6 +799,12 @@ MixPlan baselinePlan(const MixPlan& plan, double bpmA, double bpmB) {
     baseline.eqCurveIn.clear();
     baseline.bassSwap = false;
     baseline.pitchLock = true;
+    baseline.strategy = bgmedia::mix::MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
     return baseline;
 }
 

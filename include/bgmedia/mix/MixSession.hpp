@@ -200,6 +200,7 @@ private:
     MixPlan lastExecutedPlan_;
     bool hasExecutedPlan_ = false;
     bool planDirty_ = true;
+    bool previewIsExecution_ = false;
     std::uint64_t cachedFromId_ = 0;
     std::uint64_t cachedToId_ = 0;
     DeckId cachedMasterDeck_ = DeckId::A;

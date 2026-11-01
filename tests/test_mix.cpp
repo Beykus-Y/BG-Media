@@ -4827,3 +4827,112 @@ TEST_CASE("mix.codex_finding_cue_ranking_strict_weak_ordering") {
     CHECK(tieList[0].time == 0.5);
     CHECK(tieList[1].time == 1.0);
 }
+
+
+TEST_CASE("mix.codex_finding_backward_seek_restores_ending_preview") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setAutoQueue(false);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto p0 = session.snapshot().preview;
+    CHECK(p0.valid);
+    CHECK(p0.duration >= 7.5);
+    CHECK(p0.transitionStartA > 15.0);
+
+    CHECK(session.seekDeck(DeckId::A, 29.0));
+    pump.once();
+    pump.once();
+
+    const auto pNearEnd = session.snapshot().preview;
+    CHECK(pNearEnd.valid);
+    CHECK(pNearEnd.duration <= 1.5);
+    CHECK(pNearEnd.transitionStartA >= 28.5);
+
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    pump.once();
+    pump.once();
+
+    const auto pRestored = session.snapshot().preview;
+    CHECK(pRestored.valid);
+    CHECK(pRestored.duration >= 7.5);
+    CHECK(pRestored.transitionStartA > 15.0);
+}
+
+TEST_CASE("mix.codex_finding_cancellation_does_not_rearm_live_preview") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.forSeconds(0.10);
+
+    session.next();
+    pump.forSeconds(0.05);
+    CHECK(session.snapshot().engine.phase == TransitionPhase::Running);
+
+    session.cancelTransition();
+    while (session.snapshot().engine.phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+
+    const auto snap = session.snapshot();
+    CHECK(snap.engine.phase == TransitionPhase::Idle);
+    CHECK(snap.preview.valid);
+    CHECK(snap.preview.transitionStartA > 15.0);
+}
+
+TEST_CASE("mix.codex_finding_baseline_plan_clears_strategy_and_curves") {
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixPlan plan;
+    plan.valid = true;
+    plan.duration = 8.0;
+    plan.strategy = MixStrategyKind::DropImpactCut;
+    plan.gainCurveOut = {{0.0, 1.0f}, {4.0, 0.9f}, {8.0, 0.0f}};
+    plan.gainCurveIn = {{0.0, 0.0f}, {4.0, 0.9f}, {8.0, 1.0f}};
+    plan.tailSendAmount = 0.45f;
+    plan.tailDecaySeconds = 2.0;
+    plan.vocalEqCarve = true;
+
+    MixPlan baseline = plan;
+    baseline.strategy = MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
+
+    CHECK(baseline.strategy == MixStrategyKind::SmoothBlend);
+    CHECK(baseline.gainCurveOut.empty());
+    CHECK(baseline.gainCurveIn.empty());
+    CHECK(baseline.tailSendAmount == 0.0f);
+    CHECK(!baseline.vocalEqCarve);
+}

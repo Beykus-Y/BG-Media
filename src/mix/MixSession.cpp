@@ -101,6 +101,7 @@ void MixSession::clearQueue() {
         items_.clear();
         currentId_ = 0;
         preview_ = {};
+        previewIsExecution_ = false;
         status_ = "Queue cleared";
         clearDecksRequested_ = true;
     }
@@ -174,6 +175,9 @@ void MixSession::cancelTransition() {
     // reverse fade: the user asked to cancel it, so drop the pending request.
     nextRequested_ = false;
     status_ = "Cancelling transition";
+    planDirty_ = true;
+    preview_ = {};
+    previewIsExecution_ = false;
 }
 
 void MixSession::setTransitionType(TransitionType type) {
@@ -442,6 +446,12 @@ void MixSession::handleTransitionCompletion() {
         return;
     }
     lastCompleted_ = snap.completedTransitions;
+    {
+        std::lock_guard lock(mutex_);
+        planDirty_ = true;
+        preview_ = {};
+        previewIsExecution_ = false;
+    }
     const DeckId master = snap.master;
     const DeckId old = otherDeck(master);
     {
@@ -615,10 +625,9 @@ bool MixSession::seekDeck(DeckId deck, double seconds) {
     engine_.seek(deck, target);
     if (deck == snap.master) {
         std::lock_guard lock(mutex_);
-        if (!preview_.valid || target >= preview_.overallStartA() - 0.5) {
-            planDirty_ = true;
-            preview_ = {};
-        }
+        planDirty_ = true;
+        preview_ = {};
+        previewIsExecution_ = false;
     }
     return true;
 }
@@ -658,8 +667,8 @@ void MixSession::ensurePlanValid() {
     const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
 
     // Fast-path: both decks unchanged, configuration unchanged, plan not dirty,
-    // and live cursor has not passed the scheduled transition window.
-    if (!planDirty_ && preview_.valid &&
+    // not an emergency execution plan, and live cursor has not passed the scheduled transition window.
+    if (!planDirty_ && preview_.valid && !previewIsExecution_ &&
         fromId == cachedFromId_ && toId == cachedToId_ &&
         from == cachedMasterDeck_ &&
         livePosA < preview_.overallStartA() + 0.5) {
@@ -668,14 +677,17 @@ void MixSession::ensurePlanValid() {
     if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
         // Build the planned ending transition first
         preview_ = buildPlan(from, to, snap, duration_, false);
+        previewIsExecution_ = false;
 
         // Only if the live playback cursor has already passed the planned window,
         // re-plan from the live cursor so the transition fits the remaining audio.
         if (preview_.valid && livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5) {
-            preview_ = buildPlan(from, to, snap, duration_, true);
+            preview_ = buildPlan(from, to, snap, 0.0, true);
+            previewIsExecution_ = true;
         }
     } else {
         preview_ = {};
+        previewIsExecution_ = false;
     }
     cachedFromId_ = fromId;
     cachedToId_ = toId;
@@ -689,6 +701,7 @@ void MixSession::refreshPlan() {
     const DeckId from = snap.master;
     const DeckId to = otherDeck(from);
     preview_ = {};
+    previewIsExecution_ = false;
     if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
         preview_ = buildPlan(from, to, snap, duration_, false);
     }

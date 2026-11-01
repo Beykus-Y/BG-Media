@@ -603,6 +603,12 @@ bool offlineRun(const Options& options, const PreparedMixTrack& a,
     baseline.eqCurveOut.clear();
     baseline.eqCurveIn.clear();
     baseline.bassSwap = false;
+    baseline.strategy = bgmedia::mix::MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
     const CaseResult base = renderCase(a, b, baseline, true);
     if (base.ok) {
         std::printf("  baseline: rms %.4f, peak %.3f, wall %.3f s\n",
