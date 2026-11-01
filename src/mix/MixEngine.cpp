@@ -245,6 +245,7 @@ void MixEngine::pause(DeckId deck) {
 }
 
 void MixEngine::seek(DeckId deck, double seconds) {
+    planReady_.store(false, std::memory_order_release);
     DeckRuntime& runtime = decks_[deckIndex(deck)];
     runtime.seekSeconds.store(std::max(0.0, seconds), std::memory_order_release);
     runtime.seekSerial.fetch_add(1, std::memory_order_acq_rel);
@@ -290,6 +291,7 @@ bool MixEngine::startTransition(const MixPlan& plan) {
 }
 
 void MixEngine::cancelTransition() {
+    planReady_.store(false, std::memory_order_release);
     if (phase_.load(std::memory_order_acquire) ==
         static_cast<int>(Phase::Running)) {
         cancelRequested_.store(true, std::memory_order_release);
@@ -298,7 +300,12 @@ void MixEngine::cancelTransition() {
 
 bool MixEngine::transitionActive() const noexcept {
     return phase_.load(std::memory_order_acquire) !=
-           static_cast<int>(Phase::Idle);
+           static_cast<int>(Phase::Idle) ||
+           planReady_.load(std::memory_order_acquire);
+}
+
+bool MixEngine::hasPendingTransition() const noexcept {
+    return planReady_.load(std::memory_order_acquire);
 }
 
 void MixEngine::setPaused(bool paused) {

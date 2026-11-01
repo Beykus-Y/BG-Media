@@ -56,6 +56,7 @@ public:
     // Reverse-fades to the outgoing deck and stops the incoming deck.
     void cancelTransition();
     [[nodiscard]] bool transitionActive() const noexcept;
+    [[nodiscard]] bool hasPendingTransition() const noexcept;
 
     // Global transport freeze. Both decks and the transition clock stop.
     void setPaused(bool paused);

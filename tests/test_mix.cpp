@@ -5031,3 +5031,49 @@ TEST_CASE("mix.codex_finding_backward_seek_within_scheduling_window_suppresses_s
     pump.once();
     CHECK(engine.snapshot().phase == TransitionPhase::Idle);
 }
+
+TEST_CASE("mix.codex_finding_seek_after_update_cancels_pending_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    // Position playback at 21.92s directly on engine
+    CHECK(session.seekDeck(DeckId::A, 21.92));
+    engine.render(pump.block.data(), 480);
+    CHECK(engine.snapshot().decks[0].positionSeconds >= 21.9);
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Update() queues the auto-transition against the 21.92s window
+    session.update();
+
+    // Now seekDeck(A, 1.0) is called BEFORE render callback consumes the start request:
+    // It must invalidate the pending plan rather than letting render() enter Running at 1.0s
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+
+    // Render callback runs
+    pump.once();
+
+    // Phase must remain Idle, NOT Running
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().decks[0].positionSeconds <= 1.5);
+
+    // Subsequent seeks must be accepted
+    CHECK(session.seekDeck(DeckId::A, 2.0));
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+}
