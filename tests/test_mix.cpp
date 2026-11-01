@@ -4782,3 +4782,48 @@ TEST_CASE("mix.codex_finding_candidate_overlap_fit_to_musical_end") {
         CHECK(plan.duration <= 4.25);
     }
 }
+
+
+TEST_CASE("mix.codex_finding_cue_ranking_strict_weak_ordering") {
+    using bgmedia::mix::CuePointCandidate;
+
+    CuePointCandidate a;
+    a.time = 1.0;
+    a.priorScore = 0.50000f;
+
+    CuePointCandidate b;
+    b.time = 2.0;
+    b.priorScore = 0.500075f;
+
+    CuePointCandidate c;
+    c.time = 3.0;
+    c.priorScore = 0.50015f;
+
+    auto cmp = [](const CuePointCandidate& x, const CuePointCandidate& y) {
+        if (x.priorScore != y.priorScore) {
+            return x.priorScore > y.priorScore;
+        }
+        return x.time < y.time;
+    };
+
+    CHECK(cmp(c, b));
+    CHECK(cmp(b, a));
+    CHECK(cmp(c, a));
+    CHECK(!cmp(a, b));
+    CHECK(!cmp(b, c));
+    CHECK(!cmp(a, c));
+
+    std::vector<CuePointCandidate> list = {a, b, c};
+    std::sort(list.begin(), list.end(), cmp);
+    CHECK(list[0].priorScore == 0.50015f);
+    CHECK(list[1].priorScore == 0.500075f);
+    CHECK(list[2].priorScore == 0.50000f);
+
+    CuePointCandidate d;
+    d.time = 0.5;
+    d.priorScore = 0.50000f;
+    std::vector<CuePointCandidate> tieList = {a, d};
+    std::sort(tieList.begin(), tieList.end(), cmp);
+    CHECK(tieList[0].time == 0.5);
+    CHECK(tieList[1].time == 1.0);
+}

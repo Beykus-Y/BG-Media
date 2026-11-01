@@ -718,7 +718,7 @@ void buildBarsPhrasesAndCues(MixFeatureMap& map,
     auto sortAndTrim = [](std::vector<CuePointCandidate>& list, int maxCount) {
         std::sort(list.begin(), list.end(),
                   [](const CuePointCandidate& a, const CuePointCandidate& b) {
-                      if (std::abs(a.priorScore - b.priorScore) > 1e-4f) {
+                      if (a.priorScore != b.priorScore) {
                           return a.priorScore > b.priorScore;
                       }
                       return a.time < b.time;
