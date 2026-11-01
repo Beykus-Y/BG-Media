@@ -468,10 +468,41 @@ TempoMatchKind classifyMatch(const TempoMatch& match) {
 }
 
 bool metricLevelTrusted(const AnalysisResult& analysis,
-                        const PlannerConfig& config) {
+                        const PlannerConfig& config,
+                        double expectedRelatedBpm = 0.0) {
     const float minimum = static_cast<float>(config.minMetricConfidence);
-    return analysis.tempoStable && analysis.bpmLevelConfidence >= minimum &&
-           analysis.beatPhaseConfidence >= minimum;
+    if (!analysis.tempoStable || analysis.beatPhaseConfidence < minimum ||
+        analysis.bpmConfidence < minimum) {
+        return false;
+    }
+    // High level confidence directly confirms the chosen metric level.
+    if (analysis.bpmLevelConfidence >= minimum) {
+        return true;
+    }
+    // For octave-ambiguous material, BG Beat's levelSeparation drops because
+    // the octave alternative is nearly as strong as the primary tempo. That
+    // metric ambiguity specifically supports an octave relation when the
+    // candidate evidence confirms the related tempo (or when the level is not
+    // an untrusted floor/guess < 0.25).
+    if (analysis.octaveAmbiguous && analysis.bpmLevelConfidence >= 0.25f) {
+        if (expectedRelatedBpm > 0.0 && !analysis.bpmCandidates.empty()) {
+            for (std::size_t i = 0; i < analysis.bpmCandidates.size(); ++i) {
+                const double cand = analysis.bpmCandidates[i];
+                if (std::abs(cand - expectedRelatedBpm) / expectedRelatedBpm <=
+                    config.maxTempoDeltaPercent / 100.0 + 0.02) {
+                    const float score = i < analysis.bpmCandidateScores.size()
+                                            ? analysis.bpmCandidateScores[i]
+                                            : 1.0f;
+                    if (score >= minimum * 0.8f) {
+                        return true;
+                    }
+                }
+            }
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Metric-relative tempo matching. 1:1 is always tried first (existing
@@ -518,7 +549,11 @@ TempoMatch matchTempo(const AnalysisResult& a, const AnalysisResult& b,
     if (!found) {
         return best;
     }
-    if (!metricLevelTrusted(a, config) || !metricLevelTrusted(b, config)) {
+    const double expectedBpmInA = chosen.targetBpm * chosen.relation.aBeats /
+                                  static_cast<double>(chosen.relation.bBeats);
+    const double expectedBpmInB = chosen.targetBpm;
+    if (!metricLevelTrusted(a, config, expectedBpmInB) ||
+        !metricLevelTrusted(b, config, expectedBpmInA)) {
         char note[192];
         std::snprintf(note, sizeof(note),
                       "; a %d:%d metric relation would fit but the beat level "
@@ -527,10 +562,18 @@ TempoMatch matchTempo(const AnalysisResult& a, const AnalysisResult& b,
         best.reason += note;
         return best;
     }
-    chosen.targetBpmA = chosen.targetBpm * chosen.relation.aBeats /
-                        static_cast<double>(chosen.relation.bBeats);
-    chosen.matched = std::abs(chosen.ratioA - 1.0) > 1e-4 ||
-                     std::abs(chosen.ratioB - 1.0) > 1e-4;
+    if (chosen.deltaPercent <= 0.20) {
+        chosen.ratioA = 1.0;
+        chosen.ratioB = 1.0;
+        chosen.targetBpm = b.bpm;
+        chosen.targetBpmA = localBpmA;
+        chosen.matched = false;
+    } else {
+        chosen.targetBpmA = chosen.targetBpm * chosen.relation.aBeats /
+                            static_cast<double>(chosen.relation.bBeats);
+        chosen.matched = std::abs(chosen.ratioA - 1.0) > 1e-4 ||
+                         std::abs(chosen.ratioB - 1.0) > 1e-4;
+    }
     chosen.kind = classifyMatch(chosen);
     char rates[256];
     std::snprintf(rates, sizeof(rates),
@@ -1011,7 +1054,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 a.info.duration - duration - overallStartA;
             const int fitBars =
                 room > 0.0 ? static_cast<int>(std::floor(room / barMedia)) : 0;
-            if (fitBars >= 2) {
+            if (fitBars >= 1 && (fitBars >= 2 || room >= 3.0 || std::abs(ratioA - 1.0) <= 0.03)) {
                 rampBars = std::min(rampBars, fitBars);
                 rampMediaSeconds =
                     static_cast<double>(rampBars * bpbA) * 60.0 / localBpmA;
@@ -1062,7 +1105,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             const double barMedia =
                 static_cast<double>(bpbA) * 60.0 / localBpmA;
             const int fitBars = static_cast<int>(std::floor(available / barMedia));
-            if (fitBars >= 2) {
+            if (fitBars >= 1 && (fitBars >= 2 || available >= 3.0 || std::abs(ratioA - 1.0) <= 0.03)) {
                 rampBars = std::min(rampBars, fitBars);
                 rampMediaSeconds = static_cast<double>(rampBars * bpbA) * 60.0 /
                                    localBpmA;

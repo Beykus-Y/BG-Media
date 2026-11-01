@@ -441,3 +441,36 @@ During crossfades with incoming tempo matching, the incoming deck holds its matc
 ### 9.4 Metric phrase alignment
 
 Musical phrases scale across metric levels: an A phrase of $K$ bars corresponds to $K \times \frac{bBeats}{aBeats} \times \frac{bpbA}{bpbB}$ bars in B. For 60 → 120 BPM in 4/4, 4 bars of A (16 s) align with 8 bars of B (16 s). When `preferPhraseBoundaries` is active and meter/downbeat confidence is verified, both tracks snap to their respective phrase boundaries.
+
+
+### 9.5 End-to-end verification (BG Beat -> MixPlanner -> MixEngine)
+
+Real integration testing through `bgmedia_mix_qa` verified that metric beatmatching works seamlessly end-to-end without falling back to Smart Crossfade:
+* **Metric Confidence Nuance**: In BG Beat, `bpmLevelConfidence` measures separation between the top tempo candidate and its metric/octave competitor (`levelSeparation`). For any octave-ambiguous material, this is mathematically capped at ~0.25-0.38 by design. `MixPlanner::metricLevelTrusted()` recognizes this: when `octaveAmbiguous` is set and `bpmCandidates` confirms the octave partner with score >= 0.8 * minConfidence, the metric relation is trusted while preserving the strict 0.50 threshold against noise/speech.
+* **Exact Metric Unison Threshold**: Track tempo deltas <= 0.20% (e.g. 60.013 vs 120.045 BPM, delta 0.015%) are treated as exact metric match (`rates 1.000 / 1.000`), avoiding artificial 32-second pre-roll ramps on 24-second tracks.
+* **1-bar Pre-roll Ramp Support**: Small residual deltas (<= 3%) are allowed to ramp over 1 bar (4.0 s at 60 BPM) when available room is >= 3.0 s, enabling clean pre-roll execution on short tracks.
+
+#### Verification Results:
+1. **Synthetic Signals (fixturegen)**:
+   * **60 <-> 120 BPM** (`beat_060.wav` -> `beat_120.wav`):
+     * Plan: `Phrase-aware (ready) 8.00 s, relation 2:1, exact metric match`.
+     * Playback rates: Deck A `1.0000`, Deck B `1.0000` (0% stretch).
+     * Measured beat phase over 7 paired beats: **RMS 2.0 ms, p95 5.1 ms, drift 2.9 ms**.
+     * Render: 8.00 s audio in 0.048 s wall (0.6% CPU core), peak 0.745, limiter 1.000, 0 clipped, 0 nonfinite.
+   * **60 <-> 118 BPM** (`beat_060.wav` -> `beat_118.wav`):
+     * Plan: `Phrase-aware (ready) 8.00 s, relation 2:1, metric match + bounded stretch`.
+     * Pre-transition tempo ramp: 60.0 -> 58.9 BPM over 1.0 bar (4.0 s); S-curve 1.0000 -> 0.9821, WSOLA pitch locked.
+     * Playback rates: Deck A `0.9821`, Deck B `1.0000`.
+     * Measured beat phase over 7 paired beats: **RMS 5.1 ms, p95 9.7 ms, drift 9.6 ms**.
+     * Render: 12.03 s audio in 0.060 s wall (0.5% CPU core), peak 0.796, limiter 1.000, 0 clipped, 0 nonfinite.
+2. **Real Music Tracks**:
+   * **NEVERLOVE** (140.02 BPM) -> **anniversary_song** (144.20 BPM):
+     * Plan: `Phrase-aware (ready) 16.00 s, relation 1:1, metric match + bounded stretch`.
+     * Ramp: 140.0 -> 144.2 BPM over 4.0 bars (6.8 s); S-curve 1.0000 -> 1.0299.
+     * Measured beat phase over 33 paired beats: **RMS 19.9 ms, p95 28.5 ms, drift 12.8 ms**.
+     * Render: 22.76 s audio in 0.220 s wall (1.0% CPU core), peak 0.980, limiter 1.000, 0 clipped, 0 nonfinite.
+   * **Kai Angel** (124.99 BPM) -> **ALEXANDER MY FAMILY** (128.09 BPM):
+     * Plan: `Phrase-aware (ready) 3.84 s, relation 1:1, metric match + bounded stretch`.
+     * Ramp: 125.0 -> 128.1 BPM over 4.0 bars (7.6 s); S-curve 1.0000 -> 1.0248.
+     * Measured beat phase over 7 paired beats: **RMS 29.3 ms, p95 56.8 ms, drift 45.9 ms**.
+     * Render: 11.43 s audio in 0.051 s wall (0.5% CPU core), peak 0.980, limiter 1.000, 0 clipped, 0 nonfinite.
