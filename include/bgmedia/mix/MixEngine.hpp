@@ -92,6 +92,7 @@ private:
         std::uint64_t endFrame = 0;            // overlay ends
         double startB = 0.0;
         double handoverProgress = 0.5;
+        double rateReleaseProgress = 0.85;
         double rateStart = 1.0;
         double rateEnd = 1.0;
         double tempoRatioB = 1.0;

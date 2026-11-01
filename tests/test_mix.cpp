@@ -2654,6 +2654,87 @@ TEST_CASE("mix.metric_ambiguity_81_vs_121_is_not_forced") {
     CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
 }
 
+namespace {
+
+void checkPhase(const MixPlan& plan) {
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phasePairs >= 3);
+    CHECK(plan.phaseRmsMs <= 20.0);
+    CHECK(plan.phaseP95Ms <= 40.0);
+    CHECK(plan.phaseDriftMs <= 20.0);
+    CHECK_NEAR(plan.beatPhaseErrorMs, plan.phaseRmsMs, 1e-9);
+    std::printf("phase: %d:%d pairs=%d rms=%.2f p95=%.2f drift=%.2f ms\n",
+                plan.metricRelation.bBeats, plan.metricRelation.aBeats,
+                plan.phasePairs, plan.phaseRmsMs, plan.phaseP95Ms,
+                plan.phaseDriftMs);
+}
+
+} // namespace
+
+TEST_CASE("mix.phase_measured_on_exact_fixtures") {
+    checkPhase(planMetric(60.0, 120.0));
+    checkPhase(planMetric(120.0, 60.0));
+    checkPhase(planMetric(80.0, 160.0));
+    checkPhase(planMetric(60.0, 118.0));
+    checkPhase(planMetric(123.0, 125.0));
+}
+
+TEST_CASE("mix.phase_drifting_grid_is_not_called_beatmatched") {
+    // B claims 120 BPM but its detected beats run at 123 BPM: the grids
+    // slide apart during the overlap. The planner must measure that and fall
+    // back instead of reporting a phase-aligned 2:1 mix.
+    AnalysisResult a = analysisFor(60.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+    const double interval = 60.0 / 123.0;
+    for (std::size_t i = 0; i < b.beats.size(); ++i) {
+        b.beats[i].time = static_cast<double>(i) * interval;
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phaseP95Ms > planner.config().maxPhaseP95Ms);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(plan.fallbackReason.find("beat-phase") != std::string::npos);
+    CHECK(!plan.beatAligned);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK(!plan.tempoRampActive);
+}
+
+TEST_CASE("mix.engine_holds_incoming_rate_while_both_audible") {
+    MixEngine engine(kRate);
+    auto a = dcTrack(30.0, 0.25f);
+    auto b = dcTrack(30.0, 0.25f);
+    CHECK(engine.loadDeck(DeckId::A, a, 61, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, b, 62, 120.0));
+    engine.play(DeckId::A);
+    renderSeconds(engine, 0.2, nullptr);
+
+    MixPlan plan = crossfadePlan(engine, 4.0, 2.0);
+    plan.type = TransitionType::Beatmatched;
+    plan.tempoRatioB = 1.1;
+    plan.rateReleaseProgress = 0.85;
+    CHECK(engine.startTransition(plan));
+    // Past the old 50% handover the incoming deck must still run at 1.1x.
+    renderSeconds(engine, 3.4, nullptr);
+    const double early = engine.snapshot().decks[1].positionSeconds;
+    CHECK_NEAR(early, 2.0 + 1.1 * 3.4, 0.05);
+    // Remaining 0.6 s glide from 1.1x to 1.0x.
+    renderSeconds(engine, 0.6, nullptr);
+    const double expected = 2.0 + 1.1 * 3.4 + 1.1 * 0.6 -
+                            0.1 * 0.6 * 0.6 / (2.0 * 0.6);
+    const double end = engine.snapshot().decks[1].positionSeconds;
+    CHECK_NEAR(end, expected, 0.06);
+    std::printf("rate hold: B early=%.3f (%.3f) end=%.3f (%.3f)\n", early,
+                2.0 + 1.1 * 3.4, end, expected);
+}
+
 TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
     // 60 -> 118 needs A to move to 59 BPM, but A (30 s) has no room for the
     // ramp at 20 s plus an 8 s fade: the plan must not keep a tempo-synced
@@ -2673,4 +2754,122 @@ TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
                                      TransitionType::SmartCrossfade, 30.0);
     CHECK(exact.metricRelation.bBeats == 2);
     CHECK(exact.tempoMatchKind == TempoMatchKind::ExactMetric);
+}
+
+TEST_CASE("mix.phase_fallback_refits_overlap_to_incoming_audio") {
+    // B claims 132 BPM but its beats run at 140: the phase check rejects the
+    // sync, and the 7.5 s incoming track must not be overrun by the fade.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(132.0, 7.5);
+    const double interval = 60.0 / 140.0;
+    for (std::size_t i = 0; i < b.beats.size(); ++i) {
+        b.beats[i].time = static_cast<double>(i) * interval;
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK(plan.startB + plan.duration <= b.info.duration + 1e-6);
+    CHECK(plan.endB <= b.info.duration + 1e-6);
+}
+
+TEST_CASE("mix.phase_measure_survives_missing_beat") {
+    // Exact 120 -> 60 (1:2). Dropping one unpaired outgoing detection must
+    // not shift the stride parity and reject an aligned transition.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(60.0, 120.0);
+    for (auto it = a.beats.begin(); it != a.beats.end(); ++it) {
+        if (std::abs(it->time - 21.5) < 1e-6) {
+            a.beats.erase(it);
+            break;
+        }
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phaseP95Ms <= 40.0);
+    CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
+    CHECK(plan.fallbackReason.empty());
+}
+
+TEST_CASE("mix.phase_measure_survives_missing_incoming_beat") {
+    // Exact 120 -> 60 (1:2) with one incoming detection removed (e.g. inside
+    // a silence region): that pair is unavailable, not a 1000 ms error.
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(60.0, 120.0);
+    for (auto it = b.beats.begin(); it != b.beats.end(); ++it) {
+        if (std::abs(it->time - 3.0) < 1e-6) {
+            b.beats.erase(it);
+            break;
+        }
+    }
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.phaseMeasured);
+    CHECK(plan.phaseP95Ms <= 40.0);
+    CHECK(plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.bBeats == 1 && plan.metricRelation.aBeats == 2);
+}
+
+TEST_CASE("mix.phrase_aligned_across_metric_levels") {
+    // 60 -> 120 (2:1). 4 bars of A = 16 seconds; 8 bars of B = 16 seconds.
+    // Both tracks should align on a musical phrase boundary.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::PhraseAware;
+    request.requestedDuration = 16.0;
+    request.currentPositionA = 16.0;  // exact 4-bar boundary at 60 BPM
+    AnalysisResult a = analysisFor(60.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::PhraseAware);
+    CHECK(plan.phraseBoundary);
+    CHECK(plan.phraseConfidence > 0.0f);
+    CHECK(plan.downbeatAligned);
+    CHECK(plan.metricRelation.bBeats == 2 && plan.metricRelation.aBeats == 1);
+    CHECK_NEAR(plan.startB, 0.0, 0.05);
+
+    // If downbeat or meter confidence is low, phrase alignment must honestly
+    // fall back to a safe crossfade.
+    b.downbeatConfidence = 0.2f;
+    const MixPlan unconfident = planner.plan(a, b, request);
+    CHECK(unconfident.valid);
+    CHECK(unconfident.type == TransitionType::Crossfade);
+    CHECK(unconfident.fallbackReason.find("downbeats and meter") !=
+          std::string::npos);
+}
+
+TEST_CASE("mix.phrase_fallback_disables_prepared_ramp") {
+    // A at 120, B at 124 (would otherwise ramp A). Low downbeat confidence
+    // forces fallback to Crossfade: the prepared ramp must not leak into A.
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::PhraseAware;
+    request.requestedDuration = 8.0;
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(124.0, 120.0);
+    b.downbeatConfidence = 0.2f;
+    const MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(!plan.tempoRampActive);
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK_NEAR(plan.preTransitionSeconds, 0.0, 1e-9);
+    CHECK(!plan.fallbackReason.empty());
 }

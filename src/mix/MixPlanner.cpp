@@ -544,6 +544,163 @@ TempoMatch matchTempo(const AnalysisResult& a, const AnalysisResult& b,
     return chosen;
 }
 
+struct PhaseMeasurement {
+    bool measured = false;
+    int pairs = 0;
+    double rmsMs = 0.0;
+    double p95Ms = 0.0;
+    double driftMs = 0.0;
+};
+
+// Source position of the incoming deck `t` output seconds after the crossfade
+// start: it holds `ratioB` until `release * duration`, then glides to 1.0x
+// (exactly what MixEngine renders).
+double incomingSourceAt(double startB, double ratioB, double duration,
+                        double release, double t) {
+    const double releaseTime = std::clamp(release, 0.0, 1.0) * duration;
+    if (t <= releaseTime) {
+        return startB + ratioB * t;
+    }
+    const double s = t - releaseTime;
+    const double span = std::max(1e-9, duration - releaseTime);
+    return startB + ratioB * releaseTime + ratioB * s +
+           (1.0 - ratioB) * s * s / (2.0 * span);
+}
+
+// Output time at which the incoming deck reaches `source` (monotonic, so a
+// bisection is exact enough and branch-free).
+double incomingTimeFor(double startB, double ratioB, double duration,
+                       double release, double source) {
+    double low = 0.0;
+    double high = duration * 1.5 + 1.0;
+    for (int i = 0; i < 48; ++i) {
+        const double mid = 0.5 * (low + high);
+        if (incomingSourceAt(startB, ratioB, duration, release, mid) <
+            source) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    return 0.5 * (low + high);
+}
+
+// Two-grid beat-phase residual over the audible overlap. Real detected beats
+// of both tracks are mapped to output time through the deck rates, and every
+// `aBeats`-th outgoing beat (counted from the cue beat) is compared with the
+// nearest incoming beat: for 2:1 every A beat meets a B beat, for 1:2 every
+// second A beat does. Independently snapped cues therefore never imply zero
+// error; drift from rate mismatch or grid jitter is measured.
+PhaseMeasurement measureBeatPhase(const AnalysisResult& a,
+                                  const AnalysisResult& b, double startA,
+                                  double rateA, double startB, double rateB,
+                                  double duration, double release,
+                                  const MetricRelation& relation,
+                                  double periodA, double periodB) {
+    PhaseMeasurement result;
+    if (duration <= 0.5 || rateA <= 1e-6 || a.beats.empty() ||
+        b.beats.empty()) {
+        return result;
+    }
+    // Only the span where the incoming deck still holds its matched rate is
+    // judged: after the release it glides back to 1.0x on purpose, while the
+    // outgoing deck is already nearly inaudible.
+    const double window = std::clamp(release, 0.0, 1.0) * duration;
+    if (window <= 0.5) {
+        return result;
+    }
+    // Output times of incoming beats inside the overlap.
+    std::vector<double> bTimes;
+    for (const Beat& beat : b.beats) {
+        if (beat.time < startB - 1e-6) {
+            continue;
+        }
+        const double t =
+            incomingTimeFor(startB, rateB, duration, release, beat.time);
+        if (t > window + 0.25) {
+            break;
+        }
+        bTimes.push_back(t);
+    }
+    if (bTimes.size() < 2) {
+        return result;
+    }
+    const int stride = std::max(1, relation.aBeats);
+    // Musical beat index relative to the cue beat comes from elapsed beat
+    // periods, not from vector positions, so a missing detection does not
+    // shift which outgoing beats are expected to coincide.
+    double cueTime = -1.0;
+    for (const Beat& beat : a.beats) {
+        if (beat.time >= startA - 0.02) {
+            cueTime = beat.time;
+            break;
+        }
+    }
+    if (cueTime < 0.0 || periodA <= 1e-3) {
+        return result;
+    }
+    std::vector<double> errors;  // signed ms
+    for (const Beat& beat : a.beats) {
+        if (beat.time < startA - 0.02) {
+            continue;
+        }
+        const double t = (beat.time - startA) / rateA;
+        if (t > window) {
+            break;
+        }
+        // The incoming track may end (or not yet be covered) inside the
+        // window; a beat it cannot answer is not evidence of misalignment.
+        if (t < bTimes.front() - 0.05 || t > bTimes.back() + 0.05) {
+            continue;
+        }
+        const long musicalIndex =
+            std::lround((beat.time - cueTime) / periodA);
+        if (musicalIndex % stride != 0) {
+            continue;
+        }
+        double nearest = bTimes.front();
+        for (double bt : bTimes) {
+            if (std::abs(bt - t) < std::abs(nearest - t)) {
+                nearest = bt;
+            }
+        }
+        // With every incoming beat present the nearest one is never farther
+        // than half a beat period away. A larger distance means the incoming
+        // detection is missing there (silence, dropped beat): that pair is
+        // unavailable, not evidence of misalignment.
+        if (periodB > 1e-3 && std::abs(nearest - t) > 0.5 * periodB) {
+            continue;
+        }
+        errors.push_back((nearest - t) * 1000.0);
+    }
+    if (errors.size() < 2) {
+        return result;
+    }
+    double sumSquares = 0.0;
+    std::vector<double> magnitudes;
+    for (double e : errors) {
+        sumSquares += e * e;
+        magnitudes.push_back(std::abs(e));
+    }
+    std::sort(magnitudes.begin(), magnitudes.end());
+    const std::size_t p95Index = std::min(
+        magnitudes.size() - 1,
+        static_cast<std::size_t>(std::ceil(0.95 * magnitudes.size())) - 1);
+    const std::size_t third = std::max<std::size_t>(1, errors.size() / 3);
+    double head = 0.0;
+    double tail = 0.0;
+    for (std::size_t i = 0; i < third; ++i) {
+        head += errors[i];
+        tail += errors[errors.size() - 1 - i];
+    }
+    result.measured = true;
+    result.pairs = static_cast<int>(errors.size());
+    result.rmsMs = std::sqrt(sumSquares / errors.size());
+    result.p95Ms = magnitudes[p95Index];
+    result.driftMs = std::abs(tail - head) / static_cast<double>(third);
+    return result;
+}
+
 double shapeValue(TempoCurveKind kind, double t) {
     t = std::clamp(t, 0.0, 1.0);
     switch (kind) {
@@ -994,11 +1151,37 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             "beatmatching needs tempo sync but the tempo ramp cannot run here; "
             "using a plain crossfade";
     }
-    if (type == TransitionType::PhraseAware && (!grids || lowConfidence)) {
-        type = TransitionType::Crossfade;
-        plan.fallbackReason =
-            "phrase alignment needs a confident beat grid; using a plain "
-            "crossfade";
+    if (type == TransitionType::PhraseAware) {
+        if (!grids || lowConfidence) {
+            type = TransitionType::Crossfade;
+            plan.fallbackReason =
+                "phrase alignment needs a confident beat grid; using a plain "
+                "crossfade";
+        } else if (a.downbeatConfidence < config_.minConfidence ||
+                   b.downbeatConfidence < config_.minConfidence ||
+                   a.meterConfidence < config_.minConfidence ||
+                   b.meterConfidence < config_.minConfidence) {
+            type = TransitionType::Crossfade;
+            plan.fallbackReason =
+                "phrase alignment needs confident downbeats and meter; using "
+                "a safe crossfade";
+        }
+    }
+
+    if (type == TransitionType::Crossfade && ramp) {
+        // A plain crossfade must not execute an un-synced tempo ramp on the
+        // outgoing deck. Reset the ramp state and crossfade window.
+        ramp = false;
+        rampBars = 0;
+        rampSeconds = 0.0;
+        rampMediaSeconds = 0.0;
+        ratioA = 1.0;
+        crossfadeStartA = overallStartA;
+        endA = std::min(a.info.duration, crossfadeStartA + duration);
+        duration = endA - crossfadeStartA;
+        plan.duration = duration;
+        plan.transitionStartA = crossfadeStartA;
+        plan.transitionEndA = endA;
     }
 
     // ------------------------------------------------------------------
@@ -1016,9 +1199,17 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     if (grids && plan.confidence >= config_.minConfidence) {
         const double barSecondsB = static_cast<double>(bpbB) * 60.0 /
                                    std::max(1.0, b.bpm);
+        const double barSecondsA = static_cast<double>(bpbA) * 60.0 / localBpmA;
+        const double phraseDurationA = phraseBars * barSecondsA;
+        // In the incoming track, the corresponding musical phrase covers
+        // phraseBars * (bBeats / aBeats) bars (adjusted for meter).
+        const int phraseBarsB = std::clamp(
+            static_cast<int>(std::llround(phraseDurationA /
+                                          std::max(1e-3, barSecondsB))),
+            2, 32);
         if (config_.preferPhraseBoundaries) {
             const PhraseCue phraseCue =
-                findPhraseCue(b, cue, phraseBars, std::max(1.0, barSecondsB * 2.0));
+                findPhraseCue(b, cue, phraseBarsB, std::max(1.0, barSecondsB * 2.0));
             if (phraseCue.found) {
                 startB = phraseCue.time;
                 bDownbeat = phraseCue.downbeat;
@@ -1071,15 +1262,27 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         double error = 0.0;
         bool snapped = false;
         bool snappedDownbeat = false;
-        // Prefer a downbeat, but only when it is genuinely close. At slow
-        // tempos the nearest downbeat can be most of a bar away; in that case
-        // align to the beat instead of delaying the mix by half a bar.
-        if (downbeats &&
+        bool snappedPhrase = false;
+        float aPhraseConfidence = 0.0f;
+        if (config_.preferPhraseBoundaries && downbeats) {
+            const PhraseCue phraseCue =
+                findPhraseCue(a, crossfadeStartA, phraseBars, tolerance);
+            if (phraseCue.found && phraseCue.phrase) {
+                snapped = true;
+                snappedDownbeat = true;
+                snappedPhrase = true;
+                aligned = phraseCue.time;
+                error = (aligned - crossfadeStartA) * 1000.0;
+                aPhraseConfidence = phraseCue.confidence;
+            }
+        }
+        if (!snapped && downbeats &&
             findGridPoint(a, crossfadeStartA, true, &aligned, nullptr, &error) &&
             std::abs(aligned - crossfadeStartA) <= tolerance) {
             snapped = true;
             snappedDownbeat = true;
-        } else if (findGridPoint(a, crossfadeStartA, false, &aligned, nullptr,
+        } else if (!snapped &&
+                   findGridPoint(a, crossfadeStartA, false, &aligned, nullptr,
                                  &error) &&
                    std::abs(aligned - crossfadeStartA) <= tolerance) {
             snapped = true;
@@ -1107,6 +1310,11 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 plan.downbeatAligned || snappedDownbeat;
             plan.alignmentErrorMs = std::max(plan.alignmentErrorMs,
                                              std::abs(error));
+            if (snappedPhrase && bPhrase) {
+                plan.phraseBoundary = true;
+                plan.phraseConfidence =
+                    0.5f * (bPhraseConfidence + aPhraseConfidence);
+            }
         }
     }
 
@@ -1116,16 +1324,16 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     // The incoming deck may play at a matched rate during the fade and then
     // return to 1.0 after the handover. Fit the fade against the source it
     // actually consumes, not against wall-clock duration.
-    const bool syncB =
+    bool syncB =
         tempo.compatible && tempo.matched &&
         (type == TransitionType::TempoRamp ||
          type == TransitionType::Beatmatched ||
          type == TransitionType::PhraseAware);
     const double incomingRate = syncB ? tempo.ratioB : 1.0;
-    const double handover = 0.5;
-    const double meanRateB =
-        incomingRate * handover +
-        0.5 * (incomingRate + 1.0) * (1.0 - handover);
+    const double rateRelease = plan.rateReleaseProgress;
+    double meanRateB =
+        incomingRate * rateRelease +
+        0.5 * (incomingRate + 1.0) * (1.0 - rateRelease);
     const double availableB = b.info.duration - startB;
     const double maxByB =
         meanRateB > 1e-6 ? availableB / meanRateB : availableB;
@@ -1146,6 +1354,64 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     plan.phraseBars = phraseBars;
     plan.beatPhaseErrorMs =
         plan.beatAligned ? 0.0 : (b.bpm > 0.0 ? 30000.0 / b.bpm : 0.0);
+
+    // Measure the real two-grid phase residual for tempo-synced transitions
+    // and refuse to call a misaligned mix "beatmatched".
+    const bool syncedType = type == TransitionType::TempoRamp ||
+                            type == TransitionType::Beatmatched ||
+                            type == TransitionType::PhraseAware;
+    if (syncedType && tempo.compatible && grids &&
+        plan.confidence >= config_.minConfidence) {
+        const PhaseMeasurement phase = measureBeatPhase(
+            a, b, plan.transitionStartA, ramp ? ratioA : 1.0, startB,
+            syncB ? tempo.ratioB : 1.0, plan.duration, rateRelease,
+            tempo.relation, 60.0 / std::max(1.0, localBpmA),
+            60.0 / (std::max(1.0, b.bpm) * (syncB ? tempo.ratioB : 1.0)));
+        if (phase.measured) {
+            plan.phaseMeasured = true;
+            plan.phasePairs = phase.pairs;
+            plan.phaseRmsMs = phase.rmsMs;
+            plan.phaseP95Ms = phase.p95Ms;
+            plan.phaseDriftMs = phase.driftMs;
+            plan.beatPhaseErrorMs = phase.rmsMs;
+            plan.reasons.push_back(format(
+                "Measured beat phase over %.0f paired beats: RMS %.1f ms, "
+                "p95 %.1f ms, drift %.1f ms",
+                static_cast<double>(phase.pairs), phase.rmsMs, phase.p95Ms,
+                phase.driftMs));
+            if (phase.p95Ms > config_.maxPhaseP95Ms) {
+                type = TransitionType::Crossfade;
+                plan.fallbackReason = format(
+                    "measured beat-phase error p95 %.0f ms exceeds the %.0f "
+                    "ms limit; using a plain crossfade",
+                    phase.p95Ms, config_.maxPhaseP95Ms);
+                plan.beatAligned = false;
+                plan.downbeatAligned = false;
+                ramp = false;
+                rampSeconds = 0.0;
+                ratioA = 1.0;
+                syncB = false;
+                meanRateB = 1.0;
+                // Without the matched incoming rate B is consumed at natural
+                // speed: refit the overlap to what B and A can still supply.
+                const double refit = std::min(
+                    plan.duration,
+                    std::min(plan.transitionEndA - plan.transitionStartA,
+                             b.info.duration - startB));
+                if (refit < plan.duration - 1e-6) {
+                    plan.duration = std::max(0.0, refit);
+                    plan.transitionEndA =
+                        plan.transitionStartA + plan.duration;
+                    plan.reasons.push_back(format(
+                        "Shortened to %.2f s after the phase fallback: the "
+                        "incoming track supplies no more at natural speed",
+                        plan.duration));
+                }
+                plan.endB = std::min(b.info.duration,
+                                     startB + plan.duration);
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Direct cut.
