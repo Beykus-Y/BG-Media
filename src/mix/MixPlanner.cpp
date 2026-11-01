@@ -1,6 +1,8 @@
 #include "bgmedia/mix/MixPlanner.hpp"
 
 #include "bgmedia/mix/Crossfade.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
+#include "bgmedia/mix/VocalDetector.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -232,13 +234,21 @@ double outroStart(const AnalysisResult& analysis) {
     return analysis.info.duration;
 }
 
-double musicalEnd(const AnalysisResult& analysis) {
+double musicalEnd(const AnalysisResult& analysis,
+                  const MixFeatureMap* features = nullptr) {
     double end = analysis.info.duration;
     for (const SilenceRegion& silence : analysis.silences) {
         if (silence.end >= analysis.info.duration - 0.35 &&
             silence.start >= analysis.info.duration - 8.0) {
             end = std::min(end, silence.start + 0.20);
         }
+    }
+    if (features && features->valid() &&
+        features->audible.audibleEnd > 0.5 &&
+        features->audible.audibleEnd < analysis.info.duration - 0.25) {
+        end = std::min(end,
+                       std::min(analysis.info.duration,
+                                features->audible.audibleEnd + 0.20));
     }
     return end;
 }
@@ -781,8 +791,52 @@ int rampBarsFor(const PlannerConfig& config, double deltaPercent) {
     return std::clamp(bars, 2, 32);
 }
 
-void appendBassSwap(MixPlan& plan, double duration) {
-    if (!plan.bassSwap || duration <= 0.0) {
+double chooseBassSwapProgress(const MixFeatureMap* featuresA, double startA, double rateA,
+                              const MixFeatureMap* featuresB, double startB, double rateB,
+                              double duration) {
+    if (!featuresA || !featuresA->valid() || !featuresB || !featuresB->valid() ||
+        duration < 2.0) {
+        return 0.35;
+    }
+    const double safeRateA = std::max(0.25, rateA);
+    const double safeRateB = std::max(0.25, rateB);
+    constexpr double kCandidates[] = {0.25, 0.30, 0.35, 0.42, 0.50, 0.58, 0.65};
+    double bestProgress = 0.35;
+    double bestScore = -1e9;
+
+    for (double p : kCandidates) {
+        const double t = p * duration;
+        const double posA = startA + t * safeRateA;
+        const double posB = startB + t * safeRateB;
+        const MixFeatureFrame fA = featuresA->sampleAt(posA);
+        const MixFeatureFrame fB = featuresB->sampleAt(posB);
+        const MixFeatureFrame fBPre =
+            featuresB->sampleAt(std::max(0.0, posB - 0.35 * safeRateB));
+        const MixFeatureFrame fBPost =
+            featuresB->sampleAt(std::min(featuresB->info.duration, posB + 0.35 * safeRateB));
+
+        // Prefer swapping bass where A's bass thins out or B's bass/phrase enters.
+        const double aBassDrop = 1.0 - static_cast<double>(fA.bassDominance);
+        const double bBassRise =
+            std::max(0.0, static_cast<double>(fBPost.bassDominance - fBPre.bassDominance));
+        const double boundaryBonus =
+            0.5 * (static_cast<double>(fA.boundaryStrength) + fB.boundaryStrength);
+        // Mild prior toward 0.35 so flat signals retain the classic 35% swap point.
+        const double centerPrior = 1.0 - 0.65 * std::abs(p - 0.35);
+        const double score =
+            0.35 * aBassDrop + 0.35 * bBassRise + 0.20 * boundaryBonus + 0.35 * centerPrior;
+        if (score > bestScore + 1e-6) {
+            bestScore = score;
+            bestProgress = p;
+        }
+    }
+    return bestProgress;
+}
+
+void appendBassSwap(MixPlan& plan, double duration,
+                    const MixFeatureMap* featuresA = nullptr,
+                    const MixFeatureMap* featuresB = nullptr) {
+    if ((!plan.bassSwap && !plan.vocalEqCarve) || duration <= 0.0) {
         return;
     }
     constexpr int kPoints = 9;
@@ -790,25 +844,187 @@ void appendBassSwap(MixPlan& plan, double duration) {
     plan.eqCurveIn.clear();
     plan.eqCurveOut.reserve(kPoints);
     plan.eqCurveIn.reserve(kPoints);
+
+    const double swapP = std::clamp(plan.bassSwapProgress, 0.20, 0.70);
+    const double outSpan = std::clamp(swapP + 0.05, 0.20, 0.80);
+    const double inStart = std::clamp(swapP - 0.10, 0.05, 0.55);
+    const double safeRateA = std::max(0.25, plan.tempoRatioAEnd);
+    const double safeRateB = std::max(0.25, plan.tempoRatioB);
+
     for (int i = 0; i < kPoints; ++i) {
         const double t = static_cast<double>(i) / (kPoints - 1);
         const double time = duration * t;
-        // Outgoing bass leaves over the first 40% of the fade; the incoming
-        // bass enters from 25% to 70%. The overlap is short but never sums to
-        // two full bass lines.
-        const double outAmount = smoothStep(std::clamp(t / 0.40, 0.0, 1.0));
-        const double inAmount =
-            smoothStep(std::clamp((t - 0.25) / 0.45, 0.0, 1.0));
         EqGainPoint out;
         out.time = time;
-        out.low = static_cast<float>(1.0 - outAmount);
         EqGainPoint in;
         in.time = time;
-        in.low = static_cast<float>(inAmount);
+
+        if (plan.bassSwap) {
+            const double outAmount = smoothStep(std::clamp(t / outSpan, 0.0, 1.0));
+            const double inAmount =
+                smoothStep(std::clamp((t - inStart) / 0.45, 0.0, 1.0));
+            out.low = static_cast<float>(1.0 - outAmount);
+            in.low = static_cast<float>(inAmount);
+        }
+
+        if (plan.vocalEqCarve && featuresA && featuresA->valid() &&
+            featuresB && featuresB->valid()) {
+            const MixFeatureFrame fA =
+                featuresA->sampleAt(plan.transitionStartA + time * safeRateA);
+            const MixFeatureFrame fB =
+                featuresB->sampleAt(plan.startB + time * safeRateB);
+            // Carve mid band on the non-dominant vocal deck during the overlap.
+            const double overlapEnv = std::sin(kPi * std::clamp(t, 0.0, 1.0));
+            if (fB.vocalScore >= 0.35f && (fB.vocalScore >= fA.vocalScore - 0.05f || t >= 0.40)) {
+                const double carve = 0.46 * overlapEnv * std::clamp(static_cast<double>(fB.vocalScore) * 1.3, 0.3, 1.0);
+                out.mid = static_cast<float>(std::clamp(1.0 - carve, 0.48, 1.0));
+            }
+            if (fA.vocalScore >= 0.35f && fA.vocalScore > fB.vocalScore + 0.05f && t <= 0.65) {
+                const double carve = 0.44 * overlapEnv * std::clamp(static_cast<double>(fA.vocalScore) * 1.3, 0.3, 1.0);
+                in.mid = static_cast<float>(std::clamp(1.0 - carve, 0.50, 1.0));
+            }
+        }
+
         plan.eqCurveOut.push_back(out);
         plan.eqCurveIn.push_back(in);
     }
 }
+
+void applyStrategyGainCurves(MixPlan& plan) {
+    if (plan.type == TransitionType::DirectCut || plan.duration <= 0.0) {
+        return;
+    }
+    if (plan.strategy == MixStrategyKind::SmoothBlend) {
+        return;
+    }
+    constexpr int kPoints = 17;
+    plan.gainCurveOut.clear();
+    plan.gainCurveIn.clear();
+    plan.gainCurveOut.reserve(kPoints);
+    plan.gainCurveIn.reserve(kPoints);
+
+    for (int i = 0; i < kPoints; ++i) {
+        const double t = static_cast<double>(i) / (kPoints - 1);
+        const double time = plan.duration * t;
+        float outGain = equalPowerOut(t);
+        float inGain = equalPowerIn(t);
+
+        switch (plan.strategy) {
+        case MixStrategyKind::VocalHandoff: {
+            // Hold outgoing vocal clear through the first 40%, while bringing in
+            // B's instrumental accompaniment bed gently, then execute a clean
+            // vocal handover around t = 0.42..0.88.
+            if (t <= 0.40) {
+                const double u = t / 0.40;
+                outGain = static_cast<float>(1.0 - 0.14 * smoothStep(u));
+                inGain = static_cast<float>(0.48 * smoothStep(u));
+            } else {
+                const double u = std::clamp((t - 0.40) / 0.60, 0.0, 1.0);
+                outGain = static_cast<float>(0.86 * (1.0 - smoothStep(u)));
+                inGain = static_cast<float>(0.48 + 0.52 * smoothStep(u));
+            }
+            break;
+        }
+        case MixStrategyKind::DropImpactCut: {
+            // Build incoming tension up to the impact point (t = 0.55), then
+            // drop the outgoing deck sharply as the incoming drop hits unity.
+            if (t <= 0.55) {
+                const double u = t / 0.55;
+                outGain = static_cast<float>(1.0 - 0.12 * smoothStep(u));
+                inGain = static_cast<float>(0.55 * smoothStep(u));
+            } else {
+                const double uOut = std::clamp((t - 0.55) / 0.30, 0.0, 1.0);
+                const double uIn = std::clamp((t - 0.55) / 0.18, 0.0, 1.0);
+                outGain = static_cast<float>(0.88 * (1.0 - smoothStep(uOut)));
+                inGain = static_cast<float>(0.55 + 0.45 * smoothStep(uIn));
+            }
+            break;
+        }
+        case MixStrategyKind::EnergyBridge: {
+            // Breakdown / low-energy bridge: lift the mid-transition plateau
+            // so total energy never dips into a hole between sparse sections.
+            outGain = (i == kPoints - 1) ? 0.0f : std::pow(equalPowerOut(t), 0.80f);
+            inGain = (i == 0) ? 0.0f : std::pow(equalPowerIn(t), 0.80f);
+            break;
+        }
+        case MixStrategyKind::EchoReverbOut: {
+            // Fade dry outgoing signal out by t = 0.78 while the engine's
+            // stereo feedback delay/reverb tail washes out across the remainder.
+            const double dryT = std::clamp(t / 0.78, 0.0, 1.0);
+            outGain = (i == kPoints - 1) ? 0.0f : equalPowerOut(dryT);
+            inGain = equalPowerIn(t);
+            break;
+        }
+        case MixStrategyKind::SmoothBlend:
+            break;
+        }
+
+        plan.gainCurveOut.push_back({time, std::clamp(outGain, 0.0f, 1.0f)});
+        plan.gainCurveIn.push_back({time, std::clamp(inGain, 0.0f, 1.0f)});
+    }
+}
+
+void computeLoudnessBalance(const MixFeatureMap* featuresA,
+                            const MixFeatureMap* featuresB,
+                            MixPlan& plan,
+                            float* outBalanceScore) {
+    plan.loudnessTrimDbA = 0.0f;
+    plan.loudnessTrimDbB = 0.0f;
+    plan.loudnessGainA = 1.0f;
+    plan.loudnessGainB = 1.0f;
+    if (outBalanceScore) {
+        *outBalanceScore = 0.75f;
+    }
+    if (!featuresA || !featuresA->valid() || !featuresB || !featuresB->valid() ||
+        !featuresA->loudness.gatedValid || !featuresB->loudness.gatedValid) {
+        return;
+    }
+
+    // Match loudness in the engine's stereo playback domain.
+    // Mono is duplicated into both Left and Right channels by MixEngine,
+    // which equals stereo playback power.
+    auto playbackLufs = [](const MixFeatureMap* feat) noexcept -> float {
+        if (!feat) return -70.0f;
+        float l = feat->loudness.integratedLufs;
+        if (feat->info.sourceChannels == 1) {
+            l += 3.0103f;
+        }
+        return l;
+    };
+    const float lufsA = playbackLufs(featuresA);
+    const float lufsB = playbackLufs(featuresB);
+    const float targetLufs = std::clamp(0.5f * (lufsA + lufsB), -18.0f, -11.0f);
+
+    float trimA = std::clamp(targetLufs - lufsA, -6.0f, 4.5f);
+    float trimB = std::clamp(targetLufs - lufsB, -6.0f, 4.5f);
+
+    // Peak headroom protection: never boost a deck above -0.5 dBFS peak ceiling.
+    const float maxBoostA = std::max(0.0f, -0.5f - featuresA->loudness.samplePeakDbfs);
+    const float maxBoostB = std::max(0.0f, -0.5f - featuresB->loudness.samplePeakDbfs);
+    trimA = std::min(trimA, maxBoostA);
+    trimB = std::min(trimB, maxBoostB);
+
+    if (std::abs(trimA) < 0.15f) trimA = 0.0f;
+    if (std::abs(trimB) < 0.15f) trimB = 0.0f;
+
+    plan.loudnessTrimDbA = trimA;
+    plan.loudnessTrimDbB = trimB;
+    plan.loudnessGainA = std::pow(10.0f, trimA / 20.0f);
+    plan.loudnessGainB = std::pow(10.0f, trimB / 20.0f);
+
+    if (outBalanceScore) {
+        const float residualLu = std::abs((lufsA + trimA) - (lufsB + trimB));
+        *outBalanceScore = std::clamp(1.0f - residualLu / 8.0f, 0.20f, 1.0f);
+    }
+}
+
+struct CandidateOverride {
+    bool active = false;
+    double targetStartA = -1.0;
+    double targetStartB = -1.0;
+    double targetDuration = -1.0;
+    bool forceImpactCut = false;
+};
 
 } // namespace
 
@@ -856,8 +1072,81 @@ double MixPlanner::suggestDuration(const AnalysisResult& a,
     return clampDuration(duration, config_);
 }
 
-MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
-                         const PlanRequest& request) const {
+namespace {
+
+struct MusicalContinuationAssessment {
+    bool valid = false;
+    bool resumesDropOrEnergy = false;
+    double remainingSeconds = 0.0;
+    float postEnergyMean = 0.0f;
+    float continuationScore = 1.0f;
+    std::string diagnosticReason;
+};
+
+MusicalContinuationAssessment evaluateMusicalContinuation(
+    const MixFeatureMap* featuresA,
+    const AnalysisResult& a,
+    double cueTimeA,
+    double durationA) {
+    MusicalContinuationAssessment result;
+    if (!featuresA || !featuresA->valid() || a.info.duration <= 0.0) {
+        result.continuationScore = 1.0f;
+        return result;
+    }
+    result.valid = true;
+    const double transitionEndA = cueTimeA + durationA;
+    const double totalDur = a.info.duration;
+    const double naturalEnd = musicalEnd(a, featuresA);
+    const double remaining = std::max(0.0, naturalEnd - transitionEndA);
+    result.remainingSeconds = remaining;
+
+    // Natural ending window / outro: if near the end of the track or past tailStart,
+    // this is a completed track ending with zero continuation penalty.
+    if (remaining <= 14.0 || transitionEndA >= totalDur - 14.0 ||
+        (featuresA->audible.tailStart > 0.0 && transitionEndA >= featuresA->audible.tailStart - 1.0)) {
+        result.continuationScore = 1.0f;
+        result.diagnosticReason = "natural track completion / outro window";
+        return result;
+    }
+
+    // Inspect the forward window in Track A (next 12-16 seconds after transitionEndA)
+    const double forwardEnd = std::min(totalDur, transitionEndA + 14.0);
+    const WindowFeatureSummary forwardWin =
+        featuresA->summarizeWindow(transitionEndA, forwardEnd);
+    result.postEnergyMean = forwardWin.meanEnergy;
+
+    // Check if full energy, bass, or rhythm resumes after this cue
+    const bool highEnergyResumption =
+        forwardWin.meanEnergy >= 0.46f || forwardWin.bassDominance >= 0.40f;
+    const bool longMaterialRemaining = (remaining >= 18.0) && (transitionEndA < totalDur * 0.78);
+
+    if (highEnergyResumption && longMaterialRemaining) {
+        result.resumesDropOrEnergy = true;
+        const double remFraction = std::clamp(remaining / totalDur, 0.0, 1.0);
+        const float severity = static_cast<float>(
+            std::clamp(forwardWin.meanEnergy * 0.65 + remFraction * 0.35, 0.0, 1.0));
+        result.continuationScore = std::clamp(1.0f - 0.75f * severity, 0.10f, 0.55f);
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "premature exit at %.1f s inside active drop/section (%.1f s music remaining, post-energy %.2f)",
+                      cueTimeA, remaining, static_cast<double>(forwardWin.meanEnergy));
+        result.diagnosticReason = buf;
+    } else {
+        result.continuationScore = std::clamp(
+            1.0f - 0.20f * static_cast<float>(remaining / totalDur), 0.75f, 1.0f);
+        result.diagnosticReason = "completed phrase with moderate remaining material";
+    }
+    return result;
+}
+
+MixPlan planSingleCandidate(const PlannerConfig& config_,
+                            const AnalysisResult& a,
+                            const AnalysisResult& b,
+                            const MixFeatureMap* featuresA,
+                            const MixFeatureMap* featuresB,
+                            const PlanRequest& request,
+                            const CandidateOverride& overrideSpec) {
     MixPlan plan;
     plan.requestedType = request.type;
     plan.type = request.type;
@@ -889,9 +1178,32 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     const int bpbB = b.beatsPerBar >= 2 ? b.beatsPerBar : 4;
     const int phraseBars = std::clamp(config_.phraseBars, 2, 16);
 
+    double defaultDur = config_.defaultCrossfadeSeconds;
+    const double outro = outroStart(a);
+    if (outro < a.info.duration - 0.25) {
+        const double length = a.info.duration - outro;
+        if (length >= 1.5) {
+            defaultDur = length;
+            if (config_.preferPhraseBoundaries) {
+                defaultDur *= 1.15;
+            }
+        }
+    }
+    if (!b.sections.empty() && b.info.duration < 12.0) {
+        defaultDur = std::min(defaultDur, std::max(2.0, b.info.duration * 0.35));
+    }
+    if (config_.aggressiveness == Aggressiveness::Gentle) {
+        defaultDur = std::min(config_.maxCrossfadeSeconds, defaultDur * 1.25);
+    } else if (config_.aggressiveness == Aggressiveness::Energetic) {
+        defaultDur *= 0.75;
+    }
+    defaultDur = clampDuration(defaultDur, config_);
+
     double duration = request.requestedDuration > 0.0
                           ? request.requestedDuration
-                          : suggestDuration(a, b);
+                          : (overrideSpec.active && overrideSpec.targetDuration > 0.0
+                                 ? overrideSpec.targetDuration
+                                 : defaultDur);
 
     // ------------------------------------------------------------------
     // Adaptive type selection. The requested Smart Crossfade is the
@@ -1090,12 +1402,17 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             }
         }
         // Even without a ramp (or after the ramp was shortened), the window
-        // must never run past the outgoing track. The low-confidence path has
-        // no grid correction below, so clamp it here for every plan.
-        endA = std::min(endA, a.info.duration);
+        // must never run past the outgoing track. Clamp to musicalEnd when feasible.
+        const double liveMusicalEndA = musicalEnd(a, featuresA);
+        const double maxLimitA = (liveMusicalEndA > crossfadeStartA + 0.5) ? liveMusicalEndA : a.info.duration;
+        endA = std::min(endA, maxLimitA);
     } else {
-        endA = musicalEnd(a);
-        crossfadeStartA = std::max(0.0, endA - duration * ratioA);
+        const double mEndA = musicalEnd(a, featuresA);
+        endA = mEndA;
+        crossfadeStartA = (overrideSpec.active && overrideSpec.targetStartA >= 0.0)
+                              ? std::clamp(overrideSpec.targetStartA, 0.0,
+                                           std::max(0.0, endA - 0.5))
+                              : std::max(0.0, endA - duration * ratioA);
         if (grids && plan.confidence >= config_.minConfidence) {
             double aligned = 0.0;
             double error = 0.0;
@@ -1105,9 +1422,10 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 crossfadeStartA = aligned;
             }
         }
-        endA = std::min(a.info.duration, crossfadeStartA + duration * ratioA);
+        endA = std::min(mEndA, crossfadeStartA + duration * ratioA);
         overallStartA = std::max(0.0, crossfadeStartA -
                                           (ramp ? rampMediaSeconds : 0.0));
+
         if (ramp && crossfadeStartA - overallStartA <
                         rampMediaSeconds - 1e-6) {
             // Not enough outgoing material for the full ramp: shorten it in
@@ -1244,7 +1562,17 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     // ------------------------------------------------------------------
     const double intro = sectionCue(b, SectionKind::Intro,
                                     b.beats.empty() ? 0.2 : b.beats.front().time);
-    double cue = std::clamp(intro, 0.0, std::max(0.0, b.info.duration - 0.5));
+    double cue = (overrideSpec.active && overrideSpec.targetStartB >= 0.0)
+                     ? std::clamp(overrideSpec.targetStartB, 0.0,
+                                  std::max(0.0, b.info.duration - 0.5))
+                     : std::clamp(intro, 0.0, std::max(0.0, b.info.duration - 0.5));
+    double minAudibleB = 0.0;
+    if (featuresB && featuresB->valid() && featuresB->info.fromPcm &&
+        featuresB->audible.audibleStart > 0.05 &&
+        featuresB->audible.audibleStart < b.info.duration - 0.5) {
+        minAudibleB = featuresB->audible.audibleStart;
+        cue = std::max(cue, minAudibleB);
+    }
     double startB = cue;
     bool bDownbeat = false;
     double bErrorMs = 0.0;
@@ -1265,7 +1593,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         if (config_.preferPhraseBoundaries) {
             const PhraseCue phraseCue =
                 findPhraseCue(b, cue, phraseBarsB, std::max(1.0, barSecondsB * 2.0));
-            if (phraseCue.found) {
+            if (phraseCue.found && phraseCue.time >= minAudibleB - 0.15) {
                 startB = phraseCue.time;
                 bDownbeat = phraseCue.downbeat;
                 bPhrase = phraseCue.phrase;
@@ -1275,10 +1603,16 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         if (!bPhrase) {
             double aligned = 0.0;
             if (findGridPoint(b, cue, downbeats, &aligned, &bDownbeat,
-                              &bErrorMs)) {
-                if (aligned >= 0.0 && aligned < b.info.duration - 0.2) {
-                    startB = aligned;
-                }
+                              &bErrorMs) &&
+                aligned >= std::max(0.0, minAudibleB - 0.15) &&
+                aligned < b.info.duration - 0.2) {
+                startB = aligned;
+            } else if (minAudibleB > 0.05 &&
+                       nextGridPoint(b, cue, downbeats,
+                                     std::max(1.0, barSecondsB * 2.0), &aligned,
+                                     &bDownbeat, &bErrorMs) &&
+                       aligned < b.info.duration - 0.2) {
+                startB = aligned;
             }
         }
         if (startB > cue + 0.01) {
@@ -1608,19 +1942,14 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     }
 
     // ------------------------------------------------------------------
-    // Bass swap / EQ automation.
+    // Equal-power preview curves, adaptive bass swap, vocal mid-EQ carving,
+    // loudness normalization, strategy classification, and multi-objective score.
     // ------------------------------------------------------------------
-    plan.bassSwap = config_.bassSwap && plan.type != TransitionType::DirectCut &&
-                    plan.duration >= 2.0;
-    if (plan.bassSwap) {
-        appendBassSwap(plan, plan.duration);
-        plan.reasons.push_back(
-            "Bass swap: outgoing low band leaves before the incoming low band "
-            "enters");
+    if (overrideSpec.active && overrideSpec.forceImpactCut &&
+        plan.type != TransitionType::DirectCut) {
+        plan.strategy = MixStrategyKind::DropImpactCut;
     }
 
-    // Equal-power preview curves. The engine computes the live gains and adds
-    // correlation-aware headroom and the output limiter.
     constexpr int kGainPoints = 17;
     plan.gainCurveOut.reserve(kGainPoints);
     plan.gainCurveIn.reserve(kGainPoints);
@@ -1631,9 +1960,279 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         plan.gainCurveIn.push_back({time, equalPowerIn(t)});
     }
 
+    plan.bassSwap = config_.bassSwap && plan.type != TransitionType::DirectCut &&
+                    plan.duration >= 2.0;
+    if (plan.bassSwap) {
+        plan.bassSwapProgress = chooseBassSwapProgress(
+            featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+            featuresB, plan.startB, plan.tempoRatioB, plan.duration);
+        appendBassSwap(plan, plan.duration, featuresA, featuresB);
+        plan.reasons.push_back(
+            "Bass swap: outgoing low band leaves before the incoming low band "
+            "enters");
+    }
+
+    float loudnessBalanceScore = 0.75f;
+    computeLoudnessBalance(featuresA, featuresB, plan, &loudnessBalanceScore);
+
+    VocalOverlapAssessment voc;
+    HarmonicCompatibility harm;
+    if ((featuresA && featuresA->valid()) || (featuresB && featuresB->valid())) {
+        const double lufsA = featuresA ? featuresA->loudness.integratedLufs : 0.0;
+        const double lufsB = featuresB ? featuresB->loudness.integratedLufs : 0.0;
+        const double audEndA = featuresA ? featuresA->audible.audibleEnd : a.info.duration;
+        const double audStartB = featuresB ? featuresB->audible.audibleStart : 0.0;
+        plan.reasons.push_back(format(
+            "Feature map: A %.1f LUFS (audible end %.2f s), B %.1f LUFS (audible start %.2f s)",
+            lufsA, audEndA, lufsB, audStartB));
+        if (std::abs(plan.loudnessTrimDbA) >= 0.15f ||
+            std::abs(plan.loudnessTrimDbB) >= 0.15f) {
+            plan.reasons.push_back(format(
+                "Loudness trim: A %+.1f dB (gain %.2f), B %+.1f dB (gain %.2f) with -0.5 dBFS peak headroom",
+                plan.loudnessTrimDbA, plan.loudnessGainA,
+                plan.loudnessTrimDbB, plan.loudnessGainB));
+        }
+        if (featuresA && featuresA->valid() && featuresB && featuresB->valid() &&
+            plan.duration > 0.05) {
+            voc = evaluateVocalOverlap(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+            harm = evaluateHarmonicCompatibility(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.pitchLock, plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+
+            // If simultaneous vocal activity or mid-band crowding is detected in
+            // adaptive mode, enable vocal mid-EQ carving and re-evaluate overlap.
+            if (config_.adaptive && plan.duration >= 2.0 &&
+                ((voc.available && (voc.vocalClashScore >= 0.18f ||
+                                    (voc.outgoingVocalMean >= 0.35f && voc.incomingVocalMean >= 0.22f))) ||
+                 harm.spectralCrowdScore >= 0.42f)) {
+                plan.vocalEqCarve = true;
+                appendBassSwap(plan, plan.duration, featuresA, featuresB);
+                voc = evaluateVocalOverlap(
+                    *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                    *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                    plan.gainCurveOut, plan.gainCurveIn,
+                    plan.eqCurveOut, plan.eqCurveIn);
+                harm = evaluateHarmonicCompatibility(
+                    *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                    *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                    plan.pitchLock, plan.gainCurveOut, plan.gainCurveIn,
+                    plan.eqCurveOut, plan.eqCurveIn);
+                plan.reasons.push_back(
+                    "Vocal EQ carve: dynamic mid-band attenuation reduces overlap masking");
+            }
+
+            if (!voc.summary.empty()) {
+                plan.reasons.push_back(voc.summary);
+            }
+            if (!harm.summary.empty()) {
+                plan.reasons.push_back(harm.summary);
+            }
+        }
+    }
+
+    // Determine high-level MixStrategyKind.
+    const bool allowAdaptiveStrategy =
+        config_.adaptive &&
+        (plan.type == TransitionType::SmartCrossfade ||
+         plan.type == TransitionType::Beatmatched ||
+         plan.type == TransitionType::PhraseAware ||
+         plan.type == TransitionType::TempoRamp ||
+         plan.type == TransitionType::BreakdownBridge);
+
+    if (plan.type == TransitionType::DirectCut || overrideSpec.forceImpactCut) {
+        plan.strategy = MixStrategyKind::DropImpactCut;
+    } else if (!allowAdaptiveStrategy) {
+        plan.strategy = MixStrategyKind::SmoothBlend;
+    } else if (plan.duration > 0.0 && plan.duration <= 2.2) {
+        plan.strategy = MixStrategyKind::DropImpactCut;
+    } else if (voc.available && voc.cleanVocalHandoff &&
+               (voc.outgoingVocalMean >= 0.28f || voc.incomingVocalMean >= 0.28f)) {
+        plan.strategy = MixStrategyKind::VocalHandoff;
+    } else if (featuresA && featuresA->valid() &&
+               (featuresA->audible.hasReverbTail || featuresA->audible.hasFadeOut) &&
+               plan.transitionEndA >= featuresA->audible.tailStart - 0.5) {
+        plan.strategy = MixStrategyKind::EchoReverbOut;
+        plan.tailSendAmount = 0.45f;
+        plan.tailDecaySeconds = std::clamp(plan.duration * 0.45, 1.2, 3.5);
+    } else if (featuresA && featuresA->valid() && featuresB && featuresB->valid()) {
+        const WindowFeatureSummary winA =
+            featuresA->summarizeWindow(plan.transitionStartA, plan.transitionEndA);
+        const WindowFeatureSummary winB =
+            featuresB->summarizeWindow(plan.startB, plan.endB);
+        if (winA.meanEnergy <= 0.42f && winB.meanEnergy <= 0.45f) {
+            plan.strategy = MixStrategyKind::EnergyBridge;
+        } else {
+            plan.strategy = MixStrategyKind::SmoothBlend;
+        }
+    } else {
+        plan.strategy = MixStrategyKind::SmoothBlend;
+    }
+
+    if (plan.strategy != MixStrategyKind::SmoothBlend &&
+        plan.type != TransitionType::DirectCut && plan.duration > 0.05) {
+        applyStrategyGainCurves(plan);
+        if (featuresA && featuresA->valid() && featuresB && featuresB->valid()) {
+            voc = evaluateVocalOverlap(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+            harm = evaluateHarmonicCompatibility(
+                *featuresA, plan.transitionStartA, plan.tempoRatioAEnd,
+                *featuresB, plan.startB, plan.tempoRatioB, plan.duration,
+                plan.pitchLock, plan.gainCurveOut, plan.gainCurveIn,
+                plan.eqCurveOut, plan.eqCurveIn);
+        }
+    }
+
+    // Multi-objective score breakdown.
+    {
+        MixCandidateScore sc;
+        float phraseScore = plan.phraseBoundary ? 0.85f : (plan.downbeatAligned ? 0.68f : (plan.beatAligned ? 0.52f : 0.35f));
+        if (featuresA && featuresA->valid()) {
+            for (const CuePointCandidate& c : featuresA->mixOutCandidates) {
+                if (std::abs(c.time - plan.transitionStartA) <= 0.60) {
+                    phraseScore = std::max(phraseScore, 0.55f + 0.45f * c.priorScore);
+                    break;
+                }
+            }
+        }
+        if (featuresB && featuresB->valid()) {
+            for (const CuePointCandidate& c : featuresB->mixInCandidates) {
+                if (std::abs(c.time - plan.startB) <= 0.60) {
+                    phraseScore = std::max(phraseScore, 0.55f + 0.45f * c.priorScore);
+                    break;
+                }
+            }
+        }
+        sc.phraseBoundaryScore = std::clamp(phraseScore, 0.0f, 1.0f);
+
+        float rhythmScore = tempo.compatible ? 0.80f : 0.42f;
+        if (plan.beatAligned) rhythmScore += 0.10f;
+        if (plan.downbeatAligned) rhythmScore += 0.06f;
+        if (plan.phaseMeasured) {
+            const float phaseQuality = static_cast<float>(
+                std::clamp(1.0 - plan.phaseP95Ms / std::max(20.0, config_.maxPhaseP95Ms * 1.25), 0.0, 1.0));
+            rhythmScore = 0.55f * rhythmScore + 0.45f * phaseQuality;
+        }
+        sc.rhythmBeatScore = std::clamp(rhythmScore, 0.0f, 1.0f);
+
+        const MusicalContinuationAssessment cont =
+            evaluateMusicalContinuation(featuresA, a, plan.transitionStartA, plan.duration);
+        sc.continuationScore = cont.continuationScore;
+        sc.prematureDropExit = cont.resumesDropOrEnergy;
+
+        if (voc.available) {
+            float rawVoc = 1.0f - 0.90f * voc.vocalClashScore +
+                           0.14f * voc.vocalOverInstrumentalScore +
+                           (voc.cleanVocalHandoff ? 0.15f : 0.0f) -
+                           (voc.cutsMidVocalPhraseA ? 0.28f : 0.0f) -
+                           (voc.entersMidVocalPhraseB ? 0.24f : 0.0f);
+            if (voc.severeLeadVocalClash) {
+                rawVoc = std::min(rawVoc, 0.08f);
+            }
+            rawVoc = std::clamp(rawVoc, 0.0f, 1.0f);
+            if (voc.lowConfidenceConservative) {
+                sc.vocalSafetyScore = 0.50f * rawVoc + 0.50f * 0.50f;
+            } else {
+                sc.vocalSafetyScore =
+                    voc.confidence * rawVoc + (1.0f - voc.confidence) * 0.55f;
+            }
+            if (voc.severeLeadVocalClash) {
+                sc.vocalSafetyScore = std::min(sc.vocalSafetyScore, 0.10f);
+            }
+            sc.vocalClashRisk = voc.vocalClashScore;
+            sc.cutsVocalPhraseA = voc.cutsMidVocalPhraseA;
+            sc.entersVocalPhraseB = voc.entersMidVocalPhraseB;
+            sc.cleanVocalHandoff = voc.cleanVocalHandoff;
+            sc.severeVocalClash = voc.severeLeadVocalClash;
+        } else {
+            sc.vocalSafetyScore = 0.55f; // conservative default when unanalyzed
+        }
+
+        if (harm.available) {
+            sc.harmonicScore = std::clamp(
+                0.76f * harm.compatibilityScore +
+                    0.24f * (1.0f - harm.spectralCrowdScore) -
+                    0.18f * harm.harmonicClashScore,
+                0.0f, 1.0f);
+            sc.harmonicClashRisk = harm.harmonicClashScore;
+            sc.spectralCrowding = harm.spectralCrowdScore;
+        } else {
+            sc.harmonicScore = 0.65f;
+            sc.spectralCrowding = harm.spectralCrowdScore;
+        }
+
+        float energyScore = 0.75f;
+        if (featuresA && featuresA->valid() && featuresB && featuresB->valid()) {
+            const WindowFeatureSummary wA =
+                featuresA->summarizeWindow(plan.transitionStartA, plan.transitionEndA);
+            const WindowFeatureSummary wB =
+                featuresB->summarizeWindow(plan.startB, plan.endB);
+            const float diff = std::abs(wA.meanEnergy - wB.meanEnergy);
+            energyScore = std::clamp(1.0f - 0.75f * diff, 0.25f, 1.0f);
+            if (wA.activeRatio < 0.65f || wB.activeRatio < 0.65f) {
+                energyScore *= 0.65f; // penalize overlapping dead air / silence
+            }
+        }
+        sc.energyContinuityScore = std::clamp(energyScore, 0.0f, 1.0f);
+        sc.loudnessBalanceScore = loudnessBalanceScore;
+
+        const double barSec = static_cast<double>(bpbA) * 60.0 / std::max(1.0, localBpmA);
+        const double barsFloat = barSec > 1e-3 ? (plan.duration / barSec) : 4.0;
+        const double nearestBars = std::max(1.0, std::round(barsFloat));
+        const double barFit = 1.0 - std::min(1.0, std::abs(barsFloat - nearestBars) * 1.5);
+        sc.durationFitScore = static_cast<float>(std::clamp(0.45 + 0.55 * barFit, 0.20, 1.0));
+
+        sc.totalScore = std::clamp(
+            0.18f * sc.phraseBoundaryScore +
+                0.18f * sc.rhythmBeatScore +
+                0.24f * sc.vocalSafetyScore +
+                0.14f * sc.harmonicScore +
+                0.12f * sc.energyContinuityScore +
+                0.05f * sc.loudnessBalanceScore +
+                0.04f * sc.durationFitScore +
+                0.05f * sc.continuationScore,
+            0.0f, 1.0f);
+
+        // Safety constraint: high-confidence severe lead vocal collisions cannot be masked by rhythm/phrase
+        if (sc.severeVocalClash) {
+            const float clashPenalty = static_cast<float>(
+                0.25f + 0.15f * std::clamp(voc.clashDurationSeconds / 2.0, 0.0, 1.0));
+            sc.totalScore = std::max(0.05f, sc.totalScore - clashPenalty);
+        }
+        // Safety constraint: premature exit inside active drop is penalized when music resumes
+        if (sc.prematureDropExit) {
+            const float dropPenalty = static_cast<float>(
+                0.25f + 0.15f * std::clamp(cont.remainingSeconds / a.info.duration, 0.0, 1.0));
+            sc.totalScore = std::max(0.05f, sc.totalScore - dropPenalty);
+        }
+
+        char sbuf[256];
+        std::snprintf(
+            sbuf, sizeof(sbuf),
+            "%s: score %.2f (phrase %.2f, beat %.2f, vocal %.2f, harm %.2f, energy %.2f)",
+            mixStrategyKindName(plan.strategy),
+            static_cast<double>(sc.totalScore),
+            static_cast<double>(sc.phraseBoundaryScore),
+            static_cast<double>(sc.rhythmBeatScore),
+            static_cast<double>(sc.vocalSafetyScore),
+            static_cast<double>(sc.harmonicScore),
+            static_cast<double>(sc.energyContinuityScore));
+        sc.summary = sbuf;
+        plan.scoreBreakdown = sc;
+    }
+
     if (adaptiveChoice && plan.fallbackReason.empty()) {
         plan.reasons.push_back(
-            "Adaptive: chose " + std::string(transitionTypeName(plan.type)));
+            "Adaptive: chose " + std::string(transitionTypeName(plan.type)) +
+            " (" + std::string(mixStrategyKindName(plan.strategy)) + ")");
     }
     if (lowConfidence) {
         plan.reasons.push_back(format(
@@ -1654,6 +2253,309 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         plan.fallbackReason = "transition window does not fit the loaded tracks";
     }
     return plan;
+}
+
+MixCandidate candidateFromPlan(const MixPlan& p, int rank, double localBpmA, int bpbA) {
+    MixCandidate c;
+    c.rank = rank;
+    c.type = p.type;
+    c.strategy = p.strategy;
+    c.transitionStartA = p.transitionStartA;
+    c.transitionEndA = p.transitionEndA;
+    c.tempoRampStartA = p.tempoRampStartA;
+    c.startB = p.startB;
+    c.endB = p.endB;
+    c.duration = p.duration;
+    const double barSec = static_cast<double>(bpbA) * 60.0 / std::max(1.0, localBpmA);
+    c.durationBars = barSec > 1e-3 ? std::max(0, static_cast<int>(std::lround(p.duration / barSec))) : 0;
+    c.bassSwapProgress = p.bassSwapProgress;
+    c.vocalEqCarve = p.vocalEqCarve;
+    c.loudnessTrimDbA = p.loudnessTrimDbA;
+    c.loudnessTrimDbB = p.loudnessTrimDbB;
+    c.score = p.scoreBreakdown;
+    c.rationale = p.scoreBreakdown.summary;
+    return c;
+}
+
+std::vector<MixPlan> evaluateCandidatePlans(
+    const PlannerConfig& config,
+    const AnalysisResult& a,
+    const AnalysisResult& b,
+    const MixFeatureMap* featuresA,
+    const MixFeatureMap* featuresB,
+    const PlanRequest& request) {
+    std::vector<MixPlan> plans;
+    const MixPlan baseline =
+        planSingleCandidate(config, a, b, featuresA, featuresB, request, CandidateOverride{});
+    if (!baseline.valid) {
+        plans.push_back(baseline);
+        return plans;
+    }
+    plans.push_back(baseline);
+
+    if (!featuresA || !featuresA->valid() || !featuresB || !featuresB->valid() ||
+        request.type == TransitionType::Off || request.type == TransitionType::DirectCut) {
+        return plans;
+    }
+
+    const int bpbA = a.beatsPerBar >= 2 ? a.beatsPerBar : 4;
+    const double localBpm = baseline.localBpmA > 0.0 ? baseline.localBpmA : (a.bpm > 0.0 ? a.bpm : 120.0);
+    const double barSec = static_cast<double>(bpbA) * 60.0 / std::max(1.0, localBpm);
+
+    // Candidate durations.
+    std::vector<double> durations = {baseline.duration};
+    if (request.requestedDuration <= 0.0) {
+        const double d4 = clampDuration(4.0 * barSec, config);
+        const double d8 = clampDuration(8.0 * barSec, config);
+        if ( std::abs(d4 - baseline.duration) > 0.35 ) durations.push_back(d4);
+        if ( std::abs(d8 - baseline.duration) > 0.35 && std::abs(d8 - d4) > 0.35 ) durations.push_back(d8);
+        if (!baseline.beatAligned || baseline.tempoMatchKind == TempoMatchKind::FallbackCrossfade) {
+            const double dShort = clampDuration(std::max(2.0, 2.0 * barSec), config);
+            if (std::abs(dShort - baseline.duration) > 0.35) {
+                durations.push_back(dShort);
+            }
+        }
+    }
+
+    // Outgoing start candidates on A (only when not live-executing from currentPositionA).
+    std::vector<double> startsA = {baseline.transitionStartA};
+    if (request.currentPositionA < 0.0) {
+        const double minOutA = std::max(0.0, a.info.duration * 0.30);
+        const double maxEndA = musicalEnd(a, featuresA);
+        for (const CuePointCandidate& c : featuresA->mixOutCandidates) {
+            if (c.time >= minOutA && c.time + 1.5 <= maxEndA) {
+                bool dup = false;
+                for (double s : startsA) {
+                    if (std::abs(s - c.time) < 0.45) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup && startsA.size() < 5) {
+                    startsA.push_back(c.time);
+                }
+            }
+        }
+        // Also include phrase boundaries in the second half of track A.
+        for (const PhraseSpan& p : featuresA->phrases) {
+            if (p.start >= minOutA && p.start + 2.0 <= maxEndA && startsA.size() < 6) {
+                bool dup = false;
+                for (double s : startsA) {
+                    if (std::abs(s - p.start) < 0.45) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    startsA.push_back(p.start);
+                }
+            }
+        }
+        // Also include vocal phrase ends from A to enable clean vocal handoff
+        if (featuresA->vocal.available) {
+            for (const VocalRegion& reg : featuresA->vocal.regions) {
+                if (reg.end >= minOutA && reg.end + 1.5 <= maxEndA && startsA.size() < 7) {
+                    bool dup = false;
+                    for (double s : startsA) {
+                        if (std::abs(s - reg.end) < 0.45) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        startsA.push_back(reg.end);
+                    }
+                }
+            }
+        }
+    }
+
+    // Incoming start candidates on B (only when preferPhraseBoundaries is enabled).
+    std::vector<double> startsB = {baseline.startB};
+    if (config.preferPhraseBoundaries) {
+        const double maxInB = std::min(b.info.duration * 0.55, b.info.duration - 2.0);
+        for (const CuePointCandidate& c : featuresB->mixInCandidates) {
+            if (c.time >= featuresB->audible.audibleStart - 0.15 && c.time <= maxInB) {
+                bool dup = false;
+                for (double s : startsB) {
+                    if (std::abs(s - c.time) < 0.45) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup && startsB.size() < 4) {
+                    startsB.push_back(c.time);
+                }
+            }
+        }
+        for (const PhraseSpan& p : featuresB->phrases) {
+            if (p.start >= featuresB->audible.audibleStart - 0.15 && p.start <= maxInB &&
+                startsB.size() < 5) {
+                bool dup = false;
+                for (double s : startsB) {
+                    if (std::abs(s - p.start) < 0.45) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    startsB.push_back(p.start);
+                }
+            }
+        }
+    }
+
+    for (double sA : startsA) {
+        for (double sB : startsB) {
+            for (double dur : durations) {
+                CandidateOverride ov;
+                ov.active = true;
+                ov.targetStartA = sA;
+                ov.targetStartB = sB;
+                ov.targetDuration = dur;
+                ov.forceImpactCut = (dur <= 2.2);
+                MixPlan cand = planSingleCandidate(config, a, b, featuresA, featuresB, request, ov);
+                if (!cand.valid) {
+                    continue;
+                }
+                bool duplicate = false;
+                for (MixPlan& existing : plans) {
+                    if (std::abs(existing.transitionStartA - cand.transitionStartA) < 0.20 &&
+                        std::abs(existing.startB - cand.startB) < 0.20 &&
+                        std::abs(existing.duration - cand.duration) < 0.25 &&
+                        existing.strategy == cand.strategy) {
+                        if (cand.scoreBreakdown.totalScore > existing.scoreBreakdown.totalScore + 1e-4f) {
+                            existing = std::move(cand);
+                        }
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    plans.push_back(std::move(cand));
+                }
+            }
+        }
+    }
+
+    const float baseTotal = baseline.scoreBreakdown.totalScore;
+    const float baseVoc = baseline.scoreBreakdown.vocalSafetyScore;
+    const float baseHarm = baseline.scoreBreakdown.harmonicScore;
+    const float basePhrase = baseline.scoreBreakdown.phraseBoundaryScore;
+
+    std::stable_sort(plans.begin(), plans.end(), [](const MixPlan& lhs, const MixPlan& rhs) {
+        return lhs.scoreBreakdown.totalScore > rhs.scoreBreakdown.totalScore;
+    });
+
+    auto isBasePlan = [&](const MixPlan& p) {
+        return std::abs(p.transitionStartA - baseline.transitionStartA) < 0.20 &&
+               std::abs(p.startB - baseline.startB) < 0.20 &&
+               std::abs(p.duration - baseline.duration) < 0.25;
+    };
+    const bool baseSafe = !baseline.scoreBreakdown.severeVocalClash &&
+                          !baseline.scoreBreakdown.prematureDropExit;
+    auto hasMeaningfulGain = [&](const MixPlan& alt) {
+        if (!baseSafe) {
+            // Any candidate avoiding a severe vocal collision or premature drop cut is prioritized
+            if (!alt.scoreBreakdown.severeVocalClash && !alt.scoreBreakdown.prematureDropExit) {
+                return true;
+            }
+            return alt.scoreBreakdown.totalScore > baseTotal;
+        }
+        return (alt.scoreBreakdown.totalScore > baseTotal + 0.025f) ||
+               (alt.scoreBreakdown.vocalSafetyScore > baseVoc + 0.06f &&
+                alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
+               (alt.scoreBreakdown.harmonicScore > baseHarm + 0.06f &&
+                alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||
+               (alt.scoreBreakdown.phraseBoundaryScore > basePhrase + 0.08f &&
+                alt.scoreBreakdown.totalScore >= baseTotal);
+    };
+    if (!plans.empty() && !isBasePlan(plans.front()) && !hasMeaningfulGain(plans.front())) {
+        // Check if any candidate with meaningful gain exists; if so, promote the
+        // highest-scoring one, otherwise retain the baseline plan as winner.
+        auto bestAltIt = std::find_if(plans.begin(), plans.end(), [&](const MixPlan& p) {
+            return !isBasePlan(p) && hasMeaningfulGain(p);
+        });
+        if (bestAltIt != plans.end()) {
+            std::rotate(plans.begin(), bestAltIt, bestAltIt + 1);
+        } else {
+            auto baseIt = std::find_if(plans.begin(), plans.end(), isBasePlan);
+            if (baseIt != plans.end() && baseIt != plans.begin()) {
+                std::rotate(plans.begin(), baseIt, baseIt + 1);
+            }
+        }
+    }
+
+    if (plans.size() > 6) {
+        plans.resize(6);
+    }
+    return plans;
+}
+
+} // namespace
+
+MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
+                         const PlanRequest& request) const {
+    return plan(a, b, nullptr, nullptr, request);
+}
+
+std::vector<MixCandidate> MixPlanner::planCandidates(
+    const AnalysisResult& a, const AnalysisResult& b,
+    const MixFeatureMap* featuresA,
+    const MixFeatureMap* featuresB,
+    const PlanRequest& request) const {
+    const std::vector<MixPlan> plans =
+        evaluateCandidatePlans(config_, a, b, featuresA, featuresB, request);
+    std::vector<MixCandidate> out;
+    out.reserve(plans.size());
+    const int bpbA = a.beatsPerBar >= 2 ? a.beatsPerBar : 4;
+    for (std::size_t i = 0; i < plans.size(); ++i) {
+        const double localBpm =
+            plans[i].localBpmA > 0.0 ? plans[i].localBpmA : (a.bpm > 0.0 ? a.bpm : 120.0);
+        out.push_back(candidateFromPlan(plans[i], static_cast<int>(i + 1), localBpm, bpbA));
+    }
+    return out;
+}
+
+MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
+                         const MixFeatureMap* featuresA,
+                         const MixFeatureMap* featuresB,
+                         const PlanRequest& request) const {
+    if (!config_.adaptive || request.type != TransitionType::SmartCrossfade ||
+        !featuresA || !featuresA->valid() || !featuresB || !featuresB->valid()) {
+        MixPlan single = planSingleCandidate(
+            config_, a, b, featuresA, featuresB, request, CandidateOverride{});
+        if (single.valid) {
+            const int bpbA = a.beatsPerBar >= 2 ? a.beatsPerBar : 4;
+            const double localBpm =
+                single.localBpmA > 0.0 ? single.localBpmA : (a.bpm > 0.0 ? a.bpm : 120.0);
+            single.alternatives.push_back(candidateFromPlan(single, 1, localBpm, bpbA));
+        }
+        return single;
+    }
+
+    std::vector<MixPlan> candidates =
+        evaluateCandidatePlans(config_, a, b, featuresA, featuresB, request);
+    if (candidates.empty()) {
+        return planSingleCandidate(
+            config_, a, b, featuresA, featuresB, request, CandidateOverride{});
+    }
+
+    MixPlan winner = candidates.front();
+    const int bpbA = a.beatsPerBar >= 2 ? a.beatsPerBar : 4;
+    winner.alternatives.reserve(candidates.size());
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const double localBpm =
+            candidates[i].localBpmA > 0.0 ? candidates[i].localBpmA : (a.bpm > 0.0 ? a.bpm : 120.0);
+        winner.alternatives.push_back(
+            candidateFromPlan(candidates[i], static_cast<int>(i + 1), localBpm, bpbA));
+    }
+    if (!winner.scoreBreakdown.summary.empty()) {
+        winner.reasons.push_back(
+            "Candidate planner (#1/" + std::to_string(winner.alternatives.size()) +
+            "): " + winner.scoreBreakdown.summary);
+    }
+    return winner;
 }
 
 } // namespace bgmedia::mix

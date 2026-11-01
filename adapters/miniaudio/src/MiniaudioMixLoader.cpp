@@ -4,6 +4,8 @@
 #include "bgmedia/audio/AudioData.hpp"
 #include "bgmedia/audio/MiniaudioDecoder.hpp"
 #include "bgmedia/cache/AnalysisCache.hpp"
+#include "bgmedia/mix/MixFeatureCache.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
 
 #include <algorithm>
@@ -77,13 +79,13 @@ bool prepareMixTrack(const std::filesystem::path& path,
     auto analysis = std::make_shared<AnalysisResult>();
     if (cached) {
         *analysis = std::move(*cached);
-        report(progress, 0.84f, "loaded from cache");
+        report(progress, 0.78f, "loaded analysis from cache");
     } else {
         Analyzer analyzer(options.analysis);
         report(progress, 0.25f, "analysing");
         AnalysisReport analysisReport = analyzer.analyze(
             pcm, [&](float fraction, const std::string& stage) {
-                report(progress, 0.25f + 0.58f * fraction, stage);
+                report(progress, 0.25f + 0.52f * fraction, stage);
             });
         if (!analysisReport.ok()) {
             error = analysisReport.status == AnalysisStatus::Cancelled
@@ -93,10 +95,35 @@ bool prepareMixTrack(const std::filesystem::path& path,
         }
         *analysis = std::move(analysisReport.result);
         if (options.useCache && !options.cacheDirectory.empty()) {
-            report(progress, 0.86f, "saving cache");
+            report(progress, 0.79f, "saving analysis cache");
             AnalysisCache cache(options.cacheDirectory);
             std::string cacheError;
             (void)cache.store(*analysis, pcm, options.analysis, &cacheError);
+        }
+    }
+
+    report(progress, 0.82f, "building feature map");
+    std::optional<mix::MixFeatureMap> cachedFeatures;
+    if (options.useCache && !options.cacheDirectory.empty()) {
+        mix::MixFeatureCache featureCache(options.cacheDirectory);
+        mix::FeatureCacheLoadResult loadedFeatures =
+            featureCache.load(decoded.audio, pcm, *analysis, options.features);
+        if (loadedFeatures.hit()) {
+            cachedFeatures = std::move(loadedFeatures.features);
+        }
+    }
+    auto features = std::make_shared<mix::MixFeatureMap>();
+    if (cachedFeatures) {
+        *features = std::move(*cachedFeatures);
+    } else {
+        mix::MixFeatureExtractor extractor(options.features);
+        *features = extractor.extract(decoded.audio, pcm, *analysis);
+        if (options.useCache && !options.cacheDirectory.empty() &&
+            features->valid()) {
+            mix::MixFeatureCache featureCache(options.cacheDirectory);
+            std::string featureCacheError;
+            (void)featureCache.store(*features, options.features,
+                                     &featureCacheError);
         }
     }
 
@@ -111,6 +138,7 @@ bool prepareMixTrack(const std::filesystem::path& path,
 
     out.audio = std::move(track);
     out.analysis = std::move(analysis);
+    out.features = std::move(features);
     report(progress, 1.0f, "ready");
     return true;
 }

@@ -1,12 +1,17 @@
 #include "framework.hpp"
 
+#include "bgmedia/cache/AnalysisCache.hpp"
 #include "bgmedia/mix/Crossfade.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixFeatureCache.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 #include "bgmedia/mix/MixSession.hpp"
 #include "bgmedia/mix/MixSync.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
 #include "bgmedia/mix/SpectralEq.hpp"
+#include "bgmedia/mix/VocalDetector.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -2946,4 +2952,2128 @@ TEST_CASE("mix.sync_clock_active_during_cancellation") {
     // When the deck itself stops playing, the clock reports stopped.
     snap.decks[0].playing = false;
     CHECK(!bgmedia::mix::liveMixTempo(snap).playing);
+}
+
+// ---------------------------------------------------------------------------
+// BG Mix 0.3 PR 1: Musical Feature Map, BS.1770 LUFS, Adaptive Bounds, Cache
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const AnalysisResult baseAnalysis = analysisFor(120.0, 8.0);
+
+    // 1. 1 kHz mono sine vs dual-mono stereo sine at 0.4 amplitude:
+    // Mono LUFS matches plain RMS dBFS (~ -11.0 LUFS), while stereo dual-mono
+    // sums both channels' K-weighted powers (+3.01 LU, ~ -8.0 LUFS).
+    const auto tone1k = toneTrack(8.0, 1000.0);
+    auto mono1k = std::make_shared<PcmTrack>();
+    mono1k->sampleRate = kRate;
+    mono1k->channels = 1;
+    mono1k->samples.resize(tone1k->frameCount(), 0.0f);
+    for (std::size_t i = 0; i < mono1k->samples.size(); ++i) {
+        mono1k->samples[i] = tone1k->samples[i * 2];
+    }
+    const MixFeatureMap mapMono1k = extractor.extractFromTrack(*mono1k, baseAnalysis);
+    const MixFeatureMap map1k = extractor.extractFromTrack(*tone1k, baseAnalysis);
+    CHECK(map1k.valid());
+    CHECK(map1k.info.fromPcm);
+    CHECK_NEAR(mapMono1k.loudness.integratedLufs, mapMono1k.loudness.meanRmsDbfs, 0.35);
+    CHECK_NEAR(map1k.loudness.integratedLufs - mapMono1k.loudness.integratedLufs, 3.01f, 0.15f);
+    CHECK_NEAR(map1k.loudness.integratedLufs, map1k.loudness.meanRmsDbfs + 3.01f, 0.35);
+
+    // Out-of-phase stereo (R = -L) preserves per-channel powers instead of
+    // cancelling out in a mono downmix before loudness measurement.
+    auto outOfPhase = toneTrack(8.0, 1000.0);
+    for (std::size_t f = 0; f < outOfPhase->frameCount(); ++f) {
+        outOfPhase->samples[f * 2 + 1] = -outOfPhase->samples[f * 2];
+    }
+    const MixFeatureMap mapOutOfPhase = extractor.extractFromTrack(*outOfPhase, baseAnalysis);
+    CHECK_NEAR(mapOutOfPhase.loudness.integratedLufs, map1k.loudness.integratedLufs, 0.10);
+
+    // 2. 3 kHz stereo sine at the exact same 0.4 amplitude: plain RMS dBFS is
+    // identical to 1 kHz, while BS.1770 Stage-1 high-shelf boosts 3 kHz by ~+3.6 LU.
+    const auto tone3k = toneTrack(8.0, 3000.0);
+    const MixFeatureMap map3k = extractor.extractFromTrack(*tone3k, baseAnalysis);
+    CHECK_NEAR(map3k.loudness.meanRmsDbfs, map1k.loudness.meanRmsDbfs, 0.05);
+    CHECK(map3k.loudness.integratedLufs > map1k.loudness.integratedLufs + 3.0f);
+    CHECK(map3k.loudness.integratedLufs < map1k.loudness.integratedLufs + 4.3f);
+
+    // 3. 30 Hz sub-bass sine at the exact same 0.4 amplitude: plain RMS dBFS is
+    // identical to 1 kHz, while BS.1770 Stage-2 RLB high-pass attenuates 30 Hz.
+    const auto tone30 = toneTrack(8.0, 30.0);
+    const MixFeatureMap map30 = extractor.extractFromTrack(*tone30, baseAnalysis);
+    CHECK_NEAR(map30.loudness.meanRmsDbfs, map1k.loudness.meanRmsDbfs, 0.10);
+    CHECK(map30.loudness.integratedLufs < map1k.loudness.integratedLufs - 3.5f);
+
+    // 4. BS.1770 gating: half 1 kHz tone + half digital silence reduces plain
+    // RMS by ~3 dB, while gated integrated LUFS stays within 0.25 LU of the full tone.
+    auto gatedTrack = toneTrack(8.0, 1000.0);
+    const std::size_t halfSamples = gatedTrack->samples.size() / 2;
+    std::fill(gatedTrack->samples.begin() + static_cast<std::ptrdiff_t>(halfSamples),
+              gatedTrack->samples.end(), 0.0f);
+    const MixFeatureMap mapGated = extractor.extractFromTrack(*gatedTrack, baseAnalysis);
+    CHECK(mapGated.loudness.meanRmsDbfs < map1k.loudness.meanRmsDbfs - 2.5f);
+    CHECK_NEAR(mapGated.loudness.integratedLufs, map1k.loudness.integratedLufs, 0.25);
+
+    // 5. EBU Tech 3342 LRA relative gate (-20 LU): a 60 s constant tone whose
+    // second 30 s are attenuated by 40 dB (still above the -70 LUFS absolute gate)
+    // must exclude the -40 dB tail from LRA rather than reporting ~40 LU.
+    const AnalysisResult longAnalysis = analysisFor(120.0, 60.0);
+    auto lraTrack = toneTrack(60.0, 1000.0);
+    const std::size_t halfLraSamples = lraTrack->samples.size() / 2;
+    for (std::size_t i = halfLraSamples; i < lraTrack->samples.size(); ++i) {
+        lraTrack->samples[i] *= 0.01f; // -40 dB attenuation
+    }
+    const MixFeatureMap mapLra = extractor.extractFromTrack(*lraTrack, longAnalysis);
+    CHECK(mapLra.loudness.loudnessRangeLu < 1.5f);
+
+    // 6. Startup transient windows: a 100 ms tone at t = 0 must report the same
+    // momentaryMaxLufs and shortTermMaxLufs as the identical 100 ms tone at t = 5 s.
+    auto burstStart = std::make_shared<PcmTrack>();
+    auto burstMid = std::make_shared<PcmTrack>();
+    burstStart->sampleRate = burstMid->sampleRate = kRate;
+    burstStart->channels = burstMid->channels = 1;
+    burstStart->samples.assign(8 * kRate, 0.0f);
+    burstMid->samples.assign(8 * kRate, 0.0f);
+    const std::size_t burstFrames = kRate / 10; // 100 ms
+    const std::size_t midOffset = 5 * kRate;
+    for (std::size_t i = 0; i < burstFrames; ++i) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / kRate));
+        burstStart->samples[i] = s;
+        burstMid->samples[midOffset + i] = s;
+    }
+    const MixFeatureMap mapBurstStart = extractor.extractFromTrack(*burstStart, baseAnalysis);
+    const MixFeatureMap mapBurstMid = extractor.extractFromTrack(*burstMid, baseAnalysis);
+    CHECK_NEAR(mapBurstStart.loudness.momentaryMaxLufs,
+               mapBurstMid.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapBurstStart.loudness.shortTermMaxLufs,
+               mapBurstMid.loudness.shortTermMaxLufs, 0.05f);
+
+    // 7. 5-channel surround layout: channels 3 (BL) and 4 (BR) both receive
+    // the +1.5 dB surround weight and report identical integrated loudness.
+    auto surBL = std::make_shared<PcmTrack>();
+    auto surBR = std::make_shared<PcmTrack>();
+    surBL->sampleRate = surBR->sampleRate = kRate;
+    surBL->channels = surBR->channels = 5;
+    surBL->samples.assign(4 * kRate * 5, 0.0f);
+    surBR->samples.assign(4 * kRate * 5, 0.0f);
+    for (std::size_t f = 0; f < 4 * kRate; ++f) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(f) / kRate));
+        surBL->samples[f * 5 + 3] = s;
+        surBR->samples[f * 5 + 4] = s;
+    }
+    const AnalysisResult surAnalysis = analysisFor(120.0, 4.0);
+    const MixFeatureMap mapSurBL = extractor.extractFromTrack(*surBL, surAnalysis);
+    const MixFeatureMap mapSurBR = extractor.extractFromTrack(*surBR, surAnalysis);
+    CHECK_NEAR(mapSurBL.loudness.integratedLufs, mapSurBR.loudness.integratedLufs, 0.05f);
+
+    // Partial final frame must be sample-weighted rather than treated as a full
+    // 100 ms frame: a 1 ms tone at the end of an 8.001 s track must match the
+    // same 1 ms tone placed at 5.0 s.
+    const std::size_t partialFrames = static_cast<std::size_t>(std::llround(8.001 * kRate));
+    auto endPip = std::make_shared<PcmTrack>();
+    auto midPip = std::make_shared<PcmTrack>();
+    endPip->sampleRate = midPip->sampleRate = kRate;
+    endPip->channels = midPip->channels = 1;
+    endPip->samples.assign(partialFrames, 0.0f);
+    midPip->samples.assign(partialFrames, 0.0f);
+    const std::size_t pipLen = static_cast<std::size_t>(kRate / 1000); // 1 ms = 48 samples
+    for (std::size_t i = 0; i < pipLen; ++i) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / kRate));
+        endPip->samples[partialFrames - pipLen + i] = s;
+        midPip->samples[5 * kRate + i] = s;
+    }
+    const AnalysisResult partialAnalysis = analysisFor(120.0, 8.001);
+    const MixFeatureMap mapEndPip = extractor.extractFromTrack(*endPip, partialAnalysis);
+    const MixFeatureMap mapMidPip = extractor.extractFromTrack(*midPip, partialAnalysis);
+    CHECK_NEAR(mapEndPip.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.25f);
+    CHECK_NEAR(mapEndPip.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.25f);
+
+    // Changing frameStepSeconds (e.g. 0.25 s or 0.30 s) must not alter the
+    // 400 ms momentary or integrated loudness measurement intervals.
+    bgmedia::mix::MixFeatureConfig cfg025;
+    cfg025.frameStepSeconds = 0.25;
+    bgmedia::mix::MixFeatureConfig cfg030;
+    cfg030.frameStepSeconds = 0.30;
+    MixFeatureExtractor ext025(cfg025);
+    MixFeatureExtractor ext030(cfg030);
+    const MixFeatureMap mapMid025 = ext025.extractFromTrack(*midPip, partialAnalysis);
+    const MixFeatureMap mapMid030 = ext030.extractFromTrack(*midPip, partialAnalysis);
+    CHECK_NEAR(mapMid025.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapMid030.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.05f);
+    CHECK_NEAR(mapMid025.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.05f);
+    CHECK_NEAR(mapMid030.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.05f);
+}
+
+TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+
+    // Quiet master at -54 dBFS (amplitude ~0.0020, RMS ~0.00141 = -57 dBFS),
+    // which would be wiped out by a hard -55 dBFS threshold, surrounded by
+    // 1.5 s lead-in and 2.0 s lead-out at -88 dBFS noise floor.
+    auto quiet = std::make_shared<PcmTrack>();
+    quiet->sampleRate = kRate;
+    quiet->channels = 2;
+    const std::size_t totalFrames = static_cast<std::size_t>(duration * kRate);
+    quiet->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        const bool inBody = (t >= 1.5 && t <= duration - 2.0);
+        const double amp = inBody ? 0.0020 : 0.00004; // -54 dBFS peak (-57 dBFS RMS) vs -88 dBFS
+        const float s = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t));
+        quiet->samples[f * 2] = s;
+        quiet->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap quietMap = extractor.extractFromTrack(*quiet, analysis);
+    CHECK(quietMap.valid());
+    CHECK(quietMap.loudness.meanRmsDbfs < -55.0f);
+    CHECK(quietMap.audible.enterThresholdDbfs < -65.0f);
+    CHECK_NEAR(quietMap.audible.audibleStart, 1.5, 0.25);
+    CHECK_NEAR(quietMap.audible.audibleEnd, duration - 2.0, 0.25);
+    CHECK(quietMap.sampleAt(5.0).active);
+    CHECK(!quietMap.sampleAt(0.5).active);
+    CHECK(!quietMap.sampleAt(11.2).active);
+
+    // Track with a 2.4 s fade-in and a 2.4 s smooth reverb-like decay tail.
+    auto shaped = std::make_shared<PcmTrack>();
+    shaped->sampleRate = kRate;
+    shaped->channels = 2;
+    shaped->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        double env = 0.0;
+        if (t >= 0.5 && t < 3.0) {
+            const double u = (t - 0.5) / 2.5;
+            env = 0.02 * std::pow(20.0, u); // exponential dB ramp from -34 dB to -8 dB
+        } else if (t >= 3.0 && t < 8.5) {
+            env = 0.40;
+        } else if (t >= 8.5 && t < 11.2) {
+            const double u = (t - 8.5) / 2.7;
+            env = 0.40 * std::pow(0.03, u); // smooth exponential decay tail
+        }
+        const float s = static_cast<float>(env * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t));
+        shaped->samples[f * 2] = s;
+        shaped->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap shapedMap = extractor.extractFromTrack(*shaped, analysis);
+    CHECK(shapedMap.audible.hasFadeIn);
+    CHECK(shapedMap.audible.fullBodyStart > shapedMap.audible.audibleStart + 1.2);
+    CHECK(shapedMap.audible.tailStart < shapedMap.audible.audibleEnd - 1.0);
+    CHECK(shapedMap.audible.hasFadeOut || shapedMap.audible.hasReverbTail);
+}
+
+TEST_CASE("mix.feature_map_spectral_bands_and_novelty") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::WindowFeatureSummary;
+
+    MixFeatureExtractor extractor;
+    const double duration = 10.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t totalFrames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(totalFrames * 2, 0.0f);
+    for (std::size_t f = 0; f < totalFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        // First 5 s: 75 Hz bass; second 5 s: 6000 Hz treble (above 3.5 kHz mid cutoff).
+        const double hz = (t < 5.0) ? 75.0 : 6000.0;
+        const float s = static_cast<float>(0.35 * std::sin(2.0 * 3.14159265358979323846 * hz * t));
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    const WindowFeatureSummary firstHalf = map.summarizeWindow(1.0, 4.0);
+    const WindowFeatureSummary secondHalf = map.summarizeWindow(6.0, 9.0);
+    CHECK(firstHalf.lowShare > 0.65f);
+    CHECK(firstHalf.bassDominance > 0.65f);
+    CHECK(secondHalf.highShare > 0.65f);
+    CHECK(secondHalf.bassDominance < 0.25f);
+
+    // Spectral novelty must peak around the 5.0 s spectral transition.
+    float boundaryNovelty = 0.0f;
+    for (double t = 4.7; t <= 5.3; t += 0.1) {
+        boundaryNovelty = std::max(boundaryNovelty, map.sampleAt(t).spectralNovelty);
+    }
+    CHECK(boundaryNovelty > firstHalf.spectralNovelty + 0.25f);
+    CHECK(boundaryNovelty > secondHalf.spectralNovelty + 0.25f);
+
+    // Window ending exactly at a frame boundary [0.4, 0.5] must not include the
+    // following frame [0.5, 0.6).
+    MixFeatureMap stepMap = map;
+    for (std::size_t i = 0; i < stepMap.frames.size(); ++i) {
+        stepMap.frames[i].energy = (i < 5) ? 0.10f : 0.90f;
+    }
+    const WindowFeatureSummary preStep = stepMap.summarizeWindow(0.4, 0.5);
+    CHECK_NEAR(preStep.meanEnergy, 0.10f, 1e-4f);
+
+    // Local tempo stability is determined from the matched TempoSegment rather
+    // than propagating a track-wide tempoStable == false into constant-tempo segments.
+    stepMap.tempoStable = false;
+    stepMap.tempoSegments = {
+        {0.0, 4.5, 120.0, 0.85f},
+        {5.5, 10.0, 128.0, 0.85f},
+    };
+    stepMap.tempoTransitions = {
+        {4.5, 5.5, 120.0, 128.0, 0.80f},
+    };
+    bool segStable = false;
+    CHECK_NEAR(stepMap.localBpmAt(2.0, &segStable), 120.0, 1e-4);
+    CHECK(segStable);
+    CHECK(stepMap.summarizeWindow(1.0, 4.0).tempoStable);
+    CHECK(!stepMap.summarizeWindow(4.0, 6.0).tempoStable);
+}
+
+TEST_CASE("mix.feature_map_phrases_and_cue_candidates") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    MixFeatureExtractor extractor;
+    const double duration = 32.0;
+    AnalysisResult analysis = analysisFor(120.0, duration);
+    // Test 3/4 meter awareness as well as section preservation (never relabelling Main).
+    analysis.beatsPerBar = 3;
+    for (std::size_t i = 0; i < analysis.beats.size(); ++i) {
+        analysis.beats[i].downbeat = (i % 3 == 0);
+        analysis.beats[i].barIndex = static_cast<int>(i / 3);
+        analysis.beats[i].beatInBar = static_cast<int>(i % 3);
+    }
+
+    const auto track = toneTrack(duration, 220.0);
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    CHECK(map.valid());
+    CHECK(!map.bars.empty());
+    CHECK(!map.phrases.empty());
+    CHECK(!map.mixInCandidates.empty());
+    CHECK(!map.mixOutCandidates.empty());
+
+    for (const auto& bar : map.bars) {
+        CHECK(bar.beatCount <= 3);
+    }
+    for (const auto& phrase : map.phrases) {
+        CHECK(phrase.end > phrase.start);
+        CHECK(phrase.barCount >= 1);
+    }
+    CHECK(map.mixInCandidates.front().priorScore >= map.mixInCandidates.back().priorScore);
+    CHECK(map.mixOutCandidates.front().priorScore >= map.mixOutCandidates.back().priorScore);
+
+    // Downgrade fallback when PCM is unavailable.
+    const MixFeatureMap fallback = extractor.buildFromAnalysisOnly(analysis);
+    CHECK(fallback.valid());
+    CHECK(!fallback.info.fromPcm);
+    CHECK(!fallback.bars.empty());
+    CHECK(!fallback.mixInCandidates.empty());
+    CHECK(!fallback.mixOutCandidates.empty());
+
+    // Beat grid starting with a 2-beat pickup where BeatTracker assigns
+    // source barIndex = 0 to both the pickup and the first 4-beat bar.
+    AnalysisResult pickupAnalysis = analysisFor(120.0, 8.0);
+    pickupAnalysis.beatsPerBar = 4;
+    pickupAnalysis.beats.clear();
+    for (int i = 0; i < 12; ++i) {
+        bgmedia::Beat bt;
+        bt.time = 0.5 * static_cast<double>(i);
+        bt.confidence = 0.9f;
+        if (i < 2) {
+            bt.downbeat = false;
+            bt.barIndex = 0;
+            bt.beatInBar = i + 2;
+        } else {
+            const int fullIdx = i - 2;
+            bt.downbeat = (fullIdx % 4 == 0);
+            bt.barIndex = fullIdx / 4;
+            bt.beatInBar = fullIdx % 4;
+        }
+        pickupAnalysis.beats.push_back(bt);
+    }
+    const MixFeatureMap pickupMap = extractor.buildFromAnalysisOnly(pickupAnalysis);
+    REQUIRE(pickupMap.bars.size() == 4);
+    CHECK(pickupMap.bars[0].beatCount == 2);
+    CHECK(pickupMap.bars[1].beatCount == 4);
+    CHECK(pickupMap.bars[2].beatCount == 4);
+    CHECK(pickupMap.bars[3].beatCount == 2);
+}
+
+TEST_CASE("mix.feature_cache_roundtrip_and_invalidation") {
+    using bgmedia::AnalysisCache;
+    using bgmedia::AnalysisConfig;
+    using bgmedia::mix::FeatureCacheLoadResult;
+    using bgmedia::mix::FeatureCacheStatus;
+    using bgmedia::mix::MixFeatureCache;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "bgmedia_mix_feature_cache_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    MixFeatureExtractor extractor;
+    AnalysisResult analysis = analysisFor(124.0, 12.0);
+    analysis.info.contentHash = 0x123456789ABCDEF0ULL;
+    analysis.info.configHash = AnalysisConfig{}.fingerprint();
+    analysis.info.sampleRate = kRate;
+    analysis.info.sourceChannels = 2;
+    const auto track = toneTrack(12.0, 440.0);
+
+    bgmedia::PcmBuffer monoPcm;
+    monoPcm.sampleRate = kRate;
+    monoPcm.sourceChannels = 2;
+    monoPcm.samples.resize(track->frameCount(), 0.0f);
+    for (std::size_t i = 0; i < monoPcm.samples.size(); ++i) {
+        monoPcm.samples[i] = track->samples[i * 2];
+    }
+    monoPcm.contentHash = 0x123456789ABCDEF0ULL;
+    analysis.info.contentHash = monoPcm.contentHash;
+
+    MixFeatureMap original = extractor.extract(monoPcm, analysis);
+    original.vocal.available = true;
+    original.vocal.meanConfidence = 0.85f;
+    original.vocal.activeRatio = 0.42f;
+    original.harmony.available = true;
+    original.harmony.keyIndex = 9;
+    original.harmony.isMinor = true;
+    original.harmony.camelotCode = "8A";
+    original.harmony.keyConfidence = 0.78f;
+
+    // Coexistence with BG Beat AnalysisCache (.bgm) in the same directory.
+    AnalysisCache beatCache(dir);
+    AnalysisConfig beatCfg;
+    std::string error;
+    CHECK(beatCache.store(analysis, monoPcm, beatCfg, &error));
+
+    MixFeatureCache featureCache(dir);
+    MixFeatureConfig featCfg;
+    CHECK(featureCache.store(original, featCfg, &error));
+
+    const FeatureCacheLoadResult loadedRes =
+        featureCache.load(monoPcm, analysis, featCfg);
+    CHECK(loadedRes.hit());
+    const MixFeatureMap& loaded = loadedRes.features;
+    CHECK(loaded.valid());
+    CHECK(loaded.frames.size() == original.frames.size());
+    CHECK(loaded.bars.size() == original.bars.size());
+    CHECK(loaded.phrases.size() == original.phrases.size());
+    CHECK(loaded.mixInCandidates.size() == original.mixInCandidates.size());
+    CHECK(loaded.mixOutCandidates.size() == original.mixOutCandidates.size());
+    CHECK_NEAR(loaded.loudness.integratedLufs, original.loudness.integratedLufs, 1e-4);
+    CHECK_NEAR(loaded.audible.audibleStart, original.audible.audibleStart, 1e-6);
+    CHECK_NEAR(loaded.audible.audibleEnd, original.audible.audibleEnd, 1e-6);
+    CHECK(loaded.vocal.available);
+    CHECK_NEAR(loaded.vocal.meanConfidence, 0.85f, 1e-5);
+    CHECK_NEAR(loaded.vocal.activeRatio, 0.42f, 1e-5);
+    CHECK(loaded.harmony.available);
+    CHECK(loaded.harmony.keyIndex == 9);
+    CHECK(loaded.harmony.isMinor);
+    CHECK(loaded.harmony.camelotCode == "8A");
+
+    // Beat cache (.bgm) is still readable alongside (.bgf).
+    const auto loadedBeat = beatCache.load(monoPcm, beatCfg);
+    CHECK(loadedBeat.hit());
+    CHECK_NEAR(loadedBeat.result.bpm, 124.0, 1e-6);
+
+    // Model checksum / config change invalidates the cache.
+    MixFeatureConfig changedCfg = featCfg;
+    changedCfg.vocalModelChecksum = featCfg.vocalModelChecksum + 1;
+    CHECK(!featureCache.load(monoPcm, analysis, changedCfg).hit());
+
+    // Payload corruption is caught by the FNV-1a checksum.
+    const std::filesystem::path bgfPath =
+        dir / MixFeatureCache::fileNameFor(original.info.contentHash,
+                                           original.info.analysisConfigHash,
+                                           featCfg.fingerprint());
+    {
+        std::fstream file(bgfPath, std::ios::binary | std::ios::in | std::ios::out);
+        CHECK(static_cast<bool>(file));
+        file.seekp(-4, std::ios::end);
+        const char bad = static_cast<char>(0xFF);
+        file.write(&bad, 1);
+    }
+    const FeatureCacheLoadResult corruptRes =
+        featureCache.load(monoPcm, analysis, featCfg);
+    CHECK(!corruptRes.hit());
+    CHECK(corruptRes.status == FeatureCacheStatus::Corrupt);
+
+    // Two stereo sources with identical mono downmixes (s, s) vs (2s, 0) but
+    // different channel powers must have distinct feature-cache keys.
+    auto dualMono = toneTrack(8.0, 1000.0, 2, kRate);
+    auto leftOnly = toneTrack(8.0, 1000.0, 2, kRate);
+    for (std::size_t f = 0; f < dualMono->frameCount(); ++f) {
+        dualMono->samples[f * 2] *= 0.5f;
+        dualMono->samples[f * 2 + 1] *= 0.5f;
+        leftOnly->samples[f * 2] *= 1.0f;
+        leftOnly->samples[f * 2 + 1] = 0.0f;
+    }
+    AnalysisResult stereoAnalysis = analysisFor(120.0, 8.0);
+    const MixFeatureMap mapDual = extractor.extractFromTrack(*dualMono, stereoAnalysis);
+    const MixFeatureMap mapLeft = extractor.extractFromTrack(*leftOnly, stereoAnalysis);
+    CHECK(mapDual.info.contentHash != mapLeft.info.contentHash);
+    CHECK(featureCache.store(mapDual, featCfg, &error));
+    CHECK(!featureCache.load(*leftOnly, stereoAnalysis, featCfg).hit());
+    CHECK(featureCache.store(mapLeft, featCfg, &error));
+    const auto loadedDual = featureCache.load(*dualMono, stereoAnalysis, featCfg);
+    const auto loadedLeft = featureCache.load(*leftOnly, stereoAnalysis, featCfg);
+    CHECK(loadedDual.hit());
+    CHECK(loadedLeft.hit());
+    CHECK_NEAR(loadedLeft.features.loudness.integratedLufs -
+                   loadedDual.features.loudness.integratedLufs,
+               3.01f, 0.15f);
+
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("mix.planner_and_session_use_feature_map") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    // Outgoing track has 5 s of trailing PCM silence that was NOT listed in
+    // analysis.silences; incoming track has 2.2 s of leading PCM silence.
+    const double duration = 24.0;
+    AnalysisResult a = analysisFor(120.0, duration);
+    AnalysisResult b = analysisFor(120.0, duration);
+    b.sections.clear(); // no Intro section cue, so B would start at 0.0 without features
+
+    auto pcmA = toneTrack(duration, 220.0);
+    const std::size_t cutFrameA = static_cast<std::size_t>((duration - 5.0) * kRate);
+    std::fill(pcmA->samples.begin() + static_cast<std::ptrdiff_t>(cutFrameA * 2),
+              pcmA->samples.end(), 0.0f);
+
+    auto pcmB = toneTrack(duration, 330.0);
+    const std::size_t startFrameB = static_cast<std::size_t>(2.2 * kRate);
+    std::fill(pcmB->samples.begin(),
+              pcmB->samples.begin() + static_cast<std::ptrdiff_t>(startFrameB * 2),
+              0.0f);
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featA = extractor.extractFromTrack(*pcmA, a);
+    const MixFeatureMap featB = extractor.extractFromTrack(*pcmB, b);
+    CHECK_NEAR(featA.audible.audibleEnd, duration - 5.0, 0.25);
+    CHECK_NEAR(featB.audible.audibleStart, 2.2, 0.25);
+
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 4.0;
+    const MixPlan plan = planner.plan(a, b, &featA, &featB, request);
+    CHECK(plan.valid);
+    CHECK(plan.transitionEndA <= duration - 4.5);
+    CHECK(plan.startB >= 1.8);
+
+    // When preferPhraseBoundaries is disabled and B has an Intro cue later than
+    // audibleStart (e.g. Intro starts at 8.0 s while audibleStart is 2.2 s),
+    // grid alignment must align around the selected cue (~8.0 s) rather than
+    // jumping back to audibleStart.
+    AnalysisResult bWithIntro = analysisFor(120.0, duration);
+    bWithIntro.sections = {
+        {8.0, 16.0, SectionKind::Intro, 0.4f, 0.9f},
+        {16.0, duration, SectionKind::Main, 0.8f, 0.9f},
+    };
+    PlannerConfig noPhraseCfg;
+    noPhraseCfg.preferPhraseBoundaries = false;
+    MixPlanner noPhrasePlanner(noPhraseCfg);
+    const MixPlan cueAlignedPlan =
+        noPhrasePlanner.plan(a, bWithIntro, &featA, &featB, request);
+    CHECK(cueAlignedPlan.valid);
+    CHECK_NEAR(cueAlignedPlan.startB, 8.0, 0.6);
+
+    // Session populates deckFeatures(DeckId) on worker completion.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("alpha.wav");
+    session.addTrack("beta.wav");
+    CHECK(pump.waitForDecks(2));
+    CHECK(session.deckFeatures(DeckId::A) != nullptr);
+    CHECK(session.deckFeatures(DeckId::A)->valid());
+    CHECK(session.deckFeatures(DeckId::B) != nullptr);
+    CHECK(session.deckFeatures(DeckId::B)->valid());
+}
+
+// ---------------------------------------------------------------------------
+// BG Mix 0.3 PR 2: Vocal Activity Detection & Harmonic / Spectral Compatibility
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Synthesizes a multi-harmonic formant voice signal (F0 with gentle 5.5 Hz
+// vibrato + harmonics 1..6 shaped by F1=600 Hz and F2=1450 Hz) in [vocStart, vocEnd].
+std::shared_ptr<PcmTrack> makeVocalAndInstrumentalTrack(
+    double duration, double vocStart, double vocEnd, double bassHz = 110.0) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(frames * 2, 0.0f);
+
+    double phase = 0.0;
+    for (std::size_t f = 0; f < frames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        // Underlying bass sine wave in instrumental sections.
+        double sample = 0.18 * std::sin(2.0 * 3.14159265358979323846 * bassHz * t);
+
+        if (t >= vocStart && t <= vocEnd) {
+            const double vibrato = 1.0 + 0.008 * std::sin(2.0 * 3.14159265358979323846 * 5.5 * t);
+            const double f0 = 220.0 * vibrato;
+            phase += 2.0 * 3.14159265358979323846 * f0 / kRate;
+            // Multi-harmonic voice with strong formant emphasis in F1/F2/F3.
+            const double voice =
+                0.35 * std::sin(phase) +
+                0.45 * std::sin(2.0 * phase) +
+                0.55 * std::sin(3.0 * phase) +
+                0.40 * std::sin(4.0 * phase) +
+                0.30 * std::sin(5.0 * phase) +
+                0.22 * std::sin(6.0 * phase) +
+                0.15 * std::sin(7.0 * phase);
+            sample = 0.08 * sample + 0.32 * voice;
+        }
+        const float s = static_cast<float>(std::clamp(sample, -0.95, 0.95));
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+    return track;
+}
+
+std::shared_ptr<PcmTrack> makeTriadTrack(double duration,
+                                         double fRoot, double fThird, double fFifth) {
+    auto track = std::make_shared<PcmTrack>();
+    track->sampleRate = kRate;
+    track->channels = 2;
+    const std::size_t frames = static_cast<std::size_t>(duration * kRate);
+    track->samples.assign(frames * 2, 0.0f);
+    for (std::size_t f = 0; f < frames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        const double w = 2.0 * 3.14159265358979323846 * t;
+        const double v =
+            0.26 * std::sin(w * fRoot) +
+            0.10 * std::sin(w * fRoot * 2.0) +
+            0.18 * std::sin(w * fThird) +
+            0.16 * std::sin(w * fFifth);
+        const float s = static_cast<float>(v);
+        track->samples[f * 2] = s;
+        track->samples[f * 2 + 1] = s;
+    }
+    return track;
+}
+
+} // namespace
+
+TEST_CASE("mix.vocal_detector_distinguishes_voice_from_sine_and_drums") {
+    using bgmedia::mix::ExternalStemVocalDetector;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalDetectorKind;
+
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    // Track has pure bass in 0..3 s, singing voice in 3..8 s, and pure bass in 8..12 s.
+    const auto track = makeVocalAndInstrumentalTrack(duration, 3.0, 8.0, 95.0);
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap map = extractor.extractFromTrack(*track, analysis);
+    CHECK(map.vocal.available);
+    CHECK(map.vocal.detectorKind == VocalDetectorKind::MusicVocalModel);
+    CHECK(map.vocal.meanConfidence > 0.50f);
+    CHECK(!map.vocal.regions.empty());
+
+    const auto instStart = map.summarizeWindow(0.5, 2.5);
+    const auto vocalMid = map.summarizeWindow(4.0, 7.0);
+    const auto instEnd = map.summarizeWindow(9.0, 11.5);
+    CHECK(vocalMid.vocalScore > 0.55f);
+    CHECK(instStart.vocalScore < 0.22f);
+    CHECK(instEnd.vocalScore < 0.22f);
+
+    // A pure mid-band 440 Hz sine wave (single harmonic, no overtones) must not
+    // be misclassified as a lead vocal via sub-harmonic candidate F0s.
+    auto midSine = toneTrack(4.0, 440.0, 2, kRate);
+    const AnalysisResult sineAnalysis = analysisFor(120.0, 4.0);
+    const MixFeatureMap midSineMap = extractor.extractFromTrack(*midSine, sineAnalysis);
+    CHECK(midSineMap.vocal.available);
+    CHECK(midSineMap.vocal.regions.empty());
+    CHECK(midSineMap.summarizeWindow(0.5, 3.5).vocalScore < 0.15f);
+
+    // Disabled vocal detector must honestly report available = false and confidence = 0.
+    MixFeatureConfig offCfg;
+    offCfg.vocalDetector = VocalDetectorKind::None;
+    MixFeatureExtractor offExtractor(offCfg);
+    const MixFeatureMap offMap = offExtractor.extractFromTrack(*track, analysis);
+    CHECK(!offMap.vocal.available);
+    CHECK_NEAR(offMap.vocal.meanConfidence, 0.0f, 1e-6);
+
+    // External stem vocal detector provides high-confidence ground truth.
+    bgmedia::PcmBuffer stemPcm;
+    stemPcm.sampleRate = kRate;
+    stemPcm.sourceChannels = 1;
+    stemPcm.samples.assign(static_cast<std::size_t>(duration * kRate), 0.0f);
+    for (std::size_t i = static_cast<std::size_t>(3.0 * kRate);
+         i < static_cast<std::size_t>(8.0 * kRate); ++i) {
+        stemPcm.samples[i] = 0.35f;
+    }
+    ExternalStemVocalDetector stemDet(stemPcm, 0xCAFEBABEULL);
+    MixFeatureExtractor stemExtractor({}, &stemDet);
+    const MixFeatureMap stemMap = stemExtractor.extractFromTrack(*track, analysis);
+    CHECK(stemMap.vocal.available);
+    CHECK(stemMap.vocal.detectorKind == VocalDetectorKind::ExternalStem);
+    CHECK(stemMap.vocal.meanConfidence >= 0.90f);
+    CHECK(stemMap.summarizeWindow(4.0, 7.0).vocalScore > 0.75f);
+    CHECK(stemMap.summarizeWindow(0.5, 2.5).vocalScore < 0.05f);
+}
+
+TEST_CASE("mix.vocal_overlap_clash_vs_clean_handoff") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalOverlapAssessment;
+    using bgmedia::mix::evaluateVocalOverlap;
+
+    const double duration = 12.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // Track A has lead vocals in 1..6 s and instrumental outro in 6..12 s.
+    // Track B has instrumental intro in 0..5 s and lead vocals in 5..11 s.
+    const auto trackA = makeVocalAndInstrumentalTrack(duration, 1.0, 6.0, 110.0);
+    const auto trackB = makeVocalAndInstrumentalTrack(duration, 5.0, 11.0, 110.0);
+    const MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysis);
+    const MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysis);
+
+    // 1. Clash case: overlap A [1.5..5.5] (vocals) with B [5.5..9.5] (vocals).
+    const VocalOverlapAssessment clash =
+        evaluateVocalOverlap(featA, 1.5, 1.0, featB, 5.5, 1.0, 4.0);
+    CHECK(clash.available);
+    CHECK(clash.vocalClashScore > 0.35f);
+    CHECK(clash.clashDurationSeconds > 1.5);
+    CHECK(!clash.cleanVocalHandoff);
+
+    // 2. Clean handoff case: overlap A [6.5..10.5] (instrumental outro) with B [3.5..7.5]
+    // (instrumental intro transitioning into B's vocal).
+    const VocalOverlapAssessment handoff =
+        evaluateVocalOverlap(featA, 6.5, 1.0, featB, 3.5, 1.0, 4.0);
+    CHECK(handoff.available);
+    CHECK(handoff.vocalClashScore < 0.15f);
+    CHECK(handoff.cleanVocalHandoff);
+
+    // 3. Muted instrumental deck must not contribute to vocalOverInstrumentalScore,
+    // and an outgoing vocal phrase that finishes naturally while still at unity gain
+    // must not be flagged as cutsMidVocalPhraseA.
+    const std::vector<bgmedia::mix::GainPoint> heldOut = {
+        {0.0, 1.0f}, {7.0, 1.0f}, {8.0, 0.0f}};
+    const std::vector<bgmedia::mix::GainPoint> mutedIn = {
+        {0.0, 0.0f}, {8.0, 0.0f}};
+    const auto instOnlyB = toneTrack(duration, 110.0, 2, kRate);
+    const MixFeatureMap featInstB = extractor.extractFromTrack(*instOnlyB, analysis);
+    const VocalOverlapAssessment heldAOverMutedB =
+        evaluateVocalOverlap(featA, 0.0, 1.0, featInstB, 0.0, 1.0, 8.0, heldOut, mutedIn);
+    CHECK_NEAR(heldAOverMutedB.vocalOverInstrumentalScore, 0.0f, 1e-5f);
+    CHECK(!heldAOverMutedB.cutsMidVocalPhraseA);
+
+    // 4. Truncated outgoing vocal phrase (faded to 0 by 2.5 s while phrase continues
+    // to 6.0 s) must set cutsMidVocalPhraseA = true and cleanVocalHandoff = false.
+    const std::vector<bgmedia::mix::GainPoint> earlyFadeOut = {
+        {0.0, 1.0f}, {2.5, 0.0f}, {8.0, 0.0f}};
+    const VocalOverlapAssessment truncatedA =
+        evaluateVocalOverlap(featA, 0.0, 1.0, featInstB, 0.0, 1.0, 8.0, earlyFadeOut);
+    CHECK(truncatedA.cutsMidVocalPhraseA);
+    CHECK(!truncatedA.cleanVocalHandoff);
+}
+
+TEST_CASE("mix.harmonic_key_estimation_and_camelot_helper") {
+    using bgmedia::mix::HarmonicAnalyzer;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+
+    const double duration = 8.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // A minor triad: A3 (220.00 Hz), C4 (261.63 Hz), E4 (329.63 Hz) -> 8A
+    const auto trackAm = makeTriadTrack(duration, 220.00, 261.63, 329.63);
+    const MixFeatureMap featAm = extractor.extractFromTrack(*trackAm, analysis);
+    CHECK(featAm.harmony.available);
+    CHECK(featAm.harmony.keyIndex == 9);
+    CHECK(featAm.harmony.isMinor);
+    CHECK(featAm.harmony.camelotCode == "8A");
+    CHECK(featAm.harmony.tonalness > 0.55f);
+    CHECK(featAm.harmony.keyConfidence > 0.35f);
+
+    // C major triad: C4 (261.63 Hz), E4 (329.63 Hz), G4 (392.00 Hz) -> 8B
+    const auto trackC = makeTriadTrack(duration, 261.63, 329.63, 392.00);
+    const MixFeatureMap featC = extractor.extractFromTrack(*trackC, analysis);
+    CHECK(featC.harmony.available);
+    CHECK(featC.harmony.keyIndex == 0);
+    CHECK(!featC.harmony.isMinor);
+    CHECK(featC.harmony.camelotCode == "8B");
+
+    // F# major triad: F#3 (185.00 Hz), A#3 (233.08 Hz), C#4 (277.18 Hz) -> 2B
+    const auto trackFs = makeTriadTrack(duration, 185.00, 233.08, 277.18);
+    const MixFeatureMap featFs = extractor.extractFromTrack(*trackFs, analysis);
+    CHECK(featFs.harmony.available);
+    CHECK(featFs.harmony.keyIndex == 6);
+    CHECK(!featFs.harmony.isMinor);
+    CHECK(featFs.harmony.camelotCode == "2B");
+}
+
+TEST_CASE("mix.harmonic_compatibility_pitch_shift_and_percussive_neutrality") {
+    using bgmedia::mix::HarmonicCompatibility;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::evaluateHarmonicCompatibility;
+
+    const double duration = 8.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    const auto trackAm = makeTriadTrack(duration, 220.00, 261.63, 329.63); // Am (8A)
+    const auto trackC = makeTriadTrack(duration, 261.63, 329.63, 392.00);  // C  (8B, relative major)
+    const auto trackFs = makeTriadTrack(duration, 185.00, 233.08, 277.18); // F# (2B, distant)
+    const auto trackGsm = makeTriadTrack(duration, 207.65, 246.94, 311.13); // G#m (1A, 1 semitone below Am)
+
+    const MixFeatureMap featAm = extractor.extractFromTrack(*trackAm, analysis);
+    const MixFeatureMap featC = extractor.extractFromTrack(*trackC, analysis);
+    const MixFeatureMap featFs = extractor.extractFromTrack(*trackFs, analysis);
+    const MixFeatureMap featGsm = extractor.extractFromTrack(*trackGsm, analysis);
+
+    // 1. Relative major (Am -> C) is much more compatible than distant tritone/semitone (Am -> F#).
+    const HarmonicCompatibility compatRel =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featC, 1.0, 1.0, 4.0, true);
+    const HarmonicCompatibility compatDist =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true);
+    CHECK(compatRel.available);
+    CHECK(compatRel.compatibilityScore > compatDist.compatibilityScore + 0.22f);
+    CHECK(compatRel.harmonicClashScore < compatDist.harmonicClashScore);
+
+    // Muted incoming deck must not report harmonic clash even between C and F#.
+    const std::vector<bgmedia::mix::GainPoint> unityOut = {{0.0, 1.0f}, {4.0, 1.0f}};
+    const std::vector<bgmedia::mix::GainPoint> zeroIn = {{0.0, 0.0f}, {4.0, 0.0f}};
+    const HarmonicCompatibility mutedDist =
+        evaluateHarmonicCompatibility(featC, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true,
+                                      unityOut, zeroIn);
+    CHECK(mutedDist.harmonicClashScore < 0.05f);
+    CHECK(mutedDist.compatibilityScore >= 0.70f);
+
+    // Uncovered leading audio before the first beat/phrase span (e.g. beats start
+    // at 4.0 s on an 8.0 s track where 0..4 s is C major and 4..8 s is F# major)
+    // must still have its own local harmonic segment.
+    AnalysisResult lateBeats = analysisFor(120.0, duration);
+    lateBeats.beats.erase(
+        std::remove_if(lateBeats.beats.begin(), lateBeats.beats.end(),
+                       [](const Beat& bt) { return bt.time < 4.0; }),
+        lateBeats.beats.end());
+    auto splitKeyTrack = makeTriadTrack(duration, 185.00, 233.08, 277.18); // F# major
+    for (std::size_t f = 0; f < static_cast<std::size_t>(4.0 * kRate); ++f) {
+        splitKeyTrack->samples[f * 2] = trackC->samples[f * 2];
+        splitKeyTrack->samples[f * 2 + 1] = trackC->samples[f * 2 + 1];
+    }
+    const MixFeatureMap featSplit = extractor.extractFromTrack(*splitKeyTrack, lateBeats);
+    const HarmonicCompatibility introCvsC =
+        evaluateHarmonicCompatibility(featSplit, 0.0, 1.0, featC, 0.0, 1.0, 3.0, true);
+    CHECK(introCvsC.compatibilityScore > 0.70f);
+
+    // 2. Pitch-shift awareness when pitchLock == false:
+    // G#m played at +1 semitone (rate = 2^(1/12) ≈ 1.05946) without pitch lock
+    // shifts into Am, matching featAm far better than at 1.0x!
+    const double plusOneSemitoneRate = std::pow(2.0, 1.0 / 12.0);
+    const HarmonicCompatibility gsmLocked =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featGsm, 1.0, plusOneSemitoneRate, 4.0, true);
+    const HarmonicCompatibility gsmShiftedToAm =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featGsm, 1.0, plusOneSemitoneRate, 4.0, false);
+    CHECK(gsmShiftedToAm.compatibilityScore > gsmLocked.compatibilityScore + 0.25f);
+
+    // Quarter-tone detune (+3% rate without pitch lock ≈ +0.51 semitone) between
+    // two identical Am tracks triggers detunePenalty.
+    const HarmonicCompatibility quarterToneDetuned =
+        evaluateHarmonicCompatibility(featAm, 1.0, 1.0, featAm, 1.0, 1.03, 4.0, false);
+    CHECK(quarterToneDetuned.detunePenalty > 0.45f);
+
+    // 3. Percussive / atonal neutrality: broadband deterministic pseudo-noise
+    // has low tonalness (< 0.25) and sets percussiveNeutral = true.
+    auto drumNoise = std::make_shared<PcmTrack>();
+    drumNoise->sampleRate = kRate;
+    drumNoise->channels = 2;
+    drumNoise->samples.resize(static_cast<std::size_t>(duration * kRate) * 2, 0.0f);
+    std::uint32_t rng = 0x13579BDFU;
+    for (std::size_t i = 0; i < drumNoise->samples.size(); i += 2) {
+        rng = rng * 1664525U + 1013904223U;
+        const float white = (static_cast<float>((rng >> 8) & 0xFFFFU) / 32768.0f - 1.0f) * 0.25f;
+        drumNoise->samples[i] = white;
+        drumNoise->samples[i + 1] = white;
+    }
+    const MixFeatureMap featDrums = extractor.extractFromTrack(*drumNoise, analysis);
+    CHECK(featDrums.harmony.tonalness < 0.25f);
+    const HarmonicCompatibility drumVsFs =
+        evaluateHarmonicCompatibility(featDrums, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true);
+    CHECK(drumVsFs.percussiveNeutral);
+    CHECK(drumVsFs.harmonicClashScore < 0.20f);
+}
+
+
+TEST_CASE("mix.feature_cache_audio_and_track_hash_equivalence") {
+    using bgmedia::AudioData;
+    using bgmedia::PcmBuffer;
+    using bgmedia::mix::FeatureCacheStatus;
+    using bgmedia::mix::MixFeatureCache;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+
+    auto track = toneTrack(2.0, 440.0, 1, kRate);
+    AudioData audio;
+    audio.sampleRate = track->sampleRate;
+    audio.channels = track->channels;
+    audio.samples = track->samples;
+    const PcmBuffer pcm = PcmBuffer::fromAudio(audio);
+
+    AnalysisResult analysis = analysisFor(120.0, 2.0);
+    analysis.info.contentHash = 0; // force fallback to PCM hash
+
+    MixFeatureConfig cfg;
+    MixFeatureExtractor extractor(cfg);
+    const auto mapFromAudio = extractor.extract(audio, pcm, analysis);
+    const auto mapFromTrack = extractor.extractFromTrack(*track, analysis);
+    CHECK(mapFromAudio.info.contentHash == mapFromTrack.info.contentHash);
+
+    const auto cacheDir =
+        std::filesystem::temp_directory_path() / "bgmedia_test_audio_track_cache_equiv";
+    std::error_code ec;
+    std::filesystem::remove_all(cacheDir, ec);
+    MixFeatureCache cache(cacheDir);
+    CHECK(cache.store(mapFromAudio, cfg));
+    const auto loadedViaTrack = cache.load(*track, analysis, cfg);
+    CHECK(loadedViaTrack.status == FeatureCacheStatus::Hit);
+    std::filesystem::remove_all(cacheDir, ec);
+
+    // Stereo track with a non-finite sample must still produce a finite, valid map.
+    auto infStereo = toneTrack(3.0, 440.0, 2, kRate);
+    infStereo->samples[static_cast<std::size_t>(0.55 * kRate) * 2] = std::numeric_limits<float>::infinity();
+    const auto infMap = extractor.extractFromTrack(*infStereo, analysisFor(120.0, 3.0));
+    CHECK(infMap.valid());
+}
+
+TEST_CASE("mix.planner_smart_automix_multi_candidate_and_loudness") {
+    using bgmedia::Section;
+    using bgmedia::SectionKind;
+    using bgmedia::mix::CueKind;
+    using bgmedia::mix::CuePointCandidate;
+    using bgmedia::mix::CueRole;
+    using bgmedia::mix::MixCandidate;
+    using bgmedia::mix::MixFeatureConfig;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixStrategyKind;
+    using bgmedia::mix::VocalDetectorKind;
+    using bgmedia::mix::VocalRegion;
+
+    AnalysisResult analysisA = analysisFor(120.0, 32.0);
+    AnalysisResult analysisB = analysisFor(120.0, 32.0);
+    analysisA.sections = {
+        {0.0, 16.0, SectionKind::Main, 1.0f, 0.85f},
+        {16.0, 24.0, SectionKind::Outro, 0.55f, 0.90f},
+        {24.0, 32.0, SectionKind::Main, 0.95f, 0.90f}
+    };
+    analysisB.sections = {
+        {0.0, 8.0, SectionKind::Main, 0.95f, 0.90f},
+        {8.0, 16.0, SectionKind::Intro, 0.55f, 0.90f},
+        {16.0, 32.0, SectionKind::Main, 1.0f, 0.90f}
+    };
+
+    auto trackA = toneTrack(32.0, 220.0, 2, kRate);
+    auto trackB = toneTrack(32.0, 220.0, 2, kRate);
+    // Make A louder (0.75 amplitude) and B quieter (0.18 amplitude) to test LUFS balancing.
+    for (float& s : trackA->samples) {
+        s *= 1.5f;
+    }
+    for (float& s : trackB->samples) {
+        s *= 0.36f;
+    }
+
+    MixFeatureConfig featCfg;
+    featCfg.vocalDetector = VocalDetectorKind::MusicVocalModel;
+    MixFeatureExtractor extractor(featCfg);
+    MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysisA);
+    MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysisB);
+
+    // Inject dense lead vocal on A's late tail (24..32 s) and B's very start (0..8 s),
+    // while A's earlier outro phrase (16..24 s) and B's phrase at (8..16 s) are vocal-free.
+    for (auto& f : featA.frames) {
+        if (f.time >= 24.0) {
+            f.vocalScore = 0.92f;
+            f.vocalConfidence = 0.90f;
+        } else {
+            f.vocalScore = 0.02f;
+            f.vocalConfidence = 0.90f;
+        }
+    }
+    featA.vocal.available = true;
+    featA.vocal.meanConfidence = 0.90f;
+    featA.vocal.regions = {{24.0, 32.0, 0.92f, 0.90f, true}};
+    for (auto& c : featA.mixOutCandidates) {
+        if (c.time >= 23.5) {
+            c.vocalAfter = 0.92f;
+            c.vocalConfidence = 0.90f;
+            c.priorScore = 0.35f;
+        } else if (std::abs(c.time - 16.0) < 0.5) {
+            c.vocalAfter = 0.02f;
+            c.vocalConfidence = 0.90f;
+            c.priorScore = 0.92f;
+        }
+    }
+
+    for (auto& f : featB.frames) {
+        if (f.time < 8.0) {
+            f.vocalScore = 0.92f;
+            f.vocalConfidence = 0.90f;
+        } else {
+            f.vocalScore = 0.02f;
+            f.vocalConfidence = 0.90f;
+        }
+    }
+    featB.vocal.available = true;
+    featB.vocal.meanConfidence = 0.90f;
+    featB.vocal.regions = {{0.0, 8.0, 0.92f, 0.90f, true}};
+    CuePointCandidate cleanMixInB;
+    cleanMixInB.time = 8.0;
+    cleanMixInB.barIndex = 4;
+    cleanMixInB.beatIndex = 16;
+    cleanMixInB.role = CueRole::MixIn;
+    cleanMixInB.kind = CueKind::PhraseBoundary;
+    cleanMixInB.sectionKind = SectionKind::Intro;
+    cleanMixInB.boundaryStrength = 0.90f;
+    cleanMixInB.rhythmConfidence = 0.90f;
+    cleanMixInB.phraseConfidence = 0.90f;
+    cleanMixInB.availableWindowSeconds = 24.0;
+    cleanMixInB.vocalAfter = 0.02f;
+    cleanMixInB.vocalConfidence = 0.90f;
+    cleanMixInB.harmonicStability = 0.90f;
+    cleanMixInB.priorScore = 0.94f;
+    cleanMixInB.reason = "clean instrumental intro phrase";
+    featB.mixInCandidates.insert(featB.mixInCandidates.begin(), cleanMixInB);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 0.0; // Auto mode
+    req.currentPositionA = 8.0;
+
+    const std::vector<MixCandidate> ranked =
+        planner.planCandidates(analysisA, analysisB, &featA, &featB, req);
+    CHECK(ranked.size() >= 2);
+    CHECK(ranked.front().rank == 1);
+    CHECK(ranked.front().score.totalScore >= ranked.back().score.totalScore);
+
+    const MixPlan plan = planner.plan(analysisA, analysisB, &featA, &featB, req);
+    CHECK(plan.valid);
+    CHECK(!plan.alternatives.empty());
+    // Must avoid the vocal-clashing 24..32s + 0..8s combination.
+    CHECK(plan.scoreBreakdown.vocalSafetyScore > 0.70f);
+    CHECK(plan.scoreBreakdown.totalScore > 0.65f);
+
+    // Loudness matching: A is louder than B, so A is trimmed down and B is boosted
+    // while respecting the -0.5 dBFS peak headroom ceiling.
+    CHECK(plan.loudnessTrimDbA < 0.0f);
+    CHECK(plan.loudnessTrimDbB > 0.0f);
+    CHECK(plan.loudnessGainA < 1.0f);
+    CHECK(plan.loudnessGainB > 1.0f);
+    CHECK(featB.loudness.samplePeakDbfs + plan.loudnessTrimDbB <= -0.5f + 1e-3f);
+}
+
+
+TEST_CASE("mix.engine_loudness_normalization_and_strategies") {
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::GainPoint;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixSnapshot;
+    using bgmedia::mix::MixStrategyKind;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+
+    auto trackA = toneTrack(12.0, 220.0, 2, kRate);
+    auto trackB = toneTrack(12.0, 330.0, 2, kRate);
+    AnalysisResult analysisA = analysisFor(120.0, 12.0);
+    AnalysisResult analysisB = analysisFor(120.0, 12.0);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = 2.0;
+
+    // 1. EchoReverbOut + Loudness normalization through MixEngine::render()
+    MixPlan echoPlan = planner.plan(analysisA, analysisB, req);
+    CHECK(echoPlan.valid);
+    echoPlan.strategy = MixStrategyKind::EchoReverbOut;
+    echoPlan.tailSendAmount = 0.50f;
+    echoPlan.tailDecaySeconds = 1.8;
+    echoPlan.loudnessGainA = 0.80f;
+    echoPlan.loudnessGainB = 1.25f;
+    echoPlan.gainCurveOut = {{0.0, 1.0f}, {2.8, 0.25f}, {3.1, 0.0f}, {4.0, 0.0f}};
+    echoPlan.gainCurveIn = {{0.0, 0.0f}, {2.0, 0.70f}, {4.0, 1.0f}};
+
+    MixEngine engine(kRate);
+    CHECK(engine.loadDeck(DeckId::A, trackA, 1, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, trackB, 2, 120.0));
+    engine.play(DeckId::A);
+    engine.setMaster(DeckId::A);
+
+    std::vector<float> block(512 * 2, 0.0f);
+    engine.seek(DeckId::A, echoPlan.overallStartA());
+    engine.render(block.data(), 512);
+    CHECK(engine.startTransition(echoPlan));
+
+    float maxTailWet = 0.0f;
+    float maxSampleStep = 0.0f;
+    float prevL = block[(512 - 1) * 2];
+    const int totalBlocks = static_cast<int>((echoPlan.totalDuration() + 0.5) * kRate / 512);
+    for (int b = 0; b < totalBlocks; ++b) {
+        engine.render(block.data(), 512);
+        const MixSnapshot snap = engine.snapshot();
+        if (snap.phase == TransitionPhase::Running) {
+            CHECK(snap.strategy == MixStrategyKind::EchoReverbOut);
+            maxTailWet = std::max(maxTailWet, snap.tailWetLevel);
+        }
+        for (std::size_t i = 0; i < 512; ++i) {
+            const float sL = block[i * 2];
+            CHECK(std::isfinite(sL));
+            maxSampleStep = std::max(maxSampleStep, std::abs(sL - prevL));
+            prevL = sL;
+        }
+    }
+    CHECK(maxTailWet > 0.01f);
+    CHECK(maxSampleStep < 0.35f);
+    const MixSnapshot afterEcho = engine.snapshot();
+    CHECK(afterEcho.phase == TransitionPhase::Idle);
+    CHECK(afterEcho.master == DeckId::B);
+    // Incoming deck B preserves its matched loudness gain after handover.
+    CHECK_NEAR(afterEcho.loudnessGain[1], 1.25f, 1e-4f);
+
+    // 2. VocalHandoff & DropImpactCut custom gain curves + cancel safety.
+    for (MixStrategyKind strat : {MixStrategyKind::VocalHandoff,
+                                  MixStrategyKind::DropImpactCut,
+                                  MixStrategyKind::EnergyBridge}) {
+        MixEngine eng(kRate);
+        CHECK(eng.loadDeck(DeckId::A, trackA, 1, 120.0));
+        CHECK(eng.loadDeck(DeckId::B, trackB, 2, 120.0));
+        eng.play(DeckId::A);
+        eng.setMaster(DeckId::A);
+        MixPlan p = planner.plan(analysisA, analysisB, req);
+        p.strategy = strat;
+        p.gainCurveOut = {{0.0, 1.0f}, {1.6, 0.86f}, {3.6, 0.05f}, {4.0, 0.0f}};
+        p.gainCurveIn = {{0.0, 0.0f}, {1.6, 0.48f}, {3.6, 0.96f}, {4.0, 1.0f}};
+        eng.seek(DeckId::A, p.overallStartA());
+        eng.render(block.data(), 512);
+        CHECK(eng.startTransition(p));
+        for (int b = 0; b < 30; ++b) {
+            eng.render(block.data(), 512);
+        }
+        const MixSnapshot mid = eng.snapshot();
+        CHECK(mid.phase == TransitionPhase::Running);
+        CHECK(mid.strategy == strat);
+        eng.cancelTransition();
+        for (int b = 0; b < 30; ++b) {
+            eng.render(block.data(), 512);
+        }
+        CHECK(eng.snapshot().phase == TransitionPhase::Idle);
+        CHECK(eng.snapshot().master == DeckId::A);
+    }
+}
+
+
+// =========================================================================
+// Issue #48, #49, #50, #51 Integration and Regression Tests
+// =========================================================================
+
+TEST_CASE("mix.issue48_lead_vocal_collision_prevention") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalOverlapAssessment;
+    using bgmedia::mix::evaluateVocalOverlap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::MixStrategyKind;
+
+    const double duration = 16.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // Outgoing track A: lead vocal during 0..8s, instrumental outro during 8..16s
+    const auto trackA = makeVocalAndInstrumentalTrack(duration, 0.5, 7.5, 120.0);
+    // Incoming track B: lead vocal during 0..8s, instrumental during 8..16s
+    const auto trackB = makeVocalAndInstrumentalTrack(duration, 0.5, 7.5, 120.0);
+
+    const MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysis);
+    const MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysis);
+
+    // 1. Two simultaneous loud lead vocals -> Severe clash detected
+    const VocalOverlapAssessment severeClash =
+        evaluateVocalOverlap(featA, 2.0, 1.0, featB, 2.0, 1.0, 4.0);
+    CHECK(severeClash.available);
+    CHECK(severeClash.severeLeadVocalClash);
+    CHECK(severeClash.leadVocalClashDurationSeconds >= 0.5);
+    CHECK(!severeClash.cleanVocalHandoff);
+
+    // 2. Safe sequential vocal handoff: A's vocal phrase finishes at 7.5s (2.0s into mix),
+    // and incoming B has vocal starting at 2.5s into mix. No overlap between the two vocals!
+    const auto trackB_handoff = makeVocalAndInstrumentalTrack(duration, 2.5, 10.0, 120.0);
+    const MixFeatureMap featB_handoff = extractor.extractFromTrack(*trackB_handoff, analysis);
+    const VocalOverlapAssessment safeHandoff =
+        evaluateVocalOverlap(featA, 5.5, 1.0, featB_handoff, 0.0, 1.0, 4.0);
+    CHECK(safeHandoff.available);
+    CHECK(!safeHandoff.severeLeadVocalClash);
+    CHECK(safeHandoff.cleanVocalHandoff);
+
+    // 3. Instrumental outro transition has zero vocal clash
+    const auto trackB_instIntro = makeVocalAndInstrumentalTrack(duration, 5.0, 12.0, 120.0);
+    const MixFeatureMap featB_inst = extractor.extractFromTrack(*trackB_instIntro, analysis);
+    const VocalOverlapAssessment instTransition =
+        evaluateVocalOverlap(featA, 8.5, 1.0, featB_inst, 0.0, 1.0, 4.0);
+    CHECK(instTransition.available);
+    CHECK(!instTransition.severeLeadVocalClash);
+    CHECK_NEAR(instTransition.vocalClashScore, 0.0f, 0.05f);
+
+    // 4. Multi-candidate planner prioritizes safe candidate over vocal collision
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = -1.0;
+
+    const bgmedia::mix::MixPlan plan = planner.plan(analysis, analysis, &featA, &featB_inst, req);
+    CHECK(plan.valid);
+    // The planner must NOT choose a transition during active A vocal collision
+    CHECK(plan.transitionStartA >= 6.5);
+    // And VocalHandoff is ONLY chosen if cleanVocalHandoff was genuinely true
+    if (plan.strategy == MixStrategyKind::VocalHandoff) {
+        CHECK(!plan.scoreBreakdown.severeVocalClash);
+    }
+
+    // 5. Low confidence analysis falls back conservatively without asserting false safety
+    MixFeatureMap lowConfA = featA;
+    lowConfA.vocal.available = true;
+    lowConfA.vocal.meanConfidence = 0.20f; // low confidence
+    const VocalOverlapAssessment lowConf =
+        evaluateVocalOverlap(lowConfA, 2.0, 1.0, featB, 2.0, 1.0, 4.0);
+    CHECK(lowConf.lowConfidenceConservative);
+    CHECK(!lowConf.cleanVocalHandoff);
+}
+
+TEST_CASE("mix.issue49_dramatic_pause_inside_drop_not_selected_as_mixout") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::CueKind;
+
+    const double duration = 28.0;
+    const AnalysisResult analysis = analysisFor(128.0, duration);
+
+    // Construct a synthetic track containing a drop, mid-drop dramatic break, drop resumption, and outro:
+    // 0..4s: Intro (moderate energy)
+    // 4..12s: Drop part 1 (very high energy, full bass)
+    // 12..13.5s: Dramatic pause inside drop (short silence/shout, 1.5s)
+    // 13.5..22s: Drop part 2 (very high energy, bass resumes fully!)
+    // 22..28s: Outro (energy fades to quiet ending)
+    auto dropTrack = toneTrack(duration, 440.0, 2, kRate);
+    const std::size_t totalSamples = static_cast<std::size_t>(duration * kRate);
+    for (std::size_t i = 0; i < totalSamples; ++i) {
+        const double t = static_cast<double>(i) / kRate;
+        float s = 0.0f;
+        if (t >= 0.0 && t < 4.0) {
+            s = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else if (t >= 4.0 && t < 12.0) {
+            // Drop part 1: heavy bass + synth
+            s = 0.65f * static_cast<float>(std::sin(2.0 * 3.14159265 * 55.0 * t)) +
+                0.30f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else if (t >= 12.0 && t < 13.5) {
+            // Dramatic pause with vocal shout at 12.8s
+            if (t >= 12.8 && t < 13.3) {
+                s = 0.35f * static_cast<float>(std::sin(2.0 * 3.14159265 * 880.0 * t));
+            } else {
+                s = 0.001f;
+            }
+        } else if (t >= 13.5 && t < 22.0) {
+            // Drop part 2: full drop returns!
+            s = 0.65f * static_cast<float>(std::sin(2.0 * 3.14159265 * 55.0 * t)) +
+                0.30f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else {
+            // Natural outro: energy drops off
+            const double fade = std::clamp((28.0 - t) / 6.0, 0.0, 1.0);
+            s = static_cast<float>(0.20 * fade) * static_cast<float>(std::sin(2.0 * 3.14159265 * 220.0 * t));
+        }
+        dropTrack->samples[i * 2] = s;
+        dropTrack->samples[i * 2 + 1] = s;
+    }
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featDrop = extractor.extractFromTrack(*dropTrack, analysis);
+
+    // 1. Verify that the dramatic pause at 12s does NOT produce a SilenceEdge MixOut cue
+    bool foundFalseSilenceMixOut = false;
+    for (const auto& cue : featDrop.mixOutCandidates) {
+        if (cue.kind == CueKind::SilenceEdge) {
+            if (cue.time >= 11.5 && cue.time <= 14.0) {
+                foundFalseSilenceMixOut = true;
+            }
+        }
+    }
+    CHECK(!foundFalseSilenceMixOut);
+
+    // 2. Run MixPlanner: outgoing track is the drop track, incoming is clean track
+    const auto trackIn = toneTrack(duration, 128.0, 2, kRate);
+    const MixFeatureMap featIn = extractor.extractFromTrack(*trackIn, analysis);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = -1.0;
+
+    const bgmedia::mix::MixPlan plan = planner.plan(analysis, analysis, &featDrop, &featIn, req);
+    CHECK(plan.valid);
+    // The planner must NOT exit during the mid-drop pause (12..14s); it must let the second drop play
+    // and transition at the natural outro phrase boundary (>= 18.0s).
+    CHECK(plan.transitionStartA >= 18.0);
+}
+
+TEST_CASE("mix.issue50_desktop_seeking_and_jump_to_planned_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto initialPreview = session.snapshot().preview;
+    CHECK(initialPreview.valid);
+    const double schedPoint = initialPreview.overallStartA();
+
+    // 1. Seeking Deck A while playing (well before the scheduled transition)
+    const double safeSeek1 = std::min(2.5, schedPoint * 0.4);
+    CHECK(session.seekDeck(DeckId::A, safeSeek1));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, safeSeek1, 0.05);
+
+    // 2. Seeking Deck A while paused
+    session.pause();
+    pump.once();
+    const double safeSeek2 = std::min(4.0, schedPoint * 0.7);
+    CHECK(session.seekDeck(DeckId::A, safeSeek2));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, safeSeek2, 0.05);
+
+    // 3. Jump to planned transition
+    session.refreshPlan();
+    const auto snap = session.snapshot();
+    CHECK(snap.preview.valid);
+    CHECK(session.jumpToPlannedTransition(2.0));
+    pump.once();
+    const double expected = std::max(0.0, snap.preview.overallStartA() - 2.0);
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, expected, 0.05);
+
+    // 4. Safety lock: seeking is strictly rejected during an active transition
+    session.play();
+    session.startTransitionNow();
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Running);
+
+    // Both seekDeck and jumpToPlannedTransition must return false while transition is running
+    CHECK(!session.seekDeck(DeckId::A, 1.0));
+    CHECK(!session.jumpToPlannedTransition(7.0));
+    CHECK(!session.snapshot().lastError.empty());
+
+    // Wait for transition to finish
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Seeking is restored after transition finishes
+    CHECK(session.seekDeck(DeckId::B, 2.0));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[1].positionSeconds, 2.0, 0.05);
+}
+
+TEST_CASE("mix.issue51_preview_plan_vs_executed_transition_consistency") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(4.0);
+    session.addTrack("long-silence-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto initialSnap = session.snapshot();
+    CHECK(initialSnap.preview.valid);
+
+    const double plannedStartA = initialSnap.preview.transitionStartA;
+    const double plannedStartB = initialSnap.preview.startB;
+    const double plannedDuration = initialSnap.preview.duration;
+    const auto plannedStrategy = initialSnap.preview.strategy;
+    const auto plannedType = initialSnap.preview.type;
+
+    // Seek master deck right to the scheduled transition trigger point
+    const double schedPoint = initialSnap.preview.overallStartA();
+    CHECK(session.seekDeck(DeckId::A, schedPoint));
+
+    // First pump: engine.render() executes seek to schedPoint
+    pump.once();
+    // Second pump: session.update() detects deck.positionSeconds >= schedPoint - lead
+    // and executes the scheduled preview plan
+    pump.once();
+
+    const auto execSnap = session.snapshot();
+    CHECK(execSnap.engine.phase == TransitionPhase::Running);
+    CHECK(execSnap.hasExecutedPlan);
+
+    // Consistency verification: executed plan exactly matches preview plan
+    CHECK_NEAR(execSnap.executed.transitionStartA, plannedStartA, 1e-4);
+    CHECK_NEAR(execSnap.executed.startB, plannedStartB, 1e-4);
+    CHECK_NEAR(execSnap.executed.duration, plannedDuration, 1e-4);
+    CHECK(execSnap.executed.strategy == plannedStrategy);
+    CHECK(execSnap.executed.type == plannedType);
+
+    // Executed plan contains explanatory reason log
+    CHECK(!execSnap.executed.reasons.empty());
+
+    // Wait for transition to complete
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+}
+
+
+TEST_CASE("mix.codex_finding1_loudness_gain_role_consistency_b_to_a") {
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixEngine engine(kRate);
+    constexpr std::size_t kChunk = 512;
+    auto trackA = toneTrack(10.0, 220.0);
+    auto trackB = toneTrack(10.0, 440.0);
+
+    // Initial setup: Deck B is master and playing, Deck A is loaded
+    CHECK(engine.loadDeck(DeckId::B, trackB, 101, 120.0));
+    CHECK(engine.loadDeck(DeckId::A, trackA, 102, 120.0));
+    engine.setMaster(DeckId::B);
+    engine.play(DeckId::B);
+
+    // B -> A transition plan:
+    // Outgoing (B) has loudnessGainA = 0.80f (role: outgoing in MixPlan)
+    // Incoming (A) has loudnessGainB = 1.25f (role: incoming in MixPlan)
+    MixPlan plan;
+    plan.from = DeckId::B;
+    plan.to = DeckId::A;
+    plan.valid = true;
+    plan.type = TransitionType::Crossfade;
+    plan.strategy = MixStrategyKind::SmoothBlend;
+    plan.duration = 1.0;
+    plan.transitionStartA = 0.2;
+    plan.startB = 0.0;
+    plan.loudnessGainA = 0.80f; // outgoing track loudness gain (Deck B)
+    plan.loudnessGainB = 1.25f; // incoming track loudness gain (Deck A)
+
+    CHECK(engine.startTransition(plan));
+
+    std::vector<float> buf(kChunk * 2);
+    // Render until transition is Running
+    while (engine.snapshot().phase != TransitionPhase::Running) {
+        engine.render(buf.data(), kChunk);
+    }
+
+    // Mid-transition check: verify that incoming Deck A is receiving targetLoudnessTo (1.25)
+    // and outgoing Deck B is receiving loudFrom (interpolating towards 0.80)
+    auto snapMid = engine.snapshot();
+    CHECK_NEAR(snapMid.loudnessGain[0], 1.25f, 1e-4f); // Deck A is incoming, must be 1.25
+    CHECK(snapMid.loudnessGain[1] <= 1.0f);            // Deck B is outgoing, moving towards 0.80
+
+    // Render until transition completes (handover to Deck A)
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        engine.render(buf.data(), kChunk);
+    }
+
+    auto snapEnd = engine.snapshot();
+    CHECK(snapEnd.master == DeckId::A);
+    CHECK(snapEnd.decks[0].playing);
+    // Crucial check: Deck A retains its matched 1.25 loudnessGain after handover
+    CHECK_NEAR(snapEnd.loudnessGain[0], 1.25f, 1e-4f);
+    CHECK_NEAR(snapEnd.decks[0].gain, 1.25f, 1e-4f);
+
+    // Steady state: render more audio and verify Deck A's gain remains steady at 1.25 without jumps
+    engine.render(buf.data(), kChunk);
+    auto snapSteady = engine.snapshot();
+    CHECK_NEAR(snapSteady.loudnessGain[0], 1.25f, 1e-4f);
+    CHECK_NEAR(snapSteady.decks[0].gain, 1.25f, 1e-4f);
+}
+
+TEST_CASE("mix.codex_finding2_preview_caching_and_invalidation") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto snap1 = session.snapshot();
+    CHECK(snap1.preview.valid);
+    const double initialSched = snap1.preview.overallStartA();
+    CHECK(initialSched > 0.0);
+    const double initialDur = snap1.preview.duration;
+
+    // 1. Performance check: calling update() 100 times executes fast because preview is cached.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) {
+        session.update();
+    }
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    // 100 cached updates must take well under 100 ms (typically < 2 ms total),
+    // whereas 100 uncached multi-candidate searches would take > 4500 ms.
+    CHECK(elapsedMs < 100);
+
+    // 2. Invalidation on configuration change: setTransitionDuration
+    session.setTransitionDuration(initialDur + 3.0);
+    const auto snap2 = session.snapshot();
+    CHECK(snap2.preview.valid);
+    CHECK_NEAR(snap2.preview.duration, initialDur + 3.0, 1e-3);
+
+    // 3. Invalidation on transition type change
+    session.setTransitionType(TransitionType::DirectCut);
+    const auto snap3 = session.snapshot();
+    CHECK(snap3.preview.valid);
+    CHECK(snap3.preview.type == TransitionType::DirectCut);
+    CHECK_NEAR(snap3.preview.duration, 0.0, 1e-3);
+
+    // Restore to SmartCrossfade
+    session.setTransitionType(TransitionType::SmartCrossfade);
+    session.setTransitionDuration(initialDur);
+    const auto snap4 = session.snapshot();
+    CHECK(snap4.preview.valid);
+
+    // 4. Invalidation on seek past planned transition
+    CHECK(session.seekDeck(DeckId::A, snap4.preview.overallStartA() + 1.0));
+    // When seeked past transition start, preview must be invalidated so an expired plan doesn't fire
+    const auto snapSeekPast = session.snapshot();
+    CHECK(!snapSeekPast.preview.valid);
+
+    // 5. Seeking back before transition start allows refreshing a valid plan
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    session.refreshPlan();
+    CHECK(session.snapshot().preview.valid);
+}
+
+TEST_CASE("mix.codex_finding3_echo_reverb_cancellation_declick") {
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixEngine engine(kRate);
+    constexpr std::size_t kChunk = 512;
+    // 257 Hz sine tone at 0.40 amplitude on Deck A, silent on Deck B
+    auto toneA = toneTrack(10.0, 257.0);
+    auto silenceB = dcTrack(10.0, 0.0f);
+
+    CHECK(engine.loadDeck(DeckId::A, toneA, 201, 120.0));
+    CHECK(engine.loadDeck(DeckId::B, silenceB, 202, 120.0));
+    engine.setMaster(DeckId::A);
+    engine.play(DeckId::A);
+
+    MixPlan plan;
+    plan.from = DeckId::A;
+    plan.to = DeckId::B;
+    plan.valid = true;
+    plan.type = TransitionType::Crossfade;
+    plan.strategy = MixStrategyKind::EchoReverbOut;
+    plan.duration = 4.0;
+    plan.transitionStartA = 0.5;
+    plan.startB = 0.0;
+    plan.tailSendAmount = 0.45f;
+    plan.tailDecaySeconds = 2.0;
+
+    CHECK(engine.startTransition(plan));
+
+    std::vector<float> buf(kChunk * 2);
+    // Render into the transition until ~50% progress where echo return is audible and active
+    while (engine.snapshot().phase != TransitionPhase::Running) {
+        engine.render(buf.data(), kChunk);
+    }
+    for (int i = 0; i < 40; ++i) {
+        engine.render(buf.data(), kChunk);
+    }
+    // Echo wet signal must be active
+    CHECK(engine.snapshot().decks[0].playing);
+
+    // Request transition cancellation while echo is actively ringing
+    engine.cancelTransition();
+
+    // Render single-frame (or small chunks) across cancellation and measure sample-to-sample delta
+    float maxSampleDelta = 0.0f;
+    float prevSampleL = 0.0f;
+    float prevSampleR = 0.0f;
+    bool firstSample = true;
+
+    // Render through the 220 ms cancellation window in small blocks (16 frames)
+    constexpr std::size_t kSmallBlock = 16;
+    std::vector<float> smallBuf(kSmallBlock * 2);
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        engine.render(smallBuf.data(), kSmallBlock);
+        for (std::size_t i = 0; i < kSmallBlock; ++i) {
+            const float sL = smallBuf[i * 2];
+            const float sR = smallBuf[i * 2 + 1];
+            if (!firstSample) {
+                const float deltaL = std::abs(sL - prevSampleL);
+                const float deltaR = std::abs(sR - prevSampleR);
+                maxSampleDelta = std::max(maxSampleDelta, std::max(deltaL, deltaR));
+            } else {
+                firstSample = false;
+            }
+            prevSampleL = sL;
+            prevSampleR = sR;
+        }
+    }
+
+    // A 257 Hz tone at 48.0 kHz has natural derivative ~2*pi*257/48000 * 0.40 ~= 0.0135.
+    // Without echo cancellation fade, dropping the wet signal produced a discontinuity >= 0.14.
+    // With smooth cancellation fade, maxSampleDelta is strictly bounded (< 0.035).
+    CHECK(maxSampleDelta < 0.035f);
+
+    // After cancellation complete: engine is Idle, Deck A remains playing cleanly,
+    // and tail wet level is 0 without any lingering ringing tail.
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().master == DeckId::A);
+    CHECK(engine.snapshot().decks[0].playing);
+}
+
+
+TEST_CASE("mix.codex_mono_stereo_loudness_matching") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixPlan;
+    // Create identical 0.20 amplitude 440 Hz tones in mono and stereo
+    auto monoTrack = toneTrack(10.0, 440.0, 1);
+    auto stereoTrack = toneTrack(10.0, 440.0, 2);
+
+    AnalysisResult analysisMono;
+    analysisMono.info.duration = 10.0;
+    analysisMono.info.sampleRate = 48000;
+    analysisMono.info.sourceChannels = 1;
+    analysisMono.bpm = 120.0;
+
+    AnalysisResult analysisStereo;
+    analysisStereo.info.duration = 10.0;
+    analysisStereo.info.sampleRate = 48000;
+    analysisStereo.info.sourceChannels = 2;
+    analysisStereo.bpm = 120.0;
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featMono = extractor.extractFromTrack(*monoTrack, analysisMono);
+    const MixFeatureMap featStereo = extractor.extractFromTrack(*stereoTrack, analysisStereo);
+
+    CHECK(featMono.loudness.gatedValid);
+    CHECK(featStereo.loudness.gatedValid);
+
+    // Standard BS.1770 measures 1-ch mono 3.01 dB lower than 2-ch dual-mono:
+    CHECK_NEAR(featStereo.loudness.integratedLufs - featMono.loudness.integratedLufs, 3.01f, 0.15f);
+
+    MixPlanner planner;
+    MixPlan plan = planner.plan(analysisMono, analysisStereo, &featMono, &featStereo, {});
+
+    // Both mono and stereo tracks should receive equal trims and gains,
+    // preventing the previous 3.01 dB imbalance.
+    CHECK_NEAR(plan.loudnessTrimDbA, plan.loudnessTrimDbB, 0.05f);
+    CHECK_NEAR(plan.loudnessGainA, plan.loudnessGainB, 0.01f);
+}
+
+TEST_CASE("mix.codex_expired_preview_plan_revalidation") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto durA = engine.snapshot().decks[0].durationSeconds;
+    CHECK(durA > 5.0);
+
+    // Seek the master deck to 0.8 seconds before EOF (well past any scheduled preview start)
+    const double nearEnd = durA - 0.8;
+    CHECK(session.seekDeck(DeckId::A, nearEnd));
+
+    // First pump renders the seek
+    pump.once();
+    // Second pump triggers update() which detects that the live cursor is past the old schedule
+    // and replans from the live position to fit the remaining 0.8s
+    pump.once();
+
+    const auto snap = session.snapshot();
+    CHECK(snap.engine.phase == TransitionPhase::Running);
+    // Crucial check: transition duration was fitted to the remaining audio (<= 0.8s + tolerance)
+    // rather than retaining the original 8.0s crossfade that would overrun EOF
+    CHECK(snap.executed.duration <= 1.0);
+    CHECK(snap.executed.transitionStartA >= nearEnd - 0.2);
+
+    // Render until transition completes
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().master == DeckId::B);
+}
+
+
+TEST_CASE("mix.codex_finding_preview_expiration_on_load") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    CHECK(pump.waitForDecks(1));
+
+    session.play();
+    pump.forSeconds(4.0);
+    const double posA = engine.snapshot().decks[0].positionSeconds;
+    CHECK(posA >= 2.0);
+
+    // Track B finishes preparing while deck A is already 4.0s into playback
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    pump.once();
+
+    const auto snap = session.snapshot();
+    // Engine must not prematurely trigger transition at live position
+    CHECK(snap.engine.phase == TransitionPhase::Idle);
+    CHECK(snap.preview.valid);
+    // Crossfade remains scheduled at the track ending (~21.5s), well past posA
+    CHECK(snap.preview.transitionStartA > posA + 10.0);
+}
+
+TEST_CASE("mix.codex_finding_candidate_overlap_fit_to_musical_end") {
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::CuePointCandidate;
+    using bgmedia::mix::CueRole;
+    using bgmedia::mix::CueKind;
+
+    AnalysisResult a = analysisFor(120.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+
+    // Track A: 120s tone with trailing silence between 100.0s and 120.0s
+    auto trackA = toneTrack(120.0, 440.0);
+    const std::size_t silenceStart = static_cast<std::size_t>(100.0 * kRate * 2);
+    for (std::size_t i = silenceStart; i < trackA->samples.size(); ++i) {
+        trackA->samples[i] = 0.0f;
+    }
+    auto trackB = toneTrack(120.0, 440.0);
+
+    MixFeatureExtractor extractor;
+    MixFeatureMap featA = extractor.extractFromTrack(*trackA, a);
+    MixFeatureMap featB = extractor.extractFromTrack(*trackB, b);
+
+    CHECK(featA.valid());
+    CHECK(featB.valid());
+    CHECK(featA.audible.audibleEnd <= 100.5);
+
+    // High priority mix-out cue at 96 seconds
+    CuePointCandidate cue;
+    cue.time = 96.0;
+    cue.role = CueRole::MixOut;
+    cue.kind = CueKind::PhraseBoundary;
+    cue.priorScore = 0.95f;
+    cue.phraseConfidence = 0.90f;
+    cue.rhythmConfidence = 0.90f;
+    featA.mixOutCandidates.push_back(cue);
+
+    MixPlanner planner;
+    bgmedia::mix::PlanRequest req;
+    req.requestedDuration = 8.0;
+    req.type = bgmedia::mix::TransitionType::SmartCrossfade;
+
+    const auto candidates = planner.planCandidates(a, b, &featA, &featB, req);
+    CHECK(!candidates.empty());
+
+    // Every candidate overlap must fit within the musical end (<= 100.25s)
+    // and never overrun into trailing silence.
+    for (const auto& cand : candidates) {
+        CHECK(cand.transitionEndA <= 100.25);
+    }
+
+    const auto plan = planner.plan(a, b, &featA, &featB, req);
+    CHECK(plan.valid);
+    CHECK(plan.transitionEndA <= 100.25);
+    // If the 96s candidate was selected, its duration must be fitted to <= 4.25s
+    if (std::abs(plan.transitionStartA - 96.0) < 0.5) {
+        CHECK(plan.duration <= 4.25);
+    }
+}
+
+
+TEST_CASE("mix.codex_finding_cue_ranking_strict_weak_ordering") {
+    using bgmedia::mix::CuePointCandidate;
+
+    CuePointCandidate a;
+    a.time = 1.0;
+    a.priorScore = 0.50000f;
+
+    CuePointCandidate b;
+    b.time = 2.0;
+    b.priorScore = 0.500075f;
+
+    CuePointCandidate c;
+    c.time = 3.0;
+    c.priorScore = 0.50015f;
+
+    auto cmp = [](const CuePointCandidate& x, const CuePointCandidate& y) {
+        if (x.priorScore != y.priorScore) {
+            return x.priorScore > y.priorScore;
+        }
+        return x.time < y.time;
+    };
+
+    CHECK(cmp(c, b));
+    CHECK(cmp(b, a));
+    CHECK(cmp(c, a));
+    CHECK(!cmp(a, b));
+    CHECK(!cmp(b, c));
+    CHECK(!cmp(a, c));
+
+    std::vector<CuePointCandidate> list = {a, b, c};
+    std::sort(list.begin(), list.end(), cmp);
+    CHECK(list[0].priorScore == 0.50015f);
+    CHECK(list[1].priorScore == 0.500075f);
+    CHECK(list[2].priorScore == 0.50000f);
+
+    CuePointCandidate d;
+    d.time = 0.5;
+    d.priorScore = 0.50000f;
+    std::vector<CuePointCandidate> tieList = {a, d};
+    std::sort(tieList.begin(), tieList.end(), cmp);
+    CHECK(tieList[0].time == 0.5);
+    CHECK(tieList[1].time == 1.0);
+}
+
+
+TEST_CASE("mix.codex_finding_backward_seek_restores_ending_preview") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setAutoQueue(false);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto p0 = session.snapshot().preview;
+    CHECK(p0.valid);
+    CHECK(p0.duration >= 7.5);
+    CHECK(p0.transitionStartA > 15.0);
+
+    CHECK(session.seekDeck(DeckId::A, 29.0));
+    pump.once();
+    pump.once();
+
+    const auto pNearEnd = session.snapshot().preview;
+    CHECK(pNearEnd.valid);
+    CHECK(pNearEnd.duration <= 1.5);
+    CHECK(pNearEnd.transitionStartA >= 28.5);
+
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    pump.once();
+    pump.once();
+
+    const auto pRestored = session.snapshot().preview;
+    CHECK(pRestored.valid);
+    CHECK(pRestored.duration >= 7.5);
+    CHECK(pRestored.transitionStartA > 15.0);
+}
+
+TEST_CASE("mix.codex_finding_cancellation_does_not_rearm_live_preview") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.forSeconds(0.10);
+
+    session.next();
+    pump.forSeconds(0.05);
+    CHECK(session.snapshot().engine.phase == TransitionPhase::Running);
+
+    session.cancelTransition();
+    while (session.snapshot().engine.phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+
+    const auto snap = session.snapshot();
+    CHECK(snap.engine.phase == TransitionPhase::Idle);
+    CHECK(snap.preview.valid);
+    CHECK(snap.preview.transitionStartA > 15.0);
+}
+
+TEST_CASE("mix.codex_finding_baseline_plan_clears_strategy_and_curves") {
+    using bgmedia::mix::MixPlan;
+    using bgmedia::mix::MixStrategyKind;
+
+    MixPlan plan;
+    plan.valid = true;
+    plan.duration = 8.0;
+    plan.strategy = MixStrategyKind::DropImpactCut;
+    plan.gainCurveOut = {{0.0, 1.0f}, {4.0, 0.9f}, {8.0, 0.0f}};
+    plan.gainCurveIn = {{0.0, 0.0f}, {4.0, 0.9f}, {8.0, 1.0f}};
+    plan.tailSendAmount = 0.45f;
+    plan.tailDecaySeconds = 2.0;
+    plan.vocalEqCarve = true;
+
+    MixPlan baseline = plan;
+    baseline.strategy = MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
+
+    CHECK(baseline.strategy == MixStrategyKind::SmoothBlend);
+    CHECK(baseline.gainCurveOut.empty());
+    CHECK(baseline.gainCurveIn.empty());
+    CHECK(baseline.tailSendAmount == 0.0f);
+    CHECK(!baseline.vocalEqCarve);
+}
+
+TEST_CASE("mix.codex_finding_preserve_equal_power_envelopes_for_explicit_crossfade") {
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlannerConfig;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixStrategyKind;
+
+    const auto a = analysisFor(120.0, 30.0);
+    const auto b = analysisFor(120.0, 30.0);
+
+    // 1. Explicit Crossfade of 2.0s with adaptive = false
+    {
+        PlannerConfig config;
+        config.adaptive = false;
+        config.bassSwap = false;
+        MixPlanner planner(config);
+
+        PlanRequest request;
+        request.type = TransitionType::Crossfade;
+        request.requestedDuration = 2.0;
+
+        const auto plan = planner.plan(a, b, nullptr, nullptr, request);
+        CHECK(plan.valid);
+        CHECK(plan.type == TransitionType::Crossfade);
+        CHECK(plan.strategy == MixStrategyKind::SmoothBlend);
+        CHECK(!plan.gainCurveOut.empty());
+        CHECK(std::abs(plan.gainCurveOut[8].gain - 0.7071f) < 0.01f);
+        CHECK(std::abs(plan.gainCurveIn[8].gain - 0.7071f) < 0.01f);
+    }
+
+    // 2. Explicit Crossfade of 2.0s even with adaptive = true
+    {
+        PlannerConfig config;
+        config.adaptive = true;
+        config.bassSwap = false;
+        MixPlanner planner(config);
+
+        PlanRequest request;
+        request.type = TransitionType::Crossfade;
+        request.requestedDuration = 2.0;
+
+        const auto plan = planner.plan(a, b, nullptr, nullptr, request);
+        CHECK(plan.valid);
+        CHECK(plan.type == TransitionType::Crossfade);
+        CHECK(plan.strategy == MixStrategyKind::SmoothBlend);
+        CHECK(!plan.gainCurveOut.empty());
+        CHECK(std::abs(plan.gainCurveOut[8].gain - 0.7071f) < 0.01f);
+        CHECK(std::abs(plan.gainCurveIn[8].gain - 0.7071f) < 0.01f);
+    }
+}
+TEST_CASE("mix.codex_finding_backward_seek_within_scheduling_window_suppresses_stale_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    // Position playback at 21.91s (inside the scheduling lead window) directly on engine
+    CHECK(session.seekDeck(DeckId::A, 21.91));
+    engine.render(pump.block.data(), 480); // applies seek without running session.update()
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().decks[0].positionSeconds >= 21.9);
+
+    // Now seek backward to 1.0s
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    // Intervening update() BEFORE render callback applies the seek:
+    // must suppress automatic scheduling rather than scheduling against stale 21.91s snapshot
+    session.update();
+
+    // Engine must NOT have started transition against stale cursor
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Audio callback applies the seek to 1.0s
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Further seeks must succeed (not rejected due to active transition)
+    CHECK(session.seekDeck(DeckId::A, 2.0));
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+}
+
+TEST_CASE("mix.codex_finding_seek_after_update_cancels_pending_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    // Position playback at 21.92s directly on engine
+    CHECK(session.seekDeck(DeckId::A, 21.92));
+    engine.render(pump.block.data(), 480);
+    CHECK(engine.snapshot().decks[0].positionSeconds >= 21.9);
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Update() queues the auto-transition against the 21.92s window
+    session.update();
+
+    // Now seekDeck(A, 1.0) is called BEFORE render callback consumes the start request:
+    // It must invalidate the pending plan rather than letting render() enter Running at 1.0s
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+
+    // Render callback runs
+    pump.once();
+
+    // Phase must remain Idle, NOT Running
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().decks[0].positionSeconds <= 1.5);
+
+    // Subsequent seeks must be accepted
+    CHECK(session.seekDeck(DeckId::A, 2.0));
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
 }

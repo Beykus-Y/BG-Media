@@ -352,6 +352,7 @@ struct MixLayout {
     Rect deckGainMinus[2]{};
     Rect deckGainPlus[2]{};
     Rect deckWave[2]{};
+    Rect jumpTransitionButton{};
     Rect queueRow[8]{};
     Rect queueRemove[8]{};
 };
@@ -563,6 +564,8 @@ struct DesktopApp::Impl {
     std::string mixError;
     bool mixPlanDetail = false;
     float mixDeckGain[2] = {1.0f, 1.0f};
+    int mixScrubbingDeck = -1;
+    double mixScrubTime = 0.0;
     std::vector<float> mixSilentPump;
 
     // ---------------------------------------------------------------
@@ -2800,6 +2803,27 @@ struct DesktopApp::Impl {
             if (scrubbing) {
                 scrubPosition = xToTime(static_cast<float>(mouseX), layout.plot);
             }
+            if (module == Module::Mix && mixScrubbingDeck >= 0 && mixSession) {
+                const auto snap = mixSession->snapshot();
+                if (snap.engine.phase == mix::TransitionPhase::Idle) {
+                    const int i = mixScrubbingDeck;
+                    const auto deckId = i == 0 ? mix::DeckId::A : mix::DeckId::B;
+                    const auto& dStatus = snap.engine.decks[i];
+                    if (dStatus.loaded && dStatus.durationSeconds > 0.0) {
+                        const float relX = std::clamp(
+                            (static_cast<float>(mouseX) - mixLayout.deckWave[i].x) /
+                                std::max(1.0f, mixLayout.deckWave[i].w),
+                            0.0f, 1.0f);
+                        const double targetSeconds =
+                            static_cast<double>(relX) * dStatus.durationSeconds;
+                        mixScrubTime = targetSeconds;
+                        mixSession->seekDeck(deckId, targetSeconds);
+                        if (deckId == snap.engine.master) {
+                            dance.setGrid(danceGrid(), danceTime());
+                        }
+                    }
+                }
+            }
             if (panning) {
                 const double span = timelineSpan();
                 const double delta =
@@ -3335,6 +3359,9 @@ struct DesktopApp::Impl {
             const bool resume = resumeAfterScrub;
             seekTo(xToTime(x, layout.plot), resume);
             resumeAfterScrub = false;
+        }
+        if (mixScrubbingDeck >= 0) {
+            mixScrubbingDeck = -1;
         }
     }
 
@@ -5484,6 +5511,7 @@ void DesktopApp::Impl::computeMixLayout() {
 
     mixLayout.timeline = { plan.x + 16.0f, plan.y + 90.0f, plan.w - 32.0f,
                            std::clamp(plan.h * 0.16f, 40.0f, 58.0f) };
+    mixLayout.jumpTransitionButton = { plan.right() - 176.0f, plan.y + 11.0f, 160.0f, 22.0f };
 
     const float displayY = control.bottom() - 42.0f;
     const float displayW = (innerW - 12.0f) / 3.0f;
@@ -5654,6 +5682,14 @@ void DesktopApp::Impl::drawMixDeck(const Rect& card, mix::DeckId deck,
                formatTime(status.positionSeconds, true) + " / " +
                formatTime(status.durationSeconds) + "  ·  " +
                formatNumber(status.rate * 100.0, 1) + "%";
+        if (const auto feat = mixSession->deckFeatures(deck)) {
+            if (!feat->harmony.camelotCode.empty()) {
+                info += "  ·  " + feat->harmony.camelotCode;
+            }
+            if (feat->loudness.gatedValid) {
+                info += "  ·  " + formatNumber(feat->loudness.integratedLufs, 1) + " LUFS";
+            }
+        }
         if (status.ended) {
             info += "  ·  END";
         }
@@ -5714,12 +5750,84 @@ void DesktopApp::Impl::drawMixDeck(const Rect& card, mix::DeckId deck,
             ui::thickLine(renderer, x, y0, x, y1, 1.2f,
                           theme::alpha(tint, 0.78f), false);
         }
+        // Draw cue markers and transition bands
+        if (snap.preview.valid) {
+            if (snap.preview.from == deck) {
+                // Outgoing deck: tempo ramp start and mix-out cues
+                if (snap.preview.tempoRampStartA >= 0.0 &&
+                    snap.preview.tempoRampStartA < snap.preview.transitionStartA) {
+                    const float rx = wave.x + static_cast<float>(
+                        std::clamp(snap.preview.tempoRampStartA / duration, 0.0, 1.0)) * wave.w;
+                    const float mx = wave.x + static_cast<float>(
+                        std::clamp(snap.preview.transitionStartA / duration, 0.0, 1.0)) * wave.w;
+                    ui::fillRect(renderer, { rx, wave.y, std::max(2.0f, mx - rx), wave.h },
+                                 theme::alpha(theme::amber, 0.14f));
+                    ui::thickLine(renderer, rx, wave.y + 2.0f, rx, wave.bottom() - 2.0f,
+                                  1.4f, theme::amber, false);
+                    label("RAMP", rx + 3.0f, wave.y + 4.0f, 7, theme::amber, 0.8f);
+                }
+                const float x0 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.transitionStartA / duration, 0.0, 1.0)) * wave.w;
+                const float x1 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.transitionEndA / duration, 0.0, 1.0)) * wave.w;
+                ui::thickLine(renderer, x0, wave.y + 2.0f, x0, wave.bottom() - 2.0f,
+                              1.8f, theme::accent, false);
+                label("MIX OUT", x0 + 3.0f, wave.y + 4.0f, 7, theme::accent, 0.9f);
+                ui::thickLine(renderer, x1, wave.y + 2.0f, x1, wave.bottom() - 2.0f,
+                              1.2f, theme::alpha(theme::accent, 0.6f), false);
+                label("END", std::max(wave.x + 4.0f, x1 - 22.0f), wave.bottom() - 14.0f,
+                      6, theme::dim, 0.6f);
+            } else if (snap.preview.to == deck) {
+                // Incoming deck: mix-in cue marker
+                const float bx0 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.startB / duration, 0.0, 1.0)) * wave.w;
+                const float bx1 = wave.x + static_cast<float>(
+                    std::clamp(snap.preview.endB / duration, 0.0, 1.0)) * wave.w;
+                ui::thickLine(renderer, bx0, wave.y + 2.0f, bx0, wave.bottom() - 2.0f,
+                              1.8f, theme::violet, false);
+                label("MIX IN", bx0 + 3.0f, wave.y + 4.0f, 7, theme::violet, 0.9f);
+                ui::thickLine(renderer, bx1, wave.y + 2.0f, bx1, wave.bottom() - 2.0f,
+                              1.2f, theme::alpha(theme::violet, 0.6f), false);
+            }
+        }
+
+        // Bottom progress track
+        const float trackH = 3.0f;
+        const Rect progTrack{ wave.x + 2.0f, wave.bottom() - 5.0f, wave.w - 4.0f, trackH };
+        ui::fillRoundedRect(renderer, progTrack, 1.5f, theme::alpha(theme::white, 0.08f));
+
         if (status.loaded && status.durationSeconds > 0.0) {
+            const double curPos = (mixScrubbingDeck == idx) ? mixScrubTime : status.positionSeconds;
             const float px = wave.x + static_cast<float>(
-                std::clamp(status.positionSeconds / status.durationSeconds,
-                           0.0, 1.0)) * wave.w;
-            ui::thickLine(renderer, px, wave.y + 2.0f, px, wave.bottom() - 2.0f,
-                          1.6f, theme::text, false);
+                std::clamp(curPos / status.durationSeconds, 0.0, 1.0)) * wave.w;
+            // Progress fill
+            ui::fillRoundedRect(renderer,
+                                { progTrack.x, progTrack.y,
+                                  std::max(0.0f, px - progTrack.x), trackH },
+                                1.5f, theme::alpha(tint, 0.70f));
+            // Interactive Playhead
+            ui::thickLine(renderer, px, wave.y + 1.0f, px, wave.bottom() - 1.0f,
+                          2.0f, theme::white, false);
+            ui::fillCircle(renderer, px, wave.y + 4.0f, 3.5f, theme::white);
+            ui::fillCircle(renderer, px, wave.bottom() - 4.0f, 3.5f, theme::white);
+
+            // Time badge on hover or scrub
+            if (hover(wave) || mixScrubbingDeck == idx) {
+                const float hx = (mixScrubbingDeck == idx) ? px : static_cast<float>(mouseX);
+                const double hoverSec = (mixScrubbingDeck == idx)
+                    ? curPos
+                    : static_cast<double>(std::clamp((hx - wave.x) / std::max(1.0f, wave.w),
+                                                    0.0f, 1.0f)) * status.durationSeconds;
+                const std::string badge = formatTime(hoverSec, true);
+                const float badgeW = 48.0f;
+                const float badgeX = std::clamp(hx - badgeW * 0.5f, wave.x + 4.0f,
+                                               wave.right() - badgeW - 4.0f);
+                const Rect badgeRect{ badgeX, wave.y + 18.0f, badgeW, 16.0f };
+                ui::fillRoundedRect(renderer, badgeRect, 4.0f, theme::panel);
+                ui::strokeRoundedRect(renderer, badgeRect, 4.0f, theme::border, 1.0f);
+                text->drawCentered(badge, badgeRect.centerX(), badgeRect.y + 3.0f, 8,
+                                   FontWeight::SemiBold, theme::text);
+            }
         }
     } else {
         text->drawCentered("NO WAVEFORM", wave.centerX(),
@@ -5751,6 +5859,11 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
                FontWeight::SemiBold, theme::text);
 
     const mix::MixPlan& plan = snap.preview;
+    if (plan.valid) {
+        const bool activeTrans = snap.engine.phase != mix::TransitionPhase::Idle;
+        drawMixButton(mixLayout.jumpTransitionButton, ">> JUMP TO MIX (-7s)", false,
+                      activeTrans ? theme::dim : theme::accent);
+    }
     if (!plan.valid) {
         label("NO PLAN", card.x + 16.0f, card.y + 40.0f, 9, theme::amber, 1.4f);
         body("Load two tracks and press play. The planner needs a prepared",
@@ -5796,7 +5909,9 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
     if (plan.tempoMatchKind != mix::TempoMatchKind::None) {
         route += " (" + std::string(mix::tempoMatchKindName(plan.tempoMatchKind)) + ")";
     }
-    route += "  ·  " + formatNumber(plan.duration, 1) + " s";
+    route += "  ·  " + formatNumber(plan.duration, 1) + " s  ·  " +
+             std::string(mix::mixStrategyKindShortName(plan.strategy)) + " (" +
+             formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%)";
     label(route, card.x + 16.0f, card.y + 56.0f, 8, theme::muted, 0.8f);
 
     std::string alignment;
@@ -6161,8 +6276,9 @@ void DesktopApp::Impl::drawMixScreen() {
                 title += " (" + std::to_string(plan.metricRelation.bBeats) + ":" +
                          std::to_string(plan.metricRelation.aBeats) + ")";
             }
-            title += "  ·  " + formatNumber(plan.duration, 2) + " s  ·  " +
-                     formatNumber(plan.confidence * 100.0, 0) + "% confidence";
+            title += "  ·  " + std::string(mix::mixStrategyKindName(plan.strategy)) +
+                     "  ·  " + formatNumber(plan.duration, 2) + " s  ·  score " +
+                     formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%";
             body(title, card.x + 22.0f, card.y + 68.0f, 14, theme::text,
                  FontWeight::SemiBold);
             const Rect curve{ card.x + 22.0f, card.y + 96.0f, card.w - 44.0f,
@@ -6218,10 +6334,21 @@ void DesktopApp::Impl::drawMixScreen() {
                 label("TEMPO (AMBER) · OUT GAIN (GREEN) · IN GAIN (VIOLET)",
                       curve.x + 8.0f, curve.y + 5.0f, 7, theme::dim, 0.5f);
             }
-            float y = curve.bottom() + 12.0f;
+            float y = curve.bottom() + 10.0f;
+            const std::string breakdownLine =
+                "SCORE BREAKDOWN  ·  PHRASE " +
+                formatNumber(plan.scoreBreakdown.phraseBoundaryScore * 100.0, 0) + "%  ·  RHYTHM " +
+                formatNumber(plan.scoreBreakdown.rhythmBeatScore * 100.0, 0) + "%  ·  VOCAL SAFETY " +
+                formatNumber(plan.scoreBreakdown.vocalSafetyScore * 100.0, 0) + "%  ·  HARMONIC " +
+                formatNumber(plan.scoreBreakdown.harmonicScore * 100.0, 0) + "%  ·  ENERGY " +
+                formatNumber(plan.scoreBreakdown.energyContinuityScore * 100.0, 0) + "%  ·  LUFS " +
+                formatNumber(plan.scoreBreakdown.loudnessBalanceScore * 100.0, 0) + "%";
+            label(ellipsize(*text, breakdownLine, card.w - 44.0f, 8, FontWeight::SemiBold),
+                  card.x + 22.0f, y, 8, theme::accent, 0.5f);
+            y += 16.0f;
             int shown = 0;
             for (const std::string& reason : plan.reasons) {
-                if (shown >= 7) {
+                if (shown >= 5) {
                     break;
                 }
                 body("- " + ellipsize(*text, reason, card.w - 68.0f, 10,
@@ -6229,6 +6356,27 @@ void DesktopApp::Impl::drawMixScreen() {
                      card.x + 22.0f, y, 10, theme::muted);
                 y += 16.0f;
                 ++shown;
+            }
+            if (!plan.alternatives.empty()) {
+                y += 4.0f;
+                label("RANKED CANDIDATES", card.x + 22.0f, y, 8, theme::violet, 0.8f);
+                y += 14.0f;
+                const std::size_t maxAlt = std::min<std::size_t>(3, plan.alternatives.size());
+                for (std::size_t i = 0; i < maxAlt; ++i) {
+                    const auto& alt = plan.alternatives[i];
+                    const std::string altLine =
+                        "#" + std::to_string(alt.rank) + " [" +
+                        std::string(mix::mixStrategyKindShortName(alt.strategy)) + "] A " +
+                        formatNumber(alt.transitionStartA, 1) + "->" +
+                        formatNumber(alt.transitionEndA, 1) + " s, B " +
+                        formatNumber(alt.startB, 1) + " s (" +
+                        formatNumber(alt.duration, 1) + " s) · score " +
+                        formatNumber(alt.score.totalScore * 100.0, 0) + "% · " +
+                        alt.rationale;
+                    body(ellipsize(*text, altLine, card.w - 44.0f, 9, FontWeight::Regular),
+                         card.x + 22.0f, y, 9, i == 0 ? theme::text : theme::dim);
+                    y += 14.0f;
+                }
             }
             if (!plan.fallbackReason.empty()) {
                 body("Fallback: " + plan.fallbackReason, card.x + 22.0f, y, 10,
@@ -6263,6 +6411,50 @@ void DesktopApp::Impl::handleMixClick(float x, float y, int clicks) {
         return;
     }
     auto hit = [&](const Rect& rect) { return rect.w > 0.0f && rect.contains(x, y); };
+
+    if (hit(mixLayout.jumpTransitionButton)) {
+        const auto snap = mixSession->snapshot();
+        if (snap.engine.phase != mix::TransitionPhase::Idle) {
+            showToast("Seeking disabled during active transition");
+            return;
+        }
+        if (!snap.preview.valid) {
+            showToast("No transition plan preview available");
+            return;
+        }
+        if (mixSession->jumpToPlannedTransition(7.0)) {
+            dance.setGrid(danceGrid(), danceTime());
+            showToast("Jumped to transition (-7s)");
+        } else {
+            showToast("Cannot jump to planned transition");
+        }
+        return;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (hit(mixLayout.deckWave[i])) {
+            const auto snap = mixSession->snapshot();
+            if (snap.engine.phase != mix::TransitionPhase::Idle) {
+                showToast("Seeking disabled during active transition");
+                return;
+            }
+            const auto deckId = i == 0 ? mix::DeckId::A : mix::DeckId::B;
+            const auto& dStatus = snap.engine.decks[i];
+            if (!dStatus.loaded || dStatus.durationSeconds <= 0.0) {
+                return;
+            }
+            const float relX = std::clamp((x - mixLayout.deckWave[i].x) /
+                                              std::max(1.0f, mixLayout.deckWave[i].w),
+                                          0.0f, 1.0f);
+            const double targetSeconds = static_cast<double>(relX) * dStatus.durationSeconds;
+            mixScrubbingDeck = i;
+            mixScrubTime = targetSeconds;
+            mixSession->seekDeck(deckId, targetSeconds);
+            if (deckId == snap.engine.master) {
+                dance.setGrid(danceGrid(), danceTime());
+            }
+            return;
+        }
+    }
 
     if (hit(mixLayout.addButton) || hit(mixLayout.openDeckA) ||
         hit(mixLayout.openDeckB)) {

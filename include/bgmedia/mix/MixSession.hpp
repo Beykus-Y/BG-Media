@@ -6,6 +6,7 @@
 
 #include "bgmedia/analysis/AnalysisResult.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 #include "bgmedia/mix/MixTypes.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
@@ -27,6 +28,7 @@ namespace bgmedia::mix {
 struct PreparedMixTrack {
     std::shared_ptr<const PcmTrack> audio;
     std::shared_ptr<const AnalysisResult> analysis;
+    std::shared_ptr<const MixFeatureMap> features;
 };
 
 // Returns false with `error` set on failure. The progress callback may be
@@ -100,11 +102,23 @@ public:
     [[nodiscard]] int phraseBars() const noexcept { return phraseBars_; }
     [[nodiscard]] bool autoQueue() const noexcept { return autoQueue_; }
 
+    // Seeks a loaded deck to position in seconds.
+    // Safe policy: rejected (returns false) during an active transition to prevent clicks/desync.
+    bool seekDeck(DeckId deck, double seconds);
+
+    // Jumps the master deck to ~leadSeconds before the planned transition start for rapid auditioning.
+    bool jumpToPlannedTransition(double leadSeconds = 7.0);
+
+    // Explicitly rebuilds the transition plan preview.
+    void refreshPlan();
+
     // Must be called from the UI thread every frame.
     void update();
 
     [[nodiscard]] MixSessionSnapshot snapshot() const;
     [[nodiscard]] std::shared_ptr<const AnalysisResult> deckAnalysis(
+        DeckId deck) const;
+    [[nodiscard]] std::shared_ptr<const MixFeatureMap> deckFeatures(
         DeckId deck) const;
     [[nodiscard]] std::string deckName(DeckId deck) const;
     [[nodiscard]] MixEngine& engine() noexcept { return engine_; }
@@ -118,6 +132,7 @@ private:
         float progress = 0.0f;
         std::shared_ptr<const PcmTrack> audio;
         std::shared_ptr<const AnalysisResult> analysis;
+        std::shared_ptr<const MixFeatureMap> features;
         std::string error;
     };
 
@@ -135,7 +150,7 @@ private:
     void collectCompleted();
     void serviceDecks();
     void handleTransitionCompletion();
-    void refreshPlan();
+    void executeScheduledTransition(const MixPlan& plannedPreview);
     [[nodiscard]] double deckPosition(DeckId deck) const;
     [[nodiscard]] DeckId masterDeck() const;
     [[nodiscard]] double deckDuration(DeckId deck) const;
@@ -147,6 +162,8 @@ private:
                                     const MixSnapshot& snap,
                                     double durationOverride, bool execution);
     void promoteEndedMaster(const MixSnapshot& snap);
+    void ensurePlanValid();
+    void invalidatePlan();
 
     MixEngine& engine_;
     MixPrepareCallback prepare_;
@@ -180,6 +197,13 @@ private:
     std::string status_;
     std::string lastError_;
     MixPlan preview_;
+    MixPlan lastExecutedPlan_;
+    bool hasExecutedPlan_ = false;
+    bool planDirty_ = true;
+    bool previewIsExecution_ = false;
+    std::uint64_t cachedFromId_ = 0;
+    std::uint64_t cachedToId_ = 0;
+    DeckId cachedMasterDeck_ = DeckId::A;
 
     std::thread worker_;
     std::mutex jobMutex_;

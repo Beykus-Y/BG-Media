@@ -1,11 +1,12 @@
 #pragma once
 
 // BG Mix Transition Planner: a deterministic, explainable mapping from two
-// BG Beat analysis results to one transition plan. The planner never "decides"
-// silently: every recommendation carries reasons and every fallback carries a
-// fallbackReason.
+// BG Beat analysis results (and optional BG Mix 0.3 feature maps) to one
+// transition plan. The planner never "decides" silently: every recommendation
+// carries reasons and every fallback carries a fallbackReason.
 
 #include "bgmedia/analysis/AnalysisResult.hpp"
+#include "bgmedia/mix/MixFeatureMap.hpp"
 #include "bgmedia/mix/MixTypes.hpp"
 
 #include <string>
@@ -33,6 +34,22 @@ public:
     // Plans a transition from A to B. `a` and `b` must outlive the call.
     [[nodiscard]] MixPlan plan(const AnalysisResult& a, const AnalysisResult& b,
                                const PlanRequest& request) const;
+
+    // Context-aware overload accepting optional BG Mix 0.3 feature maps.
+    // When either pointer is null or invalid, the planner deterministically
+    // synthesizes a fallback feature map from AnalysisResult alone.
+    [[nodiscard]] MixPlan plan(const AnalysisResult& a, const AnalysisResult& b,
+                               const MixFeatureMap* featuresA,
+                               const MixFeatureMap* featuresB,
+                               const PlanRequest& request) const;
+
+    // Evaluates and ranks multiple (Mix-Out, Mix-In, duration, strategy)
+    // transition candidates using the musical feature maps of both tracks.
+    [[nodiscard]] std::vector<MixCandidate> planCandidates(
+        const AnalysisResult& a, const AnalysisResult& b,
+        const MixFeatureMap* featuresA,
+        const MixFeatureMap* featuresB,
+        const PlanRequest& request) const;
 
     // Chooses the default crossfade length from BG Beat sections/confidence.
     [[nodiscard]] double suggestDuration(const AnalysisResult& a,

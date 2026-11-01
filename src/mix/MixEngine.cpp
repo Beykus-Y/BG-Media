@@ -75,6 +75,9 @@ MixEngine::MixEngine(std::uint32_t outputSampleRate)
     snapshotBuffers_[1] = initial;
     scratchA_.resize(kChunkFrames * 2);
     scratchB_.resize(kChunkFrames * 2);
+    tailMaxFrames_ = std::max<std::size_t>(4096, static_cast<std::size_t>(outputSampleRate_) * 2);
+    tailBuffer_.assign(tailMaxFrames_ * 2, 0.0f);
+    resetTailEcho();
     for (int i = 0; i < 2; ++i) {
         decks_[i].owned.reset();
         decks_[i].audio.store(nullptr, std::memory_order_relaxed);
@@ -242,6 +245,7 @@ void MixEngine::pause(DeckId deck) {
 }
 
 void MixEngine::seek(DeckId deck, double seconds) {
+    planReady_.store(false, std::memory_order_release);
     DeckRuntime& runtime = decks_[deckIndex(deck)];
     runtime.seekSeconds.store(std::max(0.0, seconds), std::memory_order_release);
     runtime.seekSerial.fetch_add(1, std::memory_order_acq_rel);
@@ -259,6 +263,12 @@ void MixEngine::setDeckRate(DeckId deck, double rate) {
 
 void MixEngine::setMaster(DeckId deck) {
     master_.store(deckIndex(deck), std::memory_order_release);
+}
+
+bool MixEngine::hasPendingSeek(DeckId deck) const noexcept {
+    const auto idx = deckIndex(deck);
+    return decks_[idx].seekSerial.load(std::memory_order_acquire) !=
+           decks_[idx].seekApplied.load(std::memory_order_acquire);
 }
 
 bool MixEngine::startTransition(const MixPlan& plan) {
@@ -281,6 +291,7 @@ bool MixEngine::startTransition(const MixPlan& plan) {
 }
 
 void MixEngine::cancelTransition() {
+    planReady_.store(false, std::memory_order_release);
     if (phase_.load(std::memory_order_acquire) ==
         static_cast<int>(Phase::Running)) {
         cancelRequested_.store(true, std::memory_order_release);
@@ -289,7 +300,12 @@ void MixEngine::cancelTransition() {
 
 bool MixEngine::transitionActive() const noexcept {
     return phase_.load(std::memory_order_acquire) !=
-           static_cast<int>(Phase::Idle);
+           static_cast<int>(Phase::Idle) ||
+           planReady_.load(std::memory_order_acquire);
+}
+
+bool MixEngine::hasPendingTransition() const noexcept {
+    return planReady_.load(std::memory_order_acquire);
 }
 
 void MixEngine::setPaused(bool paused) {
@@ -382,6 +398,139 @@ EqGains MixEngine::planEq(const EqGainPoint* points, int count,
     gains.mid = last.mid;
     gains.high = last.high;
     return gains;
+}
+
+float MixEngine::planGain(const GainPoint* points, int count,
+                          double elapsed, float fallback) const noexcept {
+    if (count <= 0) {
+        return fallback;
+    }
+    if (elapsed <= points[0].time) {
+        return std::clamp(points[0].gain, 0.0f, 1.0f);
+    }
+    for (int i = 1; i < count; ++i) {
+        if (elapsed <= points[i].time) {
+            const GainPoint& a = points[i - 1];
+            const GainPoint& b = points[i];
+            const double span = std::max(1e-9, b.time - a.time);
+            const float t = static_cast<float>(
+                std::clamp((elapsed - a.time) / span, 0.0, 1.0));
+            return std::clamp(a.gain + (b.gain - a.gain) * t, 0.0f, 1.0f);
+        }
+    }
+    return std::clamp(points[count - 1].gain, 0.0f, 1.0f);
+}
+
+void MixEngine::resetTailEcho() noexcept {
+    if (!tailBuffer_.empty()) {
+        std::memset(tailBuffer_.data(), 0, tailBuffer_.size() * sizeof(float));
+    }
+    tailWriteIndex_ = 0;
+    tailHpState_[0] = 0.0f;
+    tailHpState_[1] = 0.0f;
+    tailPrevInput_[0] = 0.0f;
+    tailPrevInput_[1] = 0.0f;
+    tailLpState_[0] = 0.0f;
+    tailLpState_[1] = 0.0f;
+    tailWetLevel_ = 0.0f;
+}
+
+void MixEngine::configureTailEcho(double bpm, double decaySeconds) noexcept {
+    resetTailEcho();
+    const double safeBpm = (bpm >= 50.0 && bpm <= 220.0) ? bpm : 120.0;
+    const double beatSeconds = 60.0 / safeBpm;
+    // Dotted-eighth (0.75 beat) and half-beat (0.50 beat) stereo ping-pong taps.
+    const double delaySecL = std::clamp(beatSeconds * 0.50, 0.12, 0.65);
+    const double delaySecR = std::clamp(beatSeconds * 0.75, 0.16, 0.85);
+    const std::size_t maxFrames = tailMaxFrames_ > 16 ? (tailMaxFrames_ - 8) : 1;
+    tailDelayFramesL_ = std::clamp<std::size_t>(
+        static_cast<std::size_t>(std::llround(delaySecL * outputSampleRate_)),
+        64, maxFrames);
+    tailDelayFramesR_ = std::clamp<std::size_t>(
+        static_cast<std::size_t>(std::llround(delaySecR * outputSampleRate_)),
+        64, maxFrames);
+    const double safeDecay = std::clamp(decaySeconds, 0.4, 4.5);
+    const double avgDelay = 0.5 * (delaySecL + delaySecR);
+    // RT60-inspired feedback coefficient clamped for musical stability.
+    tailFeedback_ = static_cast<float>(
+        std::clamp(std::pow(0.001, avgDelay / safeDecay), 0.18, 0.76));
+}
+
+void MixEngine::processTailEcho(float* stereo, std::size_t frames,
+                                double progress0, double progress1,
+                                bool cancelling,
+                                float cancelFade0, float cancelFade1) noexcept {
+    if (!stereo || frames == 0 || tailBuffer_.empty() || tailMaxFrames_ == 0 ||
+        runtime_.tailSendAmount <= 0.0f) {
+        tailWetLevel_ = 0.0f;
+        return;
+    }
+    const float sr = static_cast<float>(std::max<std::uint32_t>(1, outputSampleRate_));
+    // 1-pole high-pass (~180 Hz) and low-pass (~4200 Hz) damping coefficients.
+    const float hpAlpha = std::clamp(1.0f / (1.0f + 2.0f * 3.14159265f * 180.0f / sr), 0.85f, 0.995f);
+    const float lpAlpha = std::clamp(1.0f - std::exp(-2.0f * 3.14159265f * 4200.0f / sr), 0.05f, 0.85f);
+    const float maxSend = std::clamp(runtime_.tailSendAmount, 0.0f, 0.90f);
+
+    float blockWetPeak = 0.0f;
+    for (std::size_t i = 0; i < frames; ++i) {
+        const double t = frames > 1 ? static_cast<double>(i) / static_cast<double>(frames - 1) : 1.0;
+        float sendGain = 0.0f;
+        float wetGain = 0.0f;
+        if (!cancelling) {
+            const double p = std::clamp(progress0 + (progress1 - progress0) * t, 0.0, 1.0);
+            // Feed the echo line across the first 78% of the transition, and let
+            // the wet return decay smoothly to zero at p = 1.0 so there is no step.
+            const float sendEnv = (p < 0.80)
+                                      ? static_cast<float>(std::sin(3.14159265358979323846 * (p / 0.80)))
+                                      : 0.0f;
+            const float wetReturnEnv = static_cast<float>(std::sin(3.14159265358979323846 * p));
+            sendGain = maxSend * sendEnv;
+            wetGain = (0.55f + 0.35f * maxSend) * wetReturnEnv;
+        } else {
+            // During cancellation, do not send more dry signal into the delay.
+            // Fade the existing echo return smoothly to zero over the cancellation envelope.
+            sendGain = 0.0f;
+            const float cancelFade = std::clamp(
+                cancelFade0 + (cancelFade1 - cancelFade0) * static_cast<float>(t),
+                0.0f, 1.0f);
+            wetGain = cancelWetGainStart_ * cancelFade;
+        }
+
+        const std::size_t readL =
+            (tailWriteIndex_ + tailMaxFrames_ - tailDelayFramesL_) % tailMaxFrames_;
+        const std::size_t readR =
+            (tailWriteIndex_ + tailMaxFrames_ - tailDelayFramesR_) % tailMaxFrames_;
+
+        const float delayedL = sanitize(tailBuffer_[readL * 2]);
+        const float delayedR = sanitize(tailBuffer_[readR * 2 + 1]);
+
+        const float dryL = sanitize(stereo[i * 2]);
+        const float dryR = sanitize(stereo[i * 2 + 1]);
+
+        // Cross-channel diffusion (22%) creates a lush stereo echo/reverb wash.
+        const float fbInL = dryL * sendGain + (0.78f * delayedL + 0.22f * delayedR) * tailFeedback_;
+        const float fbInR = dryR * sendGain + (0.78f * delayedR + 0.22f * delayedL) * tailFeedback_;
+
+        // High-pass then low-pass in the feedback path so bass never muddies the incoming deck.
+        tailHpState_[0] = hpAlpha * (tailHpState_[0] + fbInL - tailPrevInput_[0]);
+        tailPrevInput_[0] = fbInL;
+        tailLpState_[0] += lpAlpha * (tailHpState_[0] - tailLpState_[0]);
+
+        tailHpState_[1] = hpAlpha * (tailHpState_[1] + fbInR - tailPrevInput_[1]);
+        tailPrevInput_[1] = fbInR;
+        tailLpState_[1] += lpAlpha * (tailHpState_[1] - tailLpState_[1]);
+
+        tailBuffer_[tailWriteIndex_ * 2] = sanitize(tailLpState_[0]);
+        tailBuffer_[tailWriteIndex_ * 2 + 1] = sanitize(tailLpState_[1]);
+        tailWriteIndex_ = (tailWriteIndex_ + 1) % tailMaxFrames_;
+
+        const float wetL = delayedL * wetGain;
+        const float wetR = delayedR * wetGain;
+        stereo[i * 2] = dryL + wetL;
+        stereo[i * 2 + 1] = dryR + wetR;
+        blockWetPeak = std::max(blockWetPeak, std::max(std::abs(wetL), std::abs(wetR)));
+    }
+    tailWetLevel_ = blockWetPeak;
 }
 
 TransitionStage MixEngine::liveStage() const noexcept {
@@ -509,6 +658,39 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     for (int i = 0; i < runtime_.eqInCount; ++i) {
         runtime_.eqIn[i] = plan.eqCurveIn[static_cast<std::size_t>(i)];
     }
+    runtime_.gainOutCount =
+        std::min<int>(static_cast<int>(plan.gainCurveOut.size()), 64);
+    for (int i = 0; i < runtime_.gainOutCount; ++i) {
+        runtime_.gainOut[i] = plan.gainCurveOut[static_cast<std::size_t>(i)];
+    }
+    runtime_.gainInCount =
+        std::min<int>(static_cast<int>(plan.gainCurveIn.size()), 64);
+    for (int i = 0; i < runtime_.gainInCount; ++i) {
+        runtime_.gainIn[i] = plan.gainCurveIn[static_cast<std::size_t>(i)];
+    }
+    runtime_.strategy = plan.strategy;
+    runtime_.useCustomGainCurve =
+        (plan.strategy != MixStrategyKind::SmoothBlend) &&
+        (runtime_.gainOutCount >= 2 && runtime_.gainInCount >= 2);
+    runtime_.startLoudnessFrom = std::clamp(from.loudnessGain, 0.25f, 2.5f);
+    runtime_.targetLoudnessFrom = std::clamp(
+        plan.loudnessGainA,
+        0.25f, 2.5f);
+    runtime_.targetLoudnessTo = std::clamp(
+        plan.loudnessGainB,
+        0.25f, 2.5f);
+    to.loudnessGain = runtime_.targetLoudnessTo;
+    runtime_.tailSendAmount =
+        (plan.strategy == MixStrategyKind::EchoReverbOut || plan.tailSendAmount > 0.0f)
+            ? std::clamp(plan.tailSendAmount > 0.0f ? plan.tailSendAmount : 0.45f, 0.0f, 0.90f)
+            : 0.0f;
+    runtime_.tailDecaySeconds = std::clamp(plan.tailDecaySeconds, 0.4, 4.5);
+    if (runtime_.tailSendAmount > 0.0f) {
+        configureTailEcho(from.analysedBpm.load(std::memory_order_acquire),
+                          runtime_.tailDecaySeconds);
+    } else {
+        resetTailEcho();
+    }
 
     // A playing deck keeps its cursor, WSOLA history and EQ state. A stopped
     // deck is cued to the planned point. This is what makes NEXT/auto-start
@@ -558,7 +740,8 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
         to.playing = true;
         to.ended = false;
         to.targetPlay.store(true, std::memory_order_release);
-        to.gain = 1.0f;
+        to.loudnessGain = runtime_.targetLoudnessTo;
+        to.gain = runtime_.targetLoudnessTo;
         to.fade = 1.0f;
         master_.store(deckIndex(runtime_.to), std::memory_order_release);
         runtimeStarted_ = false;
@@ -593,6 +776,7 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         phase_.store(static_cast<int>(Phase::Idle), std::memory_order_release);
         runtimeStarted_ = false;
         handoverDone_ = false;
+        resetTailEcho();
     }
 
     // loadDeck()/clearDeck() publish a reset serial instead of writing the
@@ -610,6 +794,7 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             deck.ended = false;
             deck.fade = 0.0f;
             deck.gain = 0.0f;
+            deck.loudnessGain = 1.0f;
             deck.wasTargetPlaying = false;
             resetStretchStream(i == 0 ? DeckId::A : DeckId::B, 0.0);
         }
@@ -622,8 +807,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     for (int i = 0; i < 2; ++i) {
         DeckRuntime& deck = decks_[i];
         const std::uint64_t serial = deck.seekSerial.load(std::memory_order_acquire);
-        if (serial != deck.seekApplied) {
-            deck.seekApplied = serial;
+        if (serial != deck.seekApplied.load(std::memory_order_relaxed)) {
+            deck.seekApplied.store(serial, std::memory_order_release);
             if (const PcmTrack* source = deck.audio.load(std::memory_order_acquire)) {
                 const double seconds =
                     deck.seekSeconds.load(std::memory_order_acquire);
@@ -668,7 +853,23 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         cancelRateStart_ = std::clamp(planRate(elapsed), 0.25, 2.0);
         cancelEqOutStart_ = planEq(runtime_.eqOut, runtime_.eqOutCount, elapsed);
         cancelEqInStart_ = planEq(runtime_.eqIn, runtime_.eqInCount, elapsed);
+        const float defOut = equalPowerOut(cancelStartProgress_);
+        const float defIn = equalPowerIn(cancelStartProgress_);
+        cancelGainOutStart_ = runtime_.useCustomGainCurve
+                                  ? planGain(runtime_.gainOut, runtime_.gainOutCount, elapsed, defOut)
+                                  : defOut;
+        cancelGainInStart_ = runtime_.useCustomGainCurve
+                                 ? planGain(runtime_.gainIn, runtime_.gainInCount, elapsed, defIn)
+                                 : defIn;
+        cancelLoudnessFromStart_ = decks_[deckIndex(runtime_.from)].loudnessGain;
         cancelIncomingStarted_ = incomingStarted_;
+        if (runtime_.tailSendAmount > 0.0f && framesRendered_ >= transitionStartFrame_) {
+            cancelWetGainStart_ =
+                (0.55f + 0.35f * std::clamp(runtime_.tailSendAmount, 0.0f, 0.90f)) *
+                static_cast<float>(std::sin(3.14159265358979323846 * cancelStartProgress_));
+        } else {
+            cancelWetGainStart_ = 0.0f;
+        }
     }
 
     // A play request on an empty deck is a no-op. Without this the deck would
@@ -792,10 +993,6 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         if (running) {
             fromDeck = runtime_.from;
             toDeck = runtime_.to;
-            gainFrom0 = equalPowerOut(progress0);
-            gainFrom1 = equalPowerOut(progress1);
-            gainTo0 = equalPowerIn(progress0);
-            gainTo1 = equalPowerIn(progress1);
             const double elapsed0 =
                 (static_cast<double>(framesRendered_) -
                  static_cast<double>(transitionStartFrame_)) /
@@ -805,6 +1002,33 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                  static_cast<double>(chunk) -
                  static_cast<double>(transitionStartFrame_)) /
                 outputSampleRate_;
+            const float eqOut0 = equalPowerOut(progress0);
+            const float eqOut1 = equalPowerOut(progress1);
+            const float eqIn0 = equalPowerIn(progress0);
+            const float eqIn1 = equalPowerIn(progress1);
+            if (runtime_.useCustomGainCurve && framesRendered_ >= transitionStartFrame_) {
+                gainFrom0 = planGain(runtime_.gainOut, runtime_.gainOutCount, elapsed0, eqOut0);
+                gainFrom1 = planGain(runtime_.gainOut, runtime_.gainOutCount, elapsed1, eqOut1);
+                gainTo0 = planGain(runtime_.gainIn, runtime_.gainInCount, elapsed0, eqIn0);
+                gainTo1 = planGain(runtime_.gainIn, runtime_.gainInCount, elapsed1, eqIn1);
+            } else {
+                gainFrom0 = eqOut0;
+                gainFrom1 = eqOut1;
+                gainTo0 = eqIn0;
+                gainTo1 = eqIn1;
+            }
+            const float loudFrom0 = runtime_.startLoudnessFrom +
+                                    (runtime_.targetLoudnessFrom - runtime_.startLoudnessFrom) *
+                                        static_cast<float>(progress0);
+            const float loudFrom1 = runtime_.startLoudnessFrom +
+                                    (runtime_.targetLoudnessFrom - runtime_.startLoudnessFrom) *
+                                        static_cast<float>(progress1);
+            decks_[deckIndex(fromDeck)].loudnessGain = loudFrom1;
+            decks_[deckIndex(toDeck)].loudnessGain = runtime_.targetLoudnessTo;
+            gainFrom0 *= loudFrom0;
+            gainFrom1 *= loudFrom1;
+            gainTo0 *= runtime_.targetLoudnessTo;
+            gainTo1 *= runtime_.targetLoudnessTo;
             if (framesRendered_ < runtime_.rampStartFrame) {
                 // Waiting for a future musical event: keep the deck's current
                 // playback rate, not the transition automation's first point.
@@ -847,12 +1071,19 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             const double t1 = std::clamp(
                 static_cast<double>(framesRendered_ + chunk - cancelStartFrame_) / span,
                 0.0, 1.0);
-            const float originalFrom = equalPowerOut(cancelStartProgress_);
-            const float originalTo = equalPowerIn(cancelStartProgress_);
-            gainFrom0 = originalFrom + (1.0f - originalFrom) * static_cast<float>(t0);
-            gainFrom1 = originalFrom + (1.0f - originalFrom) * static_cast<float>(t1);
-            gainTo0 = originalTo * (1.0f - static_cast<float>(t0));
-            gainTo1 = originalTo * (1.0f - static_cast<float>(t1));
+            const float originalFrom = cancelGainOutStart_;
+            const float originalTo = cancelGainInStart_;
+            const float loudFrom0 = cancelLoudnessFromStart_ +
+                                    (runtime_.startLoudnessFrom - cancelLoudnessFromStart_) *
+                                        static_cast<float>(t0);
+            const float loudFrom1 = cancelLoudnessFromStart_ +
+                                    (runtime_.startLoudnessFrom - cancelLoudnessFromStart_) *
+                                        static_cast<float>(t1);
+            decks_[deckIndex(fromDeck)].loudnessGain = loudFrom1;
+            gainFrom0 = (originalFrom + (1.0f - originalFrom) * static_cast<float>(t0)) * loudFrom0;
+            gainFrom1 = (originalFrom + (1.0f - originalFrom) * static_cast<float>(t1)) * loudFrom1;
+            gainTo0 = (originalTo * (1.0f - static_cast<float>(t0))) * runtime_.targetLoudnessTo;
+            gainTo1 = (originalTo * (1.0f - static_cast<float>(t1))) * runtime_.targetLoudnessTo;
             if (!cancelIncomingStarted_) {
                 gainTo0 = 0.0f;
                 gainTo1 = 0.0f;
@@ -899,10 +1130,11 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
         // Independent deck playback outside a transition.
         if (!running && !cancelling) {
+            tailWetLevel_ = 0.0f;
             DeckRuntime& a = decks_[0];
             DeckRuntime& b = decks_[1];
-            gainFrom0 = gainFrom1 = a.userGain.load(std::memory_order_relaxed);
-            gainTo0 = gainTo1 = b.userGain.load(std::memory_order_relaxed);
+            gainFrom0 = gainFrom1 = a.userGain.load(std::memory_order_relaxed) * a.loudnessGain;
+            gainTo0 = gainTo1 = b.userGain.load(std::memory_order_relaxed) * b.loudnessGain;
             if (!a.targetPlay.load(std::memory_order_relaxed)) {
                 gainFrom0 = gainFrom1 = 0.0f;
             }
@@ -927,6 +1159,27 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
 
         renderDeck(fromDeck, scratchA_.data(), chunk, gainFrom0, gainFrom1,
                    rateFrom0, rateFrom1, eqFrom0, eqFrom1);
+        if ((running || (cancelling && cancelWetGainStart_ > 0.0f)) &&
+            framesRendered_ >= transitionStartFrame_ &&
+            runtime_.tailSendAmount > 0.0f) {
+            float cancelFade0 = 1.0f;
+            float cancelFade1 = 1.0f;
+            if (cancelling) {
+                const double span = std::max(1.0, kCancelSeconds * outputSampleRate_);
+                const double t0 = std::clamp(
+                    static_cast<double>(framesRendered_ - cancelStartFrame_) / span,
+                    0.0, 1.0);
+                const double t1 = std::clamp(
+                    static_cast<double>(framesRendered_ + chunk - cancelStartFrame_) / span,
+                    0.0, 1.0);
+                cancelFade0 = 1.0f - static_cast<float>(t0);
+                cancelFade1 = 1.0f - static_cast<float>(t1);
+            }
+            processTailEcho(scratchA_.data(), chunk, progress0, progress1,
+                            cancelling, cancelFade0, cancelFade1);
+        } else {
+            tailWetLevel_ = 0.0f;
+        }
         renderDeck(toDeck, scratchB_.data(), chunk, gainTo0, gainTo1, rateTo,
                    rateTo, eqTo0, eqTo1);
 
@@ -1041,6 +1294,9 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                 decks_[deckIndex(from)].rampRate = 1.0;
                 master_.store(deckIndex(from), std::memory_order_release);
             }
+            resetTailEcho();
+            tailWetLevel_ = 0.0f;
+            cancelWetGainStart_ = 0.0f;
         }
         if (phase_.load(std::memory_order_acquire) ==
             static_cast<int>(Phase::Idle)) {
@@ -1200,6 +1456,9 @@ void MixEngine::finishTransition() noexcept {
     from.fade = 0.0f;
     from.rate = 1.0;
     from.rampRate = 1.0;
+    from.loudnessGain = 1.0f;
+    to.loudnessGain = runtime_.targetLoudnessTo;
+    resetTailEcho();
     to.targetPlay.store(true, std::memory_order_release);
     to.rate = 1.0;
     to.rampRate = 1.0;
@@ -1219,7 +1478,11 @@ void MixEngine::publishSnapshot() noexcept {
                                 ? TransitionPhase::Cancelling
                                 : TransitionPhase::Idle);
     snapshot.transitionType = runtime_.type;
+    snapshot.strategy = runtime_.strategy;
     snapshot.stage = liveStage();
+    snapshot.loudnessGain[0] = decks_[0].loudnessGain;
+    snapshot.loudnessGain[1] = decks_[1].loudnessGain;
+    snapshot.tailWetLevel = tailWetLevel_;
     if (phase != static_cast<int>(Phase::Idle)) {
         const double sampleRate = static_cast<double>(outputSampleRate_);
         const double preSeconds = static_cast<double>(
@@ -1294,6 +1557,7 @@ void MixEngine::publishSnapshot() noexcept {
         deck.peak = runtime.blockPeak;
         deck.sampleRate = source ? source->sampleRate : 0;
         deck.channels = source ? source->channels : 0;
+        deck.seekApplied = runtime.seekApplied.load(std::memory_order_relaxed);
     }
 
     if (snapshotLock_.test_and_set(std::memory_order_acquire)) {

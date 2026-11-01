@@ -49,6 +49,28 @@ const char* tempoMatchKindName(TempoMatchKind kind) noexcept {
     return "unknown";
 }
 
+const char* mixStrategyKindName(MixStrategyKind kind) noexcept {
+    switch (kind) {
+    case MixStrategyKind::SmoothBlend: return "Smooth Blend";
+    case MixStrategyKind::VocalHandoff: return "Vocal Handoff";
+    case MixStrategyKind::DropImpactCut: return "Drop / Impact Cut";
+    case MixStrategyKind::EnergyBridge: return "Energy Bridge";
+    case MixStrategyKind::EchoReverbOut: return "Echo / Reverb Out";
+    }
+    return "Smooth Blend";
+}
+
+const char* mixStrategyKindShortName(MixStrategyKind kind) noexcept {
+    switch (kind) {
+    case MixStrategyKind::SmoothBlend: return "BLEND";
+    case MixStrategyKind::VocalHandoff: return "VOCAL";
+    case MixStrategyKind::DropImpactCut: return "IMPACT";
+    case MixStrategyKind::EnergyBridge: return "BRIDGE";
+    case MixStrategyKind::EchoReverbOut: return "ECHO";
+    }
+    return "BLEND";
+}
+
 const char* transitionTypeShortName(TransitionType type) noexcept {
     switch (type) {
     case TransitionType::Off: return "OFF";

@@ -48,6 +48,7 @@ public:
     void setDeckGain(DeckId deck, float gain);
     void setDeckRate(DeckId deck, double rate);
     void setMaster(DeckId deck);
+    [[nodiscard]] bool hasPendingSeek(DeckId deck) const noexcept;
 
     // The plan is copied into a fixed-size runtime block. Returns false when a
     // transition is already running or the plan is invalid.
@@ -55,6 +56,7 @@ public:
     // Reverse-fades to the outgoing deck and stops the incoming deck.
     void cancelTransition();
     [[nodiscard]] bool transitionActive() const noexcept;
+    [[nodiscard]] bool hasPendingTransition() const noexcept;
 
     // Global transport freeze. Both decks and the transition clock stop.
     void setPaused(bool paused);
@@ -102,6 +104,17 @@ private:
         EqGainPoint eqOut[64]{};
         int eqInCount = 0;
         EqGainPoint eqIn[64]{};
+        int gainOutCount = 0;
+        GainPoint gainOut[64]{};
+        int gainInCount = 0;
+        GainPoint gainIn[64]{};
+        MixStrategyKind strategy = MixStrategyKind::SmoothBlend;
+        bool useCustomGainCurve = false;
+        float startLoudnessFrom = 1.0f;
+        float targetLoudnessFrom = 1.0f;
+        float targetLoudnessTo = 1.0f;
+        float tailSendAmount = 0.0f;
+        double tailDecaySeconds = 1.8;
         bool directCut = false;
         bool tempoRamp = false;
         bool bassSwap = false;
@@ -129,7 +142,7 @@ private:
         // overwrite it while the callback is still reading the previous one;
         // seekSerial only tells the callback that a new value is available.
         std::atomic<double> seekSeconds{0.0};
-        std::uint64_t seekApplied = 0;
+        std::atomic<std::uint64_t> seekApplied{0};
 
         // Audio-thread reset request. loadDeck()/clearDeck() must not touch
         // positionFrames/playing/gain: those belong to the callback.
@@ -142,6 +155,7 @@ private:
         double rampRate = 1.0;
         float gain = 0.0f;
         float fade = 0.0f;
+        float loudnessGain = 1.0f;
         bool playing = false;
         bool ended = false;
         bool wasTargetPlaying = false;
@@ -157,6 +171,14 @@ private:
     [[nodiscard]] double planRate(double elapsed) const noexcept;
     [[nodiscard]] EqGains planEq(const EqGainPoint* points, int count,
                                  double elapsed) const noexcept;
+    [[nodiscard]] float planGain(const GainPoint* points, int count,
+                                 double elapsed, float fallback) const noexcept;
+    void resetTailEcho() noexcept;
+    void configureTailEcho(double bpm, double decaySeconds) noexcept;
+    void processTailEcho(float* stereo, std::size_t frames, double progress0,
+                         double progress1, bool cancelling = false,
+                         float cancelFade0 = 1.0f,
+                         float cancelFade1 = 1.0f) noexcept;
     [[nodiscard]] TransitionStage liveStage() const noexcept;
     void renderDeck(DeckId deck, float* out, std::size_t frames, float gain0,
                     float gain1, double rate0, double rate1, EqGains eq0,
@@ -215,6 +237,9 @@ private:
     double cancelRateStart_ = 1.0;
     EqGains cancelEqOutStart_{};
     EqGains cancelEqInStart_{};
+    float cancelGainOutStart_ = 1.0f;
+    float cancelGainInStart_ = 0.0f;
+    float cancelLoudnessFromStart_ = 1.0f;
     bool cancelIncomingStarted_ = false;
     bool incomingStarted_ = false;
     std::uint64_t lastCompletionFrame_ = 0;
@@ -232,6 +257,17 @@ private:
     float outputPeak_ = 0.0f;
     std::vector<float> scratchA_;
     std::vector<float> scratchB_;
+    std::vector<float> tailBuffer_;
+    std::size_t tailMaxFrames_ = 0;
+    std::size_t tailWriteIndex_ = 0;
+    std::size_t tailDelayFramesL_ = 12000;
+    std::size_t tailDelayFramesR_ = 16000;
+    float tailFeedback_ = 0.45f;
+    float tailHpState_[2] = {0.0f, 0.0f};
+    float tailPrevInput_[2] = {0.0f, 0.0f};
+    float tailLpState_[2] = {0.0f, 0.0f};
+    float tailWetLevel_ = 0.0f;
+    float cancelWetGainStart_ = 0.0f;
 
     // Snapshot publication: the audio thread writes the inactive buffer and
     // publishes it with a short-lived flag. It never blocks on the UI thread:

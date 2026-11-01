@@ -7,6 +7,7 @@
 
 #include "bgmedia/audio/MiniaudioMixDevice.hpp"
 #include "bgmedia/audio/MiniaudioMixLoader.hpp"
+#include "bgmedia/mix/HarmonicAnalyzer.hpp"
 #include "bgmedia/mix/MixEngine.hpp"
 #include "bgmedia/mix/MixPlanner.hpp"
 
@@ -268,6 +269,44 @@ bool prepare(const Options& options, const std::filesystem::path& path,
     std::printf("  prepared %s in %.0f ms (%.1f s, %.1f BPM, conf %.2f)\n",
                 label, ms, out.audio->duration(), out.analysis->bpm,
                 static_cast<double>(out.analysis->bpmConfidence));
+    if (out.features && out.features->valid()) {
+        std::printf(
+            "    features: %.1f LUFS (plain RMS %.1f dBFS, LRA %.1f LU), "
+            "audible %.2f..%.2f s (body %.2f..%.2f s, fadeIn=%d fadeOut=%d reverbTail=%d), "
+            "bars=%zu phrases=%zu mixInCues=%zu mixOutCues=%zu\n",
+            static_cast<double>(out.features->loudness.integratedLufs),
+            static_cast<double>(out.features->loudness.meanRmsDbfs),
+            static_cast<double>(out.features->loudness.loudnessRangeLu),
+            out.features->audible.audibleStart,
+            out.features->audible.audibleEnd,
+            out.features->audible.fullBodyStart,
+            out.features->audible.tailStart,
+            out.features->audible.hasFadeIn ? 1 : 0,
+            out.features->audible.hasFadeOut ? 1 : 0,
+            out.features->audible.hasReverbTail ? 1 : 0,
+            out.features->bars.size(),
+            out.features->phrases.size(),
+            out.features->mixInCandidates.size(),
+            out.features->mixOutCandidates.size());
+        std::printf(
+            "    vocal/harmony: vocal=%s (avail=%d activeRatio=%.2f conf=%.2f regions=%zu), "
+            "key=%s (%s, avail=%d conf=%.2f tonalness=%.2f segments=%zu)\n",
+            bgmedia::mix::vocalDetectorKindName(out.features->vocal.detectorKind),
+            out.features->vocal.available ? 1 : 0,
+            static_cast<double>(out.features->vocal.activeRatio),
+            static_cast<double>(out.features->vocal.meanConfidence),
+            out.features->vocal.regions.size(),
+            bgmedia::mix::HarmonicAnalyzer::keyName(
+                out.features->harmony.keyIndex, out.features->harmony.isMinor)
+                .c_str(),
+            out.features->harmony.camelotCode.empty()
+                ? "-"
+                : out.features->harmony.camelotCode.c_str(),
+            out.features->harmony.available ? 1 : 0,
+            static_cast<double>(out.features->harmony.keyConfidence),
+            static_cast<double>(out.features->harmony.tonalness),
+            out.features->harmony.segments.size());
+    }
     return true;
 }
 
@@ -301,7 +340,8 @@ MixPlan planTransition(const Options& options, const PreparedMixTrack& a,
     request.currentPositionA = snap.decks[0].positionSeconds;
     request.autoStart = true;
     request.trackNameB = b.audio ? "B" : "";
-    return planner.plan(*a.analysis, *b.analysis, request);
+    return planner.plan(*a.analysis, *b.analysis,
+                        a.features.get(), b.features.get(), request);
 }
 
 void printPlan(const MixPlan& plan) {
@@ -338,6 +378,36 @@ void printPlan(const MixPlan& plan) {
         std::printf("    tempo curve: %zu points, %.4f -> %.4f\n",
                     plan.tempoCurve.size(), plan.tempoCurve.front().rate,
                     plan.tempoCurve.back().rate);
+    }
+    std::printf(
+        "    smart: strategy=%s bassSwapPos=%.2f vocalCarve=%d loudnessTrim=(A %+.2f dB, B %+.2f dB) "
+        "score=%.3f (phrase=%.2f rhythm=%.2f vocal=%.2f harm=%.2f energy=%.2f loud=%.2f dur=%.2f)\n",
+        bgmedia::mix::mixStrategyKindName(plan.strategy),
+        plan.bassSwapProgress,
+        plan.vocalEqCarve ? 1 : 0,
+        static_cast<double>(plan.loudnessTrimDbA),
+        static_cast<double>(plan.loudnessTrimDbB),
+        static_cast<double>(plan.scoreBreakdown.totalScore),
+        static_cast<double>(plan.scoreBreakdown.phraseBoundaryScore),
+        static_cast<double>(plan.scoreBreakdown.rhythmBeatScore),
+        static_cast<double>(plan.scoreBreakdown.vocalSafetyScore),
+        static_cast<double>(plan.scoreBreakdown.harmonicScore),
+        static_cast<double>(plan.scoreBreakdown.energyContinuityScore),
+        static_cast<double>(plan.scoreBreakdown.loudnessBalanceScore),
+        static_cast<double>(plan.scoreBreakdown.durationFitScore));
+    if (!plan.alternatives.empty()) {
+        std::printf("    candidates (%zu ranked):\n", plan.alternatives.size());
+        const std::size_t limit = std::min<std::size_t>(3, plan.alternatives.size());
+        for (std::size_t i = 0; i < limit; ++i) {
+            const auto& cand = plan.alternatives[i];
+            std::printf(
+                "      #%d [%s / %s] A %.2f->%.2f B %.2f (%.1f s) score=%.3f - %s\n",
+                cand.rank, bgmedia::mix::transitionTypeName(cand.type),
+                bgmedia::mix::mixStrategyKindShortName(cand.strategy),
+                cand.transitionStartA, cand.transitionEndA, cand.startB, cand.duration,
+                static_cast<double>(cand.score.totalScore),
+                cand.rationale.c_str());
+        }
     }
 }
 
@@ -533,6 +603,12 @@ bool offlineRun(const Options& options, const PreparedMixTrack& a,
     baseline.eqCurveOut.clear();
     baseline.eqCurveIn.clear();
     baseline.bassSwap = false;
+    baseline.strategy = bgmedia::mix::MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
     const CaseResult base = renderCase(a, b, baseline, true);
     if (base.ok) {
         std::printf("  baseline: rms %.4f, peak %.3f, wall %.3f s\n",

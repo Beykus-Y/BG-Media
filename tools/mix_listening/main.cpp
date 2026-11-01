@@ -232,6 +232,20 @@ bool prepareTrack(const Options& options, TrackSpec& track) {
         static_cast<double>(analysis.beatPhaseConfidence),
         static_cast<double>(analysis.downbeatConfidence), analysis.beatsPerBar,
         analysis.sections.size(), analysis.beats.size(), ms);
+    if (track.prepared.features && track.prepared.features->valid()) {
+        const auto& f = *track.prepared.features;
+        std::printf(
+            "    features: %.1f LUFS (peak %.1f dBFS), audible %.2f..%.2f s, "
+            "key %s (tonal %.2f), vocal %.0f%% (%zu regions), cues %zu out / %zu in\n",
+            static_cast<double>(f.loudness.integratedLufs),
+            static_cast<double>(f.loudness.samplePeakDbfs),
+            f.audible.audibleStart, f.audible.audibleEnd,
+            f.harmony.camelotCode.empty() ? "n/a" : f.harmony.camelotCode.c_str(),
+            static_cast<double>(f.harmony.tonalness),
+            static_cast<double>(f.vocal.activeRatio * 100.0f),
+            f.vocal.regions.size(),
+            f.mixOutCandidates.size(), f.mixInCandidates.size());
+    }
     return true;
 }
 
@@ -307,8 +321,10 @@ struct ChosenPlan {
     double candidate = 0.0;
 };
 
-ChosenPlan choosePlan(const Options& options, const AnalysisResult& a,
-                      const AnalysisResult& b) {
+ChosenPlan choosePlan(const Options& options, const PreparedMixTrack& trackA,
+                      const PreparedMixTrack& trackB) {
+    const AnalysisResult& a = *trackA.analysis;
+    const AnalysisResult& b = *trackB.analysis;
     PlannerConfig config;
     config.adaptive = true;
     config.allowTempoRamp = true;
@@ -335,7 +351,7 @@ ChosenPlan choosePlan(const Options& options, const AnalysisResult& a,
         request.requestedDuration = 0.0;
         request.currentPositionA = candidate;
         request.autoStart = true;
-        MixPlan plan = planner.plan(a, b, request);
+        MixPlan plan = planner.plan(a, b, trackA.features.get(), trackB.features.get(), request);
         if (!plan.valid) {
             continue;
         }
@@ -354,7 +370,7 @@ ChosenPlan choosePlan(const Options& options, const AnalysisResult& a,
         if (plan.transitionEndA > a.info.duration + 1e-6) {
             continue;
         }
-        double score = static_cast<double>(plan.confidence);
+        double score = 0.55 * static_cast<double>(plan.confidence) + 0.65 * static_cast<double>(plan.scoreBreakdown.totalScore);
         if (plan.beatAligned) score += 0.20;
         if (plan.downbeatAligned) score += 0.20;
         if (plan.phraseBoundary) score += 0.15;
@@ -783,6 +799,12 @@ MixPlan baselinePlan(const MixPlan& plan, double bpmA, double bpmB) {
     baseline.eqCurveIn.clear();
     baseline.bassSwap = false;
     baseline.pitchLock = true;
+    baseline.strategy = bgmedia::mix::MixStrategyKind::SmoothBlend;
+    baseline.gainCurveOut.clear();
+    baseline.gainCurveIn.clear();
+    baseline.tailSendAmount = 0.0f;
+    baseline.tailDecaySeconds = 0.0;
+    baseline.vocalEqCarve = false;
     return baseline;
 }
 
@@ -970,8 +992,7 @@ int main(int argc, char** argv) {
             std::printf("\n[%02d] %s -> %s\n", index, from.name.c_str(),
                         to.name.c_str());
             const ChosenPlan chosen =
-                choosePlan(options, *from.prepared.analysis,
-                           *to.prepared.analysis);
+                choosePlan(options, from.prepared, to.prepared);
             if (!chosen.plan.valid) {
                 std::fprintf(stderr, "  no valid plan for %s -> %s\n",
                              from.name.c_str(), to.name.c_str());
@@ -1000,6 +1021,18 @@ int main(int argc, char** argv) {
                 plan.phraseBoundary ? 1 : 0,
                 static_cast<double>(plan.phraseConfidence),
                 plan.bassSwap ? 1 : 0, plan.pitchLock ? 1 : 0);
+            std::printf(
+                "  smart: strategy=%s bassSwapPos=%.2f vocalCarve=%d lufsTrim=(A %+.2f dB, B %+.2f dB) "
+                "score=%.3f (vocal=%.2f harm=%.2f phrase=%.2f) alternatives=%zu\n",
+                bgmedia::mix::mixStrategyKindName(plan.strategy),
+                plan.bassSwapProgress, plan.vocalEqCarve ? 1 : 0,
+                static_cast<double>(plan.loudnessTrimDbA),
+                static_cast<double>(plan.loudnessTrimDbB),
+                static_cast<double>(plan.scoreBreakdown.totalScore),
+                static_cast<double>(plan.scoreBreakdown.vocalSafetyScore),
+                static_cast<double>(plan.scoreBreakdown.harmonicScore),
+                static_cast<double>(plan.scoreBreakdown.phraseBoundaryScore),
+                plan.alternatives.size());
             if (!plan.fallbackReason.empty()) {
                 std::printf("  fallback: %s\n", plan.fallbackReason.c_str());
             }

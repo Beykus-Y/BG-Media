@@ -101,6 +101,7 @@ void MixSession::clearQueue() {
         items_.clear();
         currentId_ = 0;
         preview_ = {};
+        previewIsExecution_ = false;
         status_ = "Queue cleared";
         clearDecksRequested_ = true;
     }
@@ -174,6 +175,9 @@ void MixSession::cancelTransition() {
     // reverse fade: the user asked to cancel it, so drop the pending request.
     nextRequested_ = false;
     status_ = "Cancelling transition";
+    planDirty_ = true;
+    preview_ = {};
+    previewIsExecution_ = false;
 }
 
 void MixSession::setTransitionType(TransitionType type) {
@@ -309,6 +313,15 @@ std::shared_ptr<const AnalysisResult> MixSession::deckAnalysis(
                                   : std::shared_ptr<const AnalysisResult>{};
 }
 
+std::shared_ptr<const MixFeatureMap> MixSession::deckFeatures(
+    DeckId deck) const {
+    const std::uint64_t id = loadedId(deck);
+    std::lock_guard lock(mutex_);
+    const Item* item = findItem(id);
+    return item && item->features ? item->features
+                                  : std::shared_ptr<const MixFeatureMap>{};
+}
+
 std::string MixSession::deckName(DeckId deck) const {
     const std::uint64_t id = loadedId(deck);
     std::lock_guard lock(mutex_);
@@ -323,6 +336,7 @@ void MixSession::installDeck(DeckId deck, const Item& item) {
     const double bpm = item.analysis ? item.analysis->bpm : 0.0;
     if (engine_.loadDeck(deck, item.audio, item.id, bpm)) {
         status_ = "Loaded " + item.name;
+        planDirty_ = true;
     } else {
         lastError_ = "Could not load " + item.name + " into a busy deck";
     }
@@ -379,6 +393,11 @@ void MixSession::workerLoop() {
                     preparingStage_ = std::string(stage);
                 }
             });
+        if (ok && prepared.audio && prepared.analysis && !prepared.features) {
+            MixFeatureExtractor extractor;
+            prepared.features = std::make_shared<const MixFeatureMap>(
+                extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+        }
         {
             std::lock_guard lock(mutex_);
             completed_.push_back({id, ok, std::move(prepared), std::move(error)});
@@ -405,9 +424,11 @@ void MixSession::collectCompleted() {
         if (job.ok && job.prepared.audio && job.prepared.analysis) {
             item->audio = std::move(job.prepared.audio);
             item->analysis = std::move(job.prepared.analysis);
+            item->features = std::move(job.prepared.features);
             item->state = QueueState::Ready;
             item->progress = 1.0f;
             status_ = "Ready: " + item->name;
+            planDirty_ = true;
         } else {
             item->state = QueueState::Failed;
             item->error = job.error.empty() ? "preparation failed" : job.error;
@@ -425,6 +446,12 @@ void MixSession::handleTransitionCompletion() {
         return;
     }
     lastCompleted_ = snap.completedTransitions;
+    {
+        std::lock_guard lock(mutex_);
+        planDirty_ = true;
+        preview_ = {};
+        previewIsExecution_ = false;
+    }
     const DeckId master = snap.master;
     const DeckId old = otherDeck(master);
     {
@@ -437,6 +464,8 @@ void MixSession::handleTransitionCompletion() {
         }
         currentId_ = snap.decks[deckIndex(master)].trackId;
         nextRequested_ = false;
+        hasExecutedPlan_ = false;
+        planDirty_ = true;
         status_ = "Transition complete";
     }
     engine_.play(master);
@@ -574,19 +603,115 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
         execution ? snap.decks[deckIndex(from)].positionSeconds : -1.0;
     request.autoStart = execution;
     request.trackNameB = b->name;
-    MixPlan plan = planner.plan(*a->analysis, *b->analysis, request);
+    MixPlan plan = planner.plan(*a->analysis, *b->analysis,
+                                a->features.get(), b->features.get(), request);
     plan.from = from;
     plan.to = to;
     return plan;
 }
 
-void MixSession::refreshPlan() {
+bool MixSession::seekDeck(DeckId deck, double seconds) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "Cannot seek during an active transition";
+        return false;
+    }
+    const int idx = deckIndex(deck);
+    if (!snap.decks[idx].loaded || snap.decks[idx].durationSeconds <= 0.0) {
+        return false;
+    }
+    const double target = std::clamp(seconds, 0.0, snap.decks[idx].durationSeconds);
+    engine_.seek(deck, target);
+    if (deck == snap.master) {
+        std::lock_guard lock(mutex_);
+        planDirty_ = true;
+        preview_ = {};
+        previewIsExecution_ = false;
+    }
+    return true;
+}
+
+bool MixSession::jumpToPlannedTransition(double leadSeconds) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "Cannot jump during an active transition";
+        return false;
+    }
+    MixPlan prev;
+    {
+        std::lock_guard lock(mutex_);
+        prev = preview_;
+    }
+    if (!prev.valid || prev.from != snap.master) {
+        return false;
+    }
+    const double sched = prev.overallStartA();
+    const double target = std::max(0.0, sched - std::max(1.0, leadSeconds));
+    return seekDeck(snap.master, target);
+}
+
+void MixSession::invalidatePlan() {
     std::lock_guard lock(mutex_);
-    preview_ = {};
+    planDirty_ = true;
+}
+
+void MixSession::ensurePlanValid() {
+    std::lock_guard lock(mutex_);
     const MixSnapshot snap = engine_.snapshot();
     const DeckId from = snap.master;
     const DeckId to = otherDeck(from);
-    preview_ = buildPlan(from, to, snap, duration_, false);
+    if (engine_.hasPendingSeek(from) || engine_.hasPendingSeek(to)) {
+        return;
+    }
+    const std::uint64_t fromId = snap.decks[deckIndex(from)].trackId;
+    const std::uint64_t toId = snap.decks[deckIndex(to)].trackId;
+    const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
+
+    // Fast-path: both decks unchanged, configuration unchanged, plan not dirty,
+    // not an emergency execution plan, and live cursor has not passed the scheduled transition window.
+    if (!planDirty_ && preview_.valid && !previewIsExecution_ &&
+        fromId == cachedFromId_ && toId == cachedToId_ &&
+        from == cachedMasterDeck_ &&
+        livePosA < preview_.overallStartA() + 0.5) {
+        return;
+    }
+    if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
+        // Build the planned ending transition first
+        preview_ = buildPlan(from, to, snap, duration_, false);
+        previewIsExecution_ = false;
+
+        // Only if the live playback cursor has already passed the planned window,
+        // re-plan from the live cursor so the transition fits the remaining audio.
+        if (preview_.valid && livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5) {
+            preview_ = buildPlan(from, to, snap, 0.0, true);
+            previewIsExecution_ = true;
+        }
+    } else {
+        preview_ = {};
+        previewIsExecution_ = false;
+    }
+    cachedFromId_ = fromId;
+    cachedToId_ = toId;
+    cachedMasterDeck_ = from;
+    planDirty_ = false;
+}
+
+void MixSession::refreshPlan() {
+    std::lock_guard lock(mutex_);
+    const MixSnapshot snap = engine_.snapshot();
+    const DeckId from = snap.master;
+    const DeckId to = otherDeck(from);
+    preview_ = {};
+    previewIsExecution_ = false;
+    if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
+        preview_ = buildPlan(from, to, snap, duration_, false);
+    }
+    cachedFromId_ = snap.decks[deckIndex(from)].trackId;
+    cachedToId_ = snap.decks[deckIndex(to)].trackId;
+    cachedMasterDeck_ = from;
+    planDirty_ = false;
 }
 
 void MixSession::startPlannedTransition(double durationOverride) {
@@ -616,9 +741,16 @@ void MixSession::startPlannedTransition(double durationOverride) {
         status_ = "Transition unavailable";
         return;
     }
+    char reasonBuf[256];
+    std::snprintf(reasonBuf, sizeof(reasonBuf),
+                  "Manual NEXT transition from live position %.3f s",
+                  snap.decks[deckIndex(from)].positionSeconds);
+    plan.reasons.push_back(reasonBuf);
     {
         std::lock_guard lock(mutex_);
         preview_ = plan;
+        lastExecutedPlan_ = plan;
+        hasExecutedPlan_ = true;
     }
     if (!engine_.startTransition(plan)) {
         std::lock_guard lock(mutex_);
@@ -631,6 +763,64 @@ void MixSession::startPlannedTransition(double durationOverride) {
     // another transition as soon as the reverse fade finished.
     nextRequested_ = false;
     status_ = std::string("Mixing: ") + transitionTypeName(plan.type);
+}
+
+void MixSession::executeScheduledTransition(const MixPlan& plannedPreview) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        return;
+    }
+    const DeckId from = snap.master;
+    const DeckId to = otherDeck(from);
+    if (!snap.decks[deckIndex(from)].loaded || !snap.decks[deckIndex(to)].loaded) {
+        return;
+    }
+
+    // Preserve the validated preview plan winner (cues, duration, strategy, gain curves, trims)
+    MixPlan plan = plannedPreview;
+    plan.from = from;
+    plan.to = to;
+
+    const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
+    const double remainingA = std::max(0.0, snap.decks[deckIndex(from)].durationSeconds - livePosA);
+    if (livePosA > plan.overallStartA() + 0.5 && plan.duration > remainingA) {
+        // Replan from the live position when the scheduled window has expired
+        // so the fade fits the remaining audio.
+        MixPlan refitted;
+        {
+            std::lock_guard lock(mutex_);
+            refitted = buildPlan(from, to, snap, 0.0, true);
+        }
+        if (refitted.valid) {
+            plan = refitted;
+        } else {
+            plan.duration = std::max(0.05, remainingA);
+            plan.transitionStartA = livePosA;
+            plan.transitionEndA = livePosA + plan.duration;
+        }
+    }
+    char reasonBuf[256];
+    std::snprintf(reasonBuf, sizeof(reasonBuf),
+                  "Executing planned transition at live A %.2f s (strategy %s, cues A %.2f -> B %.2f, dur %.1f s)",
+                  livePosA, mixStrategyKindName(plan.strategy), plan.transitionStartA, plan.startB, plan.duration);
+    plan.reasons.push_back(reasonBuf);
+
+    {
+        std::lock_guard lock(mutex_);
+        preview_ = plan;
+        lastExecutedPlan_ = plan;
+        hasExecutedPlan_ = true;
+    }
+    if (!engine_.startTransition(plan)) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "scheduled transition could not start (engine busy or tracks missing)";
+        status_ = lastError_;
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    nextRequested_ = false;
+    status_ = std::string("Mixing: ") + transitionTypeName(plan.type) +
+              " (" + mixStrategyKindName(plan.strategy) + ")";
 }
 
 void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
@@ -657,6 +847,11 @@ void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
     // Release the finished deck so serviceDecks() can refill it with the next
     // prepared queue item.
     engine_.clearDeck(from);
+    {
+        std::lock_guard lock(mutex_);
+        hasExecutedPlan_ = false;
+        planDirty_ = true;
+    }
 }
 
 void MixSession::update() {
@@ -679,7 +874,7 @@ void MixSession::update() {
         }
     }
 
-    refreshPlan();
+    ensurePlanValid();
 
     const MixSnapshot snap = engine_.snapshot();
     // Auto scheduling only runs in Auto mode. Manual and Preview still allow
@@ -726,8 +921,15 @@ void MixSession::update() {
     // rather than from transitionStartA.
     const double scheduleAt = preview.overallStartA();
     if (preview.valid && preview.from == from && schedulable &&
+        !engine_.hasPendingSeek(from) && !engine_.hasPendingSeek(otherDeck(from)) &&
         deck.positionSeconds >= scheduleAt - lead) {
-        startPlannedTransition(duration_);
+        if (deck.positionSeconds > scheduleAt + 0.5) {
+            // Replan from the live position when the scheduled window has expired
+            // so the fade fits the remaining audio.
+            startPlannedTransition(0.0);
+        } else {
+            executeScheduledTransition(preview);
+        }
     }
 }
 
@@ -769,6 +971,8 @@ MixSessionSnapshot MixSession::snapshot() const {
         out.preparingProgress = preparingProgress_.load(std::memory_order_relaxed);
     }
     out.preview = preview_;
+    out.executed = lastExecutedPlan_;
+    out.hasExecutedPlan = hasExecutedPlan_;
     out.status = status_;
     out.lastError = lastError_;
     return out;
