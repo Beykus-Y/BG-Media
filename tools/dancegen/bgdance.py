@@ -540,6 +540,8 @@ CURL_RIPPLE_ATTACK = 0.2  # beats the ripple takes to rise to full after an acce
 CURL_RIPPLE_TAIL = 0.6    # beats after an accent at which the ripple has faded out completely
 BALANCE_FALL = 0.30     # beats: the weight shift away from a foot is centred this long before its lift-off
 BALANCE_RISE = 0.22     # beats: the weight shift onto a landing foot is centred this long after the landing
+BALANCE_SMOOTH = 0.10   # beats: sigma of the zero-phase smoothing of the balance shift
+OVER_SUPPORT_Z = 1.0     # forward/back share of the pull over the support foot in single support
 COM_MIDDLE = 0.05       # weight (relative to a full foot) given to the middle of the feet in the centre of mass
 COMPRESS_DEPTH = 2.5    # cm: pelvis compression after each landing (the low end of -2..-4 cm)
 COMPRESS_DEEP = 4.0     # cm: after a lift above COMPRESS_LIFT_CM
@@ -942,6 +944,7 @@ class Dance:
         bone_tracks = {}
         hips_track, root_track, foot_tracks = [], [], {"left": [], "right": []}
         hand_tracks = {"left": [], "right": []}
+        hips_base, balance = [], []
         prev = {}
         e = 1.0 / FINE
         wrist_fine = {side: self._wrist_drag(side, e) for side in ("l", "r")}
@@ -1020,11 +1023,9 @@ class Dance:
             # over it (the gain falls to the balance gain as the second foot takes weight)
             single = (1.0 - min(li, ri)) if self.over_support else 0.0
             gain_x = self.balance[0] + (1.0 - self.balance[0]) * single
-            gain_z = self.balance[1] + (1.0 - self.balance[1]) * single
-            hx = c["hips_x"] + com_x * gain_x
-            hz = c["hips_z"] + com_z * gain_z
-            hips_y = c["hips_y"] + self._compression(t, landings)
-            hips_track.append((hx / REF_HEIGHT_CM, hips_y / REF_HEIGHT_CM, hz / REF_HEIGHT_CM))
+            gain_z = self.balance[1] + (OVER_SUPPORT_Z - self.balance[1]) * single
+            hips_base.append((c["hips_x"], c["hips_y"] + self._compression(t, landings), c["hips_z"]))
+            balance.append((com_x * gain_x, com_z * gain_z))
             hand_tracks["left"].append((self._curl("left", t, c["hand_l"]),))
             hand_tracks["right"].append((self._curl("right", t, c["hand_r"]),))
             root_track.append((c["root_x"] / REF_HEIGHT_CM, c["root_z"] / REF_HEIGHT_CM, c["root_yaw"] / 360.0))
@@ -1033,6 +1034,24 @@ class Dance:
                     (f[0] / REF_HEIGHT_CM, f[1] / REF_HEIGHT_CM, f[2] / REF_HEIGHT_CM, f[3] / 360.0,
                      self.feet[side].toe(t))
                 )
+        # The balance shift is smoothed over the loop (zero phase, so it never lags the feet). The
+        # load ramps and the single-support gain meet in corners; without this the pelvis takes
+        # them as acceleration spikes, and a short hand-over (a foot lifting a fifth of a beat
+        # after the other lands) would be a jerk. The smoothing starts the shift a little before
+        # the landing, as a body falling onto the new foot does.
+        cyc = n - 1
+        radius = int(3 * BALANCE_SMOOTH * self.kpb) + 1
+        kernel = [math.exp(-0.5 * ((j / self.kpb) / BALANCE_SMOOTH) ** 2) for j in range(-radius, radius + 1)]
+        ks = sum(kernel)
+        for i in range(n):
+            bx = bz = 0.0
+            for j, w in enumerate(kernel):
+                b = balance[(i + j - radius) % cyc]
+                bx += w * b[0]
+                bz += w * b[1]
+            hx, hy, hz = hips_base[i]
+            hips_track.append(((hx + bx / ks) / REF_HEIGHT_CM, hy / REF_HEIGHT_CM, (hz + bz / ks) / REF_HEIGHT_CM))
+
         contacts = []
         for side in ("left", "right"):
             for s, t0, t1, pivot in self.feet[side].contacts():
