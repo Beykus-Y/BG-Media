@@ -5654,6 +5654,14 @@ void DesktopApp::Impl::drawMixDeck(const Rect& card, mix::DeckId deck,
                formatTime(status.positionSeconds, true) + " / " +
                formatTime(status.durationSeconds) + "  ·  " +
                formatNumber(status.rate * 100.0, 1) + "%";
+        if (const auto feat = mixSession->deckFeatures(deck)) {
+            if (!feat->harmony.camelotCode.empty()) {
+                info += "  ·  " + feat->harmony.camelotCode;
+            }
+            if (feat->loudness.gatedValid) {
+                info += "  ·  " + formatNumber(feat->loudness.integratedLufs, 1) + " LUFS";
+            }
+        }
         if (status.ended) {
             info += "  ·  END";
         }
@@ -5796,7 +5804,9 @@ void DesktopApp::Impl::drawMixPlan(const Rect& card,
     if (plan.tempoMatchKind != mix::TempoMatchKind::None) {
         route += " (" + std::string(mix::tempoMatchKindName(plan.tempoMatchKind)) + ")";
     }
-    route += "  ·  " + formatNumber(plan.duration, 1) + " s";
+    route += "  ·  " + formatNumber(plan.duration, 1) + " s  ·  " +
+             std::string(mix::mixStrategyKindShortName(plan.strategy)) + " (" +
+             formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%)";
     label(route, card.x + 16.0f, card.y + 56.0f, 8, theme::muted, 0.8f);
 
     std::string alignment;
@@ -6161,8 +6171,9 @@ void DesktopApp::Impl::drawMixScreen() {
                 title += " (" + std::to_string(plan.metricRelation.bBeats) + ":" +
                          std::to_string(plan.metricRelation.aBeats) + ")";
             }
-            title += "  ·  " + formatNumber(plan.duration, 2) + " s  ·  " +
-                     formatNumber(plan.confidence * 100.0, 0) + "% confidence";
+            title += "  ·  " + std::string(mix::mixStrategyKindName(plan.strategy)) +
+                     "  ·  " + formatNumber(plan.duration, 2) + " s  ·  score " +
+                     formatNumber(plan.scoreBreakdown.totalScore * 100.0, 0) + "%";
             body(title, card.x + 22.0f, card.y + 68.0f, 14, theme::text,
                  FontWeight::SemiBold);
             const Rect curve{ card.x + 22.0f, card.y + 96.0f, card.w - 44.0f,
@@ -6218,10 +6229,21 @@ void DesktopApp::Impl::drawMixScreen() {
                 label("TEMPO (AMBER) · OUT GAIN (GREEN) · IN GAIN (VIOLET)",
                       curve.x + 8.0f, curve.y + 5.0f, 7, theme::dim, 0.5f);
             }
-            float y = curve.bottom() + 12.0f;
+            float y = curve.bottom() + 10.0f;
+            const std::string breakdownLine =
+                "SCORE BREAKDOWN  ·  PHRASE " +
+                formatNumber(plan.scoreBreakdown.phraseBoundaryScore * 100.0, 0) + "%  ·  RHYTHM " +
+                formatNumber(plan.scoreBreakdown.rhythmBeatScore * 100.0, 0) + "%  ·  VOCAL SAFETY " +
+                formatNumber(plan.scoreBreakdown.vocalSafetyScore * 100.0, 0) + "%  ·  HARMONIC " +
+                formatNumber(plan.scoreBreakdown.harmonicScore * 100.0, 0) + "%  ·  ENERGY " +
+                formatNumber(plan.scoreBreakdown.energyContinuityScore * 100.0, 0) + "%  ·  LUFS " +
+                formatNumber(plan.scoreBreakdown.loudnessBalanceScore * 100.0, 0) + "%";
+            label(ellipsize(*text, breakdownLine, card.w - 44.0f, 8, FontWeight::SemiBold),
+                  card.x + 22.0f, y, 8, theme::accent, 0.5f);
+            y += 16.0f;
             int shown = 0;
             for (const std::string& reason : plan.reasons) {
-                if (shown >= 7) {
+                if (shown >= 5) {
                     break;
                 }
                 body("- " + ellipsize(*text, reason, card.w - 68.0f, 10,
@@ -6229,6 +6251,27 @@ void DesktopApp::Impl::drawMixScreen() {
                      card.x + 22.0f, y, 10, theme::muted);
                 y += 16.0f;
                 ++shown;
+            }
+            if (!plan.alternatives.empty()) {
+                y += 4.0f;
+                label("RANKED CANDIDATES", card.x + 22.0f, y, 8, theme::violet, 0.8f);
+                y += 14.0f;
+                const std::size_t maxAlt = std::min<std::size_t>(3, plan.alternatives.size());
+                for (std::size_t i = 0; i < maxAlt; ++i) {
+                    const auto& alt = plan.alternatives[i];
+                    const std::string altLine =
+                        "#" + std::to_string(alt.rank) + " [" +
+                        std::string(mix::mixStrategyKindShortName(alt.strategy)) + "] A " +
+                        formatNumber(alt.transitionStartA, 1) + "->" +
+                        formatNumber(alt.transitionEndA, 1) + " s, B " +
+                        formatNumber(alt.startB, 1) + " s (" +
+                        formatNumber(alt.duration, 1) + " s) · score " +
+                        formatNumber(alt.score.totalScore * 100.0, 0) + "% · " +
+                        alt.rationale;
+                    body(ellipsize(*text, altLine, card.w - 44.0f, 9, FontWeight::Regular),
+                         card.x + 22.0f, y, 9, i == 0 ? theme::text : theme::dim);
+                    y += 14.0f;
+                }
             }
             if (!plan.fallbackReason.empty()) {
                 body("Fallback: " + plan.fallbackReason, card.x + 22.0f, y, 10,
