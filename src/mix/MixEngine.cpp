@@ -264,6 +264,12 @@ void MixEngine::setMaster(DeckId deck) {
     master_.store(deckIndex(deck), std::memory_order_release);
 }
 
+bool MixEngine::hasPendingSeek(DeckId deck) const noexcept {
+    const auto idx = deckIndex(deck);
+    return decks_[idx].seekSerial.load(std::memory_order_acquire) !=
+           decks_[idx].seekApplied.load(std::memory_order_acquire);
+}
+
 bool MixEngine::startTransition(const MixPlan& plan) {
     if (!plan.valid) {
         return false;
@@ -794,8 +800,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     for (int i = 0; i < 2; ++i) {
         DeckRuntime& deck = decks_[i];
         const std::uint64_t serial = deck.seekSerial.load(std::memory_order_acquire);
-        if (serial != deck.seekApplied) {
-            deck.seekApplied = serial;
+        if (serial != deck.seekApplied.load(std::memory_order_relaxed)) {
+            deck.seekApplied.store(serial, std::memory_order_release);
             if (const PcmTrack* source = deck.audio.load(std::memory_order_acquire)) {
                 const double seconds =
                     deck.seekSeconds.load(std::memory_order_acquire);
@@ -1544,6 +1550,7 @@ void MixEngine::publishSnapshot() noexcept {
         deck.peak = runtime.blockPeak;
         deck.sampleRate = source ? source->sampleRate : 0;
         deck.channels = source ? source->channels : 0;
+        deck.seekApplied = runtime.seekApplied.load(std::memory_order_relaxed);
     }
 
     if (snapshotLock_.test_and_set(std::memory_order_acquire)) {

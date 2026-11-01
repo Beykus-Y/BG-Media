@@ -356,6 +356,7 @@ struct DeckStatus {
     float peak = 0.0f;
     std::uint32_t sampleRate = 0;
     std::uint32_t channels = 0;
+    std::uint64_t seekApplied = 0;
 };
 
 enum class TransitionPhase : std::uint8_t {

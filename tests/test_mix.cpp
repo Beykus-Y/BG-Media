@@ -4987,3 +4987,47 @@ TEST_CASE("mix.codex_finding_preserve_equal_power_envelopes_for_explicit_crossfa
         CHECK(std::abs(plan.gainCurveIn[8].gain - 0.7071f) < 0.01f);
     }
 }
+TEST_CASE("mix.codex_finding_backward_seek_within_scheduling_window_suppresses_stale_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(8.0);
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    // Position playback at 21.91s (inside the scheduling lead window) directly on engine
+    CHECK(session.seekDeck(DeckId::A, 21.91));
+    engine.render(pump.block.data(), 480); // applies seek without running session.update()
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+    CHECK(engine.snapshot().decks[0].positionSeconds >= 21.9);
+
+    // Now seek backward to 1.0s
+    CHECK(session.seekDeck(DeckId::A, 1.0));
+    // Intervening update() BEFORE render callback applies the seek:
+    // must suppress automatic scheduling rather than scheduling against stale 21.91s snapshot
+    session.update();
+
+    // Engine must NOT have started transition against stale cursor
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Audio callback applies the seek to 1.0s
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Further seeks must succeed (not rejected due to active transition)
+    CHECK(session.seekDeck(DeckId::A, 2.0));
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+}

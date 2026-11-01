@@ -662,6 +662,9 @@ void MixSession::ensurePlanValid() {
     const MixSnapshot snap = engine_.snapshot();
     const DeckId from = snap.master;
     const DeckId to = otherDeck(from);
+    if (engine_.hasPendingSeek(from) || engine_.hasPendingSeek(to)) {
+        return;
+    }
     const std::uint64_t fromId = snap.decks[deckIndex(from)].trackId;
     const std::uint64_t toId = snap.decks[deckIndex(to)].trackId;
     const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
@@ -918,6 +921,7 @@ void MixSession::update() {
     // rather than from transitionStartA.
     const double scheduleAt = preview.overallStartA();
     if (preview.valid && preview.from == from && schedulable &&
+        !engine_.hasPendingSeek(from) && !engine_.hasPendingSeek(otherDeck(from)) &&
         deck.positionSeconds >= scheduleAt - lead) {
         if (deck.positionSeconds > scheduleAt + 0.5) {
             // Replan from the live position when the scheduled window has expired

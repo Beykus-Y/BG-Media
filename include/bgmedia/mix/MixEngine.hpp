@@ -48,6 +48,7 @@ public:
     void setDeckGain(DeckId deck, float gain);
     void setDeckRate(DeckId deck, double rate);
     void setMaster(DeckId deck);
+    [[nodiscard]] bool hasPendingSeek(DeckId deck) const noexcept;
 
     // The plan is copied into a fixed-size runtime block. Returns false when a
     // transition is already running or the plan is invalid.
@@ -140,7 +141,7 @@ private:
         // overwrite it while the callback is still reading the previous one;
         // seekSerial only tells the callback that a new value is available.
         std::atomic<double> seekSeconds{0.0};
-        std::uint64_t seekApplied = 0;
+        std::atomic<std::uint64_t> seekApplied{0};
 
         // Audio-thread reset request. loadDeck()/clearDeck() must not touch
         // positionFrames/playing/gain: those belong to the callback.
