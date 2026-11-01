@@ -535,12 +535,25 @@ void HarmonicAnalyzer::analyze(const PcmBuffer& monoPcm,
     map.harmony.camelotCode =
         toCamelotCode(map.harmony.keyIndex, map.harmony.isMinor);
 
-    // Build local HarmonicSegments aligned to phrases (or 4-second windows if no phrases).
+    // Build local HarmonicSegments aligned to phrases (or 4-second windows if no phrases),
+    // including any leading/trailing audio outside the detected phrase spans.
     std::vector<std::pair<double, double>> spans;
     if (!map.phrases.empty()) {
+        const double firstStart = map.phrases.front().start;
+        if (firstStart > 0.25) {
+            for (double t = 0.0; t + 0.25 < firstStart; t += 4.0) {
+                spans.emplace_back(t, std::min(firstStart, t + 4.0));
+            }
+        }
         for (const PhraseSpan& p : map.phrases) {
             if (p.end > p.start + 0.25) {
                 spans.emplace_back(p.start, p.end);
+            }
+        }
+        const double lastEnd = map.phrases.back().end;
+        if (lastEnd + 0.25 < map.info.duration) {
+            for (double t = lastEnd; t + 0.25 < map.info.duration; t += 4.0) {
+                spans.emplace_back(t, std::min(map.info.duration, t + 4.0));
             }
         }
     } else {
@@ -627,11 +640,12 @@ HarmonicCompatibility evaluateHarmonicCompatibility(
     const double endA = std::min(featuresA.info.duration, startA + duration * safeRateA);
     const double endB = std::min(featuresB.info.duration, startB + duration * safeRateB);
 
-    // 1. Evaluate spectral crowding over the overlap (even when chroma is unavailable).
+    // 1. Evaluate spectral crowding and simultaneous audibility over the overlap.
     const int steps = std::max(2, static_cast<int>(std::ceil(duration / 0.15)));
     const double dt = duration / static_cast<double>(steps);
     double midCrowdSum = 0.0;
     double lowCrowdSum = 0.0;
+    double audOverlapSum = 0.0;
     for (int i = 0; i <= steps; ++i) {
         const double t = i * dt;
         const MixFeatureFrame fA = featuresA.sampleAt(startA + t * safeRateA);
@@ -648,8 +662,16 @@ HarmonicCompatibility evaluateHarmonicCompatibility(
 
         lowCrowdSum += std::sqrt(std::max(0.0, lowA * lowB));
         midCrowdSum += std::sqrt(std::max(0.0, midA * midB));
+
+        const double audOut = std::clamp(
+            static_cast<double>(gOut) * 0.5 * (eqOut.mid + eqOut.high), 0.0, 1.0);
+        const double audIn = std::clamp(
+            static_cast<double>(gIn) * 0.5 * (eqIn.mid + eqIn.high), 0.0, 1.0);
+        audOverlapSum += std::min(1.0, std::sqrt(audOut * audIn) * 1.45);
     }
     const double count = static_cast<double>(steps + 1);
+    const float audOverlapFactor = static_cast<float>(
+        std::clamp((audOverlapSum / count) * 1.35, 0.0, 1.0));
     result.spectralCrowdScore = static_cast<float>(
         std::clamp(1.6 * (0.55 * (midCrowdSum / count) + 0.45 * (lowCrowdSum / count)),
                    0.0, 1.0));
@@ -716,15 +738,18 @@ HarmonicCompatibility evaluateHarmonicCompatibility(
         return result;
     }
 
+    result.detunePenalty *= audOverlapFactor;
     const float jointTonalness = std::min(result.tonalnessA, result.tonalnessB);
     const float rawHarmonic =
         0.55f * result.chromaSimilarity + 0.45f * result.keyRelationScore;
     const float detunedHarmonic =
         std::max(0.0f, rawHarmonic - 0.45f * result.detunePenalty * jointTonalness);
 
-    // Weight toward neutral (0.72) when tonalness/confidence is moderate, and
-    // apply full harmonic discrimination when both tracks are strongly tonal.
-    const float weight = std::clamp(jointTonalness * 1.15f, 0.20f, 1.0f);
+    // Weight toward neutral (0.72) when tonalness/confidence or simultaneous
+    // audibility is low, and apply full harmonic discrimination when both
+    // tracks are strongly tonal and simultaneously audible.
+    const float weight =
+        std::clamp(jointTonalness * 1.15f, 0.20f, 1.0f) * audOverlapFactor;
     result.compatibilityScore = std::clamp(
         weight * detunedHarmonic + (1.0f - weight) * 0.72f -
             0.18f * result.spectralCrowdScore,

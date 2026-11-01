@@ -697,7 +697,7 @@ VocalOverlapAssessment evaluateVocalOverlap(
         (result.incomingVocalMean >= 0.35f && result.outgoingVocalMean < 0.25f);
     result.cleanVocalHandoff =
         sequentialHandoff && result.vocalClashScore <= 0.22f &&
-        !result.entersMidVocalPhraseB;
+        !result.cutsMidVocalPhraseA && !result.entersMidVocalPhraseB;
 
     char buf[256];
     if (result.vocalClashScore >= 0.35f) {

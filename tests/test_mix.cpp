@@ -3682,6 +3682,15 @@ TEST_CASE("mix.vocal_overlap_clash_vs_clean_handoff") {
         evaluateVocalOverlap(featA, 0.0, 1.0, featInstB, 0.0, 1.0, 8.0, heldOut, mutedIn);
     CHECK_NEAR(heldAOverMutedB.vocalOverInstrumentalScore, 0.0f, 1e-5f);
     CHECK(!heldAOverMutedB.cutsMidVocalPhraseA);
+
+    // 4. Truncated outgoing vocal phrase (faded to 0 by 2.5 s while phrase continues
+    // to 6.0 s) must set cutsMidVocalPhraseA = true and cleanVocalHandoff = false.
+    const std::vector<bgmedia::mix::GainPoint> earlyFadeOut = {
+        {0.0, 1.0f}, {2.5, 0.0f}, {8.0, 0.0f}};
+    const VocalOverlapAssessment truncatedA =
+        evaluateVocalOverlap(featA, 0.0, 1.0, featInstB, 0.0, 1.0, 8.0, earlyFadeOut);
+    CHECK(truncatedA.cutsMidVocalPhraseA);
+    CHECK(!truncatedA.cleanVocalHandoff);
 }
 
 TEST_CASE("mix.harmonic_key_estimation_and_camelot_helper") {
@@ -3748,6 +3757,33 @@ TEST_CASE("mix.harmonic_compatibility_pitch_shift_and_percussive_neutrality") {
     CHECK(compatRel.available);
     CHECK(compatRel.compatibilityScore > compatDist.compatibilityScore + 0.22f);
     CHECK(compatRel.harmonicClashScore < compatDist.harmonicClashScore);
+
+    // Muted incoming deck must not report harmonic clash even between C and F#.
+    const std::vector<bgmedia::mix::GainPoint> unityOut = {{0.0, 1.0f}, {4.0, 1.0f}};
+    const std::vector<bgmedia::mix::GainPoint> zeroIn = {{0.0, 0.0f}, {4.0, 0.0f}};
+    const HarmonicCompatibility mutedDist =
+        evaluateHarmonicCompatibility(featC, 1.0, 1.0, featFs, 1.0, 1.0, 4.0, true,
+                                      unityOut, zeroIn);
+    CHECK(mutedDist.harmonicClashScore < 0.05f);
+    CHECK(mutedDist.compatibilityScore >= 0.70f);
+
+    // Uncovered leading audio before the first beat/phrase span (e.g. beats start
+    // at 4.0 s on an 8.0 s track where 0..4 s is C major and 4..8 s is F# major)
+    // must still have its own local harmonic segment.
+    AnalysisResult lateBeats = analysisFor(120.0, duration);
+    lateBeats.beats.erase(
+        std::remove_if(lateBeats.beats.begin(), lateBeats.beats.end(),
+                       [](const Beat& bt) { return bt.time < 4.0; }),
+        lateBeats.beats.end());
+    auto splitKeyTrack = makeTriadTrack(duration, 185.00, 233.08, 277.18); // F# major
+    for (std::size_t f = 0; f < static_cast<std::size_t>(4.0 * kRate); ++f) {
+        splitKeyTrack->samples[f * 2] = trackC->samples[f * 2];
+        splitKeyTrack->samples[f * 2 + 1] = trackC->samples[f * 2 + 1];
+    }
+    const MixFeatureMap featSplit = extractor.extractFromTrack(*splitKeyTrack, lateBeats);
+    const HarmonicCompatibility introCvsC =
+        evaluateHarmonicCompatibility(featSplit, 0.0, 1.0, featC, 0.0, 1.0, 3.0, true);
+    CHECK(introCvsC.compatibilityScore > 0.70f);
 
     // 2. Pitch-shift awareness when pitchLock == false:
     // G#m played at +1 semitone (rate = 2^(1/12) ≈ 1.05946) without pitch lock
