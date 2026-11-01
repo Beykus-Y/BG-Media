@@ -144,6 +144,7 @@ struct MixCandidateScore {
     float energyContinuityScore = 0.0f;// 0..1 energy continuity across handover
     float loudnessBalanceScore = 0.0f; // 0..1 LUFS balance + headroom safety
     float durationFitScore = 0.0f;     // 0..1 structural duration fit
+    float continuationScore = 1.0f;    // 0..1 completed phrase/outro vs premature exit from active drop
 
     float vocalClashRisk = 0.0f;
     float harmonicClashRisk = 0.0f;
@@ -151,6 +152,8 @@ struct MixCandidateScore {
     bool cutsVocalPhraseA = false;
     bool entersVocalPhraseB = false;
     bool cleanVocalHandoff = false;
+    bool severeVocalClash = false;
+    bool prematureDropExit = false;
     std::string summary;
 };
 
@@ -439,6 +442,8 @@ struct MixSessionSnapshot {
     std::string preparingName;
     float preparingProgress = 0.0f;
     MixPlan preview;
+    MixPlan executed;
+    bool hasExecutedPlan = false;
     std::string status;
     std::string lastError;
 };

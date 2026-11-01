@@ -4093,3 +4093,288 @@ TEST_CASE("mix.engine_loudness_normalization_and_strategies") {
         CHECK(eng.snapshot().master == DeckId::A);
     }
 }
+
+
+// =========================================================================
+// Issue #48, #49, #50, #51 Integration and Regression Tests
+// =========================================================================
+
+TEST_CASE("mix.issue48_lead_vocal_collision_prevention") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::VocalOverlapAssessment;
+    using bgmedia::mix::evaluateVocalOverlap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::MixStrategyKind;
+
+    const double duration = 16.0;
+    const AnalysisResult analysis = analysisFor(120.0, duration);
+    MixFeatureExtractor extractor;
+
+    // Outgoing track A: lead vocal during 0..8s, instrumental outro during 8..16s
+    const auto trackA = makeVocalAndInstrumentalTrack(duration, 0.5, 7.5, 120.0);
+    // Incoming track B: lead vocal during 0..8s, instrumental during 8..16s
+    const auto trackB = makeVocalAndInstrumentalTrack(duration, 0.5, 7.5, 120.0);
+
+    const MixFeatureMap featA = extractor.extractFromTrack(*trackA, analysis);
+    const MixFeatureMap featB = extractor.extractFromTrack(*trackB, analysis);
+
+    // 1. Two simultaneous loud lead vocals -> Severe clash detected
+    const VocalOverlapAssessment severeClash =
+        evaluateVocalOverlap(featA, 2.0, 1.0, featB, 2.0, 1.0, 4.0);
+    CHECK(severeClash.available);
+    CHECK(severeClash.severeLeadVocalClash);
+    CHECK(severeClash.leadVocalClashDurationSeconds >= 0.5);
+    CHECK(!severeClash.cleanVocalHandoff);
+
+    // 2. Safe sequential vocal handoff: A's vocal phrase finishes at 7.5s (2.0s into mix),
+    // and incoming B has vocal starting at 2.5s into mix. No overlap between the two vocals!
+    const auto trackB_handoff = makeVocalAndInstrumentalTrack(duration, 2.5, 10.0, 120.0);
+    const MixFeatureMap featB_handoff = extractor.extractFromTrack(*trackB_handoff, analysis);
+    const VocalOverlapAssessment safeHandoff =
+        evaluateVocalOverlap(featA, 5.5, 1.0, featB_handoff, 0.0, 1.0, 4.0);
+    CHECK(safeHandoff.available);
+    CHECK(!safeHandoff.severeLeadVocalClash);
+    CHECK(safeHandoff.cleanVocalHandoff);
+
+    // 3. Instrumental outro transition has zero vocal clash
+    const auto trackB_instIntro = makeVocalAndInstrumentalTrack(duration, 5.0, 12.0, 120.0);
+    const MixFeatureMap featB_inst = extractor.extractFromTrack(*trackB_instIntro, analysis);
+    const VocalOverlapAssessment instTransition =
+        evaluateVocalOverlap(featA, 8.5, 1.0, featB_inst, 0.0, 1.0, 4.0);
+    CHECK(instTransition.available);
+    CHECK(!instTransition.severeLeadVocalClash);
+    CHECK_NEAR(instTransition.vocalClashScore, 0.0f, 0.05f);
+
+    // 4. Multi-candidate planner prioritizes safe candidate over vocal collision
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = -1.0;
+
+    const bgmedia::mix::MixPlan plan = planner.plan(analysis, analysis, &featA, &featB_inst, req);
+    CHECK(plan.valid);
+    // The planner must NOT choose a transition during active A vocal collision
+    CHECK(plan.transitionStartA >= 6.5);
+    // And VocalHandoff is ONLY chosen if cleanVocalHandoff was genuinely true
+    if (plan.strategy == MixStrategyKind::VocalHandoff) {
+        CHECK(!plan.scoreBreakdown.severeVocalClash);
+    }
+
+    // 5. Low confidence analysis falls back conservatively without asserting false safety
+    MixFeatureMap lowConfA = featA;
+    lowConfA.vocal.available = true;
+    lowConfA.vocal.meanConfidence = 0.20f; // low confidence
+    const VocalOverlapAssessment lowConf =
+        evaluateVocalOverlap(lowConfA, 2.0, 1.0, featB, 2.0, 1.0, 4.0);
+    CHECK(lowConf.lowConfidenceConservative);
+    CHECK(!lowConf.cleanVocalHandoff);
+}
+
+TEST_CASE("mix.issue49_dramatic_pause_inside_drop_not_selected_as_mixout") {
+    using bgmedia::mix::MixFeatureExtractor;
+    using bgmedia::mix::MixFeatureMap;
+    using bgmedia::mix::MixPlanner;
+    using bgmedia::mix::PlanRequest;
+    using bgmedia::mix::CueKind;
+
+    const double duration = 28.0;
+    const AnalysisResult analysis = analysisFor(128.0, duration);
+
+    // Construct a synthetic track containing a drop, mid-drop dramatic break, drop resumption, and outro:
+    // 0..4s: Intro (moderate energy)
+    // 4..12s: Drop part 1 (very high energy, full bass)
+    // 12..13.5s: Dramatic pause inside drop (short silence/shout, 1.5s)
+    // 13.5..22s: Drop part 2 (very high energy, bass resumes fully!)
+    // 22..28s: Outro (energy fades to quiet ending)
+    auto dropTrack = toneTrack(duration, 440.0, 2, kRate);
+    const std::size_t totalSamples = static_cast<std::size_t>(duration * kRate);
+    for (std::size_t i = 0; i < totalSamples; ++i) {
+        const double t = static_cast<double>(i) / kRate;
+        float s = 0.0f;
+        if (t >= 0.0 && t < 4.0) {
+            s = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else if (t >= 4.0 && t < 12.0) {
+            // Drop part 1: heavy bass + synth
+            s = 0.65f * static_cast<float>(std::sin(2.0 * 3.14159265 * 55.0 * t)) +
+                0.30f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else if (t >= 12.0 && t < 13.5) {
+            // Dramatic pause with vocal shout at 12.8s
+            if (t >= 12.8 && t < 13.3) {
+                s = 0.35f * static_cast<float>(std::sin(2.0 * 3.14159265 * 880.0 * t));
+            } else {
+                s = 0.001f;
+            }
+        } else if (t >= 13.5 && t < 22.0) {
+            // Drop part 2: full drop returns!
+            s = 0.65f * static_cast<float>(std::sin(2.0 * 3.14159265 * 55.0 * t)) +
+                0.30f * static_cast<float>(std::sin(2.0 * 3.14159265 * 440.0 * t));
+        } else {
+            // Natural outro: energy drops off
+            const double fade = std::clamp((28.0 - t) / 6.0, 0.0, 1.0);
+            s = static_cast<float>(0.20 * fade) * static_cast<float>(std::sin(2.0 * 3.14159265 * 220.0 * t));
+        }
+        dropTrack->samples[i * 2] = s;
+        dropTrack->samples[i * 2 + 1] = s;
+    }
+
+    MixFeatureExtractor extractor;
+    const MixFeatureMap featDrop = extractor.extractFromTrack(*dropTrack, analysis);
+
+    // 1. Verify that the dramatic pause at 12s does NOT produce a SilenceEdge MixOut cue
+    bool foundFalseSilenceMixOut = false;
+    for (const auto& cue : featDrop.mixOutCandidates) {
+        if (cue.kind == CueKind::SilenceEdge) {
+            if (cue.time >= 11.5 && cue.time <= 14.0) {
+                foundFalseSilenceMixOut = true;
+            }
+        }
+    }
+    CHECK(!foundFalseSilenceMixOut);
+
+    // 2. Run MixPlanner: outgoing track is the drop track, incoming is clean track
+    const auto trackIn = toneTrack(duration, 128.0, 2, kRate);
+    const MixFeatureMap featIn = extractor.extractFromTrack(*trackIn, analysis);
+
+    MixPlanner planner;
+    PlanRequest req;
+    req.type = TransitionType::SmartCrossfade;
+    req.requestedDuration = 4.0;
+    req.currentPositionA = -1.0;
+
+    const bgmedia::mix::MixPlan plan = planner.plan(analysis, analysis, &featDrop, &featIn, req);
+    CHECK(plan.valid);
+    // The planner must NOT exit during the mid-drop pause (12..14s); it must let the second drop play
+    // and transition at the natural outro phrase boundary (>= 18.0s).
+    CHECK(plan.transitionStartA >= 18.0);
+}
+
+TEST_CASE("mix.issue50_desktop_seeking_and_jump_to_planned_transition") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto initialPreview = session.snapshot().preview;
+    CHECK(initialPreview.valid);
+    const double schedPoint = initialPreview.overallStartA();
+
+    // 1. Seeking Deck A while playing (well before the scheduled transition)
+    const double safeSeek1 = std::min(2.5, schedPoint * 0.4);
+    CHECK(session.seekDeck(DeckId::A, safeSeek1));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, safeSeek1, 0.05);
+
+    // 2. Seeking Deck A while paused
+    session.pause();
+    pump.once();
+    const double safeSeek2 = std::min(4.0, schedPoint * 0.7);
+    CHECK(session.seekDeck(DeckId::A, safeSeek2));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, safeSeek2, 0.05);
+
+    // 3. Jump to planned transition
+    session.refreshPlan();
+    const auto snap = session.snapshot();
+    CHECK(snap.preview.valid);
+    CHECK(session.jumpToPlannedTransition(2.0));
+    pump.once();
+    const double expected = std::max(0.0, snap.preview.overallStartA() - 2.0);
+    CHECK_NEAR(engine.snapshot().decks[0].positionSeconds, expected, 0.05);
+
+    // 4. Safety lock: seeking is strictly rejected during an active transition
+    session.play();
+    session.startTransitionNow();
+    pump.once();
+    CHECK(engine.snapshot().phase == TransitionPhase::Running);
+
+    // Both seekDeck and jumpToPlannedTransition must return false while transition is running
+    CHECK(!session.seekDeck(DeckId::A, 1.0));
+    CHECK(!session.jumpToPlannedTransition(7.0));
+    CHECK(!session.snapshot().lastError.empty());
+
+    // Wait for transition to finish
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+    CHECK(engine.snapshot().phase == TransitionPhase::Idle);
+
+    // Seeking is restored after transition finishes
+    CHECK(session.seekDeck(DeckId::B, 2.0));
+    pump.once();
+    CHECK_NEAR(engine.snapshot().decks[1].positionSeconds, 2.0, 0.05);
+}
+
+TEST_CASE("mix.issue51_preview_plan_vs_executed_transition_consistency") {
+    using bgmedia::mix::MixSession;
+    using bgmedia::mix::MixEngine;
+    using bgmedia::mix::DeckId;
+    using bgmedia::mix::TransitionPhase;
+    using bgmedia::mix::TransitionType;
+    using bgmedia::mix::MixMode;
+
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+
+    session.setMixMode(MixMode::Auto);
+    session.setTransitionDuration(4.0);
+    session.addTrack("long-silence-alpha.wav");
+    session.addTrack("long-beta.wav");
+    CHECK(pump.waitForDecks(2));
+
+    session.play();
+    pump.once();
+
+    const auto initialSnap = session.snapshot();
+    CHECK(initialSnap.preview.valid);
+
+    const double plannedStartA = initialSnap.preview.transitionStartA;
+    const double plannedStartB = initialSnap.preview.startB;
+    const double plannedDuration = initialSnap.preview.duration;
+    const auto plannedStrategy = initialSnap.preview.strategy;
+    const auto plannedType = initialSnap.preview.type;
+
+    // Seek master deck right to the scheduled transition trigger point
+    const double schedPoint = initialSnap.preview.overallStartA();
+    CHECK(session.seekDeck(DeckId::A, schedPoint));
+
+    // First pump: engine.render() executes seek to schedPoint
+    pump.once();
+    // Second pump: session.update() detects deck.positionSeconds >= schedPoint - lead
+    // and executes the scheduled preview plan
+    pump.once();
+
+    const auto execSnap = session.snapshot();
+    CHECK(execSnap.engine.phase == TransitionPhase::Running);
+    CHECK(execSnap.hasExecutedPlan);
+
+    // Consistency verification: executed plan exactly matches preview plan
+    CHECK_NEAR(execSnap.executed.transitionStartA, plannedStartA, 1e-4);
+    CHECK_NEAR(execSnap.executed.startB, plannedStartB, 1e-4);
+    CHECK_NEAR(execSnap.executed.duration, plannedDuration, 1e-4);
+    CHECK(execSnap.executed.strategy == plannedStrategy);
+    CHECK(execSnap.executed.type == plannedType);
+
+    // Executed plan contains explanatory reason log
+    CHECK(!execSnap.executed.reasons.empty());
+
+    // Wait for transition to complete
+    while (engine.snapshot().phase != TransitionPhase::Idle) {
+        pump.once();
+    }
+}

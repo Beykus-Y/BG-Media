@@ -579,6 +579,7 @@ VocalOverlapAssessment evaluateVocalOverlap(
     double clashAccum = 0.0;
     double clashMax = 0.0;
     double clashSeconds = 0.0;
+    double leadClashSeconds = 0.0;
     double vocalBedAccum = 0.0;
     double outVocalSum = 0.0;
     double inVocalSum = 0.0;
@@ -594,10 +595,12 @@ VocalOverlapAssessment evaluateVocalOverlap(
         const MixFeatureFrame fA = featuresA.sampleAt(posA);
         const MixFeatureFrame fB = featuresB.sampleAt(posB);
 
-        const float gOut = evalGainCurve(gainCurveOut, tOut, duration, false) *
-                           evalMidEqCurve(eqCurveOut, tOut);
-        const float gIn = evalGainCurve(gainCurveIn, tOut, duration, true) *
-                          evalMidEqCurve(eqCurveIn, tOut);
+        // Vocal EQ carve reduces mid band, but human singing formants and
+        // consonants remain audible across low/high bands (-6 dB mid is not silence).
+        const float midEqA = std::max(0.65f, evalMidEqCurve(eqCurveOut, tOut));
+        const float midEqB = std::max(0.65f, evalMidEqCurve(eqCurveIn, tOut));
+        const float gOut = evalGainCurve(gainCurveOut, tOut, duration, false) * midEqA;
+        const float gIn = evalGainCurve(gainCurveIn, tOut, duration, true) * midEqB;
 
         // Audibility-weighted vocal activity on each deck.
         const float audOut = std::clamp(gOut * 1.25f, 0.0f, 1.0f);
@@ -608,18 +611,26 @@ VocalOverlapAssessment evaluateVocalOverlap(
         outVocalSum += fA.vocalScore;
         inVocalSum += fB.vocalScore;
 
-        if (effVocalA >= 0.42f) {
+        if (effVocalA >= 0.25f) {
             lastVocalTimeA = std::max(lastVocalTimeA, tOut);
         }
-        if (effVocalB >= 0.42f) {
+        if (effVocalB >= 0.25f) {
             firstVocalTimeB = std::min(firstVocalTimeB, tOut);
         }
 
         const double jointClash = static_cast<double>(effVocalA) * effVocalB;
         clashAccum += jointClash;
         clashMax = std::max(clashMax, jointClash);
-        if (effVocalA >= 0.42f && effVocalB >= 0.42f) {
+
+        // Track both general vocal overlap and severe lead vocal collisions
+        if (effVocalA >= 0.22f && effVocalB >= 0.22f) {
             clashSeconds += dt;
+        }
+
+        const bool isLeadA = fA.vocalScore >= 0.50f || timeInsideVocalRegion(featuresA.vocal, posA, 0.15);
+        const bool isLeadB = fB.vocalScore >= 0.50f || timeInsideVocalRegion(featuresB.vocal, posB, 0.15);
+        if (isLeadA && isLeadB && audOut >= 0.18f && audIn >= 0.18f) {
+            leadClashSeconds += dt;
         }
 
         // Vocal-over-instrumental: one deck has clear vocal while the other
@@ -638,13 +649,29 @@ VocalOverlapAssessment evaluateVocalOverlap(
     result.outgoingVocalMean = static_cast<float>(outVocalSum / count);
     result.incomingVocalMean = static_cast<float>(inVocalSum / count);
     result.clashDurationSeconds = clashSeconds;
+    result.leadVocalClashDurationSeconds = leadClashSeconds;
+    result.maxSimultaneousVocalScore = static_cast<float>(clashMax);
+    result.severeLeadVocalClash = (leadClashSeconds >= 0.75 || clashSeconds >= 1.2 ||
+                                   (clashMax >= 0.20 && clashSeconds >= 0.5));
+    result.lowConfidenceConservative = (result.confidence < 0.45f);
 
     // Combine mean overlap clash, peak clash, and sustained clash duration.
-    const double durationFactor = std::clamp(clashSeconds / 2.5, 0.0, 1.0);
-    result.vocalClashScore = static_cast<float>(std::clamp(
-        (0.45 * (meanClash * 2.2) + 0.30 * clashMax + 0.25 * durationFactor) *
-            result.confidence,
-        0.0, 1.0));
+    const double durationFactor = std::clamp(clashSeconds / 2.0, 0.0, 1.0);
+    const double leadFactor = std::clamp(leadClashSeconds / 1.5, 0.0, 1.0);
+    const double meanFactor = std::clamp(meanClash * 2.8, 0.0, 1.0);
+    double rawClash = 0.30 * meanFactor + 0.30 * clashMax + 0.40 * std::max(durationFactor, leadFactor);
+    if (result.severeLeadVocalClash) {
+        rawClash = std::max(rawClash, 0.55);
+    }
+    rawClash = std::clamp(rawClash, 0.0, 1.0);
+
+    if (result.confidence >= 0.50f) {
+        result.vocalClashScore = static_cast<float>(rawClash);
+    } else {
+        // Conservative handling for low confidence: never assume 0 clash when vocal activity was detected
+        result.vocalClashScore = static_cast<float>(
+            std::clamp(0.65 * rawClash + 0.35 * (rawClash > 0.05 ? 0.30 : 0.0), 0.0, 1.0));
+    }
     result.vocalOverInstrumentalScore = static_cast<float>(
         std::clamp((vocalBedAccum / count) * 1.35, 0.0, 1.0));
 
@@ -691,20 +718,29 @@ VocalOverlapAssessment evaluateVocalOverlap(
         timeInsideVocalRegion(featuresB.vocal, startB, 0.30);
 
     // Clean vocal handoff: A finishes its vocal phrase before B's vocal phrase
-    // begins (or one side is instrumental), with minimal simultaneous clash.
+    // begins (or one side is instrumental), with strictly minimal simultaneous clash.
     const bool sequentialHandoff =
         (lastVocalTimeA >= 0.0 && firstVocalTimeB < 1e8 &&
-         firstVocalTimeB >= lastVocalTimeA - 0.20) ||
-        (result.outgoingVocalMean >= 0.35f && result.incomingVocalMean < 0.25f) ||
-        (result.incomingVocalMean >= 0.35f && result.outgoingVocalMean < 0.25f);
+         firstVocalTimeB >= lastVocalTimeA - 0.15) ||
+        (result.outgoingVocalMean >= 0.30f && result.incomingVocalMean < 0.18f) ||
+        (result.incomingVocalMean >= 0.30f && result.outgoingVocalMean < 0.18f);
     result.cleanVocalHandoff =
-        sequentialHandoff && result.vocalClashScore <= 0.22f &&
+        sequentialHandoff && !result.severeLeadVocalClash &&
+        result.clashDurationSeconds <= 0.30 &&
+        result.leadVocalClashDurationSeconds <= 0.10 &&
+        result.vocalClashScore <= 0.15f &&
         !result.cutsMidVocalPhraseA && !result.entersMidVocalPhraseB;
 
     char buf[256];
-    if (result.vocalClashScore >= 0.35f) {
+    if (result.severeLeadVocalClash) {
         std::snprintf(buf, sizeof(buf),
-                      "Vocal clash risk %.2f (%.1f s simultaneous lead vocals, conf %.2f)",
+                      "Severe lead vocal collision (%.1f s simultaneous lead vocals, clash %.2f, conf %.2f)",
+                      result.leadVocalClashDurationSeconds > 0.0 ? result.leadVocalClashDurationSeconds : result.clashDurationSeconds,
+                      static_cast<double>(result.vocalClashScore),
+                      static_cast<double>(result.confidence));
+    } else if (result.vocalClashScore >= 0.25f) {
+        std::snprintf(buf, sizeof(buf),
+                      "Vocal clash risk %.2f (%.1f s overlap, conf %.2f)",
                       static_cast<double>(result.vocalClashScore),
                       result.clashDurationSeconds,
                       static_cast<double>(result.confidence));
@@ -714,6 +750,11 @@ VocalOverlapAssessment evaluateVocalOverlap(
                       static_cast<double>(result.vocalClashScore),
                       static_cast<double>(result.vocalOverInstrumentalScore),
                       static_cast<double>(result.confidence));
+    } else if (result.lowConfidenceConservative) {
+        std::snprintf(buf, sizeof(buf),
+                      "Low vocal confidence %.2f; using conservative safety margin (clash %.2f)",
+                      static_cast<double>(result.confidence),
+                      static_cast<double>(result.vocalClashScore));
     } else {
         std::snprintf(buf, sizeof(buf),
                       "Low vocal activity in overlap (clash %.2f, conf %.2f)",

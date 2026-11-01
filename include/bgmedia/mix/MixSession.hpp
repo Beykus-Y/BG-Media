@@ -102,6 +102,16 @@ public:
     [[nodiscard]] int phraseBars() const noexcept { return phraseBars_; }
     [[nodiscard]] bool autoQueue() const noexcept { return autoQueue_; }
 
+    // Seeks a loaded deck to position in seconds.
+    // Safe policy: rejected (returns false) during an active transition to prevent clicks/desync.
+    bool seekDeck(DeckId deck, double seconds);
+
+    // Jumps the master deck to ~leadSeconds before the planned transition start for rapid auditioning.
+    bool jumpToPlannedTransition(double leadSeconds = 7.0);
+
+    // Explicitly rebuilds the transition plan preview.
+    void refreshPlan();
+
     // Must be called from the UI thread every frame.
     void update();
 
@@ -140,7 +150,7 @@ private:
     void collectCompleted();
     void serviceDecks();
     void handleTransitionCompletion();
-    void refreshPlan();
+    void executeScheduledTransition(const MixPlan& plannedPreview);
     [[nodiscard]] double deckPosition(DeckId deck) const;
     [[nodiscard]] DeckId masterDeck() const;
     [[nodiscard]] double deckDuration(DeckId deck) const;
@@ -185,6 +195,8 @@ private:
     std::string status_;
     std::string lastError_;
     MixPlan preview_;
+    MixPlan lastExecutedPlan_;
+    bool hasExecutedPlan_ = false;
 
     std::thread worker_;
     std::mutex jobMutex_;

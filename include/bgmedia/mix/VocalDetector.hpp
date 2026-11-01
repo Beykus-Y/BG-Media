@@ -109,6 +109,10 @@ struct VocalOverlapAssessment {
     // 0..1 score for simultaneous audible lead vocals (double-vocal clash).
     float vocalClashScore = 0.0f;
     double clashDurationSeconds = 0.0;
+    double leadVocalClashDurationSeconds = 0.0;
+    bool severeLeadVocalClash = false;
+    float maxSimultaneousVocalScore = 0.0f;
+    bool lowConfidenceConservative = false;
 
     // 0..1 score for singing over an instrumental bed (clean vocal-over-instrumental).
     float vocalOverInstrumentalScore = 0.0f;

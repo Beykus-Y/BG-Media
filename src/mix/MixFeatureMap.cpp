@@ -668,12 +668,25 @@ void buildBarsPhrasesAndCues(MixFeatureMap& map,
 
     for (const SilenceRegion& s : analysis.silences) {
         if (s.start >= duration * 0.35 && s.start <= duration - 0.5) {
-            const double preSilence = std::max(0.0, s.start - std::min(4.0, s.start * 0.25));
-            addUniqueCandidate(
-                map.mixOutCandidates,
-                makeCandidate(preSilence, CueRole::MixOut, CueKind::SilenceEdge,
-                              s.confidence, "pre-silence mix-out window"),
-                minSep);
+            // Distinguish true end-of-track silence / breakdown from a short dramatic pause
+            // inside a continuing section or drop.
+            const double pauseLen = s.end - s.start;
+            bool dramaticBreak = false;
+            if (pauseLen <= 3.5 && s.end + 2.0 < duration) {
+                const double checkTime = std::min(duration - 0.1, s.end + 0.5);
+                const MixFeatureFrame after = map.sampleAt(checkTime);
+                if (after.active && (after.energy >= 0.40f || after.bassDominance >= 0.38f)) {
+                    dramaticBreak = true;
+                }
+            }
+            if (!dramaticBreak) {
+                const double preSilence = std::max(0.0, s.start - std::min(4.0, s.start * 0.25));
+                addUniqueCandidate(
+                    map.mixOutCandidates,
+                    makeCandidate(preSilence, CueRole::MixOut, CueKind::SilenceEdge,
+                                  s.confidence, "pre-silence mix-out window"),
+                    minSep);
+            }
         }
     }
 

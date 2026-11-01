@@ -1063,6 +1063,72 @@ double MixPlanner::suggestDuration(const AnalysisResult& a,
 
 namespace {
 
+struct MusicalContinuationAssessment {
+    bool valid = false;
+    bool resumesDropOrEnergy = false;
+    double remainingSeconds = 0.0;
+    float postEnergyMean = 0.0f;
+    float continuationScore = 1.0f;
+    std::string diagnosticReason;
+};
+
+MusicalContinuationAssessment evaluateMusicalContinuation(
+    const MixFeatureMap* featuresA,
+    const AnalysisResult& a,
+    double cueTimeA,
+    double durationA) {
+    MusicalContinuationAssessment result;
+    if (!featuresA || !featuresA->valid() || a.info.duration <= 0.0) {
+        result.continuationScore = 1.0f;
+        return result;
+    }
+    result.valid = true;
+    const double transitionEndA = cueTimeA + durationA;
+    const double totalDur = a.info.duration;
+    const double naturalEnd = musicalEnd(a, featuresA);
+    const double remaining = std::max(0.0, naturalEnd - transitionEndA);
+    result.remainingSeconds = remaining;
+
+    // Natural ending window / outro: if near the end of the track or past tailStart,
+    // this is a completed track ending with zero continuation penalty.
+    if (remaining <= 14.0 || transitionEndA >= totalDur - 14.0 ||
+        (featuresA->audible.tailStart > 0.0 && transitionEndA >= featuresA->audible.tailStart - 1.0)) {
+        result.continuationScore = 1.0f;
+        result.diagnosticReason = "natural track completion / outro window";
+        return result;
+    }
+
+    // Inspect the forward window in Track A (next 12-16 seconds after transitionEndA)
+    const double forwardEnd = std::min(totalDur, transitionEndA + 14.0);
+    const WindowFeatureSummary forwardWin =
+        featuresA->summarizeWindow(transitionEndA, forwardEnd);
+    result.postEnergyMean = forwardWin.meanEnergy;
+
+    // Check if full energy, bass, or rhythm resumes after this cue
+    const bool highEnergyResumption =
+        forwardWin.meanEnergy >= 0.46f || forwardWin.bassDominance >= 0.40f;
+    const bool longMaterialRemaining = (remaining >= 18.0) && (transitionEndA < totalDur * 0.78);
+
+    if (highEnergyResumption && longMaterialRemaining) {
+        result.resumesDropOrEnergy = true;
+        const double remFraction = std::clamp(remaining / totalDur, 0.0, 1.0);
+        const float severity = static_cast<float>(
+            std::clamp(forwardWin.meanEnergy * 0.65 + remFraction * 0.35, 0.0, 1.0));
+        result.continuationScore = std::clamp(1.0f - 0.75f * severity, 0.10f, 0.55f);
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "premature exit at %.1f s inside active drop/section (%.1f s music remaining, post-energy %.2f)",
+                      cueTimeA, remaining, static_cast<double>(forwardWin.meanEnergy));
+        result.diagnosticReason = buf;
+    } else {
+        result.continuationScore = std::clamp(
+            1.0f - 0.20f * static_cast<float>(remaining / totalDur), 0.75f, 1.0f);
+        result.diagnosticReason = "completed phrase with moderate remaining material";
+    }
+    return result;
+}
+
 MixPlan planSingleCandidate(const PlannerConfig& config_,
                             const AnalysisResult& a,
                             const AnalysisResult& b,
@@ -1960,10 +2026,8 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
     if (plan.type == TransitionType::DirectCut || overrideSpec.forceImpactCut ||
         (plan.duration > 0.0 && plan.duration <= 2.2)) {
         plan.strategy = MixStrategyKind::DropImpactCut;
-    } else if (voc.available &&
-               ((voc.cleanVocalHandoff &&
-                 (voc.outgoingVocalMean >= 0.28f || voc.incomingVocalMean >= 0.28f)) ||
-                plan.vocalEqCarve)) {
+    } else if (voc.available && voc.cleanVocalHandoff &&
+               (voc.outgoingVocalMean >= 0.28f || voc.incomingVocalMean >= 0.28f)) {
         plan.strategy = MixStrategyKind::VocalHandoff;
     } else if (featuresA && featuresA->valid() &&
                (featuresA->audible.hasReverbTail || featuresA->audible.hasFadeOut) &&
@@ -2034,21 +2098,37 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
         }
         sc.rhythmBeatScore = std::clamp(rhythmScore, 0.0f, 1.0f);
 
+        const MusicalContinuationAssessment cont =
+            evaluateMusicalContinuation(featuresA, a, plan.transitionStartA, plan.duration);
+        sc.continuationScore = cont.continuationScore;
+        sc.prematureDropExit = cont.resumesDropOrEnergy;
+
         if (voc.available) {
-            float rawVoc = 1.0f - 0.85f * voc.vocalClashScore +
+            float rawVoc = 1.0f - 0.90f * voc.vocalClashScore +
                            0.14f * voc.vocalOverInstrumentalScore +
-                           (voc.cleanVocalHandoff ? 0.12f : 0.0f) -
-                           (voc.cutsMidVocalPhraseA ? 0.26f : 0.0f) -
-                           (voc.entersMidVocalPhraseB ? 0.22f : 0.0f);
+                           (voc.cleanVocalHandoff ? 0.15f : 0.0f) -
+                           (voc.cutsMidVocalPhraseA ? 0.28f : 0.0f) -
+                           (voc.entersMidVocalPhraseB ? 0.24f : 0.0f);
+            if (voc.severeLeadVocalClash) {
+                rawVoc = std::min(rawVoc, 0.08f);
+            }
             rawVoc = std::clamp(rawVoc, 0.0f, 1.0f);
-            sc.vocalSafetyScore =
-                voc.confidence * rawVoc + (1.0f - voc.confidence) * 0.70f;
+            if (voc.lowConfidenceConservative) {
+                sc.vocalSafetyScore = 0.50f * rawVoc + 0.50f * 0.50f;
+            } else {
+                sc.vocalSafetyScore =
+                    voc.confidence * rawVoc + (1.0f - voc.confidence) * 0.55f;
+            }
+            if (voc.severeLeadVocalClash) {
+                sc.vocalSafetyScore = std::min(sc.vocalSafetyScore, 0.10f);
+            }
             sc.vocalClashRisk = voc.vocalClashScore;
             sc.cutsVocalPhraseA = voc.cutsMidVocalPhraseA;
             sc.entersVocalPhraseB = voc.entersMidVocalPhraseB;
             sc.cleanVocalHandoff = voc.cleanVocalHandoff;
+            sc.severeVocalClash = voc.severeLeadVocalClash;
         } else {
-            sc.vocalSafetyScore = 0.70f;
+            sc.vocalSafetyScore = 0.55f; // conservative default when unanalyzed
         }
 
         if (harm.available) {
@@ -2060,7 +2140,7 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
             sc.harmonicClashRisk = harm.harmonicClashScore;
             sc.spectralCrowding = harm.spectralCrowdScore;
         } else {
-            sc.harmonicScore = 0.70f;
+            sc.harmonicScore = 0.65f;
             sc.spectralCrowding = harm.spectralCrowdScore;
         }
 
@@ -2086,14 +2166,28 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
         sc.durationFitScore = static_cast<float>(std::clamp(0.45 + 0.55 * barFit, 0.20, 1.0));
 
         sc.totalScore = std::clamp(
-            0.22f * sc.phraseBoundaryScore +
-                0.20f * sc.rhythmBeatScore +
-                0.22f * sc.vocalSafetyScore +
-                0.16f * sc.harmonicScore +
-                0.10f * sc.energyContinuityScore +
+            0.18f * sc.phraseBoundaryScore +
+                0.18f * sc.rhythmBeatScore +
+                0.24f * sc.vocalSafetyScore +
+                0.14f * sc.harmonicScore +
+                0.12f * sc.energyContinuityScore +
                 0.05f * sc.loudnessBalanceScore +
-                0.05f * sc.durationFitScore,
+                0.04f * sc.durationFitScore +
+                0.05f * sc.continuationScore,
             0.0f, 1.0f);
+
+        // Safety constraint: high-confidence severe lead vocal collisions cannot be masked by rhythm/phrase
+        if (sc.severeVocalClash) {
+            const float clashPenalty = static_cast<float>(
+                0.25f + 0.15f * std::clamp(voc.clashDurationSeconds / 2.0, 0.0, 1.0));
+            sc.totalScore = std::max(0.05f, sc.totalScore - clashPenalty);
+        }
+        // Safety constraint: premature exit inside active drop is penalized when music resumes
+        if (sc.prematureDropExit) {
+            const float dropPenalty = static_cast<float>(
+                0.25f + 0.15f * std::clamp(cont.remainingSeconds / a.info.duration, 0.0, 1.0));
+            sc.totalScore = std::max(0.05f, sc.totalScore - dropPenalty);
+        }
 
         char sbuf[256];
         std::snprintf(
@@ -2232,6 +2326,23 @@ std::vector<MixPlan> evaluateCandidatePlans(
                 }
             }
         }
+        // Also include vocal phrase ends from A to enable clean vocal handoff
+        if (featuresA->vocal.available) {
+            for (const VocalRegion& reg : featuresA->vocal.regions) {
+                if (reg.end >= minOutA && reg.end + 1.5 <= maxEndA && startsA.size() < 7) {
+                    bool dup = false;
+                    for (double s : startsA) {
+                        if (std::abs(s - reg.end) < 0.45) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        startsA.push_back(reg.end);
+                    }
+                }
+            }
+        }
     }
 
     // Incoming start candidates on B (only when preferPhraseBoundaries is enabled).
@@ -2316,7 +2427,16 @@ std::vector<MixPlan> evaluateCandidatePlans(
                std::abs(p.startB - baseline.startB) < 0.20 &&
                std::abs(p.duration - baseline.duration) < 0.25;
     };
+    const bool baseSafe = !baseline.scoreBreakdown.severeVocalClash &&
+                          !baseline.scoreBreakdown.prematureDropExit;
     auto hasMeaningfulGain = [&](const MixPlan& alt) {
+        if (!baseSafe) {
+            // Any candidate avoiding a severe vocal collision or premature drop cut is prioritized
+            if (!alt.scoreBreakdown.severeVocalClash && !alt.scoreBreakdown.prematureDropExit) {
+                return true;
+            }
+            return alt.scoreBreakdown.totalScore > baseTotal;
+        }
         return (alt.scoreBreakdown.totalScore > baseTotal + 0.025f) ||
                (alt.scoreBreakdown.vocalSafetyScore > baseVoc + 0.06f &&
                 alt.scoreBreakdown.totalScore >= baseTotal - 0.005f) ||

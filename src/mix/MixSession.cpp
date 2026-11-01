@@ -596,6 +596,45 @@ MixPlan MixSession::buildPlan(DeckId from, DeckId to, const MixSnapshot& snap,
     return plan;
 }
 
+bool MixSession::seekDeck(DeckId deck, double seconds) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "Cannot seek during an active transition";
+        return false;
+    }
+    const int idx = deckIndex(deck);
+    if (!snap.decks[idx].loaded || snap.decks[idx].durationSeconds <= 0.0) {
+        return false;
+    }
+    const double target = std::clamp(seconds, 0.0, snap.decks[idx].durationSeconds);
+    engine_.seek(deck, target);
+    if (deck == snap.master) {
+        refreshPlan();
+    }
+    return true;
+}
+
+bool MixSession::jumpToPlannedTransition(double leadSeconds) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "Cannot jump during an active transition";
+        return false;
+    }
+    MixPlan prev;
+    {
+        std::lock_guard lock(mutex_);
+        prev = preview_;
+    }
+    if (!prev.valid || prev.from != snap.master) {
+        return false;
+    }
+    const double sched = prev.overallStartA();
+    const double target = std::max(0.0, sched - std::max(1.0, leadSeconds));
+    return seekDeck(snap.master, target);
+}
+
 void MixSession::refreshPlan() {
     std::lock_guard lock(mutex_);
     preview_ = {};
@@ -632,9 +671,16 @@ void MixSession::startPlannedTransition(double durationOverride) {
         status_ = "Transition unavailable";
         return;
     }
+    char reasonBuf[256];
+    std::snprintf(reasonBuf, sizeof(reasonBuf),
+                  "Manual NEXT transition from live position %.3f s",
+                  snap.decks[deckIndex(from)].positionSeconds);
+    plan.reasons.push_back(reasonBuf);
     {
         std::lock_guard lock(mutex_);
         preview_ = plan;
+        lastExecutedPlan_ = plan;
+        hasExecutedPlan_ = true;
     }
     if (!engine_.startTransition(plan)) {
         std::lock_guard lock(mutex_);
@@ -647,6 +693,47 @@ void MixSession::startPlannedTransition(double durationOverride) {
     // another transition as soon as the reverse fade finished.
     nextRequested_ = false;
     status_ = std::string("Mixing: ") + transitionTypeName(plan.type);
+}
+
+void MixSession::executeScheduledTransition(const MixPlan& plannedPreview) {
+    const MixSnapshot snap = engine_.snapshot();
+    if (snap.phase != TransitionPhase::Idle) {
+        return;
+    }
+    const DeckId from = snap.master;
+    const DeckId to = otherDeck(from);
+    if (!snap.decks[deckIndex(from)].loaded || !snap.decks[deckIndex(to)].loaded) {
+        return;
+    }
+
+    // Preserve the validated preview plan winner (cues, duration, strategy, gain curves, trims)
+    MixPlan plan = plannedPreview;
+    plan.from = from;
+    plan.to = to;
+
+    const double livePosA = snap.decks[deckIndex(from)].positionSeconds;
+    char reasonBuf[256];
+    std::snprintf(reasonBuf, sizeof(reasonBuf),
+                  "Executing planned transition at live A %.2f s (strategy %s, cues A %.2f -> B %.2f, dur %.1f s)",
+                  livePosA, mixStrategyKindName(plan.strategy), plan.transitionStartA, plan.startB, plan.duration);
+    plan.reasons.push_back(reasonBuf);
+
+    {
+        std::lock_guard lock(mutex_);
+        preview_ = plan;
+        lastExecutedPlan_ = plan;
+        hasExecutedPlan_ = true;
+    }
+    if (!engine_.startTransition(plan)) {
+        std::lock_guard lock(mutex_);
+        lastError_ = "scheduled transition could not start (engine busy or tracks missing)";
+        status_ = lastError_;
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    nextRequested_ = false;
+    status_ = std::string("Mixing: ") + transitionTypeName(plan.type) +
+              " (" + mixStrategyKindName(plan.strategy) + ")";
 }
 
 void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
@@ -743,7 +830,7 @@ void MixSession::update() {
     const double scheduleAt = preview.overallStartA();
     if (preview.valid && preview.from == from && schedulable &&
         deck.positionSeconds >= scheduleAt - lead) {
-        startPlannedTransition(duration_);
+        executeScheduledTransition(preview);
     }
 }
 
@@ -785,6 +872,8 @@ MixSessionSnapshot MixSession::snapshot() const {
         out.preparingProgress = preparingProgress_.load(std::memory_order_relaxed);
     }
     out.preview = preview_;
+    out.executed = lastExecutedPlan_;
+    out.hasExecutedPlan = hasExecutedPlan_;
     out.status = status_;
     out.lastError = lastError_;
     return out;
