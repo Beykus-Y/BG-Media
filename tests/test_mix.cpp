@@ -3069,6 +3069,29 @@ TEST_CASE("mix.feature_map_bs1770_lufs_vs_plain_rms") {
     const MixFeatureMap mapSurBL = extractor.extractFromTrack(*surBL, surAnalysis);
     const MixFeatureMap mapSurBR = extractor.extractFromTrack(*surBR, surAnalysis);
     CHECK_NEAR(mapSurBL.loudness.integratedLufs, mapSurBR.loudness.integratedLufs, 0.05f);
+
+    // Partial final frame must be sample-weighted rather than treated as a full
+    // 100 ms frame: a 1 ms tone at the end of an 8.001 s track must match the
+    // same 1 ms tone placed at 5.0 s.
+    const std::size_t partialFrames = static_cast<std::size_t>(std::llround(8.001 * kRate));
+    auto endPip = std::make_shared<PcmTrack>();
+    auto midPip = std::make_shared<PcmTrack>();
+    endPip->sampleRate = midPip->sampleRate = kRate;
+    endPip->channels = midPip->channels = 1;
+    endPip->samples.assign(partialFrames, 0.0f);
+    midPip->samples.assign(partialFrames, 0.0f);
+    const std::size_t pipLen = static_cast<std::size_t>(kRate / 1000); // 1 ms = 48 samples
+    for (std::size_t i = 0; i < pipLen; ++i) {
+        const float s = static_cast<float>(
+            0.4 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / kRate));
+        endPip->samples[partialFrames - pipLen + i] = s;
+        midPip->samples[5 * kRate + i] = s;
+    }
+    const AnalysisResult partialAnalysis = analysisFor(120.0, 8.001);
+    const MixFeatureMap mapEndPip = extractor.extractFromTrack(*endPip, partialAnalysis);
+    const MixFeatureMap mapMidPip = extractor.extractFromTrack(*midPip, partialAnalysis);
+    CHECK_NEAR(mapEndPip.loudness.momentaryMaxLufs, mapMidPip.loudness.momentaryMaxLufs, 0.25f);
+    CHECK_NEAR(mapEndPip.loudness.integratedLufs, mapMidPip.loudness.integratedLufs, 0.25f);
 }
 
 TEST_CASE("mix.feature_map_adaptive_bounds_and_quiet_master") {

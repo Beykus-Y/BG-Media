@@ -1138,19 +1138,33 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
         map.frames[static_cast<std::size_t>(f)].rms = static_cast<float>(rawRms);
         frameKMeanSq[static_cast<std::size_t>(f)] = kMeanSq;
         prefixK[static_cast<std::size_t>(f) + 1] =
-            prefixK[static_cast<std::size_t>(f)] + kMeanSq;
+            prefixK[static_cast<std::size_t>(f)] + sumKSq;
     }
-
-    auto windowKMeanSq = [&](int fStart, int fEnd) noexcept {
-        const int a = std::clamp(fStart, 0, frameCount - 1);
-        const int b = std::clamp(fEnd, a + 1, frameCount);
-        return (prefixK[static_cast<std::size_t>(b)] -
-                prefixK[static_cast<std::size_t>(a)]) /
-               static_cast<double>(b - a);
-    };
 
     const int momFrames = std::max(1, static_cast<int>(std::lround(0.40 / actualStep)));
     const int stFrames = std::max(1, static_cast<int>(std::lround(3.00 / actualStep)));
+    const std::size_t momSamples =
+        static_cast<std::size_t>(momFrames) * static_cast<std::size_t>(stepSamples);
+    const std::size_t stSamples =
+        static_cast<std::size_t>(stFrames) * static_cast<std::size_t>(stepSamples);
+
+    auto windowKMeanSq = [&](int fStart, int fEnd, std::size_t minSamples) noexcept {
+        int a = std::clamp(fStart, 0, frameCount - 1);
+        const int b = std::clamp(fEnd, a + 1, frameCount);
+        std::size_t s0 =
+            static_cast<std::size_t>(a) * static_cast<std::size_t>(stepSamples);
+        const std::size_t s1 = std::min(
+            totalSamples,
+            static_cast<std::size_t>(b) * static_cast<std::size_t>(stepSamples));
+        if (b == frameCount && (s1 - s0) < minSamples && a > 0) {
+            --a;
+            s0 = static_cast<std::size_t>(a) * static_cast<std::size_t>(stepSamples);
+        }
+        const std::size_t samplesInWin = std::max<std::size_t>(1, s1 - s0);
+        return (prefixK[static_cast<std::size_t>(b)] -
+                prefixK[static_cast<std::size_t>(a)]) /
+               static_cast<double>(samplesInWin);
+    };
 
     float maxMomentary = -70.0f;
     float maxShortTerm = -70.0f;
@@ -1160,8 +1174,8 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
     shortTermAbsBlocks.reserve(static_cast<std::size_t>(frameCount));
 
     for (int f = 0; f < frameCount; ++f) {
-        const double momMeanSq = windowKMeanSq(f - momFrames + 1, f + 1);
-        const double stMeanSq = windowKMeanSq(f - stFrames + 1, f + 1);
+        const double momMeanSq = windowKMeanSq(f - momFrames + 1, f + 1, momSamples);
+        const double stMeanSq = windowKMeanSq(f - stFrames + 1, f + 1, stSamples);
         const float momLufs = powerToLufs(momMeanSq);
         const float stLufs = powerToLufs(stMeanSq);
         map.frames[static_cast<std::size_t>(f)].momentaryLufs = momLufs;
