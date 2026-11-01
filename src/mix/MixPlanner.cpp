@@ -1168,6 +1168,22 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
         }
     }
 
+    if (type == TransitionType::Crossfade && ramp) {
+        // A plain crossfade must not execute an un-synced tempo ramp on the
+        // outgoing deck. Reset the ramp state and crossfade window.
+        ramp = false;
+        rampBars = 0;
+        rampSeconds = 0.0;
+        rampMediaSeconds = 0.0;
+        ratioA = 1.0;
+        crossfadeStartA = overallStartA;
+        endA = std::min(a.info.duration, crossfadeStartA + duration);
+        duration = endA - crossfadeStartA;
+        plan.duration = duration;
+        plan.transitionStartA = crossfadeStartA;
+        plan.transitionEndA = endA;
+    }
+
     // ------------------------------------------------------------------
     // Entry point in the incoming track.
     // ------------------------------------------------------------------
