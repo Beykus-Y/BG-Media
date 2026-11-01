@@ -37,6 +37,8 @@ using bgmedia::mix::PcmTrack;
 using bgmedia::mix::PlanRequest;
 using bgmedia::mix::PlannerConfig;
 using bgmedia::mix::PreparedMixTrack;
+using bgmedia::mix::TempoMatchKind;
+using bgmedia::mix::TempoPoint;
 using bgmedia::mix::TransitionPhase;
 using bgmedia::mix::TransitionStage;
 using bgmedia::mix::TransitionType;
@@ -2514,4 +2516,161 @@ TEST_CASE("mix.engine_transition_start_keeps_outgoing_continuity") {
     CHECK(firstMinimum > 0.20f);
     std::printf("transition start continuity: first-100 min=%.4f\n",
                 static_cast<double>(firstMinimum));
+}
+
+namespace {
+
+MixPlan planMetric(double bpmA, double bpmB, PlannerConfig config = {},
+                   TransitionType type = TransitionType::SmartCrossfade,
+                   double durationA = 120.0) {
+    MixPlanner planner(config);
+    PlanRequest request;
+    request.type = type;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    return planner.plan(analysisFor(bpmA, durationA), analysisFor(bpmB, 120.0),
+                        request);
+}
+
+void checkMetric(const MixPlan& plan, int bBeats, int aBeats, double rateA,
+                 double rateB, TempoMatchKind kind) {
+    CHECK(plan.valid);
+    CHECK(plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.bBeats == bBeats);
+    CHECK(plan.metricRelation.aBeats == aBeats);
+    CHECK(plan.tempoMatchKind == kind);
+    CHECK_NEAR(plan.tempoRatioAEnd, rateA, 1e-3);
+    CHECK_NEAR(plan.tempoRatioB, rateB, 1e-3);
+    // Effective BPMs honour the relation: B/A beat rate == p/q.
+    CHECK_NEAR(plan.targetBpm / plan.targetBpmA,
+               static_cast<double>(bBeats) / aBeats, 1e-6);
+}
+
+} // namespace
+
+TEST_CASE("mix.metric_exact_octave_relations") {
+    // 60 -> 120: 2:1 with both decks at 1.0x, no ramp, no time-stretch.
+    MixPlan plan = planMetric(60.0, 120.0);
+    checkMetric(plan, 2, 1, 1.0, 1.0, TempoMatchKind::ExactMetric);
+    CHECK(!plan.tempoRampActive);
+    CHECK(plan.type == TransitionType::PhraseAware);
+    // 120 -> 60: 1:2.
+    plan = planMetric(120.0, 60.0);
+    checkMetric(plan, 1, 2, 1.0, 1.0, TempoMatchKind::ExactMetric);
+    CHECK(!plan.tempoRampActive);
+    // 80 -> 160.
+    plan = planMetric(80.0, 160.0);
+    checkMetric(plan, 2, 1, 1.0, 1.0, TempoMatchKind::ExactMetric);
+    // Explicit Beatmatched request behaves the same.
+    plan = planMetric(60.0, 120.0, {}, TransitionType::Beatmatched);
+    checkMetric(plan, 2, 1, 1.0, 1.0, TempoMatchKind::ExactMetric);
+}
+
+TEST_CASE("mix.metric_octave_with_bounded_residual") {
+    // 60 -> 118: keep A at 60 and speed B by 120/118; never a 2x rate.
+    const MixPlan plan = planMetric(60.0, 118.0);
+    // Bounded residual only (~1.7%), split like the existing 1:1 matching:
+    // A ramps to the incoming tempo and B stays at 1.0x.
+    CHECK(plan.valid);
+    CHECK(plan.metricRelation.bBeats == 2 && plan.metricRelation.aBeats == 1);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::MetricWithStretch);
+    CHECK_NEAR(plan.tempoRatioAEnd, 59.0 / 60.0, 1e-3);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-3);
+    // Effective beat rates keep the exact 2:1 relationship.
+    CHECK_NEAR(plan.targetBpm / plan.targetBpmA, 2.0, 1e-6);
+    CHECK(std::abs(plan.tempoRatioAEnd - 1.0) < 0.02);
+    CHECK(std::abs(plan.tempoRatioB - 1.0) < 0.02);
+    CHECK(plan.pitchLock);
+    for (const TempoPoint& point : plan.tempoCurve) {
+        CHECK(point.rate > 0.9 && point.rate < 1.1);
+    }
+}
+
+TEST_CASE("mix.metric_unison_unchanged") {
+    // 123 -> 125 still uses the existing 1:1 bounded match.
+    const MixPlan plan = planMetric(123.0, 125.0);
+    CHECK(plan.valid);
+    CHECK(plan.metricRelation.unison());
+    CHECK(plan.tempoMatchKind == TempoMatchKind::MetricWithStretch);
+    CHECK(plan.fallbackReason.empty());
+    CHECK_NEAR(plan.targetBpm, plan.targetBpmA, 1e-9);
+    // Identical tempos are an exact 1:1.
+    const MixPlan same = planMetric(124.0, 124.0);
+    CHECK(same.metricRelation.unison());
+    CHECK(same.tempoMatchKind == TempoMatchKind::ExactMetric);
+}
+
+TEST_CASE("mix.metric_polyrhythm_is_opt_in") {
+    // 100 -> 150 is 3:2; automatic mode must fall back to a safe crossfade.
+    MixPlan plan = planMetric(100.0, 150.0);
+    CHECK(plan.valid);
+    CHECK(plan.type == TransitionType::SmartCrossfade);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(!plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.unison());
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    // Explicitly enabled it is reported as experimental.
+    PlannerConfig config;
+    config.allowPolyrhythm = true;
+    plan = planMetric(100.0, 150.0, config);
+    CHECK(plan.valid);
+    CHECK(plan.metricRelation.bBeats == 3);
+    CHECK(plan.metricRelation.aBeats == 2);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::ExperimentalPolyrhythm);
+    CHECK(plan.experimental);
+}
+
+TEST_CASE("mix.metric_untrusted_levels_fall_back") {
+    MixPlanner planner;
+    PlanRequest request;
+    request.type = TransitionType::SmartCrossfade;
+    request.requestedDuration = 8.0;
+    request.currentPositionA = 20.0;
+    AnalysisResult a = analysisFor(60.0, 120.0);
+    AnalysisResult b = analysisFor(120.0, 120.0);
+    b.bpmLevelConfidence = 0.2f;  // metric level is a guess
+    MixPlan plan = planner.plan(a, b, request);
+    CHECK(plan.valid);
+    CHECK(plan.metricRelation.unison());
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(plan.fallbackReason.find("2:1") != std::string::npos);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+
+    // The feature can be switched off entirely.
+    PlannerConfig off;
+    off.allowMetricRelations = false;
+    plan = planMetric(60.0, 120.0, off);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+}
+
+TEST_CASE("mix.metric_ambiguity_81_vs_121_is_not_forced") {
+    // 81 and 121.5 are 3:2, not a metric level; no hidden octave/rate change.
+    const MixPlan plan = planMetric(81.0, 121.5);
+    CHECK(plan.valid);
+    CHECK(plan.metricRelation.unison());
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+}
+
+TEST_CASE("mix.metric_match_falls_back_when_ramp_cannot_run") {
+    // 60 -> 118 needs A to move to 59 BPM, but A (30 s) has no room for the
+    // ramp at 20 s plus an 8 s fade: the plan must not keep a tempo-synced
+    // type and a successful match classification at 1.0x rates.
+    const MixPlan plan = planMetric(60.0, 118.0, {},
+                                    TransitionType::SmartCrossfade, 30.0);
+    CHECK(plan.valid);
+    CHECK(!plan.tempoRampActive);
+    CHECK(plan.type == TransitionType::Crossfade);
+    CHECK(plan.tempoMatchKind == TempoMatchKind::FallbackCrossfade);
+    CHECK(!plan.fallbackReason.empty());
+    CHECK(plan.metricRelation.unison());
+    CHECK_NEAR(plan.tempoRatioAEnd, 1.0, 1e-9);
+    CHECK_NEAR(plan.tempoRatioB, 1.0, 1e-9);
+    // An exact 60 -> 120 pair needs no ramp and keeps its relation.
+    const MixPlan exact = planMetric(60.0, 120.0, {},
+                                     TransitionType::SmartCrossfade, 30.0);
+    CHECK(exact.metricRelation.bBeats == 2);
+    CHECK(exact.tempoMatchKind == TempoMatchKind::ExactMetric);
 }

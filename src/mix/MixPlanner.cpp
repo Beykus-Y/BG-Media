@@ -364,6 +364,9 @@ PhraseCue findPhraseCue(const AnalysisResult& analysis, double target,
 struct TempoMatch {
     bool compatible = false;
     bool matched = false;  // tempo ratios differ from 1.0
+    MetricRelation relation;  // B beats : A beats
+    TempoMatchKind kind = TempoMatchKind::None;
+    double targetBpmA = 0.0;  // outgoing BPM at the meeting point
     double targetBpm = 0.0;
     double ratioA = 1.0;
     double ratioB = 1.0;
@@ -371,7 +374,11 @@ struct TempoMatch {
     std::string reason;
 };
 
-TempoMatch matchTempo(const AnalysisResult& b, double localBpmA,
+// 1:1 matching of B against an outgoing BPM. For a metric relation p:q the
+// caller passes the outgoing BPM scaled by p/q ("A expressed at B's metric
+// level"), which makes the returned ratios genuine playback-rate corrections
+// and `targetBpm` the incoming BPM the pair meets at.
+TempoMatch matchTempoAt(const AnalysisResult& b, double localBpmA,
                       const PlannerConfig& config, bool allowOctave) {
     TempoMatch match;
     if (localBpmA <= 0.0 || b.bpm <= 0.0) {
@@ -445,6 +452,96 @@ TempoMatch matchTempo(const AnalysisResult& b, double localBpmA,
             match.deltaPercent, limit);
     }
     return match;
+}
+
+TempoMatchKind classifyMatch(const TempoMatch& match) {
+    if (!match.compatible) {
+        return TempoMatchKind::FallbackCrossfade;
+    }
+    if (match.relation.polyrhythm()) {
+        return TempoMatchKind::ExperimentalPolyrhythm;
+    }
+    return (std::abs(match.ratioA - 1.0) > 1e-4 ||
+            std::abs(match.ratioB - 1.0) > 1e-4)
+               ? TempoMatchKind::MetricWithStretch
+               : TempoMatchKind::ExactMetric;
+}
+
+bool metricLevelTrusted(const AnalysisResult& analysis,
+                        const PlannerConfig& config) {
+    const float minimum = static_cast<float>(config.minMetricConfidence);
+    return analysis.tempoStable && analysis.bpmLevelConfidence >= minimum &&
+           analysis.beatPhaseConfidence >= minimum;
+}
+
+// Metric-relative tempo matching. 1:1 is always tried first (existing
+// behaviour, including the dual-deck compromise). Only when it is out of
+// range are octave-related relations 2:1 / 1:2 (and, strictly opt-in, 3:2 /
+// 2:3) considered, each with its own small bounded rate corrections. The
+// relation is never derived from bpmCandidates, so no hidden 0.5x / 2x
+// playback-rate change can result.
+TempoMatch matchTempo(const AnalysisResult& a, const AnalysisResult& b,
+                      double localBpmA, const PlannerConfig& config,
+                      bool allowOctave) {
+    TempoMatch best = matchTempoAt(b, localBpmA, config, allowOctave);
+    best.relation = MetricRelation{1, 1};
+    best.targetBpmA = best.targetBpm;
+    best.kind = classifyMatch(best);
+    if (best.compatible || !config.allowMetricRelations || localBpmA <= 0.0 ||
+        b.bpm <= 0.0) {
+        return best;
+    }
+
+    std::vector<MetricRelation> relations = {{2, 1}, {1, 2}};
+    if (config.allowPolyrhythm) {
+        relations.push_back({3, 2});
+        relations.push_back({2, 3});
+    }
+    bool found = false;
+    double bestCost = 0.0;
+    TempoMatch chosen;
+    for (const MetricRelation& relation : relations) {
+        TempoMatch candidate = matchTempoAt(
+            b, localBpmA * relation.ratio(), config, false);
+        if (!candidate.compatible) {
+            continue;
+        }
+        const double cost = std::abs(candidate.ratioA - 1.0) +
+                            std::abs(candidate.ratioB - 1.0);
+        if (!found || cost < bestCost - 1e-9) {
+            found = true;
+            bestCost = cost;
+            chosen = candidate;
+            chosen.relation = relation;
+        }
+    }
+    if (!found) {
+        return best;
+    }
+    if (!metricLevelTrusted(a, config) || !metricLevelTrusted(b, config)) {
+        char note[192];
+        std::snprintf(note, sizeof(note),
+                      "; a %d:%d metric relation would fit but the beat level "
+                      "of both tracks is not confident enough",
+                      chosen.relation.bBeats, chosen.relation.aBeats);
+        best.reason += note;
+        return best;
+    }
+    chosen.targetBpmA = chosen.targetBpm * chosen.relation.aBeats /
+                        static_cast<double>(chosen.relation.bBeats);
+    chosen.matched = std::abs(chosen.ratioA - 1.0) > 1e-4 ||
+                     std::abs(chosen.ratioB - 1.0) > 1e-4;
+    chosen.kind = classifyMatch(chosen);
+    char rates[256];
+    std::snprintf(rates, sizeof(rates),
+                  "%d:%d metric relation (outgoing %.1f BPM, incoming %.1f "
+                  "BPM), playback rates A %.4f / B %.4f",
+                  chosen.relation.bBeats, chosen.relation.aBeats, localBpmA,
+                  chosen.targetBpm, chosen.ratioA, chosen.ratioB);
+    chosen.reason = chosen.reason.empty()
+                        ? std::string(rates)
+                        : std::string(rates) + "; " + chosen.reason;
+    return chosen;
 }
 
 double shapeValue(TempoCurveKind kind, double t) {
@@ -614,7 +711,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                               : std::max(0.0, a.info.duration - duration),
                       a.bpm);
             const TempoMatch match =
-                matchTempo(b, localBpm > 0.0 ? localBpm : 120.0, config_, true);
+                matchTempo(a, b, localBpm > 0.0 ? localBpm : 120.0, config_, true);
             if (!match.compatible) {
                 type = TransitionType::SmartCrossfade;
                 plan.fallbackReason =
@@ -694,7 +791,7 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     }
     duration = clampDuration(duration, config_);
 
-    TempoMatch tempo = matchTempo(b, localBpmA, config_, true);
+    TempoMatch tempo = matchTempo(a, b, localBpmA, config_, true);
     const bool tempoRequested =
         type == TransitionType::TempoRamp ||
         type == TransitionType::Beatmatched ||
@@ -886,8 +983,12 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
                 : "tempo is not compatible for beatmatching; using a plain "
                   "crossfade";
     }
-    if (type == TransitionType::Beatmatched && tempo.matched && !ramp &&
+    if ((type == TransitionType::Beatmatched ||
+         type == TransitionType::PhraseAware) &&
+        tempo.compatible && tempo.matched && !ramp &&
         std::abs(tempo.ratioA - 1.0) > 1e-4) {
+        // The outgoing deck would have to change speed to hold the reported
+        // metric relation, but no ramp will run, so the decks would drift.
         type = TransitionType::Crossfade;
         plan.fallbackReason =
             "beatmatching needs tempo sync but the tempo ramp cannot run here; "
@@ -1088,6 +1189,37 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
     plan.tempoRampStartA = ramp ? overallStartA : crossfadeStartA;
     plan.targetBpm = tempoSync ? tempo.targetBpm : b.bpm;
 
+    // Metric relation and match classification. The beat-rate relation is
+    // recorded separately from the playback-rate corrections above, and is
+    // only reported for transitions that actually tempo-sync the decks.
+    const bool tempoType = type == TransitionType::TempoRamp ||
+                           type == TransitionType::Beatmatched ||
+                           type == TransitionType::PhraseAware;
+    const bool syncWanted = tempoRequested || adaptiveChoice;
+    if (tempoType && tempo.compatible) {
+        plan.metricRelation = tempo.relation;
+        plan.tempoMatchKind = tempo.kind;
+        plan.targetBpm = tempo.targetBpm;
+        plan.targetBpmA = tempo.targetBpmA;
+        plan.experimental = plan.experimental || tempo.relation.polyrhythm();
+        if (!tempo.relation.unison()) {
+            plan.reasons.push_back(format(
+                "Metric relation %.0f:%.0f (incoming beats : outgoing beats)",
+                static_cast<double>(tempo.relation.bBeats),
+                static_cast<double>(tempo.relation.aBeats)));
+        }
+        if (tempo.relation.polyrhythm()) {
+            plan.reasons.push_back(
+                "Experimental polyrhythm: enabled explicitly, not an ordinary "
+                "beatmatch");
+        }
+    } else {
+        plan.targetBpmA = localBpmA;
+        plan.tempoMatchKind = (syncWanted && !plan.fallbackReason.empty())
+                                  ? TempoMatchKind::FallbackCrossfade
+                                  : TempoMatchKind::None;
+    }
+
     // ------------------------------------------------------------------
     // Tempo automation: ramp before the overlay, then hold the matched rate.
     // Curve times are relative to the crossfade start, so pre-roll points are
@@ -1104,15 +1236,15 @@ MixPlan MixPlanner::plan(const AnalysisResult& a, const AnalysisResult& b,
             plan.tempoCurve.push_back(
                 {time, rate, localBpmA * rate});
         }
-        plan.tempoCurve.push_back({0.0, ratioA, tempo.targetBpm});
+        plan.tempoCurve.push_back({0.0, ratioA, tempo.targetBpmA});
         if (plan.duration > 1e-6) {
             plan.tempoCurve.push_back(
-                {plan.duration, ratioA, tempo.targetBpm});
+                {plan.duration, ratioA, tempo.targetBpmA});
         }
         plan.reasons.push_back(format(
             "Tempo ramp: %.1f -> %.1f BPM over %.1f bars (%.1f s) before the "
             "crossfade",
-            localBpmA, tempo.targetBpm, static_cast<double>(rampBars),
+            localBpmA, tempo.targetBpmA, static_cast<double>(rampBars),
             rampSeconds));
         const char* shapeName =
             config_.tempoCurveKind == TempoCurveKind::Linear

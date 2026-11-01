@@ -35,7 +35,7 @@ if(TARGET bgmedia_miniaudio)
     target_link_libraries(bgmedia_tests PRIVATE bgmedia_miniaudio)
     target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_MINIAUDIO=1)
 endif()
-target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3 ${CMAKE_SOURCE_DIR}/apps/desktop)
+target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3 ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/apps/desktop)
 target_compile_definitions(bgmedia_tests PRIVATE
     BGMEDIA_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
     BGMEDIA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"

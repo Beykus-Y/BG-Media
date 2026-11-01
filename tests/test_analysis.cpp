@@ -1,6 +1,8 @@
 #include "framework.hpp"
 
 #include "bgmedia/analysis/Analyzer.hpp"
+#include "analysis/EventDetection.hpp"
+#include "analysis/TempoEstimator.hpp"
 #include "bgmedia/motion3/MusicalTimeline.hpp"
 #include "support/SyntheticSignals.hpp"
 
@@ -571,4 +573,111 @@ TEST_CASE(analysis.strong_hats_and_shifted_accents_keep_the_pulse) {
             scoreDownbeats(run.track.downbeatTimes, run.result.beats, 0.07, 1.0, 19.0);
         CHECK(downbeats.fMeasure > 0.80);
     }
+}
+
+TEST_CASE(analysis.section_detection_resolves_sustained_energy_changes) {
+    using namespace bgmedia;
+    SpectralFeatures features;
+    features.framesPerSecond = 50.0;
+    features.rms.resize(1500, 0.06f);
+    // A 15-second quiet intro followed by 15 seconds of sustained music.
+    for (std::size_t i = 750; i < features.rms.size(); ++i) {
+        features.rms[i] = 0.42f;
+    }
+    const std::vector<Section> sections = detectSections(features, 30.0, {});
+    REQUIRE(sections.size() >= 2);
+    CHECK_NEAR(sections.front().start, 0.0, 1e-9);
+    CHECK_NEAR(sections.back().end, 30.0, 1e-9);
+    bool hasBoundary = false;
+    for (const Section& section : sections) {
+        if (std::abs(section.end - 15.0) < 1.5) {
+            hasBoundary = true;
+        }
+    }
+    CHECK(hasBoundary);
+
+    // A static signal must not invent structural transitions.
+    std::fill(features.rms.begin(), features.rms.end(), 0.25f);
+    const std::vector<Section> stable = detectSections(features, 30.0, {});
+    REQUIRE(stable.size() == 1);
+    CHECK_NEAR(stable.front().end, 30.0, 1e-9);
+
+    // A repeating periodic drum pattern is not a new song section on each
+    // transient. Repeated accent cycles should not create phantom boundaries.
+    for (std::size_t i = 0; i < features.rms.size(); ++i) {
+        features.rms[i] = (i % 50 < 10) ? 0.55f : 0.03f;
+    }
+    const std::vector<Section> periodic = detectSections(features, 30.0, {});
+    CHECK(periodic.size() <= 2);
+}
+
+TEST_CASE(analysis.bass_accent_uses_relative_local_period_window) {
+    using namespace bgmedia;
+    SpectralFeatures features;
+    features.framesPerSecond = 100.0;
+    features.onsetTimeOffset = 0.0;
+    features.lowEnv.assign(400, 0.0f);
+    features.lowRatio.assign(400, 0.0f);
+    features.lowEnergyRatio.assign(400, 0.0f);
+    features.lowEnv[116] = 0.4f;
+    features.lowEnv[117] = 0.9f;
+    features.lowEnv[118] = 0.3f;
+    features.lowRatio[117] = 0.75f;
+    features.lowEnergyRatio[117] = 0.85f;
+    Beat a;
+    a.time = 1.0;
+    Beat b;
+    b.time = 2.0;
+    const std::vector<BassAccent> accents =
+        detectBassAccents(features, {}, {a, b}, 4.0, {});
+    REQUIRE(accents.size() == 1);
+    CHECK(accents.front().nearestBeat == 0);
+    CHECK_NEAR(accents.front().offsetFromBeat, 0.17, 0.01);
+}
+
+TEST_CASE(analysis.regression_refinement_stays_in_configured_bpm_range) {
+    using namespace bgmedia;
+    constexpr double fps = 100.0;
+    constexpr double actualBpm = 200.2;
+    std::vector<float> envelope(2000, 0.0f);
+    for (double time = 0.4; time < 19.8; time += 60.0 / actualBpm) {
+        const double frame = time * fps;
+        const int centre = static_cast<int>(std::lround(frame));
+        for (int delta = -3; delta <= 3; ++delta) {
+            const int index = centre + delta;
+            if (index < 0 || index >= static_cast<int>(envelope.size())) {
+                continue;
+            }
+            const double distance = (static_cast<double>(index) - frame) / 1.1;
+            envelope[static_cast<std::size_t>(index)] +=
+                static_cast<float>(std::exp(-0.5 * distance * distance));
+        }
+    }
+    AnalysisConfig config;
+    config.minBpm = 190.0;
+    config.maxBpm = 200.0;
+    config.preferredBpm = 195.0;
+    const TempoEstimate estimate = estimateTempo(envelope, fps, config, 1.0);
+    REQUIRE(estimate.bpm > 0.0);
+    CHECK(estimate.bpm >= config.minBpm);
+    CHECK(estimate.bpm <= config.maxBpm);
+    for (const TempoCandidate& candidate : estimate.candidates) {
+        CHECK(candidate.bpm >= config.minBpm);
+        CHECK(candidate.bpm <= config.maxBpm);
+    }
+}
+
+TEST_CASE(analysis.periodic_120_bpm_envelope_has_no_phantom_sections) {
+    using namespace bgmedia;
+    SpectralFeatures features;
+    features.framesPerSecond = 100.0;
+    features.rms.resize(3000);
+    for (std::size_t i = 0; i < features.rms.size(); ++i) {
+        const double t = static_cast<double>(i) / features.framesPerSecond;
+        const double phase = std::fmod(t, 0.5);
+        features.rms[i] = static_cast<float>(
+            0.03 + 0.5 * std::exp(-phase / 0.06));
+    }
+    const auto sections = detectSections(features, 30.0, {});
+    CHECK(sections.size() <= 2);
 }

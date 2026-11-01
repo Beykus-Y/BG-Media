@@ -305,10 +305,10 @@ MusicalTimeline MusicalTimeline::fromAnalysis(const AnalysisResult& analysis,
             continue;
         }
         const double beat = timeline.grid_.beatAt(accent.time);
-        long nearest = accent.nearestBeat;
-        if (nearest < 0 || nearest >= static_cast<long>(timeline.beats_.size())) {
-            nearest = std::lround(beat);
-        }
+        // BassAccent::nearestBeat is indexed into AnalysisResult::beats.
+        // BeatClock inserts virtual slots at gaps, so that index is NOT a
+        // stable MusicalTimeline index after an omitted beat/silence.
+        const long nearest = std::lround(beat);
         const float offset = static_cast<float>(beat - static_cast<double>(nearest));
         AccentEvent event;
         event.time = accent.time;
