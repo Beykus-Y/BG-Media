@@ -67,6 +67,9 @@ PcmTrack PcmTrack::fromAudio(const AudioData& audio, std::uint32_t targetRate,
             track.samples[f * outChannels + c] = channelAt(f, c);
         }
     }
+    if (targetRate == track.sampleRate) {
+        return track;
+    }
     return resampled(track, targetRate);
 }
 
@@ -84,12 +87,6 @@ PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
     track.samples.resize(outFrames * outChannels);
     track.sampleRate = targetRate;
     track.channels = outChannels;
-    std::vector<std::vector<float>> src(outChannels, std::vector<float>(srcFrames));
-    for (std::size_t f = 0; f < srcFrames; ++f) {
-        for (std::uint32_t c = 0; c < outChannels; ++c) {
-            src[c][f] = sanitize(source.samples[f * outChannels + c]);
-        }
-    }
 
     // Band-limited resampling: Kaiser-windowed sinc, polyphase table with
     // linear interpolation between phases. The cutoff drops to the target
@@ -149,14 +146,13 @@ PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
         const float* t1 = t0 + width;
         const long long first = base - halfWidth + 1;
         for (std::uint32_t c = 0; c < outChannels; ++c) {
-            const std::vector<float>& ch = src[c];
             float acc = 0.0f;
             for (int t = 0; t < width; ++t) {
                 const long long idx = first + t;
                 if (idx < 0 || idx >= static_cast<long long>(srcFrames)) {
                     continue;
                 }
-                acc += ch[static_cast<std::size_t>(idx)] * (t0[t] + (t1[t] - t0[t]) * mix);
+                acc += sanitize(source.samples[static_cast<std::size_t>(idx) * outChannels + c]) * (t0[t] + (t1[t] - t0[t]) * mix);
             }
             track.samples[i * outChannels + c] = std::clamp(acc, -1.0f, 1.0f);
         }

@@ -261,6 +261,7 @@ struct MusicalOverlayContext {
     std::vector<Event> events;                      // sorted by beat
     std::vector<std::pair<float, float>> silences;  // [begin, end) local beats with no sound
     std::vector<float> phraseStarts;                // local beats where a new phrase starts
+    double clipBpm = 0.0;  // clip beats per minute as played on the track; 0 = the clip's own bpm
 };
 
 // Overlay planner for an analysed track. Hand and head gestures land on onsets and bass accents

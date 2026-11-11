@@ -59,6 +59,9 @@ MusicalOverlayContext musicalContextFor(const ScheduleSegment& segment, const Hu
     const double t1 = DanceSchedule::mediaTimeAtClipBeat(segment, base + beats, timeline);
     const double from = std::min(t0, t1) - 0.5;
     const double to = std::max(t0, t1) + 0.5;
+    if (std::abs(t1 - t0) > 1.0e-3) {
+        context.clipBpm = beats * 60.0 / std::abs(t1 - t0);
+    }
     const std::vector<AccentEvent>& accents = timeline.accents();
     auto it = std::lower_bound(accents.begin(), accents.end(), from,
                                [](const AccentEvent& event, double time) {
@@ -330,7 +333,11 @@ std::vector<DancePlayer::PlannedOverlay> DancePlayer::plannedOverlays(double fro
         const HumanoidClip& clip = *segment.clip;
         // A segment plays from its start until the next one starts.
         const double begin = segment.startTime;
-        const double end = i + 1 < segments.size() ? segments[i + 1].startTime : 1.0e300;
+        // The outgoing segment is still sampled while the next one fades in.
+        const double end = i + 1 < segments.size()
+                               ? segments[i + 1].startTime +
+                                     std::max(0.0, segments[i + 1].fadeSeconds)
+                               : 1.0e300;
         if (end < fromTime || begin > toTime) continue;
         const bool looping = clip.loop && clip.beats > 0.0f;
         const double beats = looping ? static_cast<double>(clip.beats) : 0.0;

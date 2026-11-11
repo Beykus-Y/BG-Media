@@ -261,13 +261,17 @@ bool MixEngine::startTransition(const MixPlan& plan) {
         std::this_thread::yield();
     }
     pendingPlans_[target] = plan;
-    planSlot_.store(target, std::memory_order_release);
-    planReady_.store(true, std::memory_order_release);
+    planGen_.fetch_add(1, std::memory_order_seq_cst);
+    planSlot_.store(target, std::memory_order_seq_cst);
+    planReady_.store(true, std::memory_order_seq_cst);
     return true;
 }
 
 void MixEngine::cancelTransition() {
-    planReady_.store(false, std::memory_order_release);
+    // The generation bump tells a callback that already claimed the plan that
+    // it consumed a request which has since been cancelled.
+    planGen_.fetch_add(1, std::memory_order_seq_cst);
+    planReady_.store(false, std::memory_order_seq_cst);
     if (phase_.load(std::memory_order_acquire) ==
         static_cast<int>(Phase::Running)) {
         cancelRequested_.store(true, std::memory_order_release);
@@ -553,11 +557,25 @@ TransitionStage MixEngine::liveStage() const noexcept {
 }
 
 void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
-    if (!planReady_.load(std::memory_order_acquire)) {
+    if (phase_.load(std::memory_order_acquire) !=
+        static_cast<int>(Phase::Idle)) {
         return;
     }
-    const int slot = planSlot_.load(std::memory_order_acquire);
-    consumingSlot_.store(slot, std::memory_order_release);
+    // Claim protocol: publish the slot being read, then re-validate. A cancel
+    // or resubmit between the two steps changes the generation, so the stale
+    // plan is released untouched and the writer can never reuse a slot that
+    // is being read.
+    const std::uint64_t gen = planGen_.load(std::memory_order_seq_cst);
+    if (!planReady_.load(std::memory_order_seq_cst)) {
+        return;
+    }
+    const int slot = planSlot_.load(std::memory_order_seq_cst);
+    consumingSlot_.store(slot, std::memory_order_seq_cst);
+    if (planGen_.load(std::memory_order_seq_cst) != gen ||
+        !planReady_.load(std::memory_order_seq_cst)) {
+        consumingSlot_.store(-1, std::memory_order_seq_cst);
+        return;
+    }
     const MixPlan& plan = pendingPlans_[slot];
     runtime_ = {};
     runtime_.valid = plan.valid;
@@ -709,8 +727,14 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     transitionStartFrame_ = runtime_.crossfadeStartFrame;
     transitionEndFrame_ = runtime_.endFrame;
     handoverDone_ = false;
-    consumingSlot_.store(-1, std::memory_order_release);
-    planReady_.store(false, std::memory_order_release);
+    consumingSlot_.store(-1, std::memory_order_seq_cst);
+    if (planGen_.load(std::memory_order_seq_cst) == gen) {
+        planReady_.store(false, std::memory_order_seq_cst);
+    } else {
+        // Cancelled (and possibly resubmitted) while being claimed: any newer
+        // request stays pending, the stale transition is cancelled.
+        cancelRequested_.store(true, std::memory_order_release);
+    }
 
     if (runtime_.directCut || runtime_.endFrame <= frame) {
         from.targetPlay.store(false, std::memory_order_release);
@@ -1423,6 +1447,9 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
         runtime.lastSample[1] = out[(frames - 1) * 2 + 1];
     }
     if (reachesEnd) {
+        // A pending seek tail must not leak into a restarted deck.
+        runtime.seekTailRemaining = 0;
+        runtime.lastSample[0] = runtime.lastSample[1] = 0.0f;
         // De-click the physical end of the track over the samples that still
         // map to source audio. The tail ends at silence, never on a full-scale
         // step to the zeros of the next callback.

@@ -469,6 +469,14 @@ void MixSession::handleTransitionCompletion() {
         hasExecutedPlan_ = false;
         planDirty_ = true;
         lastError_.clear();
+        // A preparation failure collected on this very tick is not part of
+        // the completed transition: keep it visible.
+        for (const Item& queued : items_) {
+            if (queued.state == QueueState::Failed && !queued.error.empty()) {
+                lastError_ = queued.error;
+                break;
+            }
+        }
         status_ = "Transition complete";
     }
     engine_.play(master);
