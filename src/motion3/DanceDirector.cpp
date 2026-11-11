@@ -1436,7 +1436,7 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             const double oldAlign = segment.alignTime;
             double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
             double fade = segment.fadeSeconds;
-            const bool oneShotReturn = segment.reason == "one-shot finished" && !kept.empty() &&
+            const bool oneShotReturn = segment.oneShotReturn && !kept.empty() &&
                                        !kept.back().loop && kept.back().clip->tempoSync;
             if (oneShotReturn) {
                 // A one-shot's return follows the one-shot's own end: the rebased clip keeps
@@ -1456,11 +1456,13 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             }
             const bool loop = segment.loop;
             const std::string reason = segment.reason;
+            const bool keepOneShotReturn = segment.oneShotReturn;
             const double alignmentError = segment.alignmentErrorSeconds;
             segment = makeSegment(*segment.clip, std::max(now, alignTime - fade * 0.5),
                                   alignTime, fade);
             segment.loop = loop;
             segment.reason = reason;
+            segment.oneShotReturn = keepOneShotReturn;
             segment.alignmentErrorSeconds = alignmentError;
             // Nothing of a pending segment has been shown yet, so its planted-foot swings
             // are searched again from its new start on the new grid (append below). Kept
@@ -1532,6 +1534,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
+            back.oneShotReturn = true;
             schedule_.append(back, timeline_, warp_);
         }
     }
@@ -1575,6 +1578,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
+            back.oneShotReturn = true;
             schedule_.append(back, timeline_, warp_);
         }
     }

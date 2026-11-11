@@ -38,6 +38,7 @@ struct ScheduleSegment {
     double fadeSeconds = 0.6;      // blend length from the previous segment
     bool loop = true;
     std::string reason;            // why the planner chose this segment
+    bool oneShotReturn = false;    // Idle return that follows a one-shot clip
     bool alignedToDownbeat = false;  // the entry landed on a trusted bar start
     // Auto plan: the phrase starts after a jump of energy, so its first beat gets a hit accent
     // (overlay planner, analysed tracks only).
