@@ -374,7 +374,7 @@ bool masksConflict(BodyMask a, BodyMask b) {
 }
 
 PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
-                              int side, float accent) {
+                              int side, float accent, float snapAttack) {
     PrimitivePose pose;
     pose.bone.fill(Quat::identity());
     relaxHands(pose, 0.30f);
@@ -383,11 +383,12 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
     phase = clamp01(phase);
     intensity = clamp01(intensity);
     accent = clamp01(accent);
+    snapAttack = std::clamp(snapAttack, 0.02f, 0.6f);
     pose.localPhase = phase;
 
     const float amp = intensity * (1.0f + 0.28f * accent);
     const float env = bell(phase, 0.18f - 0.10f * accent, 0.28f);
-    const float snap = bell(phase, 0.08f, 0.45f);
+    const float snap = bell(phase, snapAttack, 0.45f);
     const float wave = std::sin(phase * 6.2831853f);
     const float sway = std::sin(phase * 3.14159265f);
     const int first = side == 0 || side == 1 ? side : 0;
@@ -431,8 +432,13 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
             if (side >= 0 && sd != side) continue;
             const ArmSet arm = armSet(sd);
             // Attack widened from 0.10 to 0.35 of the cue (about 0.15-0.2 beat for the
-            // usual 0.5-beat accents): the wrist snap no longer peaks at 25+ rad/s.
-            const float s = bell(phase, 0.35f, 0.30f);
+            // usual 0.5-beat accents): the wrist snap no longer peaks at 25+ rad/s. The
+            // planner widens rise and release further to a real-time length (snapAttack),
+            // so a fast tempo cannot bring the wrist back to 10 rad/s.
+            const float rise = std::max(0.35f, snapAttack);
+            // Ramps longer than half the cue would overlap and cusp at the midpoint.
+            const float ramp = std::min(0.5f, rise);
+            const float s = bell(phase, ramp, ramp);
             rollWrist(pose, arm, (40.0f * s) * amp);
             setBone(pose, arm.hand, axisAngle(kY, -18.0f * s * amp));
             for (int fg = 1; fg < 5; ++fg) {
@@ -594,7 +600,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
                       axisAngle(kZ, (sd == 0 ? -4.0f : 4.0f) * lift * amp));
         if (pose.footLift[static_cast<std::size_t>(sd)] < 1.0e-5f) {
             pose.footLift[static_cast<std::size_t>(sd)] = 0.055f * lift * amp;
-            pose.toePitch[static_cast<std::size_t>(sd)] = 0.35f * lift * amp;
+            pose.toePitch[static_cast<std::size_t>(sd)] = -0.35f * lift * amp;
         }
         pose.touchesFeet = true;
         pose.mask = body::Pelvis | body::Legs | body::Feet;
@@ -608,7 +614,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         addBoneParent(pose, HumanoidBone::Hips,
                       axisAngle(kY, (sd == 0 ? 6.0f : -6.0f) * lift * amp));
         pose.footLift[static_cast<std::size_t>(sd)] = 0.040f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(other)] = -0.18f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(other)] = 0.18f * lift * amp;
         pose.touchesFeet = true;
         pose.mask = body::Pelvis | body::Legs | body::Feet;
         break;
@@ -617,7 +623,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         const float lift = std::sin(phase * 3.14159265f);
         const int sd = side >= 0 ? side : first;
         pose.footLift[static_cast<std::size_t>(sd)] = 0.018f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(sd)] = 0.75f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(sd)] = -0.75f * lift * amp;
         addBoneParent(pose, sd == 0 ? HumanoidBone::LeftUpperLeg : HumanoidBone::RightUpperLeg,
                       axisAngle(kX, 2.0f * lift * amp));
         pose.touchesFeet = true;
@@ -628,7 +634,7 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         const float lift = std::sin(phase * 3.14159265f);
         const int sd = side >= 0 ? side : first;
         pose.footLift[static_cast<std::size_t>(sd)] = 0.030f * lift * amp;
-        pose.toePitch[static_cast<std::size_t>(sd)] = -0.55f * lift * amp;
+        pose.toePitch[static_cast<std::size_t>(sd)] = 0.55f * lift * amp;
         pose.touchesFeet = true;
         pose.mask = body::LeftFoot | body::RightFoot | body::LeftLeg | body::RightLeg;
         break;
@@ -664,7 +670,8 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
         break;
     }
     case PrimitiveKind::HeadAccent: {
-        const float hit = snap * amp;
+        // Scaled to 0.6 (WP-H): the full 12 deg hit read as a jerk on the clip's own motion.
+        const float hit = snap * amp * 0.6f;
         addBoneParent(pose, HumanoidBone::Neck, axisAngle(kY, 5.0f * hit));
         addBoneParent(pose, HumanoidBone::Head, axisAngle(kY, 12.0f * hit));
         addBoneParent(pose, HumanoidBone::Head, axisAngle(kX, -4.0f * hit));
@@ -882,7 +889,8 @@ ComposedPose composeMotion(const ClipPose& base, std::span<const PrimitiveCue> c
         }
         ActiveCue entry;
         entry.cue = &cue;
-        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f);
+        entry.pose = samplePrimitive(cue.kind, phase, cue.intensity, cue.side, 0.0f,
+                                     cue.snapAttack > 0.0f ? cue.snapAttack : kDefaultSnapAttack);
         entry.weight = weight;
         entry.gate = gate;
         entry.supportGate = supportGate;
@@ -1078,6 +1086,71 @@ ComposedPose composeLoopCues(const ClipPose& base, std::span<const PrimitiveCue>
     return composeMotion(base, cues, localBeat, clipBeats, false, options);
 }
 
+namespace {
+
+// Real-time rise of the snap envelopes (HeadAccent, ShoulderAccent, ChestIsolation). A
+// 0.4-beat head hit at 123 BPM used to rise in 16 ms, which reads as a jerk. The rise is
+// set from the clip tempo, so it does not depend on the frame rate: 110 ms keeps the
+// head under 3 rad/s with the authored motion on top. The HandFlick rise is longer
+// (160 ms) because its wrist roll is larger; that keeps the hand under 6 rad/s.
+constexpr float kSnapAttackSeconds = 0.11f;
+constexpr float kFlickRiseSeconds = 0.16f;
+constexpr float kAuthoredHeadWindow = 0.15f;  // beats either side of an accent
+constexpr float kAuthoredNodRad = 2.0f * kDeg;  // the shipped clips nod 1-6 deg at accents
+
+// Phase of a rise that lasts `seconds` of a cue `durationBeats` long at `bpm`, clamped to
+// [lo, hi]. An unknown tempo gets the middle of the range.
+float riseFor(float durationBeats, double bpm, float seconds, float lo, float hi) {
+    if (!(bpm > 20.0) || !(durationBeats > 1.0e-4f)) {
+        return 0.5f * (lo + hi);
+    }
+    const double cueSeconds = durationBeats * 60.0 / bpm;
+    return std::clamp(static_cast<float>(seconds / cueSeconds), lo, hi);
+}
+
+float snapAttackFor(float durationBeats, double bpm) {
+    return riseFor(durationBeats, bpm, kSnapAttackSeconds, 0.25f, 0.5f);
+}
+
+// The clip already moves its head around this accent: another authored accent in the
+// window, or a nod baked into the head or neck track. A HeadAccent on top of either
+// doubles the hit.
+bool clipAuthorsHeadHit(const HumanoidClip& clip, std::size_t index) {
+    const float beat = clip.accents[index].beat;
+    for (std::size_t i = 0; i < clip.accents.size(); ++i) {
+        if (i != index && std::abs(clip.accents[i].beat - beat) <= kAuthoredHeadWindow) {
+            return true;
+        }
+    }
+    if (clip.keysPerBeat <= 0) {
+        return false;
+    }
+    const int centre = static_cast<int>(std::lround(beat * clip.keysPerBeat));
+    const int span = static_cast<int>(std::ceil(kAuthoredHeadWindow * clip.keysPerBeat));
+    for (HumanoidBone bone : {HumanoidBone::Head, HumanoidBone::Neck}) {
+        const std::vector<Quat>& track = clip.bones[indexOf(bone)];
+        const int last = static_cast<int>(track.size()) - 1;
+        if (last < 1) {
+            continue;
+        }
+        // A looping track repeats its first key at `last`, so it wraps there.
+        const auto keyAt = [&](int k) {
+            return clip.loop ? ((k % last) + last) % last : std::clamp(k, 0, last);
+        };
+        const Quat& reference = track[static_cast<std::size_t>(keyAt(centre))];
+        for (int k = centre - span; k <= centre + span; ++k) {
+            const Quat& q = track[static_cast<std::size_t>(keyAt(k))];
+            const float d = std::min(1.0f, std::abs(math::dot(q, reference)));
+            if (2.0f * std::acos(d) > kAuthoredNodRad) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 std::vector<PrimitiveCue> planPrimitiveOverlays(const HumanoidClip& clip,
                                                 std::uint32_t seed, float density,
                                                 bool includeHands) {
@@ -1105,6 +1178,7 @@ std::vector<PrimitiveCue> planPrimitiveOverlays(const HumanoidClip& clip,
             cue.durationBeats = cue.metadata().defaultBeats;
             cue.intensity = intensity;
             cue.side = (barIndex % 2 == 0) ? 0 : 1;
+            cue.snapAttack = snapAttackFor(cue.durationBeats, clip.bpm);
             cue.reason = "bar accent";
             cues.push_back(cue);
         }
@@ -1123,6 +1197,10 @@ std::vector<PrimitiveCue> planPrimitiveOverlays(const HumanoidClip& clip,
                 cue.durationBeats = cue.metadata().defaultBeats;
                 cue.intensity = intensity * (0.7f + 0.3f * rng.unit());
                 cue.side = (beat + barIndex) % 2;
+                if (cue.kind == PrimitiveKind::HandFlick) {
+                    cue.snapAttack =
+                        riseFor(cue.durationBeats, clip.bpm, kFlickRiseSeconds, 0.35f, 0.6f);
+                }
                 cue.reason = "off-beat hand layer";
                 cues.push_back(cue);
             }
@@ -1151,17 +1229,228 @@ std::vector<PrimitiveCue> planPrimitiveOverlays(const HumanoidClip& clip,
     }
     // Authored accents are the strongest musical evidence. Put a short head or
     // chest accent exactly on them.
-    for (const AccentMark& mark : clip.accents) {
+    for (std::size_t i = 0; i < clip.accents.size(); ++i) {
+        const AccentMark& mark = clip.accents[i];
         if (mark.strength < 0.55f) continue;
+        const bool headHit = mark.strength > 0.85f;
+        // The clip's own head motion already lands here; a second hit would stack on it.
+        if (headHit && clipAuthorsHeadHit(clip, i)) continue;
         PrimitiveCue cue;
-        cue.kind = (mark.strength > 0.85f) ? PrimitiveKind::HeadAccent
-                                           : PrimitiveKind::FistPulse;
+        cue.kind = headHit ? PrimitiveKind::HeadAccent : PrimitiveKind::FistPulse;
         cue.beat = mark.beat;
         cue.durationBeats = cue.metadata().defaultBeats;
         cue.intensity = std::clamp(mark.strength * mark.confidence, 0.3f, 1.0f);
+        if (headHit) cue.snapAttack = snapAttackFor(cue.durationBeats, clip.bpm);
         cue.reason = "authored accent: " + mark.kind;
         cues.push_back(cue);
     }
+    std::sort(cues.begin(), cues.end(), [](const PrimitiveCue& a, const PrimitiveCue& b) {
+        if (a.beat != b.beat) return a.beat < b.beat;
+        return a.effectivePriority() < b.effectivePriority();
+    });
+    return cues;
+}
+
+namespace {
+
+// Thresholds on the timeline's normalised accent strength (0..1 within the track). A bass
+// accent is the body's hit, so it carries most gestures. A plain onset (a snare, a hat) carries
+// at most one gesture per bar, and only when it is strong.
+constexpr float kBassGestureMinStrength = 0.40f;
+constexpr float kOnsetGestureMinStrength = 0.90f;
+constexpr float kSyncopationMinStrength = 0.80f;  // off-beat onsets that may carry a syncopation
+constexpr float kSyncopationMinOffset = 0.30f;    // music beats from the nearest beat (the "and")
+constexpr float kAuthoredConfirmBeats = 0.12f;    // a bass hit this close confirms an authored accent
+constexpr float kPhraseHitIntensity = 0.9f;
+
+bool silentAt(const MusicalOverlayContext& music, float beat) {
+    for (const auto& [begin, end] : music.silences) {
+        if (beat >= begin && beat < end) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uint32_t seed,
+                                              float density, const MusicalOverlayContext& music,
+                                              bool includeHands) {
+    std::vector<PrimitiveCue> cues;
+    const double playedBpm = music.clipBpm > 20.0 ? music.clipBpm : clip.bpm;
+    if (!(clip.beats >= 2.0f) || clip.keyCount < 2) {
+        return cues;
+    }
+    density = std::clamp(density, 0.0f, 1.5f);
+    if (density <= 1.0e-4f) {
+        return cues;
+    }
+    // Its own random stream, so a clip planned on the grid and on the track do not share draws.
+    Rng rng(static_cast<std::uint32_t>(hashString(clip.id)) ^ (seed * 2654435761u) ^ 0x5bd1e995u);
+    const float beats = clip.beats;
+    const int bar = std::max(1, clip.beatsPerBar);
+    const float intensity = std::clamp(0.35f + clip.energy * 0.75f, 0.35f, 1.0f);
+    std::vector<bool> used(music.events.size(), false);
+
+    const auto addHand = [&](PrimitiveKind kind, float at, float strength, int side,
+                             const char* reason) {
+        PrimitiveCue cue;
+        cue.kind = kind;
+        cue.beat = at;
+        cue.durationBeats = cue.metadata().defaultBeats;
+        cue.intensity = intensity * (0.7f + 0.3f * strength);
+        cue.side = side;
+        if (kind == PrimitiveKind::HandFlick) {
+            cue.snapAttack = riseFor(cue.durationBeats, playedBpm, kFlickRiseSeconds, 0.35f, 0.6f);
+        }
+        cue.reason = reason;
+        cues.push_back(cue);
+    };
+    const auto addHead = [&](float at, float strength, const char* reason) {
+        PrimitiveCue cue;
+        cue.kind = rng.chance(0.5f) ? PrimitiveKind::HeadTilt : PrimitiveKind::LookDirection;
+        cue.beat = at;
+        cue.durationBeats = cue.metadata().defaultBeats;
+        cue.intensity = intensity * 0.8f * (0.7f + 0.3f * strength);
+        cue.reason = reason;
+        cues.push_back(cue);
+    };
+    const auto handKind = [&rng]() {
+        const int pick = rng.range(0, 3);
+        return pick == 0 ? PrimitiveKind::HandFlick
+               : pick == 1 ? PrimitiveKind::FingerRipple
+               : pick == 2 ? PrimitiveKind::WristRoll
+                           : PrimitiveKind::FingerSpread;
+    };
+
+    int barIndex = 0;
+    for (float b = 0.0f; b < beats - 1.0e-4f; b += static_cast<float>(bar), ++barIndex) {
+        const float barEnd = std::min(beats, b + static_cast<float>(bar));
+        // Strong bar start: torso or shoulder accent, as on the grid, but only in sound.
+        if (rng.chance(0.55f + 0.25f * density) && !silentAt(music, b)) {
+            PrimitiveCue cue;
+            cue.kind = (barIndex % 3 == 0) ? PrimitiveKind::ShoulderAccent
+                                           : PrimitiveKind::ChestIsolation;
+            cue.beat = b;
+            cue.durationBeats = cue.metadata().defaultBeats;
+            cue.intensity = intensity;
+            cue.side = (barIndex % 2 == 0) ? 0 : 1;
+            cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
+            cue.reason = "bar accent";
+            cues.push_back(cue);
+        }
+        // Syncopation: one or two strong off-beat onsets of the bar carry a hand gesture.
+        std::vector<std::size_t> offbeat;
+        for (std::size_t e = 0; e < music.events.size(); ++e) {
+            const MusicalOverlayContext::Event& event = music.events[e];
+            if (event.beat < b || event.beat >= barEnd) continue;
+            if (std::abs(event.offset) < kSyncopationMinOffset ||
+                event.strength < kSyncopationMinStrength || silentAt(music, event.beat)) {
+                continue;
+            }
+            offbeat.push_back(e);
+        }
+        std::stable_sort(offbeat.begin(), offbeat.end(), [&](std::size_t x, std::size_t y) {
+            return music.events[x].strength > music.events[y].strength;
+        });
+        const std::size_t syncopations =
+            std::min<std::size_t>(offbeat.size(), rng.chance(0.5f) ? 2 : 1);
+        for (std::size_t i = 0; i < syncopations; ++i) {
+            const std::size_t e = offbeat[i];
+            const MusicalOverlayContext::Event& event = music.events[e];
+            used[e] = true;
+            if (includeHands) {
+                addHand(PrimitiveKind::HandFlick, event.beat, event.strength,
+                        (barIndex + static_cast<int>(i)) % 2, "syncopated hand layer");
+            } else {
+                addHead(event.beat, event.strength, "syncopated head layer");
+            }
+        }
+        // Hand and head gestures on the bass accents and strong onsets of the bar.
+        int onsetGestures = 0;
+        for (std::size_t e = 0; e < music.events.size(); ++e) {
+            const MusicalOverlayContext::Event& event = music.events[e];
+            if (used[e] || event.beat < b || event.beat >= barEnd) continue;
+            if (silentAt(music, event.beat)) continue;
+            if (event.bass) {
+                if (event.strength < kBassGestureMinStrength) continue;
+                if (!rng.chance(0.55f + 0.35f * density)) continue;
+            } else {
+                if (event.strength < kOnsetGestureMinStrength || onsetGestures > 0) continue;
+                if (!rng.chance(0.10f + 0.10f * density)) continue;
+                ++onsetGestures;
+            }
+            used[e] = true;
+            const char* reason = event.bass ? "bass gesture" : "onset gesture";
+            if (!includeHands || rng.chance(0.33f)) {
+                addHead(event.beat, event.strength, reason);
+            } else {
+                addHand(handKind(), event.beat, event.strength, (barIndex + 1) % 2, reason);
+            }
+        }
+        // Arms: on every other bar, a wave or reach on the strongest bass accent of the bar's
+        // second half. Without such an accent the bar gets no arm gesture.
+        if (barIndex % 2 == 1 && includeHands) {
+            std::size_t best = music.events.size();
+            for (std::size_t e = 0; e < music.events.size(); ++e) {
+                const MusicalOverlayContext::Event& event = music.events[e];
+                if (!event.bass || used[e] || event.beat < b + 0.5f * bar || event.beat >= barEnd) {
+                    continue;
+                }
+                if (event.strength < kBassGestureMinStrength || silentAt(music, event.beat)) continue;
+                if (best == music.events.size() || event.strength > music.events[best].strength) {
+                    best = e;
+                }
+            }
+            if (best < music.events.size() && rng.chance(0.5f + 0.2f * density)) {
+                used[best] = true;
+                PrimitiveCue cue;
+                cue.kind = rng.chance(0.6f) ? PrimitiveKind::ArmWave : PrimitiveKind::ArmReach;
+                cue.beat = music.events[best].beat;
+                cue.durationBeats = cue.metadata().defaultBeats;
+                cue.intensity = intensity * 0.9f;
+                cue.side = (barIndex % 2 == 0) ? 1 : 0;
+                cue.reason = "bass arm gesture";
+                cues.push_back(cue);
+            }
+        }
+    }
+    // Authored accents of the clip: a short head or chest accent. On a track it stays only where a
+    // bass hit confirms it; an accent on a snare or on nothing is the clip's own beat, not the music.
+    for (std::size_t i = 0; i < clip.accents.size(); ++i) {
+        const AccentMark& mark = clip.accents[i];
+        if (mark.strength < 0.55f) continue;
+        const bool headHit = mark.strength > 0.85f;
+        if (headHit && clipAuthorsHeadHit(clip, i)) continue;
+        const bool confirmed = std::any_of(
+            music.events.begin(), music.events.end(), [&](const MusicalOverlayContext::Event& e) {
+                return e.bass && std::abs(e.beat - mark.beat) <= kAuthoredConfirmBeats;
+            });
+        if (!confirmed) continue;
+        PrimitiveCue cue;
+        cue.kind = headHit ? PrimitiveKind::HeadAccent : PrimitiveKind::FistPulse;
+        cue.beat = mark.beat;
+        cue.durationBeats = cue.metadata().defaultBeats;
+        cue.intensity = std::clamp(mark.strength * mark.confidence, 0.3f, 1.0f);
+        if (headHit) cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
+        cue.reason = "authored accent: " + mark.kind;
+        cues.push_back(cue);
+    }
+    // A phrase that starts after a large energy jump gets a hit on its first beat.
+    for (float start : music.phraseStarts) {
+        if (!(start >= 0.0f) || start >= beats) continue;
+        PrimitiveCue cue;
+        cue.kind = PrimitiveKind::HeadAccent;
+        cue.beat = start;
+        cue.durationBeats = cue.metadata().defaultBeats;
+        cue.intensity = kPhraseHitIntensity;
+        cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
+        cue.reason = "phrase hit";
+        cues.push_back(cue);
+    }
+    // Nothing plays in silence: a cue that starts in a silent region is dropped.
+    cues.erase(std::remove_if(cues.begin(), cues.end(),
+                              [&](const PrimitiveCue& cue) { return silentAt(music, cue.beat); }),
+               cues.end());
     std::sort(cues.begin(), cues.end(), [](const PrimitiveCue& a, const PrimitiveCue& b) {
         if (a.beat != b.beat) return a.beat < b.beat;
         return a.effectivePriority() < b.effectivePriority();

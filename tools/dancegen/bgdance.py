@@ -289,11 +289,56 @@ class Curve:
 # ----------------------------------------------------------------------------
 
 
+TRAVEL_LIFT_CM = 2.0    # a swing foot does not travel while it is lower than this (the ground-drag
+                        # limit of the QA metric is 1.2 cm, of motion_diag 2.0 cm)
+TRAVEL_LEAD_MAX = 0.35  # cap on the share of a swing spent lifting before the travel starts
+HEEL_PEEL = 0.12        # beats the heel rises before a lift-off, the toe stays on the floor
+HEEL_PEEL_TOE = 1.0     # toe value at the top of the peel (positive = heel up)
+TOE_OFF = 0.12          # beats for the peeled toe to come back flat in the first part of the swing
+HEEL_STRIKE = 0.12      # beats the heel takes to settle after a forward or side landing
+HEEL_STRIKE_TOE = -0.6  # toe value at the landing (negative = toes up, heel on the floor)
+
+
+def _ease7(v):
+    """Septic-style ease 0 -> 1 on [0, 1], symmetric about 1/2. Velocity, acceleration and
+    jerk are all zero at both ends, so the curve has no break against a hold or a landing."""
+    return v ** 4 * (35.0 - 84.0 * v + 70.0 * v * v - 20.0 * v ** 3)
+
+
+def swing_profile(u):
+    """Height of a swing foot, 0..1, through the swing u in [0, 1]: _ease7 of the triangle
+    v = 1 - |2u - 1| raised to 0.7. The lift has zero slope and zero curvature at the floor
+    (no infinite-slope snap like the old h*sin(pi u)^0.85, which was the knee snap of B1),
+    and it rises early, to about 35 percent of the height by u = 0.15. That early rise lets
+    the travel start sooner (see travel_lead), so the travel is not squeezed into the middle
+    of the swing: with the plain ease (exponent 1) the travel window was 0.69 of the swing
+    and the 60 fps ankle acceleration on hiphop rose by a third over origin/dev. The first
+    key after lift-off rises by 56 cm/beat on the authored clips (origin/dev: 99)."""
+    return _ease7((1.0 - abs(2.0 * u - 1.0)) ** 0.7)
+
+
+def travel_lead(h):
+    """Share of a swing, from each end, before the horizontal travel starts. It is the first
+    u where the lift h * swing_profile(u) reaches TRAVEL_LIFT_CM, so the foot never moves
+    sideways while it is low. Capped at TRAVEL_LEAD_MAX for very low swings."""
+    if h <= TRAVEL_LIFT_CM:
+        return TRAVEL_LEAD_MAX
+    lo, hi = 0.0, 0.5
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if h * swing_profile(mid) >= TRAVEL_LIFT_CM:
+            hi = mid
+        else:
+            lo = mid
+    return min(TRAVEL_LEAD_MAX, hi)
+
+
 class Foot:
     """Piecewise footwork for one foot, cyclic over the dance period.
 
     Coordinates are stage space, cm, relative to the bind (neutral) ankle:
-    x = left, z = forward. yaw in degrees (positive = toes turn left)."""
+    x = left, z = forward. yaw in degrees (positive = toes turn left). toe(t) is the heel
+    roll written as the fifth component (see toe())."""
 
     def __init__(self, period, side, x=0.0, z=0.0, yaw=0.0):
         self.period = float(period)
@@ -375,6 +420,10 @@ class Foot:
             s = smoothstep(u)
             return (p0[0], 0.0, p0[1], p0[2] + (p1[2] - p0[2]) * s, "pivot")
         s = smootherstep(u)
+        if kind in ("arc", "orbit"):
+            # the travel starts once the lift has reached TRAVEL_LIFT_CM (see travel_lead)
+            lead = travel_lead(h)
+            s = smootherstep((u - lead) / (1.0 - 2.0 * lead))
         if kind == "orbit":
             px, pz, ang = seg[6]
             half = FOOT_HALF_CM if self.side == "left" else -FOOT_HALF_CM
@@ -382,15 +431,47 @@ class Foot:
             dx, dz = half + p0[0] - px, p0[1] - pz
             nx = px + dx * math.cos(a) + dz * math.sin(a)
             nz = pz - dx * math.sin(a) + dz * math.cos(a)
-            return (nx - half, h * math.sin(math.pi * u), nz, p0[2] + ang * s, "swing")
-        lift = h * math.sin(math.pi * u) ** 0.85 if kind == "arc" else h * math.sin(math.pi * u)
+            return (nx - half, h * swing_profile(u), nz, p0[2] + ang * s, "swing")
         return (
             p0[0] + (p1[0] - p0[0]) * s,
-            lift,
+            h * swing_profile(u),
             p0[1] + (p1[1] - p0[1]) * s,
             p0[2] + (p1[2] - p0[2]) * s,
             "swing",
         )
+
+    def toe(self, t):
+        """Toe roll at beat t, the fifth foot component. Positive: the heel is up and the toe
+        stays on the floor (the heel peel, over the end of a stance before a lift-off, which
+        then comes flat in the first part of the swing). Negative: the toes are up and the
+        heel is on the floor (the heel strike after a forward or side landing, which then
+        settles flat). Zero everywhere else. The windows never reach into a neighbouring
+        swing, and each is capped at half the stance it sits in."""
+        t = t % self.period if t < self.period - 1e-9 else self.period  # the last key equals the first
+        out = 0.0
+        n = len(self.segs)
+        for i, seg in enumerate(self.segs):
+            kind, t0, t1, p0, p1, h = seg[:6]
+            if kind not in ("arc", "orbit"):
+                continue
+            prev = self.segs[i - 1]
+            nxt = self.segs[(i + 1) % n]
+            before = (t0 - prev[1]) % self.period
+            after = (nxt[2] - t1) % self.period
+            peel = min(HEEL_PEEL, 0.5 * before) if prev[0] in ("hold", "pivot") else 0.0
+            off = min(TOE_OFF, 0.5 * (t1 - t0))
+            strike = 0.0
+            if (kind == "arc" and p1[1] - p0[1] >= -1e-9 and nxt[0] in ("hold", "pivot")):
+                strike = min(HEEL_STRIKE, 0.5 * after)
+            for shift in (-self.period, 0.0, self.period):
+                tt = t + shift
+                if peel > 0.0 and t0 - peel <= tt <= t0:
+                    out += HEEL_PEEL_TOE * smoothstep((tt - t0 + peel) / peel)
+                if peel > 0.0 and t0 < tt < t0 + off:
+                    out += HEEL_PEEL_TOE * (1.0 - smoothstep((tt - t0) / off))
+                if strike > 0.0 and t1 <= tt <= t1 + strike:
+                    out += HEEL_STRIKE_TOE * (1.0 - smoothstep((tt - t1) / strike))
+        return out
 
     def contacts(self):
         out = []
@@ -871,7 +952,8 @@ class Dance:
             root_track.append((c["root_x"] / REF_HEIGHT_CM, c["root_z"] / REF_HEIGHT_CM, c["root_yaw"] / 360.0))
             for side, f in (("left", fl), ("right", fr)):
                 foot_tracks[side].append(
-                    (f[0] / REF_HEIGHT_CM, f[1] / REF_HEIGHT_CM, f[2] / REF_HEIGHT_CM, f[3] / 360.0)
+                    (f[0] / REF_HEIGHT_CM, f[1] / REF_HEIGHT_CM, f[2] / REF_HEIGHT_CM, f[3] / 360.0,
+                     self.feet[side].toe(t))
                 )
         contacts = []
         for side in ("left", "right"):

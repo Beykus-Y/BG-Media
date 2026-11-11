@@ -161,6 +161,11 @@ private:
         bool wasTargetPlaying = false;
         float blockPeak = 0.0f;
         float lastSample[2] = {0.0f, 0.0f};
+        // Short decaying tail of the pre-seek signal, mixed over the first
+        // frames after a seek so the jump does not click.
+        float seekTail[2] = {0.0f, 0.0f};
+        std::size_t seekTailRemaining = 0;
+        std::size_t seekTailLength = 0;
         ThreeBandEq eq;
         EqGains eqGains{};
     };
@@ -227,7 +232,13 @@ private:
     std::vector<RetiredProcessor> retiredProcessors_;
     std::vector<RetiredStream> retiredStreams_;
 
-    MixPlan pendingPlan_;
+    // Double-buffered plan handoff. The control thread writes only the slot
+    // the audio thread is not reading; planSlot_ names the published slot and
+    // consumingSlot_ the slot the callback is currently reading (-1 if none).
+    MixPlan pendingPlans_[2];
+    std::atomic<int> planSlot_{0};
+    std::atomic<int> consumingSlot_{-1};
+    std::atomic<std::uint64_t> planGen_{0};
     RuntimePlan runtime_;
     bool runtimeStarted_ = false;
     std::uint64_t transitionStartFrame_ = 0;

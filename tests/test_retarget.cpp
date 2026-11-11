@@ -271,6 +271,62 @@ TEST_CASE(retarget.is_deterministic_and_frame_rate_independent) {
     (void)model;
 }
 
+TEST_CASE(retarget.heel_roll_turns_the_foot_about_the_toe) {
+    // A free foot with toe roll 1 lifts its heel: the ankle rises on the arc about the toe
+    // joint, and the toe joint stays where it was. A toe value below 0 (heel strike) only
+    // turns the toe bone, so the ankle does not move.
+    auto fixture = makeFixtureRig();
+    CHECK(fixture != nullptr);
+    if (!fixture) {
+        return;
+    }
+    const VrmModel& model = *fixture->loaded.model;
+    const int ankle = model.nodeFor(HumanoidBone::LeftFoot);
+    const int toes = model.nodeFor(HumanoidBone::LeftToes);
+    CHECK(ankle >= 0);
+    CHECK(toes >= 0);
+    if (ankle < 0 || toes < 0) {
+        return;
+    }
+    bgmedia::motion::ClipPose flat = bgmedia::motion::neutralClipPose();
+    flat.foot[0].contact = 0.0f;
+    flat.foot[0].phase = bgmedia::motion::FootPhase::Swing;
+    bgmedia::motion::ClipPose heel = flat;
+    heel.foot[0].toePitch = 1.0f;
+    bgmedia::motion::ClipPose heelStrike = flat;
+    heelStrike.foot[0].toePitch = -1.0f;
+
+    const auto a = fixture->rig->applyClip(flat, 0.0);
+    const auto b = fixture->rig->applyClip(heel, 0.0);
+    const auto c = fixture->rig->applyClip(heelStrike, 0.0);
+    const auto ankleA = bgmedia::animation::HumanoidRetargeter::stagePosition(a, ankle);
+    const auto ankleB = bgmedia::animation::HumanoidRetargeter::stagePosition(b, ankle);
+    const auto ankleC = bgmedia::animation::HumanoidRetargeter::stagePosition(c, ankle);
+    const auto toesA = bgmedia::animation::HumanoidRetargeter::stagePosition(a, toes);
+    const auto toesB = bgmedia::animation::HumanoidRetargeter::stagePosition(b, toes);
+    const float heelRise = bgmedia::math::dot(ankleB - ankleA, model.up);
+    CHECK(heelRise > 0.01f);  // more than 1 cm on a 1.7 m character
+    CHECK((toesB - toesA).length() < 0.001f);
+    CHECK((ankleC - ankleA).length() < 1.0e-4f);
+
+    // The roll follows the turned foot: with the foot yawed by a quarter and half a turn the
+    // heel still rises and the toe joint still stays put.
+    for (const float turn : {0.25f, 0.5f}) {
+        bgmedia::motion::ClipPose turnedFlat = flat;
+        turnedFlat.foot[0].yaw = turn;
+        bgmedia::motion::ClipPose turnedHeel = turnedFlat;
+        turnedHeel.foot[0].toePitch = 1.0f;
+        const auto d = fixture->rig->applyClip(turnedFlat, 0.0);
+        const auto e = fixture->rig->applyClip(turnedHeel, 0.0);
+        const auto ankleD = bgmedia::animation::HumanoidRetargeter::stagePosition(d, ankle);
+        const auto ankleE = bgmedia::animation::HumanoidRetargeter::stagePosition(e, ankle);
+        const auto toesD = bgmedia::animation::HumanoidRetargeter::stagePosition(d, toes);
+        const auto toesE = bgmedia::animation::HumanoidRetargeter::stagePosition(e, toes);
+        CHECK(bgmedia::math::dot(ankleE - ankleD, model.up) > 0.01f);
+        CHECK((toesE - toesD).length() < 0.001f);
+    }
+}
+
 TEST_CASE(retarget.model1_if_available) {
     const std::filesystem::path path = realModelPath();
     if (path.empty() || !std::filesystem::exists(path)) {

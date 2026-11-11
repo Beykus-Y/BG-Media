@@ -195,10 +195,15 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
     if (!file.read(reinterpret_cast<char*>(header.data()), header.size())) {
         return DecodeResult::failure("failed to read RIFF header");
     }
-    if (std::memcmp(header.data(), "RIFF", 4) != 0 ||
+    const bool isRf64 = std::memcmp(header.data(), "RF64", 4) == 0 ||
+                        std::memcmp(header.data(), "BW64", 4) == 0;
+    if ((std::memcmp(header.data(), "RIFF", 4) != 0 && !isRf64) ||
         std::memcmp(header.data() + 8, "WAVE", 4) != 0) {
         return DecodeResult::failure("not a RIFF/WAVE file");
     }
+    // RF64: the real data size lives in the ds64 chunk.
+    std::uint64_t ds64DataSize = 0;
+    bool haveDs64 = false;
 
     FmtInfo fmt;
     bool haveFmt = false;
@@ -211,10 +216,83 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
         if (!file.read(reinterpret_cast<char*>(chunkHeader.data()), chunkHeader.size())) {
             break;
         }
-        const std::uint32_t chunkSize = readU32(chunkHeader.data() + 4);
+        std::uint64_t chunkSize = readU32(chunkHeader.data() + 4);
         const std::streamoff chunkDataPos = file.tellg();
-        if (chunkDataPos < 0 || chunkSize > static_cast<std::uint64_t>(fileSize - chunkDataPos)) {
+        const bool isData = std::memcmp(chunkHeader.data(), "data", 4) == 0;
+        if (chunkDataPos < 0) {
             return DecodeResult::failure("WAV chunk extends beyond the end of the file");
+        }
+        const std::uint64_t remaining = static_cast<std::uint64_t>(fileSize - chunkDataPos);
+        if (isData) {
+            // Streaming writers leave the data size at 0 or 0xFFFFFFFF, and
+            // RF64 stores it in ds64: in all those cases the data runs to the
+            // end of the file (or to the ds64 size).
+            if (chunkSize == 0xFFFFFFFFULL && isRf64 && haveDs64) {
+                chunkSize = ds64DataSize;
+            } else if (chunkSize == 0xFFFFFFFFULL) {
+                chunkSize = remaining;
+            } else if (chunkSize == 0 && remaining > 0 && remaining < 8) {
+                // Too short to hold another chunk header: it is streamed PCM.
+                chunkSize = remaining;
+            } else if (chunkSize == 0 && remaining >= 8) {
+                // A genuinely empty data chunk is followed by a plausible
+                // chunk header: four ASCII letters/digits/spaces and a size
+                // that fits inside the rest of the file. Anything else is
+                // streamed PCM.
+                // One plausible header is not enough: PCM can start with
+                // bytes that look like one. Walk the whole chunk chain; a
+                // real empty chunk is followed by chunks that tile the file
+                // exactly up to its end.
+                const std::streampos here = file.tellg();
+                bool tag = true;
+                std::uint64_t left = remaining;
+                while (left > 0) {
+                    std::array<std::uint8_t, 8> peek{};
+                    if (left < 8 ||
+                        !file.read(reinterpret_cast<char*>(peek.data()), peek.size())) {
+                        tag = false;
+                        break;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t c = peek[static_cast<std::size_t>(i)];
+                        tag = tag && (std::isalnum(c) != 0 || c == ' ');
+                    }
+                    const std::uint64_t nextSize = readU32(peek.data() + 4);
+                    if (!tag || nextSize > left - 8) {
+                        tag = false;
+                        break;
+                    }
+                    // Chunks are word aligned; the last one may omit its pad.
+                    const std::uint64_t advance = nextSize + (nextSize & 1u);
+                    left -= 8;
+                    if (advance >= left) {
+                        left = 0;
+                    } else {
+                        left -= advance;
+                        file.seekg(static_cast<std::streamoff>(advance), std::ios::cur);
+                    }
+                }
+                file.clear();
+                file.seekg(here);
+                if (!tag) {
+                    chunkSize = remaining;
+                }
+            }
+            if (chunkSize > remaining) {
+                chunkSize = remaining;  // truncated file: decode what is there
+            }
+        } else if (chunkSize > remaining) {
+            return DecodeResult::failure("WAV chunk extends beyond the end of the file");
+        }
+
+        if (std::memcmp(chunkHeader.data(), "ds64", 4) == 0 && chunkSize >= 16) {
+            std::array<std::uint8_t, 16> ds{};
+            if (file.read(reinterpret_cast<char*>(ds.data()), ds.size())) {
+                std::uint64_t lo = readU32(ds.data() + 8);
+                std::uint64_t hi = readU32(ds.data() + 12);
+                ds64DataSize = lo | (hi << 32);
+                haveDs64 = true;
+            }
         }
 
         if (std::memcmp(chunkHeader.data(), "fmt ", 4) == 0) {
@@ -230,7 +308,7 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
                 return DecodeResult::failure(parseError);
             }
             haveFmt = true;
-        } else if (std::memcmp(chunkHeader.data(), "data", 4) == 0) {
+        } else if (isData) {
             dataOffset = static_cast<std::uint64_t>(chunkDataPos);
             dataSize = chunkSize;
             // Continue scanning for fmt if it comes after data; most files put

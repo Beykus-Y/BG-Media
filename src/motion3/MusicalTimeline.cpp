@@ -60,6 +60,52 @@ void mergeAccents(std::vector<AccentEvent>& events, double tolerance = 0.018) {
     events = std::move(merged);
 }
 
+// Loudness of each grid beat from the waveform overview: the mean peak amplitude over the beat,
+// normalised to the track's own range (10th to 95th percentile of the beats). A track without
+// dynamics gets no loudness, so its authored amplitude is kept.
+std::vector<float> beatLoudness(const AnalysisResult& analysis,
+                                const std::vector<TimelineBeat>& beats) {
+    const double rate = analysis.waveformPeaksPerSecond;
+    const std::vector<WaveformPeak>& wave = analysis.waveform;
+    if (!(rate > 0.0) || wave.empty() || beats.size() < 4) {
+        return {};
+    }
+    std::vector<float> loudness(beats.size(), -1.0f);
+    std::vector<float> measured;
+    for (std::size_t i = 0; i + 1 < beats.size(); ++i) {
+        const double t0 = beats[i].time;
+        const double t1 = beats[i + 1].time;
+        if (!std::isfinite(t0) || !std::isfinite(t1) || !(t1 > t0)) {
+            continue;
+        }
+        const double first = std::max(0.0, std::floor(t0 * rate));
+        const double last = std::min(static_cast<double>(wave.size()), std::ceil(t1 * rate));
+        if (!(last > first)) {
+            continue;
+        }
+        double sum = 0.0;
+        for (auto k = static_cast<std::size_t>(first); k < static_cast<std::size_t>(last); ++k) {
+            sum += std::max(std::abs(wave[k].minValue), std::abs(wave[k].maxValue));
+        }
+        loudness[i] = static_cast<float>(sum / (last - first));
+        measured.push_back(loudness[i]);
+    }
+    if (measured.size() < 4) {
+        return {};
+    }
+    const float low = percentile(measured, 0.10);
+    const float high = percentile(measured, 0.95);
+    if (!(high - low > 0.1f * high)) {
+        return {};
+    }
+    for (float& value : loudness) {
+        if (value >= 0.0f) {
+            value = std::clamp((value - low) / (high - low), 0.0f, 1.0f);
+        }
+    }
+    return loudness;
+}
+
 } // namespace
 
 const char* accentKindName(AccentKind kind) {
@@ -125,6 +171,7 @@ void MusicalTimeline::buildBeatTable(const std::vector<double>& times,
 MusicalTimeline MusicalTimeline::fromAnalysis(const AnalysisResult& analysis,
                                               double fallbackBpm) {
     MusicalTimeline timeline;
+    timeline.analyzed_ = true;
     timeline.grid_ = BeatClock::fromAnalysis(analysis, fallbackBpm);
     timeline.valid_ = timeline.grid_.valid();
     timeline.duration_ = std::isfinite(analysis.info.duration) && analysis.info.duration > 0.0
@@ -215,6 +262,7 @@ MusicalTimeline MusicalTimeline::fromAnalysis(const AnalysisResult& analysis,
         }
     }
 
+    timeline.beatLoudness_ = beatLoudness(analysis, timeline.beats_);
     timeline.inferSubdivision(analysis.onsets);
 
     for (const BassAccent& accent : analysis.bassAccents) {
@@ -566,6 +614,47 @@ double MusicalTimeline::nextPhraseTime(double mediaTime, int phraseBars) const {
                                 static_cast<double>(grid_.barOffset()));
     }
     return time;
+}
+
+float MusicalTimeline::phraseLoudnessAt(double mediaTime) const {
+    if (beatLoudness_.empty() || !grid_.valid()) {
+        return -1.0f;
+    }
+    // A biweight kernel over the beats, two bars either side: its weights go to zero smoothly at
+    // the edges, so the average is continuous in media time.
+    const double centre = grid_.beatAt(mediaTime);
+    const double half = std::max(4.0, 2.0 * beatsPerBar_);
+    const double count = static_cast<double>(beatLoudness_.size());
+    const auto first = static_cast<long>(std::max(0.0, std::floor(centre - half)));
+    const auto last = static_cast<long>(std::min(count - 1.0, std::ceil(centre + half)));
+    double sum = 0.0;
+    double weights = 0.0;
+    for (long j = first; j <= last; ++j) {
+        const float value = beatLoudness_[static_cast<std::size_t>(j)];
+        const double x = (static_cast<double>(j) - centre) / half;
+        if (value < 0.0f || std::abs(x) >= 1.0) {
+            continue;
+        }
+        const double w = (1.0 - x * x) * (1.0 - x * x);
+        sum += w * value;
+        weights += w;
+    }
+    if (!(weights > 1e-9)) {
+        // Beyond the measured beats the window is empty. Holding the nearest measured value keeps
+        // the amplitude continuous instead of jumping back to the unscaled swing.
+        const long size = static_cast<long>(beatLoudness_.size());
+        const long start = static_cast<long>(std::clamp(std::llround(centre), 0LL,
+                                                         static_cast<long long>(size - 1)));
+        for (long d = 0; d < size; ++d) {
+            for (const long j : {start - d, start + d}) {
+                if (j >= 0 && j < size && beatLoudness_[static_cast<std::size_t>(j)] >= 0.0f) {
+                    return std::clamp(beatLoudness_[static_cast<std::size_t>(j)], 0.0f, 1.0f);
+                }
+            }
+        }
+        return -1.0f;
+    }
+    return static_cast<float>(std::clamp(sum / weights, 0.0, 1.0));
 }
 
 float MusicalTimeline::accentAt(double mediaTime, double window) const {

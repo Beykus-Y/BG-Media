@@ -418,6 +418,60 @@ TEST_CASE(motion32.overlay_plan_is_deterministic_and_musical) {
     CHECK(nearDownbeat);
 }
 
+TEST_CASE(motion32.head_overlays_stay_soft_at_123_bpm) {
+    // One loop of authored hits at 123 BPM with no authored head motion, so every head
+    // movement below comes from the overlays.
+    motion::HumanoidClip clip;
+    clip.id = "softAccents";
+    clip.bpm = 123.0;
+    clip.beats = 16.0f;
+    clip.beatsPerBar = 4;
+    clip.keysPerBeat = 8;
+    clip.keyCount = 16 * 8 + 1;
+    clip.loop = true;
+    clip.energy = 0.8f;
+    for (const float beat : {1.0f, 5.0f, 9.0f, 13.0f}) {
+        motion::AccentMark mark;
+        mark.beat = beat;
+        mark.strength = 1.0f;
+        mark.kind = "hit";
+        clip.accents.push_back(mark);
+    }
+    const std::vector<motion::PrimitiveCue> cues =
+        motion::planPrimitiveOverlays(clip, 9u, 1.0f, true);
+    bool headAccent = false;
+    for (const auto& cue : cues) {
+        headAccent = headAccent || cue.kind == motion::PrimitiveKind::HeadAccent;
+    }
+    CHECK(headAccent);
+
+    // Sampled every millisecond of real time: beat = seconds * 123 / 60.
+    const motion::ClipPose base = motion::neutralClipPose();
+    const std::size_t head = static_cast<std::size_t>(vrm::HumanoidBone::Head);
+    const double dt = 0.001;
+    const auto angle = [](const math::Quat& p, const math::Quat& q) {
+        const float sign = math::dot(p, q) < 0.0f ? -1.0f : 1.0f;
+        const float dx = p.x - sign * q.x;
+        const float dy = p.y - sign * q.y;
+        const float dz = p.z - sign * q.z;
+        const float dw = p.w - sign * q.w;
+        const float chord = std::sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
+        return 2.0 * std::asin(std::min(1.0, 0.5 * static_cast<double>(chord)));
+    };
+    const int steps = static_cast<int>(std::lround(clip.beats * 60.0 / 123.0 / dt));
+    double worst = 0.0;
+    math::Quat previous = motion::composeMotion(base, cues, 0.0, clip.beats, true)
+                              .pose.bone[head];
+    for (int step = 1; step <= steps; ++step) {
+        const double beat = static_cast<double>(step) * dt * 123.0 / 60.0;
+        const math::Quat current =
+            motion::composeMotion(base, cues, beat, clip.beats, true).pose.bone[head];
+        worst = std::max(worst, angle(previous, current) / dt);
+        previous = current;
+    }
+    CHECK(worst * 180.0 / 3.14159265358979323846 < 250.0);
+}
+
 // ---------------------------------------------------------------------------
 // Hands, model capabilities and spring bones
 // ---------------------------------------------------------------------------

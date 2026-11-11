@@ -1694,6 +1694,7 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
 
     Vec3 targets[2];
     Quat footDelta[2];
+    Quat footYawQuat[2];
     Vec3 poles[2];
     for (int f = 0; f < 2; ++f) {
         const motion::ClipPose::Foot& foot = pose.foot[static_cast<std::size_t>(f)];
@@ -1705,9 +1706,44 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
         const float pointed = (1.0f - foot.contact) *
                               std::clamp(lift / 0.05f, 0.0f, 1.0f) * 0.42f;
         const Quat yawQuat = math::fromAxisAngle(up, footYaw);
+        footYawQuat[f] = yawQuat;
         footDelta[f] = (yawQuat * math::fromAxisAngle(left, pointed)).normalized();
         // The knee points where the toes point (half-way, so it stays natural).
         poles[f] = math::normalize(forward * 0.6f + math::rotate(yawQuat, forward) * 0.4f);
+    }
+
+    // Heel roll (toe > 0): the heel rises and the toe stays on the floor. The foot turns about
+    // the toe joint, so the ankle target moves on the arc about it. Undo is the toe bone's
+    // share of the turn, applied after the leg solve, so the toes lie flat. The roll is
+    // weighted by the free share of the foot, like the pitch term above: a planted foot does
+    // not roll, so a small toe overshoot from the spline never moves a stance.
+    constexpr float heelRollRadians = 0.15f;
+    Quat heelUndo[2] = {Quat::identity(), Quat::identity()};
+    bool heelRolled[2] = {false, false};
+    if (options.footIK) {
+        for (int f = 0; f < 2; ++f) {
+            const LegRig& leg = impl_->legs[f];
+            const motion::ClipPose::Foot& clipFoot = pose.foot[static_cast<std::size_t>(f)];
+            const float heel = leg.toes >= 0
+                                   ? std::clamp(clipFoot.toePitch, 0.0f, 1.0f) *
+                                         (1.0f - std::clamp(clipFoot.contact, 0.0f, 1.0f))
+                                   : 0.0f;
+            if (heel <= 1.0e-4f) {
+                continue;
+            }
+            // Positive rotation about the foot's own lateral axis tips the toe down, so the
+            // heel goes up. The axis turns with the foot yaw: a foot turned half a turn has
+            // its toe behind the ankle, and the fixed model axis would drop that heel.
+            const Vec3 lateral = math::rotate(footYawQuat[f], left);
+            const Quat roll = math::fromAxisAngle(lateral, heel * heelRollRadians);
+            const Quat turned = footDelta[f];
+            const Vec3 toeOffset =
+                math::rotate(turned, impl_->bindPosition(leg.toes) - leg.bindAnkle);
+            targets[f] = targets[f] + toeOffset - math::rotate(roll, toeOffset);
+            footDelta[f] = (roll * turned).normalized();
+            heelUndo[f] = (turned.conjugate() * roll.conjugate() * turned).normalized();
+            heelRolled[f] = true;
+        }
     }
 
     // --- make the planted feet reachable ------------------------------------
@@ -1771,15 +1807,21 @@ RetargetedPose HumanoidRetargeter::applyClip(const motion::ClipPose& pose,
                             freeWeightOf(contacts[f]) <= 0.0f, out.stats, footDelta[f]);
         }
     }
-    // Heel / toe roll: rotate the toe bone after the ankle IK so the sole does
-    // not detach from the floor target. Small (0.30 rad at full strength).
+    // Toe bend, after the ankle IK. Negative toe: the toes come up (heel strike), 0.30 rad at
+    // full strength. Heel roll (positive toe, footIK on): the toe bone turns back by the roll,
+    // so the toes stay flat on the floor while the heel is up.
     for (int f = 0; f < 2; ++f) {
         const float toePitch = std::clamp(
             pose.foot[static_cast<std::size_t>(f)].toePitch, -1.0f, 1.0f);
-        if (impl_->legs[f].toes >= 0 && std::abs(toePitch) > 1.0e-4f) {
+        if (impl_->legs[f].toes < 0) {
+            continue;
+        }
+        if (heelRolled[f]) {
+            impl_->applyLocalDelta(locals, impl_->legs[f].toes, heelUndo[f]);
+        } else if (std::abs(toePitch) > 1.0e-4f && (toePitch < 0.0f || !options.footIK)) {
             impl_->applyLocalDelta(
                 locals, impl_->legs[f].toes,
-                quatToModel(math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, toePitch * 0.30f)));
+                quatToModel(math::fromAxisAngle({-1.0f, 0.0f, 0.0f}, -toePitch * 0.30f)));
         }
     }
     impl_->evaluate(locals, globals);

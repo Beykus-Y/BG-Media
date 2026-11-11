@@ -39,15 +39,6 @@ PcmTrack PcmTrack::fromAudio(const AudioData& audio, std::uint32_t targetRate,
         }
         return track;
     }
-    const double ratio = static_cast<double>(targetRate) / audio.sampleRate;
-    const std::size_t outFrames =
-        std::max<std::size_t>(1, static_cast<std::size_t>(
-                                     std::llround(sourceFrames * ratio)));
-
-    track.samples.resize(outFrames * outChannels);
-    track.sampleRate = targetRate;
-    track.channels = outChannels;
-
     const auto channelAt = [&](std::size_t frame, std::uint32_t channel) {
         if (sourceChannels == 1) {
             return sanitize(readChannel(audio.samples, frame, sourceChannels, 0));
@@ -67,17 +58,103 @@ PcmTrack PcmTrack::fromAudio(const AudioData& audio, std::uint32_t targetRate,
         return count > 0 ? sum / static_cast<float>(count) : 0.0f;
     };
 
-    for (std::size_t i = 0; i < outFrames; ++i) {
-        const double sourcePosition =
-            static_cast<double>(i) / std::max(1e-9, ratio);
-        const auto index = static_cast<std::size_t>(std::floor(sourcePosition));
-        const auto next = std::min(index + 1, static_cast<std::size_t>(sourceFrames) - 1);
-        const float frac =
-            static_cast<float>(sourcePosition - static_cast<double>(index));
+    const std::size_t srcFrames = static_cast<std::size_t>(sourceFrames);
+    track.samples.resize(srcFrames * outChannels);
+    track.sampleRate = audio.sampleRate;
+    track.channels = outChannels;
+    for (std::size_t f = 0; f < srcFrames; ++f) {
         for (std::uint32_t c = 0; c < outChannels; ++c) {
-            const float a = channelAt(index, c);
-            const float b = channelAt(next, c);
-            track.samples[i * outChannels + c] = a + (b - a) * frac;
+            track.samples[f * outChannels + c] = channelAt(f, c);
+        }
+    }
+    if (targetRate == track.sampleRate) {
+        return track;
+    }
+    return resampled(track, targetRate);
+}
+
+PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
+    if (targetRate == 0 || source.sampleRate == 0 || source.channels == 0 ||
+        targetRate == source.sampleRate || source.samples.empty()) {
+        return source;
+    }
+    PcmTrack track;
+    const std::uint32_t outChannels = source.channels;
+    const std::size_t srcFrames = source.frameCount();
+    const double ratio = static_cast<double>(targetRate) / source.sampleRate;
+    const std::size_t outFrames = std::max<std::size_t>(
+        1, static_cast<std::size_t>(std::llround(static_cast<double>(srcFrames) * ratio)));
+    track.samples.resize(outFrames * outChannels);
+    track.sampleRate = targetRate;
+    track.channels = outChannels;
+
+    // Band-limited resampling: Kaiser-windowed sinc, polyphase table with
+    // linear interpolation between phases. The cutoff drops to the target
+    // Nyquist when downsampling so nothing aliases.
+    constexpr int kHalfTaps = 24;
+    constexpr int kPhases = 512;
+    const double cutoff = std::min(1.0, ratio) * 0.97;
+    const double kaiserBeta = 9.0;
+    const auto bessel0 = [](double x) {
+        double sum = 1.0;
+        double term = 1.0;
+        for (int k = 1; k < 40; ++k) {
+            term *= (x / (2.0 * k)) * (x / (2.0 * k));
+            sum += term;
+        }
+        return sum;
+    };
+    const double i0Beta = bessel0(kaiserBeta);
+    const double support = kHalfTaps / cutoff;
+    const int halfWidth = static_cast<int>(std::ceil(support));
+    const int width = halfWidth * 2;
+    const double kPi = 3.14159265358979323846;
+    // table[phase][tap]: tap t reads source index base - halfWidth + 1 + t.
+    std::vector<float> table(static_cast<std::size_t>(kPhases + 1) * width);
+    for (int ph = 0; ph <= kPhases; ++ph) {
+        const double frac = static_cast<double>(ph) / kPhases;
+        double sum = 0.0;
+        for (int t = 0; t < width; ++t) {
+            const double d = (t - halfWidth + 1) - frac;
+            const double x = d * cutoff;
+            const double sinc = std::fabs(x) < 1e-12
+                                    ? 1.0
+                                    : std::sin(kPi * x) / (kPi * x);
+            const double u = d / support;
+            const double w = std::fabs(u) >= 1.0
+                                 ? 0.0
+                                 : bessel0(kaiserBeta * std::sqrt(1.0 - u * u)) / i0Beta;
+            const double v = sinc * w * cutoff;
+            table[static_cast<std::size_t>(ph) * width + t] = static_cast<float>(v);
+            sum += v;
+        }
+        if (sum > 0.0) {
+            for (int t = 0; t < width; ++t) {
+                table[static_cast<std::size_t>(ph) * width + t] /= static_cast<float>(sum);
+            }
+        }
+    }
+
+    const double step = 1.0 / ratio;
+    for (std::size_t i = 0; i < outFrames; ++i) {
+        const double pos = static_cast<double>(i) * step;
+        const auto base = static_cast<long long>(std::floor(pos));
+        const double fracPos = (pos - static_cast<double>(base)) * kPhases;
+        const int ph = std::min(kPhases - 1, static_cast<int>(fracPos));
+        const float mix = static_cast<float>(fracPos - ph);
+        const float* t0 = &table[static_cast<std::size_t>(ph) * width];
+        const float* t1 = t0 + width;
+        const long long first = base - halfWidth + 1;
+        for (std::uint32_t c = 0; c < outChannels; ++c) {
+            float acc = 0.0f;
+            for (int t = 0; t < width; ++t) {
+                const long long idx = first + t;
+                if (idx < 0 || idx >= static_cast<long long>(srcFrames)) {
+                    continue;
+                }
+                acc += sanitize(source.samples[static_cast<std::size_t>(idx) * outChannels + c]) * (t0[t] + (t1[t] - t0[t]) * mix);
+            }
+            track.samples[i * outChannels + c] = std::clamp(acc, -1.0f, 1.0f);
         }
     }
     return track;

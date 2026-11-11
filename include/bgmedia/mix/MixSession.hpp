@@ -148,6 +148,7 @@ private:
     void workerLoop();
     void startWorkerIfNeeded();
     void collectCompleted();
+    void pruneFinishedItems();
     void serviceDecks();
     void handleTransitionCompletion();
     void executeScheduledTransition(const MixPlan& plannedPreview);
@@ -201,6 +202,9 @@ private:
     bool hasExecutedPlan_ = false;
     bool planDirty_ = true;
     bool previewIsExecution_ = false;
+    // Live master position the current execution plan was built from; limits
+    // how often an expired-window plan is rebuilt.
+    double executionPlanPosA_ = 0.0;
     std::uint64_t cachedFromId_ = 0;
     std::uint64_t cachedToId_ = 0;
     DeckId cachedMasterDeck_ = DeckId::A;

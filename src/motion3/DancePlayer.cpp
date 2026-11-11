@@ -42,6 +42,58 @@ std::uint32_t overlayLoopSeed(std::uint32_t hostSeed, const std::string& clipId,
     return static_cast<std::uint32_t>(key ^ (key >> 32));
 }
 
+// What the track says about one loop of a clip, in local clip beats. Media time reaches clip
+// beats through the segment's stable (unwarped) mapping, the same beat the overlays are
+// composed at, so a cue planned on an event starts on that event's media time.
+MusicalOverlayContext musicalContextFor(const ScheduleSegment& segment, const HumanoidClip& clip,
+                                        std::int64_t loop, const MusicalTimeline& timeline) {
+    MusicalOverlayContext context;
+    const double beats = static_cast<double>(clip.beats);
+    const double base = static_cast<double>(loop) * beats;
+    const WarpProfile off{MotionExpression::Off, 0.0f, true, 0.0f};
+    const auto localBeatAt = [&](double mediaTime) {
+        return DanceSchedule::segmentClipBeat(segment, mediaTime, timeline, off) - base;
+    };
+    // The loop's media window; the events are sorted by time, so only the window is scanned.
+    const double t0 = DanceSchedule::mediaTimeAtClipBeat(segment, base, timeline);
+    const double t1 = DanceSchedule::mediaTimeAtClipBeat(segment, base + beats, timeline);
+    const double from = std::min(t0, t1) - 0.5;
+    const double to = std::max(t0, t1) + 0.5;
+    if (std::abs(t1 - t0) > 1.0e-3) {
+        context.clipBpm = beats * 60.0 / std::abs(t1 - t0);
+    }
+    const std::vector<AccentEvent>& accents = timeline.accents();
+    auto it = std::lower_bound(accents.begin(), accents.end(), from,
+                               [](const AccentEvent& event, double time) {
+                                   return event.time < time;
+                               });
+    for (; it != accents.end() && it->time <= to; ++it) {
+        const double local = localBeatAt(it->time);
+        if (!(local >= 0.0 && local < beats)) continue;
+        MusicalOverlayContext::Event event;
+        event.beat = static_cast<float>(local);
+        event.strength = it->strength;
+        event.offset = it->beatOffset;
+        event.bass = it->bass;
+        context.events.push_back(event);
+    }
+    for (const SilenceRegion& silence : timeline.silences()) {
+        const double begin = std::clamp(localBeatAt(silence.start), 0.0, beats);
+        const double end = std::clamp(localBeatAt(silence.end), 0.0, beats);
+        if (end > begin) {
+            context.silences.emplace_back(static_cast<float>(begin), static_cast<float>(end));
+        }
+    }
+    // The first beat of a phrase that starts after an energy jump (the entry of its segment).
+    if (segment.phraseHit) {
+        const double start = segment.entryClipBeat - base;
+        if (start >= 0.0 && start < beats) {
+            context.phraseStarts.push_back(static_cast<float>(start));
+        }
+    }
+    return context;
+}
+
 std::string trimmed(const std::string& text) {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -220,7 +272,9 @@ const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& cli
     if (const auto preset = generatedOverlays_.find(clipId); preset != generatedOverlays_.end()) {
         return preset->second;
     }
-    const std::pair<std::string, std::int64_t> key{clipId, loop};
+    OverlayPlanKey key;
+    key.clipId = clipId;
+    key.loop = loop;
     if (const auto it = overlays_.find(key); it != overlays_.end()) {
         return it->second;
     }
@@ -234,6 +288,95 @@ const std::vector<PrimitiveCue>& DancePlayer::overlaysFor(const std::string& cli
         overlays_.clear();
     }
     return overlays_.emplace(key, std::move(plan)).first->second;
+}
+
+const std::vector<PrimitiveCue>& DancePlayer::segmentOverlays(const ScheduleSegment& segment,
+                                                              std::int64_t loop) {
+    const HumanoidClip& clip = *segment.clip;
+    const MusicalTimeline& timeline = director_.timeline();
+    if (!timeline.analyzed() || generatedOverlays_.count(clip.id) != 0) {
+        return overlaysFor(clip.id, loop);
+    }
+    OverlayPlanKey key;
+    key.clipId = clip.id;
+    key.loop = loop;
+    key.musical = true;
+    key.alignTime = segment.alignTime;
+    key.entryClipBeat = segment.entryClipBeat;
+    key.rate = segment.rate;
+    key.phraseHit = segment.phraseHit;
+    if (const auto it = overlays_.find(key); it != overlays_.end()) {
+        return it->second;
+    }
+    const std::uint32_t seed = overlayLoopSeed(overlaySeed_, clip.id, loop);
+    const float density = std::clamp(0.25f + clip.energy * 0.8f, 0.25f, 1.0f);
+    std::vector<PrimitiveCue> plan = planMusicalOverlays(
+        clip, seed, density, musicalContextFor(segment, clip, loop, timeline), true);
+    if (overlays_.size() >= kMaxOverlaySets) {
+        overlays_.clear();
+    }
+    return overlays_.emplace(key, std::move(plan)).first->second;
+}
+
+std::vector<DancePlayer::PlannedOverlay> DancePlayer::plannedOverlays(double fromTime,
+                                                                       double toTime) {
+    std::vector<PlannedOverlay> out;
+    if (!(toTime >= fromTime)) {
+        return out;
+    }
+    const std::vector<ScheduleSegment>& segments = director_.schedule().segments();
+    const MusicalTimeline& timeline = director_.timeline();
+    const WarpProfile off{MotionExpression::Off, 0.0f, true, 0.0f};
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const ScheduleSegment& segment = segments[i];
+        if (!segment.clip) continue;
+        const HumanoidClip& clip = *segment.clip;
+        // A segment plays from its start until the next one starts.
+        const double begin = segment.startTime;
+        // The outgoing segment is still sampled while the next one fades in.
+        const double end = i + 1 < segments.size()
+                               ? segments[i + 1].startTime +
+                                     std::max(0.0, segments[i + 1].fadeSeconds)
+                               : 1.0e300;
+        if (end < fromTime || begin > toTime) continue;
+        const bool looping = clip.loop && clip.beats > 0.0f;
+        const double beats = looping ? static_cast<double>(clip.beats) : 0.0;
+        const double a = DanceSchedule::segmentClipBeat(segment, std::max(fromTime, begin),
+                                                        timeline, off);
+        const double b = DanceSchedule::segmentClipBeat(segment, std::min(toTime, end),
+                                                        timeline, off);
+        const std::int64_t first = looping ? std::max<std::int64_t>(
+                                                 0, static_cast<std::int64_t>(std::floor(
+                                                        std::min(a, b) / beats)))
+                                           : 0;
+        const std::int64_t last = looping ? std::max<std::int64_t>(
+                                                0, static_cast<std::int64_t>(std::floor(
+                                                       std::max(a, b) / beats)))
+                                          : 0;
+        for (std::int64_t loop = first; loop <= last; ++loop) {
+            const std::vector<PrimitiveCue> plan = segmentOverlays(segment, loop);
+            const double base = looping ? static_cast<double>(loop) * beats : 0.0;
+            for (const PrimitiveCue& cue : plan) {
+                const double mediaTime = DanceSchedule::mediaTimeAtClipBeat(
+                    segment, base + static_cast<double>(cue.beat), timeline);
+                if (mediaTime < fromTime || mediaTime > toTime || mediaTime < begin ||
+                    mediaTime >= end) {
+                    continue;
+                }
+                PlannedOverlay planned;
+                planned.mediaTime = mediaTime;
+                planned.clipId = clip.id;
+                planned.kind = cue.kind;
+                planned.intensity = cue.intensity;
+                planned.reason = cue.reason;
+                out.push_back(std::move(planned));
+            }
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const PlannedOverlay& x, const PlannedOverlay& y) {
+        return x.mediaTime < y.mediaTime;
+    });
+    return out;
 }
 
 bool DancePlayer::selectClip(const std::string& clipId, double now, bool immediate) {
@@ -252,6 +395,7 @@ bool DancePlayer::selectClip(const std::string& clipId, double now, bool immedia
 }
 
 void DancePlayer::setGrid(BeatClock clock, double now) {
+    overlays_.clear();  // musical plans follow the timeline, which may change below
     if (mode_ == DanceMode::Auto) {
         // A constant clock is an explicit Motion Lab override; a grid derived
         // from the analysis must keep the rich timeline (accents/downbeat
@@ -280,6 +424,7 @@ void DancePlayer::setGrid(BeatClock clock, double now) {
 }
 
 void DancePlayer::setMusicalTimeline(MusicalTimeline timeline, double now) {
+    overlays_.clear();
     if (mode_ == DanceMode::Auto) {
         armIfMoved(director_.beatClock(), timeline.grid(), now);
         director_.setMusicalTimeline(std::move(timeline));
@@ -294,6 +439,7 @@ void DancePlayer::setAnalysis(const AnalysisResult* analysis) {
 
 void DancePlayer::setAnalysis(const AnalysisResult* analysis, double now) {
     analysis_ = analysis;
+    overlays_.clear();
     if (mode_ == DanceMode::Auto) {
         armBlend(kPlanBlendSeconds, true);
         if (analysis_ && !analysis_->empty()) {
@@ -321,6 +467,7 @@ void DancePlayer::setMode(DanceMode mode, double now) {
         // The plan replaces the Manual schedule: the dancer carries on from the current pose.
         armBlend(kPlanBlendSeconds, true);
         if (analysis_ && !analysis_->empty()) {
+            overlays_.clear();
             director_.planAuto(*analysis_);
             autoNote_ = "plan built from BG Beat analysis";
         } else {
@@ -521,8 +668,8 @@ DanceFrame DancePlayer::sampleFrame(double mediaTime) {
         bool hands = false;
     } diag;
     director_.schedule().setPoseDecorator(
-        [this, &options, &diag](ClipPose& pose, const ScheduleSegment& segment,
-                                double clipBeat) {
+        [this, &options, &diag](ClipPose& pose, const ScheduleSegment& segment, double clipBeat,
+                                double linearBeat) {
             if (!segment.clip) {
                 return;
             }
@@ -532,17 +679,20 @@ DanceFrame DancePlayer::sampleFrame(double mediaTime) {
             // fade-in before beat 0 is loop 0. There is no crossfade between two loops' sets:
             // every cue envelope starts and ends at zero, so a change of set at the seam is
             // continuous, and a cue planned on the downbeat ramps in at full weight.
+            // With an analysed track the cues sit on the stable (unwarped) beat, so each one
+            // lands on the media time of its musical event; a grid plan keeps the warped beat.
+            const double beat = director_.timeline().analyzed() ? linearBeat : clipBeat;
             std::int64_t loop = 0;
-            double local = clipBeat;
+            double local = beat;
             if (clip.loop && clip.beats > 0.0f) {
                 loop = std::max<std::int64_t>(
-                    0, static_cast<std::int64_t>(std::floor(clipBeat / clip.beats)));
-                local = clipBeat - static_cast<double>(loop) * clip.beats;
+                    0, static_cast<std::int64_t>(std::floor(beat / clip.beats)));
+                local = beat - static_cast<double>(loop) * clip.beats;
             }
             // Copied: the lookup of loop L may evict the memo that a reference would point into.
             const std::vector<PrimitiveCue> previous =
-                loop > 0 ? overlaysFor(clip.id, loop - 1) : std::vector<PrimitiveCue>{};
-            const std::vector<PrimitiveCue>& current = overlaysFor(clip.id, loop);
+                loop > 0 ? segmentOverlays(segment, loop - 1) : std::vector<PrimitiveCue>{};
+            const std::vector<PrimitiveCue>& current = segmentOverlays(segment, loop);
             if (current.empty() && previous.empty()) {
                 return;
             }

@@ -17,6 +17,9 @@ using detail::footSmootherstep;
 constexpr float kRefCm = 160.0f;
 constexpr float kTwoPi = 6.28318530717958647692f;
 constexpr float kPi = 3.14159265358979323846f;
+// Matches the dance generator (TRAVEL_LIFT_CM, TRAVEL_LEAD_MAX in tools/dancegen/bgdance.py).
+constexpr float kTravelLiftCm = 2.0f;
+constexpr float kTravelLeadMax = 0.35f;
 
 // One step of one foot: the swing that carries it, followed by the stance it lands in.
 // All key indices are cyclic positions in [0, M).
@@ -117,6 +120,7 @@ private:
 
     void buildSteps();
     void apply(const Step& step, const Step* previous);
+    float travelLead(const Step& step) const;
     void applyAll();
     std::vector<int> affectedKeys(std::size_t index) const;
     int stepAt(int foot, int key, bool* swinging) const;
@@ -174,6 +178,46 @@ void Planner::buildSteps() {
     }
 }
 
+// Share of a swing, from each end, before the planned travel starts: the first key whose
+// authored lift reaches kTravelLiftCm, as the dance generator does for its own arcs. Keeps
+// the planner from sliding a foot along the floor (ground drag).
+float Planner::travelLead(const Step& step) const {
+    const std::size_t f = static_cast<std::size_t>(step.foot);
+    const int n = static_cast<int>(step.swing.size());
+    if (n == 0) {
+        return kTravelLeadMax;
+    }
+    // Swing key j sits at u = (j + 1) / (n + 1); the foot is on the floor at u = 0 and u = 1.
+    const auto uAt = [&](int j) { return static_cast<float>(j + 1) / static_cast<float>(n + 1); };
+    const auto liftAt = [&](int j) {
+        if (j < 0 || j >= n) return 0.0f;
+        const std::size_t k = static_cast<std::size_t>(step.swing[static_cast<std::size_t>(j)]);
+        return clip_.feet[f].position[k].y * kRefCm;
+    };
+    // Crossings are interpolated between keys, so the lead is not quantised to the key grid.
+    int first = -1;
+    for (int j = 0; j < n && first < 0; ++j) {
+        if (liftAt(j) >= kTravelLiftCm) first = j;
+    }
+    if (first < 0) {
+        return kTravelLeadMax;
+    }
+    const float l0 = liftAt(first - 1), l1 = liftAt(first);
+    const float u0 = first == 0 ? 0.0f : uAt(first - 1);
+    const float startU = u0 + (kTravelLiftCm - l0) / (l1 - l0) * (uAt(first) - u0);
+    int last = first;
+    for (int j = n - 1; j > first; --j) {
+        if (liftAt(j) >= kTravelLiftCm) {
+            last = j;
+            break;
+        }
+    }
+    const float m0 = liftAt(last), m1 = liftAt(last + 1);
+    const float u1 = last == n - 1 ? 1.0f : uAt(last + 1);
+    const float endU = 1.0f - (uAt(last) + (m0 - kTravelLiftCm) / (m0 - m1) * (u1 - uAt(last)));
+    return std::min(kTravelLeadMax, std::max(startU, endU));
+}
+
 // Writes one step's delta into the per-key arrays. The swing blends from the previous
 // stance's offset to this one, so the stance offsets are the only held values.
 void Planner::apply(const Step& step, const Step* previous) {
@@ -188,16 +232,21 @@ void Planner::apply(const Step& step, const Step* previous) {
         delta_[f][static_cast<std::size_t>(key)] = {sx, 0.0f, sz};
     }
     const int n = static_cast<int>(step.swing.size());
+    const float lead = travelLead(step);
     for (int j = 0; j < n; ++j) {
         const float u = static_cast<float>(j + 1) / static_cast<float>(n + 1);
-        const float blend = footSmootherstep(u);
-        const float bump = std::sin(kPi * u);
+        // The horizontal blend and the side bend start only once the authored lift has
+        // reached kTravelLiftCm; the extra lift itself runs over the whole swing.
+        const float p = std::clamp((u - lead) / (1.0f - 2.0f * lead), 0.0f, 1.0f);
+        const float blend = footSmootherstep(p);
+        const float bump = std::sin(kPi * p);
         const float bump2 = bump * bump;
+        const float arc = std::sin(kPi * u);
         const int key = step.swing[static_cast<std::size_t>(j)];
         float bx = 0.0f, bz = 0.0f;
         toStage(yawAt(key), 0.0f, step.bend * bump2, bx, bz);
         delta_[f][static_cast<std::size_t>(key)] = {px + (sx - px) * blend + bx,
-                                                    step.lift * bump2,
+                                                    step.lift * arc * arc,
                                                     pz + (sz - pz) * blend + bz};
     }
 }

@@ -639,6 +639,7 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         }
         phase = refineWithRegression(peaks, env, phase, lag, fps,
                                      toleranceFrames, totalPeakStrength);
+        const double regressionLag = phase.fittedLag;
         double refinedBpm = bpm;
         if (phase.beatCount >= 2 && phase.phase >= 0.0) {
             // Regression is reflected only through phase; recover the fitted
@@ -725,6 +726,7 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
         candidate.lowHitRate = low.valid ? low.hitRate : 0.0;
         candidate.lowContrast = low.valid ? low.contrast : 0.0;
         candidate.prior = prior;
+        candidate.fittedBpm = regressionLag > 0.0 ? 60.0 * fps / regressionLag : 0.0;
         candidate.score = (0.55 * evidence + 0.45 * std::clamp(acScore, 0.0, 1.0)) *
                           (0.90 + 0.10 * prior) * continuityFactor;
 
@@ -845,6 +847,13 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
 
     const TempoCandidate& best = evaluated.front();
     result.bpm = best.bpm;
+    // The coarse local search only resolves tempo to ~0.2%; the regression
+    // slope over the matched onsets is far more precise, so prefer it when it
+    // agrees with the selected candidate.
+    if (best.fittedBpm >= minBpm && best.fittedBpm <= maxBpm &&
+        std::abs(best.fittedBpm / best.bpm - 1.0) < 0.02) {
+        result.bpm = best.fittedBpm;
+    }
 
     double secondScore = 0.0;
     bool foundNonMetric = false;
@@ -855,7 +864,8 @@ TempoEstimate estimateTempo(const std::vector<float>& env, double fps,
             foundMetricAlternative = true;
             bestMetricAlternative = std::max(bestMetricAlternative, evaluated[i].score);
             // Two interpretations are materially close if the weaker one is
-            // within 20% of the stronger score. We expose that uncertainty
+            // within 50% of the stronger score (hit rates of related metric
+            // levels legitimately sit this close). We expose that uncertainty
             // instead of pretending the top item is certain.
             if (evaluated[i].score >= best.score * 0.50) {
                 result.octaveAmbiguous = true;

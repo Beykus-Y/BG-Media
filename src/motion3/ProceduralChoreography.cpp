@@ -883,8 +883,8 @@ GeneratedDance Choreographer::build() {
                                    fr.z / kRefHeightCm});
         footYaw[0].push_back(fl.yaw / 360.0f);
         footYaw[1].push_back(fr.yaw / 360.0f);
-        footToe[0].push_back(std::clamp(fl.toe, -1.0f, 1.0f));
-        footToe[1].push_back(std::clamp(fr.toe, -1.0f, 1.0f));
+        footToe[0].push_back(-std::clamp(fl.toe, -1.0f, 1.0f));
+        footToe[1].push_back(-std::clamp(fr.toe, -1.0f, 1.0f));
         const float handL = clamp01(c[Ctrl::HandL]);
         const float handR = clamp01(c[Ctrl::HandR]);
         handScalar[0].push_back(handL);
