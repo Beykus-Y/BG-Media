@@ -9,6 +9,8 @@ namespace bgmedia {
 
 struct TempoCandidate {
     double bpm = 0.0;
+    // BPM from the least-squares fit over matched onsets (0 if unavailable).
+    double fittedBpm = 0.0;
     double score = 0.0;
     double acScore = 0.0;
     double gridScore = 0.0;

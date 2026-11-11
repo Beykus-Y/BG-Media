@@ -474,9 +474,16 @@ std::vector<DpBeat> trackRegion(const std::vector<float>& env,
         }
 
         int last = indices.back();
+        // The tail follows the local period at the end of the region, not the
+        // one at its start (they differ on tracks with a drifting tempo).
+        const std::size_t tailAt = static_cast<std::size_t>(regionStart + last);
+        const double tailPeriod =
+            tailAt < periodFrames.size() && periodFrames[tailAt] > 1.0
+                ? periodFrames[tailAt]
+                : edgePeriod;
         const int limit = n - 1;
-        while (static_cast<double>(last) + edgePeriod <= static_cast<double>(limit) + 0.25 * edgePeriod) {
-            last = static_cast<int>(std::lround(static_cast<double>(last) + edgePeriod));
+        while (static_cast<double>(last) + tailPeriod <= static_cast<double>(limit) + 0.25 * tailPeriod) {
+            last = static_cast<int>(std::lround(static_cast<double>(last) + tailPeriod));
             if (last > limit) {
                 break;
             }
@@ -980,22 +987,36 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
                                                           phaseConfidenceCount)
                                      : 0.0f;
 
-    int bar = 0;
-    bool seenDownbeat = false;
+    // Bar numbers derive from the beat-grid index, not from the count of
+    // detected downbeats, so one missed downbeat cannot shift every later bar.
+    // The downbeat claim is only as good as the beat phase it rests on, so it
+    // is no longer a copy of the meter confidence.
+    result.downbeatConfidence = std::clamp(
+        result.meterConfidence * (0.5f + 0.5f * result.beatPhaseConfidence), 0.0f, 1.0f);
+    const auto floorDiv = [](int a, int b) {
+        int q = a / b;
+        if ((a % b != 0) && ((a < 0) != (b < 0))) {
+            --q;
+        }
+        return q;
+    };
+    // gridIndex restarts at 0 after a long gap, so keep bar numbers cumulative
+    // across such resets while using the local grid phase inside a segment.
+    int barOffset = 0;
+    int segmentFirstBar = beats.empty() ? 0 : floorDiv(gridIndex[0] - bestPhase, bestMeter);
     for (std::size_t i = 0; i < beats.size(); ++i) {
+        if (i > 0 && gridIndex[i] <= gridIndex[i - 1]) {
+            barOffset = beats[i - 1].barIndex + 1;
+            segmentFirstBar = floorDiv(gridIndex[i] - bestPhase, bestMeter);
+        }
         int beatInBar = (gridIndex[i] - bestPhase) % bestMeter;
         if (beatInBar < 0) {
             beatInBar += bestMeter;
         }
         beats[i].beatInBar = beatInBar;
         beats[i].downbeat = beatInBar == 0;
-        if (beats[i].downbeat) {
-            if (seenDownbeat) {
-                ++bar;
-            }
-            seenDownbeat = true;
-        }
-        beats[i].barIndex = bar;
+        beats[i].barIndex =
+            barOffset + floorDiv(gridIndex[i] - bestPhase, bestMeter) - segmentFirstBar;
     }
 
     result.beats = std::move(beats);
