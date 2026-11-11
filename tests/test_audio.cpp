@@ -135,6 +135,56 @@ TEST_CASE(audio.wav_rejects_truncated) {
     CHECK(!result.error.empty());
 }
 
+namespace {
+void patchU32(const std::filesystem::path& path, std::streamoff offset, std::uint32_t value) {
+    std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    f.seekp(offset);
+    for (int i = 0; i < 4; ++i) {
+        f.put(static_cast<char>((value >> (i * 8)) & 0xFF));
+    }
+}
+} // namespace
+
+TEST_CASE(audio.wav_streaming_sizes_and_rf64) {
+    using namespace bgmedia;
+    std::vector<std::uint8_t> data(2000);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<std::uint8_t>(i * 7);
+    }
+    WavDecoder decoder;
+    // Streaming writers leave 0 / 0xFFFFFFFF in the data size field (offset 40).
+    for (std::uint32_t marker : {0u, 0xFFFFFFFFu}) {
+        const auto path = tempPath("streaming.wav");
+        writeCustomWav(path, 1, 1, 44100, 16, data);
+        patchU32(path, 4, 0xFFFFFFFFu);
+        patchU32(path, 40, marker);
+        const auto result = decoder.decode(path);
+        CHECK(result.ok);
+        CHECK(result.audio.frameCount() == 1000);
+    }
+    // RF64 with the real data size in ds64.
+    {
+        const auto path = tempPath("rf64.wav");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        auto u16 = [&](std::uint16_t v) { out.put(char(v & 0xFF)); out.put(char(v >> 8)); };
+        auto u32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) out.put(char((v >> (i * 8)) & 0xFF)); };
+        out.write("RF64", 4); u32(0xFFFFFFFFu); out.write("WAVE", 4);
+        out.write("ds64", 4); u32(28);
+        u32(0); u32(0);                       // riff size
+        u32(static_cast<std::uint32_t>(data.size())); u32(0);  // data size
+        u32(1000); u32(0);                    // sample count
+        u32(0);                               // table length
+        out.write("fmt ", 4); u32(16);
+        u16(1); u16(1); u32(44100); u32(88200); u16(2); u16(16);
+        out.write("data", 4); u32(0xFFFFFFFFu);
+        out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        out.close();
+        const auto result = decoder.decode(path);
+        CHECK(result.ok);
+        CHECK(result.audio.frameCount() == 1000);
+    }
+}
+
 #if defined(BGMEDIA_HAVE_MINIAUDIO) && BGMEDIA_HAVE_MINIAUDIO
 TEST_CASE(audio.miniaudio_decodes_wav_mp3_flac) {
     using namespace bgmedia;
