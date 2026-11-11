@@ -1178,26 +1178,7 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
     const int bpbB = b.beatsPerBar >= 2 ? b.beatsPerBar : 4;
     const int phraseBars = std::clamp(config_.phraseBars, 2, 16);
 
-    double defaultDur = config_.defaultCrossfadeSeconds;
-    const double outro = outroStart(a);
-    if (outro < a.info.duration - 0.25) {
-        const double length = a.info.duration - outro;
-        if (length >= 1.5) {
-            defaultDur = length;
-            if (config_.preferPhraseBoundaries) {
-                defaultDur *= 1.15;
-            }
-        }
-    }
-    if (!b.sections.empty() && b.info.duration < 12.0) {
-        defaultDur = std::min(defaultDur, std::max(2.0, b.info.duration * 0.35));
-    }
-    if (config_.aggressiveness == Aggressiveness::Gentle) {
-        defaultDur = std::min(config_.maxCrossfadeSeconds, defaultDur * 1.25);
-    } else if (config_.aggressiveness == Aggressiveness::Energetic) {
-        defaultDur *= 0.75;
-    }
-    defaultDur = clampDuration(defaultDur, config_);
+    const double defaultDur = MixPlanner(config_).suggestDuration(a, b);
 
     double duration = request.requestedDuration > 0.0
                           ? request.requestedDuration
@@ -1681,9 +1662,12 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
             overallStartA + (aligned - crossfadeStartA) >= 0.0) {
             const double shift = aligned - crossfadeStartA;
             crossfadeStartA = aligned;
-            endA = std::min(a.info.duration, crossfadeStartA + duration);
+            // `duration` is output seconds; A is consumed at ratioA, so the
+            // outgoing window is duration * ratioA seconds of source audio.
+            endA = std::min(a.info.duration,
+                            crossfadeStartA + duration * std::max(1e-4, ratioA));
             overallStartA += shift;
-            duration = endA - crossfadeStartA;
+            duration = (endA - crossfadeStartA) / std::max(1e-4, ratioA);
             plan.transitionStartA = crossfadeStartA;
             plan.transitionEndA = endA;
             plan.duration = duration;
@@ -1726,12 +1710,16 @@ MixPlan planSingleCandidate(const PlannerConfig& config_,
     const double availableB = b.info.duration - startB;
     const double maxByB =
         meanRateB > 1e-6 ? availableB / meanRateB : availableB;
-    const double availableA = plan.transitionEndA - plan.transitionStartA;
+    // transitionEndA - transitionStartA is source seconds of A; convert to
+    // output seconds before comparing with plan.duration.
+    const double availableA = (plan.transitionEndA - plan.transitionStartA) /
+                              std::max(1e-4, ratioA);
     const double fitted =
         std::min(plan.duration, std::min(availableA, maxByB));
     if (fitted < plan.duration - 1e-6) {
         plan.duration = std::max(0.0, fitted);
-        plan.transitionEndA = plan.transitionStartA + plan.duration;
+        plan.transitionEndA = plan.transitionStartA +
+                              plan.duration * std::max(1e-4, ratioA);
         plan.reasons.push_back(format(
             "Shortened to %.2f s: the shortest remaining audio window is %.2f s",
             plan.duration, fitted));

@@ -161,6 +161,11 @@ private:
         bool wasTargetPlaying = false;
         float blockPeak = 0.0f;
         float lastSample[2] = {0.0f, 0.0f};
+        // Short decaying tail of the pre-seek signal, mixed over the first
+        // frames after a seek so the jump does not click.
+        float seekTail[2] = {0.0f, 0.0f};
+        std::size_t seekTailRemaining = 0;
+        std::size_t seekTailLength = 0;
         ThreeBandEq eq;
         EqGains eqGains{};
     };

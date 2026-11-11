@@ -468,6 +468,7 @@ void MixSession::handleTransitionCompletion() {
         nextRequested_ = false;
         hasExecutedPlan_ = false;
         planDirty_ = true;
+        lastError_.clear();
         status_ = "Transition complete";
     }
     engine_.play(master);
@@ -476,6 +477,20 @@ void MixSession::handleTransitionCompletion() {
     if (!snap.decks[deckIndex(old)].playing) {
         engine_.clearDeck(old);
     }
+    std::lock_guard lock(mutex_);
+    const std::uint64_t a = loadedId(DeckId::A);
+    const std::uint64_t b = loadedId(DeckId::B);
+    items_.erase(std::remove_if(items_.begin(), items_.end(),
+                                [&](const Item& item) {
+                                    return item.state == QueueState::Played &&
+                                           item.id != a && item.id != b;
+                                }),
+                 items_.end());
+}
+
+void MixSession::pruneFinishedItems() {
+    // A track that has been played and is no longer on a deck leaves the queue
+    // right away, not only at the next completed transition.
     std::lock_guard lock(mutex_);
     const std::uint64_t a = loadedId(DeckId::A);
     const std::uint64_t b = loadedId(DeckId::B);
@@ -834,6 +849,7 @@ void MixSession::executeScheduledTransition(const MixPlan& plannedPreview) {
     }
     std::lock_guard lock(mutex_);
     nextRequested_ = false;
+    lastError_.clear();
     status_ = std::string("Mixing: ") + transitionTypeName(plan.type) +
               " (" + mixStrategyKindName(plan.strategy) + ")";
 }
@@ -877,6 +893,7 @@ void MixSession::update() {
     collectCompleted();
     startWorkerIfNeeded();
     handleTransitionCompletion();
+    pruneFinishedItems();
     serviceDecks();
 
     {
