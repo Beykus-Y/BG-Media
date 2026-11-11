@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 namespace bgmedia::mix {
 namespace {
@@ -417,8 +418,12 @@ void MixSession::collectCompleted() {
     }
     for (CompletedJob& job : completed) {
         std::lock_guard lock(mutex_);
+        if (preparingId_ == job.id) {
+            preparingId_ = 0;
+        }
         Item* item = findItem(job.id);
         if (!item) {
+            // The track was removed while it was being prepared.
             continue;
         }
         if (job.ok && job.prepared.audio && job.prepared.analysis) {
@@ -433,9 +438,6 @@ void MixSession::collectCompleted() {
             item->state = QueueState::Failed;
             item->error = job.error.empty() ? "preparation failed" : job.error;
             lastError_ = item->error;
-        }
-        if (preparingId_ == job.id) {
-            preparingId_ = 0;
         }
     }
 }
@@ -671,10 +673,22 @@ void MixSession::ensurePlanValid() {
 
     // Fast-path: both decks unchanged, configuration unchanged, plan not dirty,
     // not an emergency execution plan, and live cursor has not passed the scheduled transition window.
-    if (!planDirty_ && preview_.valid && !previewIsExecution_ &&
-        fromId == cachedFromId_ && toId == cachedToId_ &&
-        from == cachedMasterDeck_ &&
+    const bool sameDecks = fromId == cachedFromId_ && toId == cachedToId_ &&
+                           from == cachedMasterDeck_;
+    if (!planDirty_ && preview_.valid && !previewIsExecution_ && sameDecks &&
         livePosA < preview_.overallStartA() + 0.5) {
+        return;
+    }
+    // While a transition is running the plan must not be rebuilt: the planner
+    // is expensive and the running transition owns its own copy of the plan.
+    if (!planDirty_ && preview_.valid && sameDecks &&
+        snap.phase != TransitionPhase::Idle) {
+        return;
+    }
+    // An expired-window (execution) plan is anchored to the live cursor; only
+    // rebuild it after the cursor moved noticeably, not on every update().
+    if (!planDirty_ && preview_.valid && previewIsExecution_ && sameDecks &&
+        std::fabs(livePosA - executionPlanPosA_) < 0.5) {
         return;
     }
     if (snap.decks[deckIndex(from)].loaded && snap.decks[deckIndex(to)].loaded) {
@@ -687,6 +701,7 @@ void MixSession::ensurePlanValid() {
         if (preview_.valid && livePosA > 0.0 && livePosA >= preview_.overallStartA() + 0.5) {
             preview_ = buildPlan(from, to, snap, 0.0, true);
             previewIsExecution_ = true;
+            executionPlanPosA_ = livePosA;
         }
     } else {
         preview_ = {};
@@ -880,8 +895,7 @@ void MixSession::update() {
     // Auto scheduling only runs in Auto mode. Manual and Preview still allow
     // the user to start a transition explicitly, and EOF promotion below keeps
     // playback continuous if nobody does.
-    if (snap.phase != TransitionPhase::Idle || !autoQueue_ || !autoPlay_ ||
-        mode_ != MixMode::Auto) {
+    if (snap.phase != TransitionPhase::Idle || !autoQueue_ || !autoPlay_) {
         return;
     }
     const DeckId from = snap.master;
@@ -894,7 +908,9 @@ void MixSession::update() {
         promoteEndedMaster(snap);
         return;
     }
-    if (!deck.playing) {
+    // Scheduling a transition is Auto-only; Manual and Preview wait for the
+    // user (EOF promotion above still keeps playback continuous).
+    if (mode_ != MixMode::Auto || !deck.playing) {
         return;
     }
     if (!snap.decks[0].loaded || !snap.decks[1].loaded) {

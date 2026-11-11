@@ -3,6 +3,7 @@
 #include "bgmedia/mix/Crossfade.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -21,44 +22,13 @@ float sanitize(float value) {
 // Control-thread sample-rate conversion. WSOLA copies source windows without
 // resampling them, so a track recorded at a different rate must be normalized
 // before it reaches the stretcher; otherwise the pitch would be wrong even at
-// playback rate 1.0. Catmull-Rom keeps the conversion clean enough for music.
+// playback rate 1.0. The windowed-sinc converter keeps the passband flat and filters aliasing.
 std::shared_ptr<const PcmTrack> resampleTrack(
     const std::shared_ptr<const PcmTrack>& source, std::uint32_t targetRate) {
     if (!source || targetRate == 0 || source->sampleRate == targetRate) {
         return source;
     }
-    auto converted = std::make_shared<PcmTrack>();
-    converted->sampleRate = targetRate;
-    converted->channels = source->channels;
-    const double ratio =
-        static_cast<double>(targetRate) / static_cast<double>(source->sampleRate);
-    const std::size_t sourceFrames = source->frameCount();
-    const std::size_t outFrames = std::max<std::size_t>(
-        1, static_cast<std::size_t>(std::llround(
-               static_cast<double>(sourceFrames) * ratio)));
-    converted->samples.resize(outFrames * source->channels);
-    const std::size_t last = sourceFrames > 0 ? sourceFrames - 1 : 0;
-    auto at = [&](std::size_t frame, std::uint32_t channel) {
-        const std::size_t clamped = std::min(frame, last);
-        return sanitize(source->samples[clamped * source->channels + channel]);
-    };
-    for (std::size_t i = 0; i < outFrames; ++i) {
-        const double position =
-            static_cast<double>(i) / std::max(1e-9, ratio);
-        const auto index = static_cast<std::size_t>(position);
-        const float frac = static_cast<float>(position - static_cast<double>(index));
-        for (std::uint32_t c = 0; c < source->channels; ++c) {
-            const float p0 = at(index > 0 ? index - 1 : 0, c);
-            const float p1 = at(index, c);
-            const float p2 = at(index + 1, c);
-            const float p3 = at(index + 2, c);
-            const float a = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
-            const float b = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
-            const float cc = -0.5f * p0 + 0.5f * p2;
-            const float value = ((a * frac + b) * frac + cc) * frac + p1;
-            converted->samples[i * source->channels + c] = sanitize(value);
-        }
-    }
+    auto converted = std::make_shared<PcmTrack>(PcmTrack::resampled(*source, targetRate));
     return converted;
 }
 
@@ -285,7 +255,13 @@ bool MixEngine::startTransition(const MixPlan& plan) {
     if (plan.from == plan.to || !deckLoaded(plan.to) || !deckLoaded(plan.from)) {
         return false;
     }
-    pendingPlan_ = plan;
+    // Write into the slot the callback is not reading, then publish it.
+    const int target = 1 - planSlot_.load(std::memory_order_acquire);
+    while (consumingSlot_.load(std::memory_order_acquire) == target) {
+        std::this_thread::yield();
+    }
+    pendingPlans_[target] = plan;
+    planSlot_.store(target, std::memory_order_release);
     planReady_.store(true, std::memory_order_release);
     return true;
 }
@@ -580,7 +556,9 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     if (!planReady_.load(std::memory_order_acquire)) {
         return;
     }
-    const MixPlan& plan = pendingPlan_;
+    const int slot = planSlot_.load(std::memory_order_acquire);
+    consumingSlot_.store(slot, std::memory_order_release);
+    const MixPlan& plan = pendingPlans_[slot];
     runtime_ = {};
     runtime_.valid = plan.valid;
     runtime_.type = plan.type;
@@ -731,6 +709,7 @@ void MixEngine::consumeStartRequest(std::uint64_t frame) noexcept {
     transitionStartFrame_ = runtime_.crossfadeStartFrame;
     transitionEndFrame_ = runtime_.endFrame;
     handoverDone_ = false;
+    consumingSlot_.store(-1, std::memory_order_release);
     planReady_.store(false, std::memory_order_release);
 
     if (runtime_.directCut || runtime_.endFrame <= frame) {
@@ -768,7 +747,7 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     // A hard stop cancels an in-flight or pending transition before the pause
     // freeze. It also drops a plan that was published but not consumed yet.
     // The plan payload itself stays control-thread-owned: the callback only
-    // clears the ready flag. Clearing pendingPlan_ here would race with
+    // clears the ready flag. Clearing pendingPlans_ here would race with
     // startTransition() overwriting it after it observed Phase::Idle.
     if (stopRequested_.exchange(false, std::memory_order_acq_rel)) {
         planReady_.store(false, std::memory_order_release);
