@@ -1318,6 +1318,8 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
     if (!source || !runtime.playing) {
         std::memset(out, 0, frames * 2 * sizeof(float));
         runtime.gain = 0.0f;
+        runtime.seekTailRemaining = 0;
+        runtime.lastSample[0] = runtime.lastSample[1] = 0.0f;
         // Do not carry filter state across a silent gap: a later start must
         // not inherit an old crossover transient.
         runtime.eq.reset();
@@ -1330,6 +1332,8 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
         runtime.playing = false;
         runtime.targetPlay.store(false, std::memory_order_release);
         runtime.gain = 0.0f;
+        runtime.seekTailRemaining = 0;
+        runtime.lastSample[0] = runtime.lastSample[1] = 0.0f;
         runtime.eq.reset();
         std::memset(out, 0, frames * 2 * sizeof(float));
         return;

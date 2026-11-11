@@ -5151,3 +5151,23 @@ TEST_CASE("mix.engine_seek_does_not_click") {
     CHECK(maxStep < 0.05f);
     CHECK(previous < -0.3f);  // the seek really landed in the -0.4 half
 }
+
+TEST_CASE("mix.engine_seek_tail_does_not_survive_eof") {
+    MixEngine engine(kRate);
+    auto track = dcTrack(5.0, 0.4f);
+    CHECK(engine.loadDeck(DeckId::A, track, 1, 120.0));
+    engine.play(DeckId::A);
+    std::vector<float> block(256 * 2);
+    for (int i = 0; i < 400; ++i) {
+        engine.render(block.data(), 256);
+    }
+    engine.seek(DeckId::A, 5.0);  // to the very end: renders silence
+    for (int i = 0; i < 20; ++i) {
+        engine.render(block.data(), 256);
+    }
+    engine.seek(DeckId::A, 1.0);
+    engine.play(DeckId::A);
+    engine.render(block.data(), 256);
+    // The restart must fade in, not begin with a stale +0.4 sample.
+    CHECK(std::abs(block[0]) < 0.05f);
+}
