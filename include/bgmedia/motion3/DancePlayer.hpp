@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -87,6 +88,16 @@ public:
     [[nodiscard]] const std::vector<PrimitiveCue>& overlaysFor(const std::string& clipId,
                                                                std::int64_t loop);
     [[nodiscard]] const std::vector<PrimitiveCue>& overlaysFor(const std::string& clipId);
+    // Overlay cue of the schedule between two media times, with the media time it starts at.
+    // Diagnostics and tests: the composition uses the same plans, per segment and loop.
+    struct PlannedOverlay {
+        double mediaTime = 0.0;
+        std::string clipId;
+        PrimitiveKind kind = PrimitiveKind::HandFlick;
+        float intensity = 0.0f;
+        std::string reason;
+    };
+    [[nodiscard]] std::vector<PlannedOverlay> plannedOverlays(double fromTime, double toTime);
     [[nodiscard]] const std::vector<GeneratedDance>& generatedDances() const {
         return generated_;
     }
@@ -132,6 +143,11 @@ public:
 
 private:
     void replanAuthored();
+    // Overlay cues of one schedule segment for one loop of its clip (the loop index comes from
+    // the segment's linear clip beat). With an analysed timeline the cues are planned from the
+    // track's events mapped through this segment; otherwise they are the grid plan of overlaysFor.
+    [[nodiscard]] const std::vector<PrimitiveCue>& segmentOverlays(const ScheduleSegment& segment,
+                                                                  std::int64_t loop);
     // Stateful hand-over from the last output pose (BG Motion 3.3, A3/A4). The schedule
     // stays a pure function of media time; only this blend remembers where it started.
     // Its progress is media time travelled, so it works for a paused or scrubbed host too.
@@ -181,8 +197,24 @@ private:
     OverlayMode overlayMode_ = OverlayMode::Full;
     std::uint32_t overlaySeed_ = 3u;
     std::vector<GeneratedDance> generated_;
-    // Per-(clip, loop) overlay plans: a pure memo of planPrimitiveOverlays, bounded in size.
-    std::map<std::pair<std::string, std::int64_t>, std::vector<PrimitiveCue>> overlays_;
+    // Overlay plans: a pure memo of the planners, bounded in size. The grid plan depends on the
+    // clip and the loop; a musical plan also on the segment's alignment. Musical plans depend on
+    // the timeline too, so the memo is dropped whenever the timeline changes.
+    struct OverlayPlanKey {
+        std::string clipId;
+        std::int64_t loop = 0;
+        bool musical = false;
+        double alignTime = 0.0;
+        double entryClipBeat = 0.0;
+        double rate = 0.0;
+        bool phraseHit = false;
+        bool operator<(const OverlayPlanKey& other) const {
+            return std::tie(clipId, loop, musical, alignTime, entryClipBeat, rate, phraseHit) <
+                   std::tie(other.clipId, other.loop, other.musical, other.alignTime,
+                            other.entryClipBeat, other.rate, other.phraseHit);
+        }
+    };
+    std::map<OverlayPlanKey, std::vector<PrimitiveCue>> overlays_;
     std::unordered_map<std::string, std::vector<PrimitiveCue>> generatedOverlays_;
 };
 

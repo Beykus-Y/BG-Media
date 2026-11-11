@@ -314,26 +314,136 @@ Quat scaleSwing(const Quat& q, const Quat& mean, float scale) {
     return (mean * Quat{k * d.x, k * d.y, k * d.z, std::cos(scaledHalf)}).normalized();
 }
 
-void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat) {
-    if (!clip.loop || !(clip.beats > 0.0f)) {
-        return;
+// BG Motion WP-J. The upper body swings with the loudness of the phrase: 0.75 in the quietest
+// passages of the track, 1.15 in the loudest. Where the track has no loudness, the swing keeps
+// its authored size.
+constexpr float kPhraseAmplitudeMin = 0.75f;
+constexpr float kPhraseAmplitudeMax = 1.15f;
+
+float phraseAmplitude(const MusicalTimeline& timeline, double mediaTime) {
+    const float loudness = timeline.phraseLoudnessAt(mediaTime);
+    if (loudness < 0.0f) {
+        return 1.0f;
     }
-    const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
-    const std::uint64_t hash = variationHash(clip.id);
+    return kPhraseAmplitudeMin + (kPhraseAmplitudeMax - kPhraseAmplitudeMin) * loudness;
+}
+
+// `phrase` scales the upper body on top of the per-loop variation. The hips and legs keep their
+// authored swing (planted contacts), and so does a clip with no loop and no phrase loudness.
+void applyLoopAmplitude(ClipPose& pose, const HumanoidClip& clip, double clipBeat, float phrase) {
     std::array<float, kAmplitudeGroups> scale{};
-    for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
-        const float from = loopAmplitude(hash, blend.from, group);
-        const float to = loopAmplitude(hash, blend.to, group);
-        scale[group] = from + (to - from) * blend.w;
+    scale.fill(1.0f);
+    if (clip.loop && clip.beats > 0.0f) {
+        const LoopBlend blend = loopBlendAt(clipBeat, clip.beats, kAmplitudeWindowBeats);
+        const std::uint64_t hash = variationHash(clip.id);
+        for (std::size_t group = 0; group < kAmplitudeGroups; ++group) {
+            const float from = loopAmplitude(hash, blend.from, group);
+            const float to = loopAmplitude(hash, blend.to, group);
+            scale[group] = from + (to - from) * blend.w;
+        }
     }
     for (std::size_t bone = 0; bone < vrm::kHumanoidBoneCount; ++bone) {
         const int group = amplitudeGroupOf(bone);
-        if (group < 0 || scale[static_cast<std::size_t>(group)] == 1.0f) {
+        if (group < 0) {
             continue;  // unscaled groups keep the authored rotation bit for bit
         }
+        const float amount = scale[static_cast<std::size_t>(group)] * phrase;
+        if (amount == 1.0f) {
+            continue;
+        }
         const Quat mean = trackMean(clip.bones[bone], clip.keyCount);
-        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, scale[static_cast<std::size_t>(group)]);
+        pose.bone[bone] = scaleSwing(pose.bone[bone], mean, amount);
     }
+}
+
+// --- WP-J. How an auto phrase joins the one before it ---------------------------------------
+//
+// The arms and legs decide the join: among the entry points that keep the bar phase, the one
+// whose limbs are closest to the outgoing clip at the alignment wins. An entry the same style used
+// last time costs a little more, so a repeated phrase starts from another point when the poses
+// allow it. When the clip has exit points, the entry also decides where the segment leaves the
+// clip: the clip beat at the next phrase boundary should sit on an exit point.
+constexpr std::array<vrm::HumanoidBone, 8> kJoinLimbs{
+    vrm::HumanoidBone::LeftUpperArm,  vrm::HumanoidBone::LeftLowerArm,
+    vrm::HumanoidBone::RightUpperArm, vrm::HumanoidBone::RightLowerArm,
+    vrm::HumanoidBone::LeftUpperLeg,  vrm::HumanoidBone::LeftLowerLeg,
+    vrm::HumanoidBone::RightUpperLeg, vrm::HumanoidBone::RightLowerLeg,
+};
+// A phrase whose energy differs from the previous one by more than this starts with a hit.
+constexpr float kPhraseHitEnergyJump = 0.3f;
+constexpr double kExitWeight = 0.5;   // cost per clip beat between the exit and an exit point
+constexpr double kRepeatCost = 1.0;   // cost of the entry the same style used last (radians, summed)
+
+// Sum over the arms and legs of the angle between two poses' bone rotations, in radians.
+double limbDistance(const ClipPose& a, const ClipPose& b) {
+    double total = 0.0;
+    for (vrm::HumanoidBone bone : kJoinLimbs) {
+        const auto at = static_cast<std::size_t>(bone);
+        const double d = std::min(1.0, std::abs(static_cast<double>(dot(a.bone[at], b.bone[at]))));
+        total += 2.0 * std::acos(d);
+    }
+    return total;
+}
+
+// Distance in clip beats from `beat` to the nearest exit point, on the clip's loop.
+double exitDistance(const HumanoidClip& clip, double beat) {
+    const double loop = std::max(1.0, static_cast<double>(clip.beats));
+    double best = loop;
+    for (float exit : clip.exitBeats) {
+        const double d = std::fmod(std::abs(beat - static_cast<double>(exit)), loop);
+        best = std::min(best, std::min(d, loop - d));
+    }
+    return best;
+}
+
+// The entry of `base` (a segment of `clip` aligned at base.alignTime) chosen among all of the
+// clip's entry points with the same bar phase. `outgoing` is the segment that plays before it
+// (null at the start), `nextAlign` the next phrase boundary (negative when there is none), and
+// `lastEntry` the entry the style used last (negative when none).
+float chooseEntry(const HumanoidClip& clip, const ScheduleSegment& base,
+                  const ScheduleSegment* outgoing, const MusicalTimeline& timeline,
+                  double nextAlign, float lastEntry) {
+    if (clip.entryBeats.empty()) {
+        return base.entryClipBeat;
+    }
+    const double bar = std::max(1, clip.beatsPerBar);
+    const double phase = std::fmod(base.entryClipBeat, bar);
+    const WarpProfile off{MotionExpression::Off, 0.0f, true, 0.0f};
+    const bool haveOutgoing = outgoing && outgoing->clip;
+    ClipPose outgoingPose;
+    if (haveOutgoing) {
+        const double beat =
+            DanceSchedule::segmentClipBeat(*outgoing, base.alignTime, timeline, off);
+        outgoingPose = sampleClip(*outgoing->clip, beat);
+    }
+    const bool haveExit = !clip.exitBeats.empty() && nextAlign > base.alignTime;
+    // Entries are shifts of one another, so the beat at the next boundary moves with the entry.
+    const double exitShift =
+        haveExit ? DanceSchedule::segmentClipBeat(base, nextAlign, timeline, off) -
+                       base.entryClipBeat
+                 : 0.0;
+    float best = base.entryClipBeat;
+    double bestCost = 1.0e300;
+    for (float entry : clip.entryBeats) {
+        if (circularDistance(std::fmod(static_cast<double>(entry), bar), phase, bar) > 1e-4) {
+            continue;
+        }
+        double cost = 0.0;
+        if (haveOutgoing) {
+            cost += limbDistance(outgoingPose, sampleClip(clip, entry));
+        }
+        if (haveExit) {
+            cost += kExitWeight * exitDistance(clip, entry + exitShift);
+        }
+        if (lastEntry >= 0.0f && std::abs(entry - lastEntry) < 1e-4f) {
+            cost += kRepeatCost;
+        }
+        if (cost < bestCost - 1e-9) {
+            bestCost = cost;
+            best = entry;
+        }
+    }
+    return best;
 }
 
 } // namespace
@@ -417,6 +527,14 @@ double DanceSchedule::segmentClipBeat(const ScheduleSegment& segment, double med
         *deviation = mapping.deviation;
     }
     return mapping.beat;
+}
+
+double DanceSchedule::mediaTimeAtClipBeat(const ScheduleSegment& segment, double clipBeat,
+                                          const MusicalTimeline& timeline) {
+    if (!segment.clip) {
+        return segment.alignTime;
+    }
+    return timeAtLinearClipBeat(segment, clipBeat, timeline.grid());
 }
 
 namespace {
@@ -658,7 +776,8 @@ void DanceSchedule::applyFollowThrough(ClipPose& pose, std::size_t index, double
 
 ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
                                  const MusicalTimeline& timeline,
-                                 const WarpProfile& warp, double* clipBeat) const {
+                                 const WarpProfile& warp, double* clipBeat,
+                                 double* linearBeat) const {
     const ScheduleSegment& segment = segments_[index];
     const Mapping stable = mapSegment(segment, mediaTime, timeline.grid(), &timeline,
                                       WarpProfile{MotionExpression::Off, 0.0f, true, 0.0f},
@@ -676,9 +795,14 @@ ClipPose DanceSchedule::basePose(std::size_t index, double mediaTime,
             own = adaptPose(linear, warped, !warp.upperBodyOnly, contact);
         }
     }
-    applyLoopAmplitude(own, *segment.clip, mapped.beat);
+    // Idle breathes on wall-clock time, not on the music: its amplitude is its own.
+    const float phrase = segment.clip->tempoSync ? phraseAmplitude(timeline, mediaTime) : 1.0f;
+    applyLoopAmplitude(own, *segment.clip, mapped.beat, phrase);
     if (clipBeat) {
         *clipBeat = mapped.beat;
+    }
+    if (linearBeat) {
+        *linearBeat = stable.linearBeat;
     }
     return own;
 }
@@ -807,12 +931,13 @@ ClipPose DanceSchedule::ownPose(std::size_t index, double mediaTime,
                                 const MusicalTimeline& timeline,
                                 const WarpProfile& warp) const {
     double clipBeat = 0.0;
-    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat);
+    double linearBeat = 0.0;
+    ClipPose own = basePose(index, mediaTime, timeline, warp, &clipBeat, &linearBeat);
     if (followThrough_) {
         applyFollowThrough(own, index, mediaTime, timeline, warp);
     }
     if (decorator_) {
-        decorator_(own, segments_[index], clipBeat);
+        decorator_(own, segments_[index], clipBeat, linearBeat);
     }
     return own;
 }
@@ -1644,6 +1769,7 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
     struct Plan {
         DanceStyle style;
         std::string reason;
+        float energy = 0.0f;
     };
     std::vector<Plan> plan;
     DanceStyle previous = DanceStyle::Groove;
@@ -1707,7 +1833,7 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         if (!clipFor(style)) {
             style = DanceStyle::Groove;
         }
-        plan.push_back({style, reason});
+        plan.push_back({style, reason, energy});
         previous = style;
     }
 
@@ -1715,8 +1841,20 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
     // of a style alternates between the authored clip and its mirror image, so a style that
     // comes back does not repeat the same bit-identical swing. The mirror is a library-owned
     // clip, so the segment's pointer stays valid.
+    // The next phrase boundary at which the style changes, where a segment hands over (negative:
+    // none). The exit of a segment is chosen against it.
+    std::vector<double> handOver(plan.size(), -1.0);
+    double upcoming = -1.0;
+    for (std::size_t p = plan.size(); p-- > 0;) {
+        handOver[p] = upcoming;
+        if (p > 0 && plan[p].style != plan[p - 1].style) {
+            upcoming = phrases[p].t0;
+        }
+    }
     // Per DanceStyle: the next segment of that style is mirrored.
     std::array<bool, kDanceStyleCount> mirrorNext{};
+    std::array<float, kDanceStyleCount> lastEntry{};
+    lastEntry.fill(-1.0f);
     std::size_t index = 0;
     bool anySegment = false;
     for (int p = 0; p < phraseCount; ++p, ++index) {
@@ -1742,6 +1880,15 @@ void DanceDirector::planAuto(const AnalysisResult& analysis, const AutoPlanOptio
         const double fade = fadeFor(align);
         const double start = std::max(0.0, align - fade * 0.5);
         ScheduleSegment segment = makeSegment(*clip, start, align, fade);
+        if (clip->tempoSync) {
+            const ScheduleSegment* outgoing =
+                schedule_.segments().empty() ? nullptr : &schedule_.segments().back();
+            segment.entryClipBeat = chooseEntry(*clip, segment, outgoing, timeline_,
+                                                handOver[index], lastEntry[styleIndex]);
+            lastEntry[styleIndex] = static_cast<float>(segment.entryClipBeat);
+        }
+        segment.phraseHit = index > 0 && std::abs(plan[index].energy - plan[index - 1].energy) >
+                                             kPhraseHitEnergyJump;
         segment.reason = mirrored ? entry.reason + " -> mirrored repeat" : entry.reason;
         schedule_.append(segment, timeline_, warp_);
         anySegment = true;

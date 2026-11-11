@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bgmedia::motion {
@@ -147,6 +148,9 @@ struct PrimitiveCue {
     BlendMode blend = BlendMode::Additive;
     int side = -1;  // -1 both, 0 left, 1 right
     float phaseOffset = 0.0f;
+    // Phase of the rise of a snap (head, shoulder and chest accents) or a hand flick. The
+    // planner sets it from the tempo so the rise lasts a fixed real time; 0 = the default.
+    float snapAttack = 0.0f;
     std::string reason;
 
     [[nodiscard]] const PrimitiveMetadata& metadata() const {
@@ -171,7 +175,7 @@ struct PrimitivePose {
     std::array<Quat, vrm::kHumanoidBoneCount> bone;
     Vec3 hips{};                 // additive offset, height units
     std::array<float, 2> footLift{};  // additive vertical lift, height units
-    std::array<float, 2> toePitch{};  // additive -1..1
+    std::array<float, 2> toePitch{};  // additive -1..1, positive = heel roll (ClipPose::Foot)
     std::array<HandPose, 2> hand;
     BodyMask mask = body::None;
     bool touchesFeet = false;
@@ -206,11 +210,15 @@ struct ComposedPose {
     CompositionDiagnostics diagnostics;
 };
 
+// Phase of the rise of a snap envelope when the cue does not set one (PrimitiveCue::snapAttack).
+inline constexpr float kDefaultSnapAttack = 0.08f;
+
 // Evaluates one primitive at a local phase (0..1) and intensity. This is a pure
 // function; the scheduler and the compositor are the only callers.
 [[nodiscard]] PrimitivePose samplePrimitive(PrimitiveKind kind, float phase,
                                             float intensity, int side,
-                                            float accent = 0.0f);
+                                            float accent = 0.0f,
+                                            float snapAttack = kDefaultSnapAttack);
 
 // Combines a base pose with active cues. Deterministic; cue order does not
 // affect the result because cues are sorted by priority and beat.
@@ -239,6 +247,29 @@ struct ComposedPose {
 [[nodiscard]] std::vector<PrimitiveCue> planPrimitiveOverlays(
     const HumanoidClip& clip, std::uint32_t seed, float density,
     bool includeHands = true);
+
+// What the track says about one loop of a clip, in local clip beats (0 .. clip.beats). It is
+// built from the analysed timeline by the host (DancePlayer maps media time to clip beats through
+// the schedule segment), so the planner itself never sees media time.
+struct MusicalOverlayContext {
+    struct Event {
+        float beat = 0.0f;      // local clip beat of an onset or a bass accent
+        float strength = 0.0f;  // 0..1 within the track
+        float offset = 0.0f;    // signed offset from the nearest musical beat, in music beats
+        bool bass = false;
+    };
+    std::vector<Event> events;                      // sorted by beat
+    std::vector<std::pair<float, float>> silences;  // [begin, end) local beats with no sound
+    std::vector<float> phraseStarts;                // local beats where a new phrase starts
+};
+
+// Overlay planner for an analysed track. Hand and head gestures land on onsets and bass accents
+// above a strength threshold, never in silence; one or two strong off-beat onsets per bar get a
+// syncopated hand gesture; a phrase start with a large energy jump gets a hit accent. Cues start
+// exactly on their event. Deterministic in (clip, seed, loop context).
+[[nodiscard]] std::vector<PrimitiveCue> planMusicalOverlays(
+    const HumanoidClip& clip, std::uint32_t seed, float density,
+    const MusicalOverlayContext& music, bool includeHands = true);
 
 // The body-mask bit that governs a humanoid bone (UpperChest -> Chest, Neck ->
 // Head, upper+lower arm -> arm). None for bones no mask can drive.

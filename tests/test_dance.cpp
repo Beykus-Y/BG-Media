@@ -2,7 +2,10 @@
 
 #include "motion_metrics.hpp"
 
+#include "bgmedia/analysis/Analyzer.hpp"
+#include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "support/SyntheticSignals.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -359,6 +362,70 @@ TEST_CASE(dance.foot_contacts_declared_and_planted_feet_do_not_slide) {
         CHECK(r.slideHeightFraction < 0.0035);  // < ~5.6 mm on a 1.6 m character
         CHECK(r.footErrorMax < 0.004);          // never pulled off a target by the reach clamp
     }
+}
+
+// A foot leaves the floor without a snap. The rise from the last stance key to the first
+// swing key is the foot's vertical speed on entering the swing. The old lift h*sin(pi u)^0.85
+// entered at 99 cm/beat on the authored clips (the knee snapped). The lift now starts with
+// zero slope but rises early so the travel can start sooner (see swing_profile in bgdance.py),
+// which enters at 56 cm/beat at most. The bound is 60 cm/beat, a finite limit below the old one.
+TEST_CASE(dance.first_swing_key_is_gentle) {
+    constexpr double kRefCm = 160.0;  // authored heights are fractions of a 160 cm character
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        const int keys = clip.keyCount;
+        for (const motion::ContactSegment& seg : clip.contacts) {
+            if (seg.end >= clip.beats - 1e-4f) {
+                continue;  // the loop seam has no swing start
+            }
+            const auto& track = clip.feet[static_cast<std::size_t>(seg.foot)].position;
+            const int k = static_cast<int>(std::floor(seg.end * clip.keysPerBeat + 1e-4)) + 1;
+            if (track.size() != static_cast<std::size_t>(keys) || k < 1 || k >= keys) {
+                continue;
+            }
+            const double rise = std::abs(static_cast<double>(track[static_cast<std::size_t>(k)].y) -
+                                         track[static_cast<std::size_t>(k - 1)].y);
+            CHECK_NEAR(rise * kRefCm * clip.keysPerBeat, 0.0, 60.0);  // cm per beat
+        }
+    }
+}
+
+// A planted foot is never under the floor. The Catmull-Rom segment through a hold-to-swing
+// break used to undershoot by up to 6 mm inside a stance. Heights at the 1.6 m reference.
+TEST_CASE(dance.planted_feet_stay_on_the_floor) {
+    constexpr double kRefMm = 1600.0;  // one height unit in millimetres
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        double lowest = 0.0;
+        for (double beat = 0.0; beat < clip.beats; beat += 1.0 / 64.0) {
+            const motion::ClipPose pose = motion::sampleClip(clip, beat);
+            for (const motion::ClipPose::Foot& foot : pose.foot) {
+                if (foot.contact > 0.0f) {
+                    lowest = std::min(lowest, static_cast<double>(foot.position.y) * kRefMm);
+                }
+            }
+        }
+        CHECK_NEAR(lowest, 0.0, 0.5);  // mm
+    }
+}
+
+// The fifth foot component carries the heel roll: a heel peel before each lift-off in the
+// dances that step, and a heel strike after forward and side landings.
+TEST_CASE(dance.heel_roll_is_authored_around_the_steps) {
+    for (const motion::HumanoidClip& clip : library().clips()) {
+        for (const motion::FootTrack& track : clip.feet) {
+            CHECK(track.toe.size() == static_cast<std::size_t>(clip.keyCount));
+        }
+    }
+    const motion::HumanoidClip& sidestep = *library().forStyle(motion::DanceStyle::SideStep);
+    float peak = 0.0f;
+    float strike = 0.0f;
+    for (const motion::FootTrack& track : sidestep.feet) {
+        for (float v : track.toe) {
+            peak = std::max(peak, v);
+            strike = std::min(strike, v);
+        }
+    }
+    CHECK(peak > 0.9f);     // a heel up, toe on the floor, before a lift-off
+    CHECK(strike < -0.3f);  // toes up on a heel strike after a landing
 }
 
 TEST_CASE(dance.footwork_moves_the_feet_not_just_the_knees) {
@@ -1910,4 +1977,321 @@ TEST_CASE(dance.overlay_pipeline_composes_each_loop_without_blending) {
     }
     CHECK(worst < 1e-5);
     CHECK(overlaid > frames / 4);
+}
+
+namespace {
+
+// BG Beat analysis of a synthetic track, as the desktop host gets it.
+AnalysisResult analyzeSynthetic(const test::SyntheticTrack& track) {
+    std::string error;
+    const PcmBuffer pcm = PcmBuffer::fromAudio(track.audio, &error);
+    if (!pcm.valid()) {
+        throw test::Failure("failed to create PCM: " + error);
+    }
+    const Analyzer analyzer(AnalysisConfig{});
+    AnalysisReport report = analyzer.analyze(pcm);
+    if (!report.ok()) {
+        throw test::Failure("analysis failed: " + report.message);
+    }
+    return std::move(report.result);
+}
+
+// A steady grid whose waveform has amplitude `before` until `switchAt` and `after` from then on.
+AnalysisResult gridWithDynamics(double bpm, double duration, double switchAt, float before,
+                                float after) {
+    AnalysisResult analysis;
+    analysis.info.duration = duration;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 0.95f;
+    analysis.beatPhaseConfidence = 0.95f;
+    analysis.meterConfidence = 0.9f;
+    analysis.downbeatConfidence = 0.9f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const int count = static_cast<int>(duration * bpm / 60.0);
+    for (int i = 0; i < count; ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / bpm;
+        beat.strength = i % 4 == 0 ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+    }
+    analysis.waveformPeaksPerSecond = 50.0f;
+    const int bins = static_cast<int>(duration * 50.0);
+    for (int k = 0; k < bins; ++k) {
+        const float amplitude = k / 50.0 < switchAt ? before : after;
+        analysis.waveform.push_back(WaveformPeak{-amplitude, amplitude});
+    }
+    return analysis;
+}
+
+// Three 8-second phrases at 120 BPM: calm, loud, calm. The sections and the onset strengths say
+// so, which gives the auto plan Groove, Energetic, Groove, with an energy jump at each seam.
+AnalysisResult threePhrases() {
+    AnalysisResult analysis;
+    const double bpm = 120.0;
+    const double duration = 24.0;
+    analysis.info.duration = duration;
+    analysis.bpm = bpm;
+    analysis.bpmConfidence = 0.95f;
+    analysis.beatPhaseConfidence = 0.95f;
+    analysis.meterConfidence = 0.9f;
+    analysis.downbeatConfidence = 0.9f;
+    analysis.beatsPerBar = 4;
+    analysis.tempoStable = true;
+    const auto energyAt = [](double t) { return t >= 8.0 && t < 16.0 ? 0.95f : 0.1f; };
+    for (int i = 0; i < static_cast<int>(duration * bpm / 60.0); ++i) {
+        Beat beat;
+        beat.time = i * 60.0 / bpm;
+        beat.strength = i % 4 == 0 ? 1.0f : 0.6f;
+        beat.confidence = 0.9f;
+        beat.beatInBar = i % 4;
+        beat.barIndex = i / 4;
+        beat.downbeat = beat.beatInBar == 0;
+        analysis.beats.push_back(beat);
+        Onset onset;
+        onset.time = beat.time;
+        onset.strength = energyAt(beat.time);
+        analysis.onsets.push_back(onset);
+    }
+    for (int k = 0; k < 3; ++k) {
+        Section section;
+        section.start = 8.0 * k;
+        section.end = 8.0 * (k + 1);
+        section.kind = SectionKind::Main;
+        section.energy = energyAt(section.start + 4.0);
+        section.confidence = 0.9f;
+        analysis.sections.push_back(section);
+    }
+    return analysis;
+}
+
+bool isHandOrHead(motion::PrimitiveKind kind) {
+    using K = motion::PrimitiveKind;
+    return kind == K::HandFlick || kind == K::FingerRipple || kind == K::WristRoll ||
+           kind == K::FingerSpread || kind == K::FistPulse || kind == K::HeadTilt ||
+           kind == K::LookDirection || kind == K::HeadAccent;
+}
+
+} // namespace
+
+TEST_CASE(dance.musical_gestures_land_on_bass_accents) {
+    // Auto plan over a track whose kick is the body's hit: at least 70 % of the hand and head
+    // cues sit within 0.12 beat of a bass accent. Snares and hats may get a gesture too, but
+    // rarely, so they stay a minority.
+    const AnalysisResult analysis = analyzeSynthetic(test::makeBassAccentTrack());
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const std::vector<motion::DancePlayer::PlannedOverlay> planned =
+        player.plannedOverlays(0.0, analysis.info.duration);
+    const motion::MusicalTimeline& timeline = player.timeline();
+    int handHead = 0;
+    int nearBass = 0;
+    for (const auto& cue : planned) {
+        if (!isHandOrHead(cue.kind)) continue;
+        ++handHead;
+        const double beat = timeline.beatAt(cue.mediaTime);
+        for (const BassAccent& accent : analysis.bassAccents) {
+            if (std::abs(beat - timeline.beatAt(accent.time)) <= 0.12) {
+                ++nearBass;
+                break;
+            }
+        }
+    }
+    CHECK(handHead >= 4);
+    CHECK(nearBass >= 0.7 * handHead);
+}
+
+TEST_CASE(dance.musical_gestures_stay_out_of_silence) {
+    // Nothing plays in the silent gap of the track: no overlay cue starts inside a silence.
+    const AnalysisResult analysis = analyzeSynthetic(test::makeSilenceTrack());
+    CHECK(!analysis.silences.empty());
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const std::vector<motion::DancePlayer::PlannedOverlay> planned =
+        player.plannedOverlays(0.0, analysis.info.duration);
+    CHECK(!planned.empty());
+    int inSilence = 0;
+    for (const auto& cue : planned) {
+        for (const SilenceRegion& silence : analysis.silences) {
+            if (cue.mediaTime >= silence.start && cue.mediaTime <= silence.end) {
+                ++inSilence;
+            }
+        }
+    }
+    CHECK(inSilence == 0);
+}
+
+TEST_CASE(dance.phrase_loudness_sets_the_upper_body_swing) {
+    // Two copies of one grid: one is quiet before 20 s and loud after, the other the reverse. At
+    // the same media time both play the same clip at the same beat, so the only difference is the
+    // phrase loudness: 0.75 in the quiet passage, 1.15 in the loud one. The chest's angular speed
+    // there scales with the swing, so it is about 0.65 times as fast in the quiet copy.
+    const AnalysisResult quietFirst = gridWithDynamics(92.0, 40.0, 20.0, 0.1f, 0.6f);
+    const AnalysisResult loudFirst = gridWithDynamics(92.0, 40.0, 20.0, 0.6f, 0.1f);
+    motion::DancePlayer quiet;
+    motion::DancePlayer loud;
+    for (motion::DancePlayer* player : {&quiet, &loud}) {
+        player->loadLibrary(dancesDir());
+        player->setOverlayMode(motion::OverlayMode::Off);
+    }
+    quiet.setAnalysis(&quietFirst, 0.0);
+    loud.setAnalysis(&loudFirst, 0.0);
+    for (motion::DancePlayer* player : {&quiet, &loud}) {
+        player->select(motion::DanceStyle::Groove, 0.0, true);
+    }
+    CHECK(quiet.timeline().phraseLoudnessAt(9.0) < 0.1f);
+    CHECK(loud.timeline().phraseLoudnessAt(9.0) > 0.9f);
+
+    const auto chestSpeed = [](motion::DancePlayer& player, double from, double to) {
+        double total = 0.0;
+        int steps = 0;
+        motion::ClipPose previous;
+        for (int i = 0; i <= static_cast<int>(to * 240.0); ++i) {
+            const motion::ClipPose pose = player.update(i / 240.0).pose;
+            if (i >= static_cast<int>(from * 240.0)) {
+                if (steps > 0) {
+                    const math::Quat& p =
+                        previous.bone[static_cast<std::size_t>(vrm::HumanoidBone::Chest)];
+                    const math::Quat& q = pose.bone[static_cast<std::size_t>(vrm::HumanoidBone::Chest)];
+                    total += 2.0 * std::acos(std::min(1.0f, std::abs(math::dot(p, q))));
+                }
+                ++steps;
+            }
+            previous = pose;
+        }
+        return total / std::max(1, steps - 1);
+    };
+    const double quietSpeed = chestSpeed(quiet, 6.0, 12.0);
+    const double loudSpeed = chestSpeed(loud, 6.0, 12.0);
+    CHECK(loudSpeed > 0.0);
+    // The ratio is 1.00 with the phrase factor off; scaling the larger swing angles is not exactly
+    // linear, so the measured 0.59 sits a little under 0.65.
+    const double ratio = quietSpeed / loudSpeed;
+    CHECK(ratio > 0.5);
+    CHECK(ratio < 0.8);
+}
+
+TEST_CASE(dance.auto_phrases_join_from_different_entries) {
+    // Two calm phrases of one style, with a loud phrase between them: the second Groove starts
+    // from another entry point of the clip, since the poses allow it.
+    const AnalysisResult analysis = threePhrases();
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    std::vector<double> grooveEntries;
+    for (const motion::ScheduleSegment& segment : player.director().schedule().segments()) {
+        if (segment.clip && segment.clip->style == motion::DanceStyle::Groove) {
+            grooveEntries.push_back(segment.entryClipBeat);
+        }
+    }
+    CHECK(grooveEntries.size() == 2);
+    if (grooveEntries.size() == 2) {
+        CHECK(grooveEntries[0] != grooveEntries[1]);
+    }
+}
+
+TEST_CASE(dance.auto_phrase_after_an_energy_jump_starts_with_a_hit) {
+    const AnalysisResult analysis = threePhrases();
+    motion::DancePlayer player;
+    player.loadLibrary(dancesDir());
+    player.setAnalysis(&analysis, 0.0);
+    player.setMode(motion::DanceMode::Auto, 0.0);
+    const auto planned = player.plannedOverlays(0.0, analysis.info.duration);
+    for (double seam : {8.0, 16.0}) {
+        bool hit = false;
+        for (const auto& cue : planned) {
+            if (cue.reason == "phrase hit" && std::abs(cue.mediaTime - seam) < 0.05) {
+                hit = true;
+            }
+        }
+        CHECK(hit);
+    }
+}
+
+TEST_CASE(dance.musical_gestures_are_deterministic_per_seed) {
+    const AnalysisResult analysis = analyzeSynthetic(test::makeBassAccentTrack());
+    const auto plan = [&](std::uint32_t seed) {
+        motion::DancePlayer player;
+        player.loadLibrary(dancesDir());
+        player.setOverlaySeed(seed);
+        player.setAnalysis(&analysis, 0.0);
+        player.setMode(motion::DanceMode::Auto, 0.0);
+        return player.plannedOverlays(0.0, analysis.info.duration);
+    };
+    const auto a = plan(3u);
+    const auto b = plan(3u);
+    const auto c = plan(77u);
+    CHECK(!a.empty());
+    CHECK(a.size() == b.size());
+    bool same = a.size() == b.size();
+    for (std::size_t i = 0; same && i < a.size(); ++i) {
+        same = a[i].mediaTime == b[i].mediaTime && a[i].kind == b[i].kind &&
+               a[i].clipId == b[i].clipId && a[i].reason == b[i].reason;
+    }
+    CHECK(same);
+    // Another host seed plans other gestures on the same track.
+    bool differs = a.size() != c.size();
+    for (std::size_t i = 0; !differs && i < a.size(); ++i) {
+        differs = a[i].mediaTime != c[i].mediaTime || a[i].kind != c[i].kind;
+    }
+    CHECK(differs);
+}
+
+TEST_CASE(dance.head_world_yaw_is_stabilised_during_the_spin) {
+    // Energetic turns the whole body by its root yaw (about 180 deg in one bit). Calm
+    // (energy 0.2), the head keeps about half of that turn in world space. At the dance's
+    // own energy (0.6) there is no stabilisation, so the head goes round with the body.
+    const motion::HumanoidClip& energetic = *library().forStyle(motion::DanceStyle::Energetic);
+    constexpr double kPi = 3.14159265358979323846;
+    const auto headYawRange = [&](float energy) {
+        const int steps = 480;
+        double previous = 0.0;
+        double unwrapped = 0.0;
+        double lo = 0.0;
+        double hi = 0.0;
+        for (int i = 0; i <= steps; ++i) {
+            const double beat = energetic.beats * static_cast<double>(i) / steps;
+            motion::ClipPose pose = motion::sampleClip(energetic, beat);
+            motion::applyAlive(pose, 0.1 * i, energy, 7u, 1.0f);
+            const math::Quat chain =
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Hips)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Spine)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Chest)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::UpperChest)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Neck)] *
+                pose.bone[static_cast<std::size_t>(motion::HumanoidBone::Head)];
+            const math::Quat root =
+                math::fromAxisAngle({0.0f, 1.0f, 0.0f},
+                                    static_cast<float>(2.0 * kPi * pose.rootYaw));
+            const math::Vec3 forward = math::rotate(root * chain, {0.0f, 0.0f, 1.0f});
+            const double yaw =
+                std::atan2(static_cast<double>(forward.x), static_cast<double>(forward.z)) *
+                180.0 / kPi;
+            if (i == 0) {
+                unwrapped = yaw;
+            } else {
+                double step = yaw - previous;
+                step -= 360.0 * std::round(step / 360.0);  // shortest way round
+                unwrapped += step;
+            }
+            previous = yaw;
+            lo = std::min(lo, unwrapped);
+            hi = std::max(hi, unwrapped);
+        }
+        return hi - lo;
+    };
+    const double rangeCalm = headYawRange(0.2f);
+    const double rangeDancing = headYawRange(0.6f);
+    CHECK(rangeDancing > 150.0);      // the spin really turns the head with the body
+    CHECK(rangeCalm < 0.7 * rangeDancing);
+    CHECK(rangeCalm > 0.3 * rangeDancing);  // half is kept, not zero: it still reads as a turn
 }
