@@ -31,10 +31,14 @@ struct PcmTrack {
 
     // Converts any decoded AudioData to the mixer's working format. Mono stays
     // mono; stereo stays stereo; >2 channels are downmixed to stereo by
-    // averaging odd/even groups. The sample rate is converted with a windowed
-    // linear interpolator so the audio thread never performs format conversion.
+    // averaging odd/even groups. The sample rate is converted with a Kaiser-windowed
+    // sinc resampler so the audio thread never performs format conversion.
     static PcmTrack fromAudio(const AudioData& audio, std::uint32_t targetRate,
                               std::string* error = nullptr);
+
+    // Band-limited sample-rate conversion (polyphase windowed sinc). Returns
+    // a copy when the rates already match.
+    static PcmTrack resampled(const PcmTrack& source, std::uint32_t targetRate);
 };
 
 } // namespace bgmedia::mix

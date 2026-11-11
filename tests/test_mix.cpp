@@ -5077,3 +5077,48 @@ TEST_CASE("mix.codex_finding_seek_after_update_cancels_pending_transition") {
     pump.once();
     CHECK(engine.snapshot().phase == TransitionPhase::Idle);
 }
+
+TEST_CASE("mix.resample_44k_to_48k_is_band_limited") {
+    using bgmedia::mix::PcmTrack;
+    // A 15 kHz tone must keep its level through 44.1 -> 48 kHz and must not
+    // pick up strong aliasing/imaging artifacts (linear interpolation lost
+    // 3.4 dB here and left artifacts at about -11 dB).
+    AudioData audio;
+    audio.sampleRate = 44100;
+    audio.channels = 1;
+    const std::size_t n = 44100;
+    audio.samples.resize(n);
+    const double w = 2.0 * 3.14159265358979323846 * 15000.0 / 44100.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        audio.samples[i] = static_cast<float>(0.5 * std::sin(w * static_cast<double>(i)));
+    }
+    std::string error;
+    const PcmTrack track = PcmTrack::fromAudio(audio, 48000, &error);
+    CHECK(track.sampleRate == 48000u);
+    CHECK(track.frameCount() > 47000);
+    // Fit amplitude and residual over a steady-state window.
+    const double w2 = 2.0 * 3.14159265358979323846 * 15000.0 / 48000.0;
+    double sc = 0.0;
+    double ss = 0.0;
+    std::size_t count = 0;
+    for (std::size_t i = 4000; i < 44000; ++i, ++count) {
+        const double x = track.samples[i];
+        sc += x * std::cos(w2 * static_cast<double>(i));
+        ss += x * std::sin(w2 * static_cast<double>(i));
+    }
+    const double a = 2.0 * sc / static_cast<double>(count);
+    const double b = 2.0 * ss / static_cast<double>(count);
+    const double amp = std::sqrt(a * a + b * b);
+    double residual = 0.0;
+    for (std::size_t i = 4000; i < 44000; ++i) {
+        const double fit = a * std::cos(w2 * static_cast<double>(i)) +
+                           b * std::sin(w2 * static_cast<double>(i));
+        const double e = track.samples[i] - fit;
+        residual += e * e;
+    }
+    residual = std::sqrt(residual / static_cast<double>(count));
+    const double levelDb = 20.0 * std::log10(amp / 0.5);
+    CHECK(levelDb > -0.5);
+    // Residual (artifacts) at least 40 dB below the tone RMS.
+    CHECK(residual < (amp / std::sqrt(2.0)) * 0.01);
+}
