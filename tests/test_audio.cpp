@@ -162,6 +162,17 @@ TEST_CASE(audio.wav_streaming_sizes_and_rf64) {
         CHECK(result.ok);
         CHECK(result.audio.frameCount() == 1000);
     }
+    // Streamed PCM whose first bytes happen to look like ASCII must still decode.
+    {
+        std::vector<std::uint8_t> ascii = {'A', 'A', 'A', 'A'};
+        ascii.insert(ascii.end(), 16, 0xFF);
+        const auto path = tempPath("streaming_ascii.wav");
+        writeCustomWav(path, 1, 1, 44100, 16, ascii);
+        patchU32(path, 40, 0u);
+        const auto result = decoder.decode(path);
+        CHECK(result.ok);
+        CHECK(result.audio.frameCount() == 10);
+    }
     // RF64 with the real data size in ds64.
     {
         const auto path = tempPath("rf64.wav");

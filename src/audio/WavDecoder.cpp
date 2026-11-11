@@ -230,18 +230,25 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
                 chunkSize = ds64DataSize;
             } else if (chunkSize == 0xFFFFFFFFULL) {
                 chunkSize = remaining;
-            } else if (chunkSize == 0 && remaining >= 4) {
-                // A genuinely empty data chunk is followed by another chunk
-                // header (four ASCII letters); anything else is streamed PCM.
-                std::array<std::uint8_t, 4> peek{};
+            } else if (chunkSize == 0 && remaining >= 8) {
+                // A genuinely empty data chunk is followed by a plausible
+                // chunk header: four ASCII letters/digits/spaces and a size
+                // that fits inside the rest of the file. Anything else is
+                // streamed PCM.
+                std::array<std::uint8_t, 8> peek{};
                 const std::streampos here = file.tellg();
                 const bool ok = static_cast<bool>(
                     file.read(reinterpret_cast<char*>(peek.data()), peek.size()));
                 file.clear();
                 file.seekg(here);
                 bool tag = ok;
-                for (std::uint8_t c : peek) {
-                    tag = tag && std::isalpha(c) != 0 || c == ' ';
+                for (int i = 0; i < 4; ++i) {
+                    const std::uint8_t c = peek[static_cast<std::size_t>(i)];
+                    tag = tag && (std::isalnum(c) != 0 || c == ' ');
+                }
+                if (tag) {
+                    const std::uint64_t nextSize = readU32(peek.data() + 4);
+                    tag = nextSize <= remaining - 8;
                 }
                 if (!tag) {
                     chunkSize = remaining;
