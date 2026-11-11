@@ -203,6 +203,7 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
     }
     // RF64: the real data size lives in the ds64 chunk.
     std::uint64_t ds64DataSize = 0;
+    bool haveDs64 = false;
 
     FmtInfo fmt;
     bool haveFmt = false;
@@ -226,9 +227,12 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
             // Streaming writers leave the data size at 0 or 0xFFFFFFFF, and
             // RF64 stores it in ds64: in all those cases the data runs to the
             // end of the file (or to the ds64 size).
-            if (chunkSize == 0xFFFFFFFFULL && isRf64 && ds64DataSize > 0) {
+            if (chunkSize == 0xFFFFFFFFULL && isRf64 && haveDs64) {
                 chunkSize = ds64DataSize;
             } else if (chunkSize == 0xFFFFFFFFULL) {
+                chunkSize = remaining;
+            } else if (chunkSize == 0 && remaining > 0 && remaining < 8) {
+                // Too short to hold another chunk header: it is streamed PCM.
                 chunkSize = remaining;
             } else if (chunkSize == 0 && remaining >= 8) {
                 // A genuinely empty data chunk is followed by a plausible
@@ -267,6 +271,7 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
                 std::uint64_t lo = readU32(ds.data() + 8);
                 std::uint64_t hi = readU32(ds.data() + 12);
                 ds64DataSize = lo | (hi << 32);
+                haveDs64 = true;
             }
         }
 

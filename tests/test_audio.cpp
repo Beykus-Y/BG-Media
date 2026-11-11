@@ -173,6 +173,33 @@ TEST_CASE(audio.wav_streaming_sizes_and_rf64) {
         CHECK(result.ok);
         CHECK(result.audio.frameCount() == 10);
     }
+    // Zero marker with fewer than eight payload bytes is still streamed PCM.
+    {
+        const auto path = tempPath("streaming_short.wav");
+        writeCustomWav(path, 1, 1, 44100, 16, std::vector<std::uint8_t>{1, 2, 3, 4});
+        patchU32(path, 40, 0u);
+        const auto result = decoder.decode(path);
+        CHECK(result.ok);
+        CHECK(result.audio.frameCount() == 2);
+    }
+    // RF64 whose ds64 declares zero audio bytes is empty, not "to EOF".
+    {
+        const auto path = tempPath("rf64_empty.wav");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        auto u16 = [&](std::uint16_t v) { out.put(char(v & 0xFF)); out.put(char(v >> 8)); };
+        auto u32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) out.put(char((v >> (i * 8)) & 0xFF)); };
+        out.write("RF64", 4); u32(0xFFFFFFFFu); out.write("WAVE", 4);
+        out.write("ds64", 4); u32(28);
+        u32(0); u32(0); u32(0); u32(0); u32(0); u32(0); u32(0);
+        out.write("fmt ", 4); u32(16);
+        u16(1); u16(1); u32(44100); u32(88200); u16(2); u16(16);
+        out.write("data", 4); u32(0xFFFFFFFFu);
+        out.write("JUNK", 4); u32(16);
+        for (int i = 0; i < 16; ++i) out.put(char(0x11));
+        out.close();
+        const auto result = decoder.decode(path);
+        CHECK(!result.ok);
+    }
     // RF64 with the real data size in ds64.
     {
         const auto path = tempPath("rf64.wav");
