@@ -5,6 +5,7 @@
 #include "bgmedia/analysis/Analyzer.hpp"
 #include "bgmedia/motion3/AliveLayer.hpp"
 #include "bgmedia/motion3/DancePlayer.hpp"
+#include "Json.hpp"
 #include "support/SyntheticSignals.hpp"
 
 #include <algorithm>
@@ -276,8 +277,8 @@ TEST_CASE(dance.joint_speed_and_acceleration_are_bounded) {
         for (double bpm : {clip.bpmMin, clip.bpm, clip.bpmMax}) {
             const qa::ClipReport r = qa::analyseClip(clip, nullptr, nullptr, bpm);
             CHECK(r.maxQuatNormError < 1e-4);
-            CHECK(r.maxAngularSpeed < 1000.0);          // deg/s: no whip-crack joints
-            CHECK(r.maxAngularAcceleration < 2.5e5);    // deg/s^2: no pathological spikes
+            CHECK(r.maxAngularSpeed < 900.0);           // deg/s: no whip-crack joints (worst now ~720)
+            CHECK(r.maxAngularAcceleration < 1.2e4);    // deg/s^2: no pathological spikes (worst now ~9.7e3)
             CHECK(r.maxHipsSpeed < 3.0);                // body heights per second
             CHECK(r.maxFootSpeed < 8.0);
         }
@@ -2294,4 +2295,23 @@ TEST_CASE(dance.head_world_yaw_is_stabilised_during_the_spin) {
     CHECK(rangeDancing > 150.0);      // the spin really turns the head with the body
     CHECK(rangeCalm < 0.7 * rangeDancing);
     CHECK(rangeCalm > 0.3 * rangeDancing);  // half is kept, not zero: it still reads as a turn
+}
+
+TEST_CASE(dance.json_numbers_are_strict_and_locale_independent) {
+    using namespace bgmedia::motion;
+    json::Value v;
+    std::string error;
+    const std::string good = "[1, -2.5e-1, 0, 3E+2]";
+    json::Parser ok(good);
+    CHECK(ok.parse(v, error));
+    CHECK(v.array.size() == 4);
+    CHECK_NEAR(v.array[1].number, -0.25, 1e-12);
+    CHECK_NEAR(v.array[3].number, 300.0, 1e-9);
+    for (const char* bad : {"[0x10]", "[inf]", "[nan]", "[01]", "[1.]", "[.5]", "[-]", "[1e]", "[+1]"}) {
+        json::Value out;
+        std::string err;
+        const std::string text = bad;
+        json::Parser parser(text);
+        CHECK(!parser.parse(out, err));
+    }
 }

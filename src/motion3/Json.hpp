@@ -4,6 +4,8 @@
 // repository has no JSON dependency; it reports line/column on errors so a
 // hand-edited clip gives an actionable message. Not a general purpose library.
 
+#include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -138,14 +140,56 @@ private:
     }
 
     bool number(Value& out) {
-        const char* begin = text_.c_str() + pos_;
-        char* end = nullptr;
-        const double parsed = std::strtod(begin, &end);
-        if (end == begin) {
+        // Strict JSON number grammar and a locale-independent conversion:
+        // strtod would honour the C locale's decimal separator and accept hex,
+        // inf and nan.
+        const char* const begin = text_.c_str() + pos_;
+        const char* const limit = text_.c_str() + text_.size();
+        const char* p = begin;
+        const auto digits = [&]() {
+            const char* start = p;
+            while (p < limit && *p >= '0' && *p <= '9') {
+                ++p;
+            }
+            return p != start;
+        };
+        if (p < limit && *p == '-') {
+            ++p;
+        }
+        if (p < limit && *p == '0') {
+            ++p;
+        } else if (!digits()) {
             fail("malformed number");
             return false;
         }
-        pos_ += static_cast<std::size_t>(end - begin);
+        if (p < limit && *p == '.') {
+            ++p;
+            if (!digits()) {
+                fail("malformed number");
+                return false;
+            }
+        }
+        if (p < limit && (*p == 'e' || *p == 'E')) {
+            ++p;
+            if (p < limit && (*p == '+' || *p == '-')) {
+                ++p;
+            }
+            if (!digits()) {
+                fail("malformed number");
+                return false;
+            }
+        }
+        double parsed = 0.0;
+        const auto result = std::from_chars(begin, p, parsed);
+        if (result.ec == std::errc::result_out_of_range) {
+            fail("number out of range");
+            return false;
+        }
+        if (result.ec != std::errc() || !std::isfinite(parsed)) {
+            fail("malformed number");
+            return false;
+        }
+        pos_ += static_cast<std::size_t>(p - begin);
         out.type = Value::Type::Number;
         out.number = parsed;
         return true;

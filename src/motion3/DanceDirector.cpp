@@ -1436,7 +1436,7 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             const double oldAlign = segment.alignTime;
             double alignTime = clock_.timeAtBeat(before.beatAt(oldAlign));
             double fade = segment.fadeSeconds;
-            const bool oneShotReturn = segment.reason == "one-shot finished" && !kept.empty() &&
+            const bool oneShotReturn = segment.oneShotReturn && !kept.empty() &&
                                        !kept.back().loop && kept.back().clip->tempoSync;
             if (oneShotReturn) {
                 // A one-shot's return follows the one-shot's own end: the rebased clip keeps
@@ -1532,6 +1532,7 @@ void DanceDirector::select(DanceStyle style, double now, bool oneShot, bool imme
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
+            back.oneShotReturn = true;
             schedule_.append(back, timeline_, warp_);
         }
     }
@@ -1575,6 +1576,7 @@ void DanceDirector::selectClip(const std::string& clipId, double now, bool oneSh
             ScheduleSegment back = makeSegment(*idle, endTime - idleFade * 0.5, endTime,
                                                idleFade);
             back.reason = "one-shot finished";
+            back.oneShotReturn = true;
             schedule_.append(back, timeline_, warp_);
         }
     }
