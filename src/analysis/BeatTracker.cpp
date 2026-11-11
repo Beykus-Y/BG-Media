@@ -1000,16 +1000,23 @@ BeatTrackingResult trackBeats(const SpectralFeatures& features,
         }
         return q;
     };
-    const int firstBar =
-        beats.empty() ? 0 : floorDiv(gridIndex[0] - bestPhase, bestMeter);
+    // gridIndex restarts at 0 after a long gap, so keep bar numbers cumulative
+    // across such resets while using the local grid phase inside a segment.
+    int barOffset = 0;
+    int segmentFirstBar = beats.empty() ? 0 : floorDiv(gridIndex[0] - bestPhase, bestMeter);
     for (std::size_t i = 0; i < beats.size(); ++i) {
+        if (i > 0 && gridIndex[i] <= gridIndex[i - 1]) {
+            barOffset = beats[i - 1].barIndex + 1;
+            segmentFirstBar = floorDiv(gridIndex[i] - bestPhase, bestMeter);
+        }
         int beatInBar = (gridIndex[i] - bestPhase) % bestMeter;
         if (beatInBar < 0) {
             beatInBar += bestMeter;
         }
         beats[i].beatInBar = beatInBar;
         beats[i].downbeat = beatInBar == 0;
-        beats[i].barIndex = floorDiv(gridIndex[i] - bestPhase, bestMeter) - firstBar;
+        beats[i].barIndex =
+            barOffset + floorDiv(gridIndex[i] - bestPhase, bestMeter) - segmentFirstBar;
     }
 
     result.beats = std::move(beats);

@@ -400,6 +400,19 @@ TEST_CASE(analysis.silence_gap_excludes_beats) {
     for (const auto& beat : run.result.beats) {
         CHECK(beat.time < silence.start - 0.05 || beat.time > silence.end + 0.05);
     }
+    // Bar numbers stay cumulative across the silence: bars after the gap must
+    // not reuse the ids of bars before it.
+    int maxBefore = -1;
+    for (const auto& beat : run.result.beats) {
+        if (beat.time < silence.start) {
+            maxBefore = std::max(maxBefore, beat.barIndex);
+        }
+    }
+    for (const auto& beat : run.result.beats) {
+        if (beat.time > silence.end && maxBefore >= 0) {
+            CHECK(beat.barIndex > maxBefore);
+        }
+    }
 }
 
 TEST_CASE(analysis.fully_silent_does_not_invent_music) {
