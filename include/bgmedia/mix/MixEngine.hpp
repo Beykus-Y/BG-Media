@@ -238,6 +238,7 @@ private:
     MixPlan pendingPlans_[2];
     std::atomic<int> planSlot_{0};
     std::atomic<int> consumingSlot_{-1};
+    std::atomic<std::uint64_t> planGen_{0};
     RuntimePlan runtime_;
     bool runtimeStarted_ = false;
     std::uint64_t transitionStartFrame_ = 0;

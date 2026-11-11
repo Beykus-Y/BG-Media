@@ -239,21 +239,41 @@ DecodeResult WavDecoder::decode(const std::filesystem::path& path,
                 // chunk header: four ASCII letters/digits/spaces and a size
                 // that fits inside the rest of the file. Anything else is
                 // streamed PCM.
-                std::array<std::uint8_t, 8> peek{};
+                // One plausible header is not enough: PCM can start with
+                // bytes that look like one. Walk the whole chunk chain; a
+                // real empty chunk is followed by chunks that tile the file
+                // exactly up to its end.
                 const std::streampos here = file.tellg();
-                const bool ok = static_cast<bool>(
-                    file.read(reinterpret_cast<char*>(peek.data()), peek.size()));
+                bool tag = true;
+                std::uint64_t left = remaining;
+                while (left > 0) {
+                    std::array<std::uint8_t, 8> peek{};
+                    if (left < 8 ||
+                        !file.read(reinterpret_cast<char*>(peek.data()), peek.size())) {
+                        tag = false;
+                        break;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t c = peek[static_cast<std::size_t>(i)];
+                        tag = tag && (std::isalnum(c) != 0 || c == ' ');
+                    }
+                    const std::uint64_t nextSize = readU32(peek.data() + 4);
+                    if (!tag || nextSize > left - 8) {
+                        tag = false;
+                        break;
+                    }
+                    // Chunks are word aligned; the last one may omit its pad.
+                    const std::uint64_t advance = nextSize + (nextSize & 1u);
+                    left -= 8;
+                    if (advance >= left) {
+                        left = 0;
+                    } else {
+                        left -= advance;
+                        file.seekg(static_cast<std::streamoff>(advance), std::ios::cur);
+                    }
+                }
                 file.clear();
                 file.seekg(here);
-                bool tag = ok;
-                for (int i = 0; i < 4; ++i) {
-                    const std::uint8_t c = peek[static_cast<std::size_t>(i)];
-                    tag = tag && (std::isalnum(c) != 0 || c == ' ');
-                }
-                if (tag) {
-                    const std::uint64_t nextSize = readU32(peek.data() + 4);
-                    tag = nextSize <= remaining - 8;
-                }
                 if (!tag) {
                     chunkSize = remaining;
                 }

@@ -173,6 +173,17 @@ TEST_CASE(audio.wav_streaming_sizes_and_rf64) {
         CHECK(result.ok);
         CHECK(result.audio.frameCount() == 10);
     }
+    // PCM that opens with a plausible JUNK header but does not tile the file as chunks.
+    {
+        std::vector<std::uint8_t> junk = {'J', 'U', 'N', 'K', 16, 0, 0, 0};
+        junk.insert(junk.end(), 40, 0x80);
+        const auto path = tempPath("streaming_junk.wav");
+        writeCustomWav(path, 1, 1, 44100, 16, junk);
+        patchU32(path, 40, 0u);
+        const auto result = decoder.decode(path);
+        CHECK(result.ok);
+        CHECK(result.audio.frameCount() == 24);
+    }
     // Zero marker with fewer than eight payload bytes is still streamed PCM.
     {
         const auto path = tempPath("streaming_short.wav");

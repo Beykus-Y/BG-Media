@@ -436,7 +436,9 @@ PrimitivePose samplePrimitive(PrimitiveKind kind, float phase, float intensity,
             // planner widens rise and release further to a real-time length (snapAttack),
             // so a fast tempo cannot bring the wrist back to 10 rad/s.
             const float rise = std::max(0.35f, snapAttack);
-            const float s = bell(phase, rise, rise);
+            // Ramps longer than half the cue would overlap and cusp at the midpoint.
+            const float ramp = std::min(0.5f, rise);
+            const float s = bell(phase, ramp, ramp);
             rollWrist(pose, arm, (40.0f * s) * amp);
             setBone(pose, arm.hand, axisAngle(kY, -18.0f * s * amp));
             for (int fg = 1; fg < 5; ++fg) {
@@ -1274,6 +1276,7 @@ std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uin
                                               float density, const MusicalOverlayContext& music,
                                               bool includeHands) {
     std::vector<PrimitiveCue> cues;
+    const double playedBpm = music.clipBpm > 20.0 ? music.clipBpm : clip.bpm;
     if (!(clip.beats >= 2.0f) || clip.keyCount < 2) {
         return cues;
     }
@@ -1297,7 +1300,7 @@ std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uin
         cue.intensity = intensity * (0.7f + 0.3f * strength);
         cue.side = side;
         if (kind == PrimitiveKind::HandFlick) {
-            cue.snapAttack = riseFor(cue.durationBeats, clip.bpm, kFlickRiseSeconds, 0.35f, 0.6f);
+            cue.snapAttack = riseFor(cue.durationBeats, playedBpm, kFlickRiseSeconds, 0.35f, 0.6f);
         }
         cue.reason = reason;
         cues.push_back(cue);
@@ -1331,7 +1334,7 @@ std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uin
             cue.durationBeats = cue.metadata().defaultBeats;
             cue.intensity = intensity;
             cue.side = (barIndex % 2 == 0) ? 0 : 1;
-            cue.snapAttack = snapAttackFor(cue.durationBeats, clip.bpm);
+            cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
             cue.reason = "bar accent";
             cues.push_back(cue);
         }
@@ -1428,7 +1431,7 @@ std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uin
         cue.beat = mark.beat;
         cue.durationBeats = cue.metadata().defaultBeats;
         cue.intensity = std::clamp(mark.strength * mark.confidence, 0.3f, 1.0f);
-        if (headHit) cue.snapAttack = snapAttackFor(cue.durationBeats, clip.bpm);
+        if (headHit) cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
         cue.reason = "authored accent: " + mark.kind;
         cues.push_back(cue);
     }
@@ -1440,7 +1443,7 @@ std::vector<PrimitiveCue> planMusicalOverlays(const HumanoidClip& clip, std::uin
         cue.beat = start;
         cue.durationBeats = cue.metadata().defaultBeats;
         cue.intensity = kPhraseHitIntensity;
-        cue.snapAttack = snapAttackFor(cue.durationBeats, clip.bpm);
+        cue.snapAttack = snapAttackFor(cue.durationBeats, playedBpm);
         cue.reason = "phrase hit";
         cues.push_back(cue);
     }

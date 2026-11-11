@@ -640,6 +640,18 @@ float MusicalTimeline::phraseLoudnessAt(double mediaTime) const {
         weights += w;
     }
     if (!(weights > 1e-9)) {
+        // Beyond the measured beats the window is empty. Holding the nearest measured value keeps
+        // the amplitude continuous instead of jumping back to the unscaled swing.
+        const long size = static_cast<long>(beatLoudness_.size());
+        const long start = static_cast<long>(std::clamp(std::llround(centre), 0LL,
+                                                         static_cast<long long>(size - 1)));
+        for (long d = 0; d < size; ++d) {
+            for (const long j : {start - d, start + d}) {
+                if (j >= 0 && j < size && beatLoudness_[static_cast<std::size_t>(j)] >= 0.0f) {
+                    return std::clamp(beatLoudness_[static_cast<std::size_t>(j)], 0.0f, 1.0f);
+                }
+            }
+        }
         return -1.0f;
     }
     return static_cast<float>(std::clamp(sum / weights, 0.0, 1.0));
