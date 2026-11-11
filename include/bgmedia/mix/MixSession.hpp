@@ -148,6 +148,7 @@ private:
     void workerLoop();
     void startWorkerIfNeeded();
     void collectCompleted();
+    void pruneFinishedItems();
     void serviceDecks();
     void handleTransitionCompletion();
     void executeScheduledTransition(const MixPlan& plannedPreview);

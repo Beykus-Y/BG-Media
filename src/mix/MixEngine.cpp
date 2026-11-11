@@ -775,6 +775,8 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
             deck.gain = 0.0f;
             deck.loudnessGain = 1.0f;
             deck.wasTargetPlaying = false;
+            deck.seekTailRemaining = 0;
+            deck.lastSample[0] = deck.lastSample[1] = 0.0f;
             resetStretchStream(i == 0 ? DeckId::A : DeckId::B, 0.0);
         }
     }
@@ -794,6 +796,14 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
                 deck.positionFrames =
                     std::clamp(seconds, 0.0, source->duration()) *
                     source->sampleRate;
+            }
+            if (deck.playing && deck.fade > 0.0f) {
+                // Carry the last rendered sample as a short decaying tail.
+                deck.seekTail[0] = deck.lastSample[0];
+                deck.seekTail[1] = deck.lastSample[1];
+                deck.seekTailLength = std::max<std::size_t>(
+                    1, static_cast<std::size_t>(0.004 * outputSampleRate_));
+                deck.seekTailRemaining = deck.seekTailLength;
             }
             deck.ended = false;
             deck.fade = 0.0f;
@@ -1395,6 +1405,19 @@ void MixEngine::renderDeck(DeckId deck, float* out, std::size_t frames,
                                         std::abs(out[i * 2 + 1])));
     }
     runtime.gain = std::max(0.0f, std::abs(gainEnd)) * runtime.fade;
+    if (runtime.seekTailRemaining > 0) {
+        for (std::size_t i = 0; i < frames && runtime.seekTailRemaining > 0; ++i) {
+            const float w = static_cast<float>(runtime.seekTailRemaining) /
+                            static_cast<float>(runtime.seekTailLength);
+            out[i * 2] += runtime.seekTail[0] * w;
+            out[i * 2 + 1] += runtime.seekTail[1] * w;
+            --runtime.seekTailRemaining;
+        }
+    }
+    if (frames > 0) {
+        runtime.lastSample[0] = out[(frames - 1) * 2];
+        runtime.lastSample[1] = out[(frames - 1) * 2 + 1];
+    }
     if (reachesEnd) {
         // De-click the physical end of the track over the samples that still
         // map to source audio. The tail ends at silence, never on a full-scale
