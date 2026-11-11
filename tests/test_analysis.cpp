@@ -706,3 +706,33 @@ TEST_CASE(analysis.issue_40_tempo_regressions_fixed) {
         CHECK(run.result.bpm > 100.0);
     }
 }
+
+TEST_CASE(analysis.bpm_is_refined_beyond_coarse_grid) {
+    using namespace bgmedia;
+    for (double bpm : {118.0, 123.0, 163.0, 80.0}) {
+        test::TrackOptions options;
+        options.bpm = bpm;
+        options.duration = 30.0;
+        const auto run = analyzeTrack(test::makeClickTrack(options));
+        CHECK_NEAR(run.result.bpm, bpm, 0.15);
+    }
+}
+
+TEST_CASE(analysis.bar_index_follows_grid_not_detected_downbeats) {
+    using namespace bgmedia;
+    test::TrackOptions options;
+    options.bpm = 120.0;
+    options.duration = 30.0;
+    const auto run = analyzeTrack(test::makeClickTrack(options));
+    const int meter = run.result.beatsPerBar;
+    CHECK(meter >= 2);
+    for (std::size_t i = 1; i < run.result.beats.size(); ++i) {
+        const auto& a = run.result.beats[i - 1];
+        const auto& b = run.result.beats[i];
+        // bar index only advances when beat-in-bar wraps.
+        CHECK(b.barIndex >= a.barIndex);
+        if (b.beatInBar > a.beatInBar) {
+            CHECK(b.barIndex == a.barIndex);
+        }
+    }
+}
