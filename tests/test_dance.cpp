@@ -1063,6 +1063,23 @@ TEST_CASE(dance.rebase_keeps_crossfade_and_pending_one_shot_return) {
     oneShot.select(motion::DanceStyle::Energetic, 0.0, true, true);
     oneShot.rebase(1.0, motion::BeatClock::constant(120.0, 0.0));
     CHECK(oneShot.sample(60.0).style == motion::DanceStyle::Idle);
+
+    // Consecutive rebases before the one-shot finishes must keep recognising the pending
+    // Idle return (the flag survives the segment rebuild), and the return must still
+    // follow the one-shot's own end.
+    motion::DanceDirector twice(&library());
+    twice.setBeatClock(motion::BeatClock::constant(100.0, 0.0));
+    twice.select(motion::DanceStyle::Energetic, 0.0, true, true);
+    twice.rebase(5.0, motion::BeatClock::constant(140.0, 0.0));
+    twice.rebase(5.1, motion::BeatClock::constant(180.0, 0.0));
+    bool sawReturn = false;
+    for (const auto& segment : twice.schedule().segments()) {
+        if (segment.reason == "one-shot finished") {
+            sawReturn = true;
+            CHECK(segment.oneShotReturn);
+        }
+    }
+    CHECK(sawReturn);
 }
 
 TEST_CASE(dance.paused_seek_reaches_the_correct_pose) {

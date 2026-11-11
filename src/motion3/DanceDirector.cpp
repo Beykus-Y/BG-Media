@@ -1456,11 +1456,13 @@ void DanceDirector::reanchorSchedule(double now, const BeatClock& before) {
             }
             const bool loop = segment.loop;
             const std::string reason = segment.reason;
+            const bool keepOneShotReturn = segment.oneShotReturn;
             const double alignmentError = segment.alignmentErrorSeconds;
             segment = makeSegment(*segment.clip, std::max(now, alignTime - fade * 0.5),
                                   alignTime, fade);
             segment.loop = loop;
             segment.reason = reason;
+            segment.oneShotReturn = keepOneShotReturn;
             segment.alignmentErrorSeconds = alignmentError;
             // Nothing of a pending segment has been shown yet, so its planted-foot swings
             // are searched again from its new start on the new grid (append below). Kept
