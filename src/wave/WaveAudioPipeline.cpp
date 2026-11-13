@@ -1,11 +1,32 @@
 #include "bgmedia/wave/WaveAudioPipeline.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <sstream>
 
 namespace bgmedia::wave {
+namespace {
+std::int64_t resolveTimestamp(std::int64_t nowUnixSeconds) noexcept {
+    if (nowUnixSeconds > 0) {
+        return nowUnixSeconds;
+    }
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+struct AudioFlightGuard {
+    std::atomic<std::uint32_t>& counter;
+    explicit AudioFlightGuard(std::atomic<std::uint32_t>& c) noexcept : counter(c) {
+        counter.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~AudioFlightGuard() {
+        counter.fetch_sub(1, std::memory_order_release);
+    }
+};
+} // namespace
 
 WaveAudioPipeline::WaveAudioPipeline(WavePipelineConfig config,
                                      std::shared_ptr<IWaveAudioCodec> codec,
@@ -117,6 +138,29 @@ void WaveAudioPipeline::wireTransportCallbacks() {
     transport_->setCallbacks(std::move(cb));
 }
 
+void WaveAudioPipeline::quiesceAudioAndResetState() {
+    audioPausedForReset_.store(true, std::memory_order_release);
+    while (audioInFlight_.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+    std::lock_guard<std::mutex> pLock(processMutex_);
+    hostRing_.reset();
+    listenerRing_.reset();
+    jitterBuffer_.reset();
+    hostResampler_.reset();
+    listenerResampler_.reset();
+    hostChunk_.clear();
+    codec_->reset();
+    nextSequence_ = 0;
+    nextTimestamp48k_ = 0;
+    packetsSent_ = 0;
+    plcFrames_ = 0;
+    bytesSent_ = 0;
+    bytesReceived_ = 0;
+    publishStatsSnapshot();
+    audioPausedForReset_.store(false, std::memory_order_release);
+}
+
 bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
                                    std::int64_t ttlSeconds) {
     std::lock_guard<std::mutex> lock(controlMutex_);
@@ -137,15 +181,15 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
         return false;
     }
 
-    sid_ = generateWaveSessionId();
+    std::string sidErr;
+    if (!generateWaveSessionId(sid_, &sidErr)) {
+        emitError(WaveErrorCode::SignalingFailed, sidErr);
+        return false;
+    }
     hasLastLocalSignal_ = false;
     hasLastRemoteNonce_ = false;
     lastRemoteNonce_ = 0;
-    hostRing_.reset();
-    hostResampler_.reset();
-    hostChunk_.clear();
-    nextSequence_ = 0;
-    nextTimestamp48k_ = 0;
+    quiesceAudioAndResetState();
 
     setState(WaveSessionState::Offering, "starting offer");
     if (!transport_->startOffer() || !hasLastLocalSignal_) {
@@ -153,14 +197,17 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
         return false;
     }
 
-    const std::int64_t ttl =
+    const std::int64_t ts = resolveTimestamp(nowUnixSeconds);
+    const std::int64_t rawTtl =
         ttlSeconds > 0 ? ttlSeconds : config_.defaultOfferTtlSeconds;
+    const std::int64_t ttl =
+        std::clamp<std::int64_t>(rawTtl, 1, kWaveMaxSignalTtlSeconds);
     WaveSignalMessage msg;
     msg.version = kWaveSignalVersion;
     msg.type = WaveSignalType::Offer;
     msg.sid = sid_;
-    msg.iat = nowUnixSeconds;
-    msg.exp = nowUnixSeconds > 0 ? (nowUnixSeconds + ttl) : 0;
+    msg.iat = ts;
+    msg.exp = ts + ttl;
     msg.caps = kWaveCapOpus48kStereo | kWaveCapDtlsSrtp |
                kWaveCapExternalCallFallback;
     msg.nonce = nextNonce_++;
@@ -197,10 +244,7 @@ bool WaveAudioPipeline::acceptOffer(const WaveSignalMessage& offer,
     hasLastLocalSignal_ = false;
     hasLastRemoteNonce_ = true;
     lastRemoteNonce_ = offer.nonce;
-    listenerRing_.reset();
-    listenerResampler_.reset();
-    jitterBuffer_.reset();
-    codec_->reset();
+    quiesceAudioAndResetState();
 
     setState(WaveSessionState::ConnectingP2P, "accepting offer");
     if (!transport_->acceptOffer(offer.signal)) {
@@ -313,6 +357,7 @@ void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
          cur == WaveSessionState::AwaitingAnswer ||
          cur == WaveSessionState::ConnectingP2P ||
          cur == WaveSessionState::LiveP2P)) {
+        const std::int64_t ts = resolveTimestamp(nowUnixSeconds);
         WaveSignalMessage endMsg;
         endMsg.version = kWaveSignalVersion;
         endMsg.type = (cur == WaveSessionState::Offering ||
@@ -320,40 +365,32 @@ void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
                           ? WaveSignalType::Cancel
                           : WaveSignalType::End;
         endMsg.sid = sid_;
-        endMsg.iat = nowUnixSeconds;
-        endMsg.exp = nowUnixSeconds > 0 ? (nowUnixSeconds + 60) : 0;
+        endMsg.iat = ts;
+        endMsg.exp = ts + 60;
         endMsg.nonce = nextNonce_++;
         callbacks_.onOutboundSignal(endMsg);
     }
+    setState(WaveSessionState::Ended, "stopped");
     if (transport_) {
         transport_->close();
     }
     if (externalCall_) {
         externalCall_->stop();
     }
-    hostRing_.reset();
-    listenerRing_.reset();
-    jitterBuffer_.reset();
-    setState(WaveSessionState::Ended, "stopped");
+    quiesceAudioAndResetState();
 }
 
 void WaveAudioPipeline::reset() {
     std::lock_guard<std::mutex> lock(controlMutex_);
+    setState(WaveSessionState::Idle, "reset");
     if (transport_) {
         transport_->close();
     }
     if (externalCall_) {
         externalCall_->stop();
     }
-    hostRing_.reset();
-    listenerRing_.reset();
-    jitterBuffer_.reset();
-    hostResampler_.reset();
-    listenerResampler_.reset();
-    hostChunk_.clear();
-    codec_->reset();
+    quiesceAudioAndResetState();
     sid_.fill(0);
-    setState(WaveSessionState::Idle, "reset");
 }
 
 bool WaveAudioPipeline::switchToExternalCallFallback(
@@ -425,7 +462,9 @@ void WaveAudioPipeline::setListenerMuted(bool muted) noexcept {
 void WaveAudioPipeline::onPcmRendered(const float* interleavedStereo,
                                       std::size_t frames,
                                       std::uint32_t sampleRate) noexcept {
-    if (config_.role != WaveRole::Host || !interleavedStereo || frames == 0) {
+    AudioFlightGuard guard(audioInFlight_);
+    if (audioPausedForReset_.load(std::memory_order_acquire) ||
+        config_.role != WaveRole::Host || !interleavedStereo || frames == 0) {
         return;
     }
     if (!publishingEnabled_.load(std::memory_order_acquire)) {
@@ -441,7 +480,15 @@ void WaveAudioPipeline::onPcmRendered(const float* interleavedStereo,
 std::size_t WaveAudioPipeline::pullListenerPcm(
     float* outInterleavedStereo, std::size_t frames,
     std::uint32_t sampleRate) noexcept {
+    AudioFlightGuard guard(audioInFlight_);
     if (!outInterleavedStereo || frames == 0) {
+        return 0;
+    }
+    if (audioPausedForReset_.load(std::memory_order_acquire)) {
+        std::memset(outInterleavedStereo, 0, frames * 2 * sizeof(float));
+        return 0;
+    }
+    if (false) {
         return 0;
     }
     if (sampleRate > 0) {
@@ -463,6 +510,7 @@ std::size_t WaveAudioPipeline::pullListenerPcm(
 }
 
 void WaveAudioPipeline::process(double currentTimeSeconds) {
+    std::lock_guard<std::mutex> pLock(processMutex_);
     if (transport_) {
         transport_->poll(currentTimeSeconds);
     }
@@ -471,6 +519,7 @@ void WaveAudioPipeline::process(double currentTimeSeconds) {
     } else {
         processListenerStep(currentTimeSeconds);
     }
+    publishStatsSnapshot();
 }
 
 void WaveAudioPipeline::processHostStep(double currentTimeSeconds) {
@@ -591,36 +640,10 @@ void WaveAudioPipeline::processListenerStep(double currentTimeSeconds) {
         }
     }
 
-    if (currentTimeSeconds - lastBitrateAdaptSec_ >= 1.0) {
-        lastBitrateAdaptSec_ = currentTimeSeconds;
-        adaptBitrateIfNeeded();
-    }
+    (void)currentTimeSeconds;
 }
 
-void WaveAudioPipeline::adaptBitrateIfNeeded() {
-    const std::uint64_t lost = jitterBuffer_.packetsLost();
-    const std::uint64_t deltaLost = lost - prevLostForAdapt_;
-    prevLostForAdapt_ = lost;
-    if (deltaLost > 2) {
-        const std::uint32_t cur = codec_->bitrate();
-        const std::uint32_t next =
-            std::max(kWaveMinBitrateBps, cur - 16000u);
-        codec_->setBitrate(next);
-        codec_->setPacketLossPercent(5);
-    } else if (deltaLost == 0 && codec_->bitrate() < config_.targetBitrateBps) {
-        const std::uint32_t next =
-            std::min(config_.targetBitrateBps, codec_->bitrate() + 8000u);
-        codec_->setBitrate(next);
-        codec_->setPacketLossPercent(0);
-    }
-}
-
-std::array<std::uint8_t, 16> WaveAudioPipeline::sessionId() const noexcept {
-    std::lock_guard<std::mutex> lock(controlMutex_);
-    return sid_;
-}
-
-WaveStats WaveAudioPipeline::stats() const {
+void WaveAudioPipeline::publishStatsSnapshot() {
     WaveStats s;
     s.packetsSent = packetsSent_;
     s.packetsReceived = jitterBuffer_.packetsReceived();
@@ -629,10 +652,6 @@ WaveStats WaveAudioPipeline::stats() const {
     s.packetsDroppedLate = jitterBuffer_.packetsDroppedLate();
     s.packetsDuplicate = jitterBuffer_.packetsDuplicate();
     s.plcFrames = plcFrames_;
-    s.ringOverruns = hostRing_.overruns() + listenerRing_.overruns();
-    s.ringUnderruns = hostRing_.underruns() + listenerRing_.underruns();
-    s.clippedSamples =
-        hostRing_.clippedSamples() + listenerRing_.clippedSamples();
     s.bytesSent = bytesSent_;
     s.bytesReceived = bytesReceived_;
     s.jitterMs = jitterBuffer_.jitterMs();
@@ -642,6 +661,25 @@ WaveStats WaveAudioPipeline::stats() const {
                            s.jitterMs +
                            static_cast<double>(kWaveFrameDurationMs);
     s.targetBitrateBps = codec_ ? codec_->bitrate() : config_.targetBitrateBps;
+    std::lock_guard<std::mutex> sLock(statsMutex_);
+    publishedStats_ = s;
+}
+
+std::array<std::uint8_t, 16> WaveAudioPipeline::sessionId() const noexcept {
+    std::lock_guard<std::mutex> lock(controlMutex_);
+    return sid_;
+}
+
+WaveStats WaveAudioPipeline::stats() const {
+    WaveStats s;
+    {
+        std::lock_guard<std::mutex> sLock(statsMutex_);
+        s = publishedStats_;
+    }
+    s.ringOverruns = hostRing_.overruns() + listenerRing_.overruns();
+    s.ringUnderruns = hostRing_.underruns() + listenerRing_.underruns();
+    s.clippedSamples =
+        hostRing_.clippedSamples() + listenerRing_.clippedSamples();
     return s;
 }
 

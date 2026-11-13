@@ -6,7 +6,17 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
-#include <random>
+#include <stdexcept>
+#if defined(_WIN32)
+#include <windows.h>
+#include <bcrypt.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#include <stdlib.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <sstream>
 
 namespace bgmedia::wave {
@@ -316,15 +326,65 @@ std::string_view trimCr(std::string_view line) {
 
 } // namespace
 
+bool generateWaveSessionId(std::array<std::uint8_t, 16>& outSid,
+                           std::string* error) {
+    outSid.fill(0);
+#if defined(_WIN32)
+    const NTSTATUS status = BCryptGenRandom(
+        nullptr, outSid.data(), static_cast<ULONG>(outSid.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status < 0) {
+        setError(error, "BCryptGenRandom failed to generate session ID");
+        return false;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+    arc4random_buf(outSid.data(), outSid.size());
+#else
+    const int fd = ::open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        setError(error, "Failed to open /dev/urandom for session ID");
+        return false;
+    }
+    std::size_t filled = 0;
+    while (filled < outSid.size()) {
+        const ssize_t n = ::read(fd, outSid.data() + filled,
+                                 outSid.size() - filled);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ::close(fd);
+            setError(error, "Failed to read OS entropy for session ID");
+            return false;
+        }
+        if (n == 0) {
+            ::close(fd);
+            setError(error, "Unexpected EOF reading /dev/urandom");
+            return false;
+        }
+        filled += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+#endif
+    bool allZero = true;
+    for (std::uint8_t b : outSid) {
+        if (b != 0) {
+            allZero = false;
+            break;
+        }
+    }
+    if (allZero) {
+        outSid[0] = 1;
+    }
+    return true;
+}
+
 std::array<std::uint8_t, 16> generateWaveSessionId() {
     std::array<std::uint8_t, 16> sid{};
-    std::random_device rd;
-    std::mt19937_64 rng((static_cast<std::uint64_t>(rd()) << 32) ^
-                        static_cast<std::uint64_t>(rd()));
-    const std::uint64_t a = rng();
-    const std::uint64_t b = rng();
-    std::memcpy(sid.data(), &a, 8);
-    std::memcpy(sid.data() + 8, &b, 8);
+    std::string err;
+    if (!generateWaveSessionId(sid, &err)) {
+        throw std::runtime_error(err);
+    }
     return sid;
 }
 
@@ -366,13 +426,27 @@ bool validateWaveSignal(const WaveSignalMessage& msg,
         setError(error, "Session ID must be non-zero");
         return false;
     }
-    if (msg.exp > 0 && msg.iat > 0 && msg.exp < msg.iat) {
-        setError(error, "Signal expiry precedes issued-at timestamp");
+    if (msg.iat <= 0 || msg.exp <= 0) {
+        setError(error, "Signal iat and exp must be positive Unix timestamps");
         return false;
     }
-    if (nowUnixSeconds > 0 && msg.exp > 0 && nowUnixSeconds > msg.exp) {
-        setError(error, "Signal has expired");
+    if (msg.exp <= msg.iat) {
+        setError(error, "Signal exp must be strictly greater than iat");
         return false;
+    }
+    if ((msg.exp - msg.iat) > kWaveMaxSignalTtlSeconds) {
+        setError(error, "Signal TTL exceeds maximum allowed 600 seconds");
+        return false;
+    }
+    if (nowUnixSeconds > 0) {
+        if (nowUnixSeconds > msg.exp) {
+            setError(error, "Signal has expired");
+            return false;
+        }
+        if (msg.iat > nowUnixSeconds + kWaveMaxClockSkewSeconds) {
+            setError(error, "Signal iat exceeds allowed future clock skew");
+            return false;
+        }
     }
     if (msg.signal.iceUfrag.size() > kMaxStringFieldBytes ||
         msg.signal.icePwd.size() > kMaxStringFieldBytes ||
@@ -742,17 +816,20 @@ bool decodeWaveUri(std::string_view uri, WaveSignalMessage& outMsg,
     }
 
     constexpr std::string_view kInternalPrefix = "bg://wave/v1/";
-    constexpr std::string_view kFragmentMarker = "#bgwave-v1.";
+    constexpr std::string_view kHttpsPrefixSlash =
+        "https://beygram.beykus.fun/#bgwave-v1.";
+    constexpr std::string_view kHttpsPrefixNoSlash =
+        "https://beygram.beykus.fun#bgwave-v1.";
     std::string_view b64;
     if (uri.starts_with(kInternalPrefix)) {
         b64 = uri.substr(kInternalPrefix.size());
+    } else if (uri.starts_with(kHttpsPrefixSlash)) {
+        b64 = uri.substr(kHttpsPrefixSlash.size());
+    } else if (uri.starts_with(kHttpsPrefixNoSlash)) {
+        b64 = uri.substr(kHttpsPrefixNoSlash.size());
     } else {
-        const std::size_t pos = uri.find(kFragmentMarker);
-        if (pos == std::string_view::npos) {
-            setError(error, "Unrecognized BG Wave URI scheme or version");
-            return false;
-        }
-        b64 = uri.substr(pos + kFragmentMarker.size());
+        setError(error, "Unrecognized BG Wave URI origin, scheme, or version");
+        return false;
     }
 
     std::vector<std::uint8_t> bytes;
@@ -800,7 +877,8 @@ bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
             }
         } else if (line.starts_with("a=candidate:")) {
             if (sig.candidates.size() >= kWaveMaxCandidates) {
-                continue; // bounded candidate count
+                setError(error, "SDP exceeds maximum ICE candidate limit");
+                return false;
             }
             std::istringstream iss(std::string(line.substr(12)));
             WaveIceCandidate c;

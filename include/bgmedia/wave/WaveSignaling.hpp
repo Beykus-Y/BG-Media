@@ -15,6 +15,8 @@ inline constexpr std::size_t kWaveMaxCandidates = 32;
 inline constexpr std::size_t kWaveMaxBinaryPayloadBytes = 2048;
 inline constexpr std::size_t kWaveMaxUriLength = 4096;
 inline constexpr std::size_t kWaveMaxSdpBytes = 16384;
+inline constexpr std::int64_t kWaveMaxSignalTtlSeconds = 600;
+inline constexpr std::int64_t kWaveMaxClockSkewSeconds = 60;
 
 enum class WaveSignalType : std::uint8_t {
     Offer = 1,
@@ -88,7 +90,9 @@ struct WaveSignalMessage {
     WaveSdpSignal signal;
 };
 
-// Generates a cryptographically seeded 128-bit random session ID.
+// Generates a 128-bit random session ID from the OS CSPRNG.
+[[nodiscard]] bool generateWaveSessionId(std::array<std::uint8_t, 16>& outSid,
+                                         std::string* error = nullptr);
 [[nodiscard]] std::array<std::uint8_t, 16> generateWaveSessionId();
 [[nodiscard]] std::string formatSessionIdHex(
     const std::array<std::uint8_t, 16>& sid);

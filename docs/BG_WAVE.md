@@ -15,7 +15,7 @@ BG Wave is split into:
   - [`WaveSignaling`](../include/bgmedia/wave/WaveSignaling.hpp): versioned (`v=1`) compact binary codec, `bg://wave/v1/...` and `https://beygram.beykus.fun/#bgwave-v1....` URI helpers, SDP <-> `WaveSdpSignal` parser/formatter (IPv4, IPv6, mDNS `.local`, multi-interface), and diagnostic redaction.
   - [`IWaveTransport`](../include/bgmedia/wave/WaveTransport.hpp) + `SimulatedWaveTransport` (deterministic latency/jitter/loss/reorder/failure simulator).
   - [`IExternalCallTransport`](../include/bgmedia/wave/WaveFallback.hpp): host-implemented external call PCM bridge for phase-2 Telegram Call fallback (no Telegram/TDLib code in BG-Media).
-  - [`WaveAudioPipeline`](../include/bgmedia/wave/WaveAudioPipeline.hpp): unified Host/Listener state machine, instant `setPublishingEnabled(bool)` revocation, bitrate adaptation on loss, and redacted diagnostics.
+  - [`WaveAudioPipeline`](../include/bgmedia/wave/WaveAudioPipeline.hpp): unified Host/Listener state machine, instant `setPublishingEnabled(bool)` revocation, and redacted diagnostics (dynamic bitrate adaptation requires listener-to-host RTCP feedback, deferred to the real WebRTC/Opus adapter phase).
 - **Optional Codec Adapter (`adapters/wave_opus/`, `BGMEDIA_BUILD_WAVE_OPUS=OFF` by default)**:
   - `OpusWaveCodec`: wraps `libopus` (BSD-3-Clause) at 48 kHz stereo, 20 ms frames, 128–160 kbit/s music profile, in-band FEC, and Opus PLC.
 

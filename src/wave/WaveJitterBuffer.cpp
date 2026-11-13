@@ -83,11 +83,25 @@ void WaveJitterBuffer::push(WaveMediaPacket packet, double arrivalTimeSeconds) {
     }
 
     if (static_cast<std::size_t>(offset) >= slots_.size()) {
-        // Jump forward if stream jumped far ahead (e.g. reconnect/discontinuity)
-        const std::size_t advance =
-            static_cast<std::size_t>(offset) - (slots_.size() / 2);
-        for (std::size_t i = 0; i < advance; ++i) {
-            advancePlaySeq();
+        // Bounded O(capacity) resync on large sequence jumps (e.g. reconnect
+        // or corrupted packet) so a ~1e9 jump never loops O(offset) times.
+        if (static_cast<std::size_t>(offset) >= slots_.size() * 2) {
+            for (auto& slot : slots_) {
+                slot.occupied = false;
+                slot.packet.payload.clear();
+            }
+            queuedCount_ = 0;
+            primed_ = false;
+            hasPrevTiming_ = false;
+            jitterMs_ = 0.0;
+            targetDepthFrames_ = std::clamp(config_.minDepthFrames, std::size_t{1}, slots_.size() / 2);
+            nextPlaySeq_ = packet.sequence;
+        } else {
+            const std::size_t advance =
+                static_cast<std::size_t>(offset) - (slots_.size() / 2);
+            for (std::size_t i = 0; i < advance; ++i) {
+                advancePlaySeq();
+            }
         }
     }
 

@@ -126,7 +126,8 @@ private:
     void wireTransportCallbacks();
     void processHostStep(double currentTimeSeconds);
     void processListenerStep(double currentTimeSeconds);
-    void adaptBitrateIfNeeded();
+    void quiesceAudioAndResetState();
+    void publishStatsSnapshot();
 
     WavePipelineConfig config_;
     std::shared_ptr<IWaveAudioCodec> codec_;
@@ -135,6 +136,11 @@ private:
     WavePipelineCallbacks callbacks_;
 
     mutable std::mutex controlMutex_;
+    mutable std::mutex processMutex_;
+    mutable std::mutex statsMutex_;
+    WaveStats publishedStats_{};
+    std::atomic<bool> audioPausedForReset_{false};
+    std::atomic<std::uint32_t> audioInFlight_{0};
     std::atomic<WaveSessionState> state_{WaveSessionState::Idle};
     std::atomic<WaveTransportRoute> route_{WaveTransportRoute::None};
     std::atomic<bool> publishingEnabled_{true};
@@ -168,8 +174,6 @@ private:
     std::uint64_t plcFrames_ = 0;
     std::uint64_t bytesSent_ = 0;
     std::uint64_t bytesReceived_ = 0;
-    double lastBitrateAdaptSec_ = 0.0;
-    std::uint64_t prevLostForAdapt_ = 0;
 };
 
 } // namespace bgmedia::wave

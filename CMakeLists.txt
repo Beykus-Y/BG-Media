@@ -103,6 +103,9 @@ target_link_libraries(bgmedia_core PUBLIC Threads::Threads)
 if(MSVC)
     target_compile_definitions(bgmedia_core PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+if(WIN32)
+    target_link_libraries(bgmedia_core PUBLIC bcrypt)
+endif()
 
 # ---------------------------------------------------------------------------
 # VRM 0.x importer and humanoid retargeter. Both are pure C++20: no SDL, no

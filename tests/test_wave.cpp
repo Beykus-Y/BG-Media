@@ -548,3 +548,117 @@ TEST_CASE(wave.ttl_and_replay_guard) {
     CHECK(host.handleRemoteSignal(staleEnd, 1012));
     CHECK(host.state() == WaveSessionState::Ended);
 }
+
+TEST_CASE(wave.jitter_buffer_huge_seq_jump) {
+    using namespace bgmedia::wave;
+    WaveJitterBuffer jb;
+    auto makePkt = [](std::uint32_t seq) {
+        WaveMediaPacket p;
+        p.sequence = seq;
+        p.timestamp48k = seq * 960;
+        p.payload = {1, 2, 3, 4};
+        return p;
+    };
+    jb.push(makePkt(10), 0.0);
+    // Jump by 1,000,000,000 (~1e9) must complete in O(capacity)
+    jb.push(makePkt(1000000010u), 0.020);
+    jb.push(makePkt(1000000011u), 0.040);
+    WaveMediaPacket out;
+    CHECK(jb.popNext(out) == WaveJitterBuffer::PopStatus::Packet);
+    CHECK(out.sequence == 1000000010u);
+}
+
+TEST_CASE(wave.signaling_security_and_limits) {
+    using namespace bgmedia::wave;
+    WaveSignalMessage base;
+    base.version = 1;
+    base.type = WaveSignalType::Offer;
+    base.sid = generateWaveSessionId();
+    base.iat = 1763000000;
+    base.exp = 1763000120;
+    base.nonce = 1;
+    base.signal.iceUfrag = "u";
+    base.signal.icePwd = "secretpwd12345678";
+    std::string err;
+
+    // Time validation: iat=0, exp=0, exp==iat, TTL>600s, future skew>60s
+    { auto m = base; m.iat = 0; CHECK(!validateWaveSignal(m, 1763000010, &err)); }
+    { auto m = base; m.exp = 0; CHECK(!validateWaveSignal(m, 1763000010, &err)); }
+    { auto m = base; m.exp = m.iat; CHECK(!validateWaveSignal(m, 1763000010, &err)); }
+    { auto m = base; m.exp = m.iat + 601; CHECK(!validateWaveSignal(m, 1763000010, &err)); }
+    { auto m = base; CHECK(!validateWaveSignal(m, m.iat - 61, &err)); }
+    CHECK(validateWaveSignal(base, base.iat, &err));
+
+    // Origin validation: reject arbitrary HTTPS origins and wrong paths
+    const std::string validHttps = encodeWaveHttpsFragmentUri(base, "https://beygram.beykus.fun/", &err);
+    const std::size_t fragPos = validHttps.find("#bgwave-v1.");
+    CHECK(fragPos != std::string::npos);
+    const std::string frag = validHttps.substr(fragPos);
+    WaveSignalMessage out;
+    CHECK(!decodeWaveUri("https://attacker.example/" + frag, out, &err));
+    CHECK(!decodeWaveUri("http://beygram.beykus.fun/" + frag, out, &err));
+    CHECK(!decodeWaveUri("https://beygram.beykus.fun/evil/" + frag, out, &err));
+
+    // >32 ICE candidates must fail explicitly (no silent truncation)
+    std::string bigSdp = "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:secretpwd12345678\r\n";
+    for (int i = 0; i < 33; ++i) {
+        bigSdp += "a=candidate:" + std::to_string(i + 1) +
+                  " 1 udp 2122260223 192.0.2." + std::to_string(i + 1) +
+                  " 50000 typ host\r\n";
+    }
+    WaveSdpSignal parsed;
+    CHECK(!parseSdpToWaveSignal(bigSdp, parsed, &err));
+}
+
+TEST_CASE(wave.stop_reset_concurrent_stress) {
+    using namespace bgmedia::wave;
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+    WavePipelineConfig hCfg; hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+    WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    WaveSignalMessage offer, answer;
+    WavePipelineCallbacks hCb;
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) offer = m;
+    };
+    host.setCallbacks(std::move(hCb));
+    WavePipelineCallbacks lCb;
+    lCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Answer) answer = m;
+    };
+    listener.setCallbacks(std::move(lCb));
+    CHECK(host.startOffer(1000));
+    CHECK(listener.acceptOffer(offer, 1001));
+    CHECK(host.acceptAnswer(answer, 1002));
+
+    std::atomic<bool> running{true};
+    std::thread audioThread([&]() {
+        std::vector<float> buf(512 * 2, 0.1f);
+        while (running.load(std::memory_order_relaxed)) {
+            host.onPcmRendered(buf.data(), 512, 48000);
+            (void)listener.pullListenerPcm(buf.data(), 512, 48000);
+        }
+    });
+    std::thread workerThread([&]() {
+        double t = 0.0;
+        while (running.load(std::memory_order_relaxed)) {
+            host.process(t);
+            listener.process(t);
+            (void)host.stats();
+            (void)listener.stats();
+            t += 0.01;
+        }
+    });
+    for (int i = 0; i < 10; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        host.stop(true, 1005 + i);
+        host.reset();
+    }
+    running.store(false, std::memory_order_relaxed);
+    audioThread.join();
+    workerThread.join();
+}
