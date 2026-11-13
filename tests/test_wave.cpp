@@ -674,41 +674,116 @@ TEST_CASE(wave.reentrant_callbacks_no_deadlock) {
     WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
     WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
 
-    WaveSignalMessage offer;
-    int stateCallbacks = 0;
     int signalCallbacks = 0;
-    WavePipelineCallbacks hCb;
-    hCb.onStateChanged = [&](WaveSessionState st, const std::string&) {
-        ++stateCallbacks;
+    // 1. Reentrant stop() at Offering -> no Offer emitted, returns false
+    WavePipelineCallbacks hCb1;
+    hCb1.onStateChanged = [&](WaveSessionState st, const std::string&) {
         (void)host.sessionId();
         (void)host.stats();
-        if (st == WaveSessionState::AwaitingAnswer) {
-            // Reentrant stop() inside onStateChanged must not deadlock!
+        if (st == WaveSessionState::Offering) {
             host.stop(false, 1005);
         }
     };
-    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+    hCb1.onOutboundSignal = [&](const WaveSignalMessage&) {
         ++signalCallbacks;
-        (void)host.sessionId();
-        (void)host.stats();
-        if (m.type == WaveSignalType::Offer) {
-            offer = m;
-        }
     };
-    host.setCallbacks(std::move(hCb));
-
-    CHECK(host.startOffer(1000));
-    CHECK(stateCallbacks >= 2);
-    CHECK(signalCallbacks >= 1);
+    host.setCallbacks(std::move(hCb1));
+    CHECK(!host.startOffer(1000));
+    CHECK(signalCallbacks == 0);
     CHECK(host.state() == WaveSessionState::Ended);
 
-    // Also verify listener onOutboundSignal -> sessionId() / stop() reentrancy
+    // 2. Reentrant stop() at AwaitingAnswer -> no orphan Offer emitted!
+    host.reset();
+    WavePipelineCallbacks hCb2;
+    hCb2.onStateChanged = [&](WaveSessionState st, const std::string&) {
+        if (st == WaveSessionState::AwaitingAnswer) {
+            host.stop(false, 1005);
+        }
+    };
+    hCb2.onOutboundSignal = [&](const WaveSignalMessage&) {
+        ++signalCallbacks;
+    };
+    host.setCallbacks(std::move(hCb2));
+    CHECK(!host.startOffer(1000));
+    CHECK(signalCallbacks == 0);
+    CHECK(host.state() == WaveSessionState::Ended);
+
+    // 3. Valid offer, then listener reentrant stop() at ConnectingP2P -> no Answer emitted
+    host.reset();
+    WaveSignalMessage validOffer;
+    WavePipelineCallbacks hCb3;
+    hCb3.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) validOffer = m;
+    };
+    host.setCallbacks(std::move(hCb3));
+    CHECK(host.startOffer(1000));
+
+    int listenerAnswers = 0;
     WavePipelineCallbacks lCb;
-    lCb.onOutboundSignal = [&](const WaveSignalMessage&) {
+    lCb.onStateChanged = [&](WaveSessionState st, const std::string&) {
         (void)listener.sessionId();
-        listener.stop(false, 1006);
+        if (st == WaveSessionState::ConnectingP2P) {
+            listener.stop(false, 1006);
+        }
+    };
+    lCb.onOutboundSignal = [&](const WaveSignalMessage&) {
+        ++listenerAnswers;
     };
     listener.setCallbacks(std::move(lCb));
-    CHECK(listener.acceptOffer(offer, 1001));
+    CHECK(!listener.acceptOffer(validOffer, 1001));
+    CHECK(listenerAnswers == 0);
     CHECK(listener.state() == WaveSessionState::Ended);
+}
+
+TEST_CASE(wave.deferred_reset_and_reconnect_no_process) {
+    using namespace bgmedia::wave;
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    WavePipelineConfig hCfg; hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+    WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    WaveSignalMessage offer, answer;
+    WavePipelineCallbacks hCb;
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) offer = m;
+    };
+    host.setCallbacks(std::move(hCb));
+    WavePipelineCallbacks lCb;
+    lCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Answer) answer = m;
+    };
+    listener.setCallbacks(std::move(lCb));
+
+    CHECK(host.startOffer(1000));
+    CHECK(listener.acceptOffer(offer, 1001));
+    CHECK(host.acceptAnswer(answer, 1002));
+
+    // Stop while audio thread is pumping, then stop audio thread WITHOUT calling process().
+    std::atomic<bool> pumping{true};
+    std::thread audioThread([&]() {
+        std::vector<float> buf(512 * 2, 0.3f);
+        while (pumping.load(std::memory_order_relaxed)) {
+            host.onPcmRendered(buf.data(), 512, 48000);
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    host.stop(true, 1010);
+    listener.stop(false, 1010);
+    pumping.store(false, std::memory_order_relaxed);
+    audioThread.join();
+
+    // Reconnect with NO intermediate process() call: audio must not stay paused.
+    CHECK(host.reconnect(1020));
+    CHECK(listener.reconnect(1020));
+    CHECK(listener.acceptOffer(offer, 1021));
+    CHECK(host.acceptAnswer(answer, 1022));
+    CHECK(host.state() == WaveSessionState::LiveP2P);
+    std::vector<float> pcm(960 * 2, 0.25f);
+    host.onPcmRendered(pcm.data(), 960, 48000);
+    host.process(1.0);
+    CHECK(host.stats().packetsSent >= 1u);
 }

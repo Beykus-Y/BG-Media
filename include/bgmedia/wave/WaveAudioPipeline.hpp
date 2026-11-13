@@ -11,6 +11,7 @@
 #include "bgmedia/wave/WaveTypes.hpp"
 
 #include <atomic>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -127,6 +128,7 @@ private:
     void processHostStep(double currentTimeSeconds);
     void processListenerStep(double currentTimeSeconds);
     void requestOrPerformReset();
+    [[nodiscard]] bool ensureResetCompletedForNewSession();
     void performResetUnderProcessLock();
     [[nodiscard]] WavePipelineCallbacks snapshotCallbacks() const;
     void publishStatsSnapshot();
@@ -143,6 +145,13 @@ private:
     mutable std::mutex processMutex_;
     mutable std::mutex statsMutex_;
     std::atomic<bool> pendingRingReset_{false};
+    std::atomic<std::uint64_t> sessionGen_{0};
+    struct InboundPacket {
+        WaveMediaPacket packet;
+        double arrivalTimeSeconds = 0.0;
+    };
+    mutable std::mutex inboundMutex_;
+    std::deque<InboundPacket> inboundQueue_;
     WaveStats publishedStats_{};
     std::atomic<bool> audioPausedForReset_{false};
     std::atomic<std::uint32_t> audioInFlight_{0};
