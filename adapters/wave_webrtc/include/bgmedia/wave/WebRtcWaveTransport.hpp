@@ -50,4 +50,50 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
+// RFC 3550 16-bit -> 32-bit RTP sequence unwrapper resilient to out-of-order
+// delayed packets across 65535 -> 0 wraparound.
+struct RtpSequenceUnwrapper {
+    bool initialized = false;
+    std::uint16_t maxSeq16 = 0;
+    std::uint32_t cycles = 0;
+
+    void reset() noexcept {
+        initialized = false;
+        maxSeq16 = 0;
+        cycles = 0;
+    }
+
+    [[nodiscard]] std::uint32_t unwrap(std::uint16_t seq16) noexcept {
+        if (!initialized) {
+            initialized = true;
+            maxSeq16 = seq16;
+            cycles = 0;
+            return seq16;
+        }
+        const std::int16_t delta = static_cast<std::int16_t>(seq16 - maxSeq16);
+        std::uint32_t packetCycles = cycles;
+        if (delta >= 0) {
+            if (seq16 < maxSeq16) {
+                cycles += 0x10000u;
+                packetCycles = cycles;
+            }
+            maxSeq16 = seq16;
+        } else if (seq16 > maxSeq16) {
+            packetCycles = (cycles >= 0x10000u) ? (cycles - 0x10000u) : 0u;
+        }
+        return packetCycles + seq16;
+    }
+};
+
+// Deterministically selects up to `maxCandidates` ICE candidates preserving
+// IPv4/IPv6 and srflx/relay/host reachability while fitting within
+// `maxBinaryBytes` (and `kWaveMaxUriLength`). Returns false if no valid signal
+// can fit within the compact wire budget.
+[[nodiscard]] bool selectCompactIceCandidates(
+    const WaveSdpSignal& baseSignal,
+    const std::vector<WaveIceCandidate>& allCandidates,
+    WaveSdpSignal& outSignal,
+    std::size_t maxCandidates = kWaveMaxCandidates,
+    std::size_t maxBinaryBytes = kWaveMaxBinaryPayloadBytes);
+
 } // namespace bgmedia::wave

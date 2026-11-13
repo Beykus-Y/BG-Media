@@ -2,6 +2,7 @@
 
 #include "bgmedia/wave/WaveAudioPipeline.hpp"
 #include "bgmedia/wave/WaveCodec.hpp"
+#include "bgmedia/wave/WaveJitterBuffer.hpp"
 #include "bgmedia/wave/WaveSignaling.hpp"
 
 #ifdef BGMEDIA_HAVE_WAVE_OPUS
@@ -491,4 +492,142 @@ TEST_CASE(wave_real.webrtc_two_processes_localhost) {
     CHECK(listStats.find("fingerprintVerified=1") != std::string::npos);
 }
 #endif
+
+TEST_CASE(wave_real.rtp_sequence_rollover_reordered) {
+    using namespace bgmedia::wave;
+
+    // Case A: 65534, 65535, 0, 65535(delayed), 1, 2
+    {
+        RtpSequenceUnwrapper u;
+        const std::vector<std::uint16_t> inSeqs = {65534, 65535, 0, 65535, 1, 2};
+        const std::vector<std::uint32_t> expected = {65534, 65535, 65536, 65535, 65537, 65538};
+        WaveJitterBuffer jb;
+        for (std::size_t i = 0; i < inSeqs.size(); ++i) {
+            const std::uint32_t seq32 = u.unwrap(inSeqs[i]);
+            CHECK(seq32 == expected[i]);
+            WaveMediaPacket pkt;
+            pkt.sequence = seq32;
+            pkt.timestamp48k = seq32 * static_cast<std::uint32_t>(kWaveFrameSamples);
+            pkt.payload = {static_cast<std::uint8_t>(i + 1)};
+            jb.push(std::move(pkt), static_cast<double>(i) * 0.02);
+        }
+        // Verify continuity through 65534..65538 with no stream corruption.
+        for (std::uint32_t want = 65534; want <= 65538; ++want) {
+            WaveMediaPacket popped;
+            CHECK(jb.popNext(popped) == WaveJitterBuffer::PopStatus::Packet);
+            CHECK(popped.sequence == want);
+        }
+    }
+
+    // Case B: 65535, 0, 1, 65535(delayed), 2
+    {
+        RtpSequenceUnwrapper u;
+        const std::vector<std::uint16_t> inSeqs = {65535, 0, 1, 65535, 2};
+        const std::vector<std::uint32_t> expected = {65535, 65536, 65537, 65535, 65538};
+        WaveJitterBuffer jb;
+        for (std::size_t i = 0; i < inSeqs.size(); ++i) {
+            const std::uint32_t seq32 = u.unwrap(inSeqs[i]);
+            CHECK(seq32 == expected[i]);
+            WaveMediaPacket pkt;
+            pkt.sequence = seq32;
+            pkt.timestamp48k = seq32 * static_cast<std::uint32_t>(kWaveFrameSamples);
+            pkt.payload = {static_cast<std::uint8_t>(i + 1)};
+            jb.push(std::move(pkt), static_cast<double>(i) * 0.02);
+        }
+        for (std::uint32_t want = 65535; want <= 65538; ++want) {
+            WaveMediaPacket popped;
+            CHECK(jb.popNext(popped) == WaveJitterBuffer::PopStatus::Packet);
+            CHECK(popped.sequence == want);
+        }
+    }
+}
+
+TEST_CASE(wave_real.ice_candidate_selection_and_budget) {
+    using namespace bgmedia::wave;
+
+    WaveSdpSignal base;
+    base.iceUfrag = "ufrag1234";
+    base.icePwd = "password1234567890123456";
+    base.dtlsFingerprintAlg = "sha-256";
+    base.dtlsFingerprint =
+        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+    base.setupRole = WaveDtlsSetupRole::Actpass;
+
+    std::vector<WaveIceCandidate> cands;
+    // 36 host candidates first (would crowd out srflx if blindly taking first 32)
+    for (int i = 0; i < 36; ++i) {
+        WaveIceCandidate c;
+        c.foundation = std::to_string(i + 1);
+        c.component = 1;
+        c.protocol = WaveIceProtocol::Udp;
+        c.priority = static_cast<std::uint32_t>(2122260223u - i);
+        c.address = "192.168." + std::to_string(i / 10 + 1) + "." + std::to_string((i % 10) + 10);
+        c.port = static_cast<std::uint16_t>(50000 + i);
+        c.type = WaveIceCandidateType::Host;
+        cands.push_back(std::move(c));
+    }
+    // Late srflx IPv4 and IPv6 candidates
+    WaveIceCandidate srflx4;
+    srflx4.foundation = "40";
+    srflx4.protocol = WaveIceProtocol::Udp;
+    srflx4.priority = 1686052607u;
+    srflx4.address = "203.0.113.45";
+    srflx4.port = 61001;
+    srflx4.type = WaveIceCandidateType::Srflx;
+    cands.push_back(srflx4);
+
+    WaveIceCandidate srflx6;
+    srflx6.foundation = "41";
+    srflx6.protocol = WaveIceProtocol::Udp;
+    srflx6.priority = 1686052606u;
+    srflx6.address = "2001:db8::45";
+    srflx6.port = 61002;
+    srflx6.type = WaveIceCandidateType::Srflx;
+    cands.push_back(srflx6);
+
+    WaveSdpSignal selected;
+    CHECK(selectCompactIceCandidates(base, cands, selected));
+    CHECK(selected.candidates.size() == kWaveMaxCandidates);
+
+    bool hasSrflx4 = false;
+    bool hasSrflx6 = false;
+    for (const auto& c : selected.candidates) {
+        if (c.type == WaveIceCandidateType::Srflx && c.address == "203.0.113.45") {
+            hasSrflx4 = true;
+        }
+        if (c.type == WaveIceCandidateType::Srflx && c.address == "2001:db8::45") {
+            hasSrflx6 = true;
+        }
+    }
+    CHECK(hasSrflx4);
+    CHECK(hasSrflx6);
+
+    WaveSignalMessage msg;
+    msg.sid.fill(0x42);
+    msg.iat = 1700000000;
+    msg.exp = 1700000120;
+    msg.nonce = 7;
+    msg.signal = selected;
+    std::vector<std::uint8_t> bin;
+    CHECK(encodeWaveSignalBinary(msg, bin));
+    CHECK(bin.size() <= kWaveMaxBinaryPayloadBytes);
+    const std::string uri = encodeWaveHttpsFragmentUri(msg);
+    CHECK(!uri.empty());
+    CHECK(uri.size() <= kWaveMaxUriLength);
+
+    // Tight byte budget trims candidate count to fit instead of failing later.
+    WaveSdpSignal tight;
+    CHECK(selectCompactIceCandidates(base, cands, tight, kWaveMaxCandidates, 220));
+    CHECK(!tight.candidates.empty());
+    CHECK(tight.candidates.size() < kWaveMaxCandidates);
+    msg.signal = tight;
+    bin.clear();
+    CHECK(encodeWaveSignalBinary(msg, bin));
+    CHECK(bin.size() <= 220u);
+
+    // Impossibly small byte budget fails explicitly.
+    WaveSdpSignal impossible;
+    CHECK(!selectCompactIceCandidates(base, cands, impossible, kWaveMaxCandidates, 60));
+}
 #endif

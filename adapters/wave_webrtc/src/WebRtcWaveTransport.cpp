@@ -37,54 +37,208 @@ std::uint32_t generateRandomSsrc() {
     return v == 0 ? 0x42475731u : v;
 }
 
-std::string trimSdpCandidatesToLimit(std::string_view sdp,
-                                     std::size_t maxCandidates) {
-    std::string out;
-    out.reserve(sdp.size());
-    std::size_t candCount = 0;
-    std::size_t pos = 0;
-    while (pos < sdp.size()) {
-        const std::size_t nl = sdp.find('\n', pos);
-        const std::size_t end = (nl == std::string_view::npos) ? sdp.size() : nl + 1;
-        const std::string_view line = sdp.substr(pos, end - pos);
-        pos = end;
-        if (line.rfind("a=candidate:", 0) == 0) {
-            if (candCount >= maxCandidates) {
-                continue;
-            }
-            ++candCount;
-        }
-        out.append(line);
-    }
-    return out;
+inline constexpr std::size_t kMaxCollectedCandidates = 256;
+
+bool isIpv6Address(std::string_view addr) {
+    return addr.find(':') != std::string_view::npos;
 }
 
-bool appendCandidateLineToSignal(std::string_view candLine,
-                                 WaveSdpSignal& signal) {
+bool isLoopbackOrLinkLocal(std::string_view addr) {
+    return addr == "127.0.0.1" || addr == "::1" ||
+           addr.rfind("169.254.", 0) == 0 || addr.rfind("fe80:", 0) == 0;
+}
+
+bool parseCandidateLine(std::string_view candLine,
+                        std::string_view iceUfrag,
+                        std::string_view icePwd,
+                        WaveIceCandidate& outCandidate) {
     std::string line(candLine);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+        line.pop_back();
+    }
     if (line.rfind("a=", 0) == 0) {
         line.erase(0, 2);
     }
     if (line.rfind("candidate:", 0) != 0) {
         return false;
     }
-    if (signal.candidates.size() >= kWaveMaxCandidates) {
-        return false;
-    }
     WaveSdpSignal tmp;
     std::ostringstream oss;
-    oss << "a=ice-ufrag:" << (signal.iceUfrag.empty() ? "x" : signal.iceUfrag)
-        << "\r\na=ice-pwd:" << (signal.icePwd.empty() ? "x" : signal.icePwd)
+    oss << "a=ice-ufrag:" << (iceUfrag.empty() ? "x" : iceUfrag)
+        << "\r\na=ice-pwd:" << (icePwd.empty() ? "x" : icePwd)
         << "\r\na=" << line << "\r\n";
     if (!parseSdpToWaveSignal(oss.str(), tmp, nullptr) ||
         tmp.candidates.empty()) {
         return false;
     }
-    signal.candidates.push_back(std::move(tmp.candidates.front()));
+    outCandidate = std::move(tmp.candidates.front());
     return true;
 }
 
+bool extractSdpAndCandidates(std::string_view sdp,
+                             WaveSdpSignal& outBaseSignal,
+                             std::vector<WaveIceCandidate>& outCandidates) {
+    std::string baseSdp;
+    baseSdp.reserve(sdp.size());
+    std::vector<std::string_view> candLines;
+    std::size_t pos = 0;
+    while (pos < sdp.size()) {
+        const std::size_t nl = sdp.find('\n', pos);
+        const std::size_t end =
+            (nl == std::string_view::npos) ? sdp.size() : nl + 1;
+        const std::string_view line = sdp.substr(pos, end - pos);
+        pos = end;
+        if (line.rfind("a=candidate:", 0) == 0) {
+            candLines.push_back(line);
+        } else {
+            baseSdp.append(line);
+        }
+    }
+    if (!parseSdpToWaveSignal(baseSdp, outBaseSignal, nullptr)) {
+        return false;
+    }
+    outCandidates.clear();
+    outCandidates.reserve(candLines.size());
+    for (std::string_view cl : candLines) {
+        WaveIceCandidate c;
+        if (parseCandidateLine(cl, outBaseSignal.iceUfrag,
+                               outBaseSignal.icePwd, c)) {
+            outCandidates.push_back(std::move(c));
+        }
+    }
+    return true;
+}
+
+int candidateTypeRank(WaveIceCandidateType t) {
+    switch (t) {
+    case WaveIceCandidateType::Srflx: return 3;
+    case WaveIceCandidateType::Prflx: return 2;
+    case WaveIceCandidateType::Relay: return 1;
+    case WaveIceCandidateType::Host: return 0;
+    }
+    return 0;
+}
+
+bool sameCandidateEndpoint(const WaveIceCandidate& a,
+                           const WaveIceCandidate& b) {
+    return a.protocol == b.protocol && a.type == b.type &&
+           a.port == b.port && a.address == b.address;
+}
+
+bool fitsWireBudget(const WaveSdpSignal& sig, std::size_t maxBinaryBytes) {
+    WaveSignalMessage probe;
+    probe.version = kWaveSignalVersion;
+    probe.type = WaveSignalType::Offer;
+    probe.sid.fill(0x5Au);
+    probe.iat = 1700000000;
+    probe.exp = 1700000120;
+    probe.caps = kWaveCapOpus48kStereo | kWaveCapDtlsSrtp;
+    probe.nonce = 1;
+    probe.signal = sig;
+    std::vector<std::uint8_t> bin;
+    if (!encodeWaveSignalBinary(probe, bin, nullptr) ||
+        bin.size() > maxBinaryBytes) {
+        return false;
+    }
+    std::string uriErr;
+    const std::string uri = encodeWaveHttpsFragmentUri(
+        probe, "https://beygram.beykus.fun/", &uriErr);
+    return !uri.empty() && uri.size() <= kWaveMaxUriLength;
+}
+
 } // namespace
+
+bool selectCompactIceCandidates(
+    const WaveSdpSignal& baseSignal,
+    const std::vector<WaveIceCandidate>& allCandidates,
+    WaveSdpSignal& outSignal,
+    std::size_t maxCandidates,
+    std::size_t maxBinaryBytes) {
+    outSignal = baseSignal;
+    outSignal.candidates.clear();
+    if (maxCandidates == 0) {
+        return false;
+    }
+
+    // 1. Deduplicate incoming candidates.
+    std::vector<WaveIceCandidate> unique;
+    unique.reserve(allCandidates.size());
+    for (const auto& c : allCandidates) {
+        auto it = std::find_if(unique.begin(), unique.end(),
+                               [&](const WaveIceCandidate& u) {
+                                   return sameCandidateEndpoint(u, c);
+                               });
+        if (it == unique.end()) {
+            unique.push_back(c);
+        } else if (c.priority > it->priority) {
+            *it = c;
+        }
+    }
+    if (unique.empty()) {
+        return false;
+    }
+
+    // 2. Sort deterministically: reachability type (srflx/prflx/relay > host),
+    // UDP > TCP, non-loopback > loopback, priority descending.
+    std::stable_sort(unique.begin(), unique.end(),
+                     [](const WaveIceCandidate& a, const WaveIceCandidate& b) {
+                         const int ra = candidateTypeRank(a.type);
+                         const int rb = candidateTypeRank(b.type);
+                         if (ra != rb) return ra > rb;
+                         const bool udpA = (a.protocol == WaveIceProtocol::Udp);
+                         const bool udpB = (b.protocol == WaveIceProtocol::Udp);
+                         if (udpA != udpB) return udpA > udpB;
+                         const bool lbA = isLoopbackOrLinkLocal(a.address);
+                         const bool lbB = isLoopbackOrLinkLocal(b.address);
+                         if (lbA != lbB) return lbA < lbB;
+                         return a.priority > b.priority;
+                     });
+
+    // 3. Pick diversity anchors first (best Srflx IPv4/IPv6, Relay IPv4/IPv6,
+    // Host IPv4/IPv6), then fill remaining slots in priority order.
+    std::vector<bool> picked(unique.size(), false);
+    std::vector<WaveIceCandidate> ordered;
+    ordered.reserve(std::min(unique.size(), maxCandidates));
+
+    auto pickFirstMatching = [&](WaveIceCandidateType wantType, bool wantIpv6) {
+        for (std::size_t i = 0; i < unique.size(); ++i) {
+            if (!picked[i] && unique[i].type == wantType &&
+                isIpv6Address(unique[i].address) == wantIpv6) {
+                picked[i] = true;
+                ordered.push_back(unique[i]);
+                return;
+            }
+        }
+    };
+
+    pickFirstMatching(WaveIceCandidateType::Srflx, false);
+    pickFirstMatching(WaveIceCandidateType::Srflx, true);
+    pickFirstMatching(WaveIceCandidateType::Relay, false);
+    pickFirstMatching(WaveIceCandidateType::Relay, true);
+    pickFirstMatching(WaveIceCandidateType::Host, false);
+    pickFirstMatching(WaveIceCandidateType::Host, true);
+
+    for (std::size_t i = 0; i < unique.size() && ordered.size() < maxCandidates;
+         ++i) {
+        if (!picked[i]) {
+            picked[i] = true;
+            ordered.push_back(unique[i]);
+        }
+    }
+    if (ordered.size() > maxCandidates) {
+        ordered.resize(maxCandidates);
+    }
+
+    // 4. Enforce wire binary/URI byte budget incrementally.
+    for (const auto& cand : ordered) {
+        outSignal.candidates.push_back(cand);
+        if (!fitsWireBudget(outSignal, maxBinaryBytes)) {
+            outSignal.candidates.pop_back();
+            break;
+        }
+    }
+    return !outSignal.candidates.empty();
+}
 
 struct WebRtcWaveTransport::Impl
     : public std::enable_shared_from_this<WebRtcWaveTransport::Impl> {
@@ -140,9 +294,7 @@ struct WebRtcWaveTransport::Impl
             expectedRemoteFingerprint.clear();
             remoteFingerprintVerified.store(false, std::memory_order_release);
             connectTimerActive = false;
-            hasFirstSeq = false;
-            seqCycles = 0;
-            lastSeq16 = 0;
+            seqUnwrapper.reset();
             if (emitClosedState &&
                 state.load(std::memory_order_acquire) !=
                     WaveTransportState::Closed) {
@@ -214,7 +366,7 @@ struct WebRtcWaveTransport::Impl
                 cand.family() == rtc::Candidate::Family::Ipv6) {
                 return;
             }
-            if (self->gatheredCandidates.size() < kWaveMaxCandidates) {
+            if (self->gatheredCandidates.size() < kMaxCollectedCandidates) {
                 self->gatheredCandidates.push_back(std::move(cand));
             }
         });
@@ -360,26 +512,7 @@ struct WebRtcWaveTransport::Impl
                         self->generation.load(std::memory_order_acquire)) {
                         return;
                     }
-                    const std::uint16_t seq16 = rtp->seqNumber();
-                    if (!self->hasFirstSeq) {
-                        self->hasFirstSeq = true;
-                        self->lastSeq16 = seq16;
-                        seq32 = seq16;
-                    } else {
-                        const std::int32_t diff = static_cast<std::int16_t>(
-                            seq16 - self->lastSeq16);
-                        if (diff > 0 && seq16 < self->lastSeq16) {
-                            self->seqCycles += 0x10000u;
-                        } else if (diff < 0 && seq16 > self->lastSeq16) {
-                            if (self->seqCycles >= 0x10000u) {
-                                self->seqCycles -= 0x10000u;
-                            }
-                        }
-                        if (diff >= 0) {
-                            self->lastSeq16 = seq16;
-                        }
-                        seq32 = self->seqCycles + seq16;
-                    }
+                    seq32 = self->seqUnwrapper.unwrap(rtp->seqNumber());
                     cb = self->callbacks.onMediaPacket;
                 }
 
@@ -423,27 +556,31 @@ struct WebRtcWaveTransport::Impl
         if (!localDesc.has_value()) {
             return false;
         }
-        const std::string sdpStr =
-            trimSdpCandidatesToLimit(localDesc->generateSdp(), kWaveMaxCandidates);
-        WaveSdpSignal sig;
-        if (!parseSdpToWaveSignal(sdpStr, sig, nullptr)) {
+        const std::string rawSdp = localDesc->generateSdp();
+        WaveSdpSignal baseSig;
+        std::vector<WaveIceCandidate> allCandidates;
+        if (!extractSdpAndCandidates(rawSdp, baseSig, allCandidates)) {
             return false;
         }
-        if (sig.candidates.empty() && !gatheredCandidates.empty()) {
-            for (const auto& c : gatheredCandidates) {
-                appendCandidateLineToSignal(c.candidate(), sig);
+        for (const auto& c : gatheredCandidates) {
+            WaveIceCandidate parsedCand;
+            if (parseCandidateLine(c.candidate(), baseSig.iceUfrag,
+                                   baseSig.icePwd, parsedCand)) {
+                allCandidates.push_back(std::move(parsedCand));
             }
         }
         if (!config.enableIpv6) {
-            sig.candidates.erase(
-                std::remove_if(sig.candidates.begin(), sig.candidates.end(),
+            allCandidates.erase(
+                std::remove_if(allCandidates.begin(), allCandidates.end(),
                                [](const WaveIceCandidate& c) {
-                                   return c.address.find(':') !=
-                                          std::string::npos;
+                                   return isIpv6Address(c.address);
                                }),
-                sig.candidates.end());
+                allCandidates.end());
         }
-        if (sig.candidates.empty()) {
+        WaveSdpSignal sig;
+        if (!selectCompactIceCandidates(baseSig, allCandidates, sig,
+                                        kWaveMaxCandidates,
+                                        kWaveMaxBinaryPayloadBytes)) {
             return false;
         }
         auto cb = callbacks.onLocalSignalReady;
@@ -520,9 +657,7 @@ struct WebRtcWaveTransport::Impl
             expectedRemoteFingerprint = fpHex;
             selectedCandidateSummary.clear();
             remoteFingerprintVerified.store(false, std::memory_order_release);
-            hasFirstSeq = false;
-            seqCycles = 0;
-            lastSeq16 = 0;
+            seqUnwrapper.reset();
             state.store(WaveTransportState::Gathering,
                         std::memory_order_release);
 
@@ -700,9 +835,7 @@ struct WebRtcWaveTransport::Impl
     std::string expectedRemoteFingerprint;
     std::string selectedCandidateSummary;
     std::uint32_t ssrc = 0x42475731u;
-    std::uint16_t lastSeq16 = 0;
-    std::uint32_t seqCycles = 0;
-    bool hasFirstSeq = false;
+    RtpSequenceUnwrapper seqUnwrapper;
     std::chrono::steady_clock::time_point connectStartTime_{};
     bool connectTimerActive = false;
     double lastFeedbackTime = -1.0;
