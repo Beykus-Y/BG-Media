@@ -78,3 +78,10 @@ Measured on Windows x64 Release (`core-only` preset):
 - `bgmedia_core` BG Wave: repository MIT license (no new third-party dependencies).
 - Optional `adapters/wave_opus`: `libopus` (BSD-3-Clause), disabled by default (`BGMEDIA_BUILD_WAVE_OPUS=OFF`).
 - Future WebRTC adapter (`libdatachannel`, MPL-2.0): not bundled in `bgmedia_core`; planned as an optional adapter target.
+
+## 6. Current Scope & E0/E1 Interoperability Notes
+
+- **Canonical Starting Point (`WaveSignaling` v1):** The C++20 binary codec (`16`-byte `sid`, `uint64` `nonce`, `uint32` `caps`, `iat`/`exp`, bounded ICE/DTLS fields) is the canonical starting point for BG Media and BeyGram JNI integration. Final v1 wire freeze requires E0 real-SDP peer-connection validation and Telegram `text-url` round-trip size verification.
+- **SDP Subset Boundary:** `parseSdpToWaveSignal` / `formatWaveSignalToSdp` operates on a compact ICE/DTLS subset (`ice-ufrag`, `ice-pwd`, `fingerprint`, `setup`, `candidate`) and omits unrelated SDP attributes (`mid`, `ice-options`, `rtcp-mux`, `raddr`/`rport`, `msid`, etc.). It does **not** claim general SDP equivalence until verified on a live WebRTC peer connection.
+- **Canonical Golden Fixtures:** Byte-level valid (`offer`, `answer`, `cancel`, `end`) and negative (`invalid_*`) fixtures plus a sanitized WebRTC SDP fixture are published in `tests/fixtures/wave_v1/` and verified by `bgmedia.wave`.
+- **Transport & Codec Status:** `SimulatedWaveTransport` is a deterministic loopback/network simulator for core pipeline and CI verification?**not** proof of real cross-device P2P NAT traversal. A concrete ICE/DTLS-SRTP transport adapter (e.g. `libdatachannel`) and `BGMEDIA_BUILD_WAVE_OPUS=ON` verification against `libopus` are subsequent E0/E2 adapter milestones.

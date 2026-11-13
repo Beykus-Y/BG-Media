@@ -1,0 +1,26 @@
+v=0
+o=- 4611731400430051336 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=extmap-allow-mixed
+a=msid-semantic: WMS bgwave-stream
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=rtcp:9 IN IP4 0.0.0.0
+a=ice-ufrag:k8Xm2PqR
+a=ice-pwd:9vL4nT7wZ2yB5cF8hJ1mN3qS6uW0xA4d
+a=ice-options:trickle
+a=fingerprint:sha-256 1A:2B:3C:4D:5E:6F:70:81:92:A3:B4:C5:D6:E7:F8:09:1A:2B:3C:4D:5E:6F:70:81:92:A3:B4:C5:D6:E7:F8:09
+a=setup:actpass
+a=mid:0
+a=sendonly
+a=rtcp-mux
+a=rtpmap:111 opus/48000/2
+a=rtcp-fb:111 transport-cc
+a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1
+a=candidate:1467250027 1 udp 2122260223 192.0.2.44 54812 typ host generation 0 network-id 1
+a=candidate:2894510021 1 udp 2122194687 2001:db8:1234::44 54813 typ host generation 0 network-id 2
+a=candidate:3912840011 1 udp 2122129151 9c1f3a2b-7d4e-4b8c-9f1a-0e2d4c6b8a10.local 54814 typ host generation 0 network-id 1
+a=candidate:4102938475 1 udp 1686052607 198.51.100.88 61204 typ srflx raddr 192.0.2.44 rport 54812 generation 0 network-id 1
+a=end-of-candidates

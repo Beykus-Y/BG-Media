@@ -9,6 +9,9 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <filesystem>
+#include <fstream>
+#include <string_view>
 #include <vector>
 
 using namespace bgmedia::wave;
@@ -48,7 +51,76 @@ void measureSignalingScenario(const char* label, const std::string& sdp) {
 
 } // namespace
 
-int main() {
+void writeBytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& data) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+void writeText(const std::filesystem::path& path, std::string_view text) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+int dumpFixtures(const std::filesystem::path& dir) {
+    std::filesystem::create_directories(dir);
+    const std::array<std::uint8_t, 16> sid = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE, 0x0F
+    };
+    auto dumpMsg = [&](const char* name, WaveSignalMessage msg) {
+        std::vector<std::uint8_t> bin;
+        std::string err;
+        if (!encodeWaveSignalBinary(msg, bin, &err)) {
+            std::cerr << name << " encode failed: " << err << "\n";
+            return;
+        }
+        writeBytes(dir / (std::string(name) + ".bin"), bin);
+        const std::string uris = encodeWaveUri(msg, &err) + "\n" + encodeWaveHttpsFragmentUri(msg, "https://beygram.beykus.fun/", &err) + "\n";
+        writeText(dir / (std::string(name) + ".uri.txt"), uris);
+    };
+    WaveSignalMessage offer;
+    offer.version = 1; offer.type = WaveSignalType::Offer; offer.sid = sid;
+    offer.iat = 1763000000; offer.exp = 1763000120;
+    offer.caps = kWaveCapOpus48kStereo | kWaveCapDtlsSrtp | kWaveCapExternalCallFallback;
+    offer.nonce = 1;
+    offer.signal.iceUfrag = "bgwHost1";
+    offer.signal.icePwd = "hostIceSecretPwd12345678";
+    offer.signal.dtlsFingerprintAlg = "sha-256";
+    offer.signal.dtlsFingerprint = "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+    offer.signal.setupRole = WaveDtlsSetupRole::Actpass;
+    offer.signal.candidates = {
+        {"1", 1, WaveIceProtocol::Udp, 2122260223u, "192.0.2.10", 50000, WaveIceCandidateType::Host, WaveIceTcpType::None},
+        {"2", 1, WaveIceProtocol::Udp, 2122194687u, "2001:db8::10", 50001, WaveIceCandidateType::Host, WaveIceTcpType::None},
+        {"3", 1, WaveIceProtocol::Udp, 1686052607u, "a1b2c3d4-0001.local", 50002, WaveIceCandidateType::Host, WaveIceTcpType::None}
+    };
+    dumpMsg("offer", offer);
+    WaveSignalMessage answer = offer;
+    answer.type = WaveSignalType::Answer; answer.nonce = 2;
+    answer.signal.iceUfrag = "bgwList1";
+    answer.signal.icePwd = "listIceSecretPwd12345678";
+    answer.signal.setupRole = WaveDtlsSetupRole::Active;
+    answer.signal.candidates = {{"1", 1, WaveIceProtocol::Udp, 2122260223u, "198.51.100.20", 51000, WaveIceCandidateType::Srflx, WaveIceTcpType::None}};
+    dumpMsg("answer", answer);
+    WaveSignalMessage cancel;
+    cancel.version = 1; cancel.type = WaveSignalType::Cancel; cancel.sid = sid;
+    cancel.iat = 1763000010; cancel.exp = 1763000070; cancel.caps = 0; cancel.nonce = 3;
+    dumpMsg("cancel", cancel);
+    WaveSignalMessage endMsg = cancel;
+    endMsg.type = WaveSignalType::End; endMsg.iat = 1763000090; endMsg.exp = 1763000150; endMsg.nonce = 4;
+    dumpMsg("end", endMsg);
+    std::vector<std::uint8_t> offerBin;
+    (void)encodeWaveSignalBinary(offer, offerBin, nullptr);
+    { auto b = offerBin; b[0] = 'X'; writeBytes(dir / "invalid_bad_magic.bin", b); }
+    { auto b = offerBin; b[2] = 99; writeBytes(dir / "invalid_unknown_version.bin", b); }
+    { auto b = offerBin; b.resize(12); writeBytes(dir / "invalid_truncated.bin", b); }
+    { auto b = offerBin; b.push_back(0xAA); writeBytes(dir / "invalid_trailing_bytes.bin", b); }
+    { auto b = offerBin; std::fill(b.begin() + 4, b.begin() + 20, std::uint8_t{0}); writeBytes(dir / "invalid_zero_sid.bin", b); }
+    std::cout << "Dumped BG Wave v1 golden fixtures to " << dir.string() << "\n";
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "--dump-fixtures") {
+        return dumpFixtures(argv[2]);
+    }
     std::cout << "=== BG Wave Spike Measurements ===\n";
 
     // 1. Signaling payload sizes across real ICE scenarios

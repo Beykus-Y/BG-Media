@@ -13,6 +13,9 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -430,4 +433,118 @@ TEST_CASE(wave.mix_engine_loopback_end_to_end) {
     engine.reclaimRetired();
     host->stop(true, 1005);
     CHECK((host->state()) == (WaveSessionState::Ended));
+}
+
+TEST_CASE(wave.golden_fixtures_v1) {
+    using namespace bgmedia::wave;
+    const std::filesystem::path dir =
+        std::filesystem::path(BGMEDIA_TEST_FIXTURE_DIR) / "wave_v1";
+    auto readBin = [&](const char* name) {
+        std::ifstream f(dir / name, std::ios::binary);
+        CHECK(f.good());
+        return std::vector<std::uint8_t>((std::istreambuf_iterator<char>(f)),
+                                         std::istreambuf_iterator<char>());
+    };
+    auto readTxt = [&](const char* name) {
+        std::ifstream f(dir / name, std::ios::binary);
+        CHECK(f.good());
+        std::ostringstream oss;
+        oss << f.rdbuf();
+        return oss.str();
+    };
+
+    const char* validNames[] = {"offer", "answer", "cancel", "end"};
+    for (const char* name : validNames) {
+        const std::string binName = std::string(name) + ".bin";
+        const std::string uriName = std::string(name) + ".uri.txt";
+        const std::vector<std::uint8_t> expectedBin = readBin(binName.c_str());
+        WaveSignalMessage msg;
+        std::string err;
+        CHECK(decodeWaveSignalBinary(expectedBin, msg, &err));
+        std::vector<std::uint8_t> reencoded;
+        CHECK(encodeWaveSignalBinary(msg, reencoded, &err));
+        CHECK(reencoded == expectedBin);
+
+        std::istringstream uris(readTxt(uriName.c_str()));
+        std::string bgUri, httpsUri;
+        CHECK(static_cast<bool>(std::getline(uris, bgUri)));
+        CHECK(static_cast<bool>(std::getline(uris, httpsUri)));
+        if (!bgUri.empty() && bgUri.back() == '\r') bgUri.pop_back();
+        if (!httpsUri.empty() && httpsUri.back() == '\r') httpsUri.pop_back();
+        CHECK(encodeWaveUri(msg, &err) == bgUri);
+        CHECK(encodeWaveHttpsFragmentUri(msg, "https://beygram.beykus.fun/", &err) == httpsUri);
+        WaveSignalMessage fromBg, fromHttps;
+        CHECK(decodeWaveUri(bgUri, fromBg, &err));
+        CHECK(decodeWaveUri(httpsUri, fromHttps, &err));
+        CHECK(fromBg.sid == msg.sid);
+        CHECK(fromHttps.nonce == msg.nonce);
+    }
+
+    const char* invalidNames[] = {
+        "invalid_bad_magic.bin",
+        "invalid_unknown_version.bin",
+        "invalid_truncated.bin",
+        "invalid_trailing_bytes.bin",
+        "invalid_zero_sid.bin"
+    };
+    for (const char* badName : invalidNames) {
+        const std::vector<std::uint8_t> badBytes = readBin(badName);
+        WaveSignalMessage badMsg;
+        std::string err;
+        CHECK(!decodeWaveSignalBinary(badBytes, badMsg, &err));
+    }
+
+    const std::string sdp = readTxt("sanitized_webrtc_offer.sdp");
+    WaveSdpSignal sdpSig;
+    std::string err;
+    CHECK(parseSdpToWaveSignal(sdp, sdpSig, &err));
+    CHECK(sdpSig.candidates.size() == 4u);
+    CHECK(sdpSig.candidates[3].type == WaveIceCandidateType::Srflx);
+}
+
+TEST_CASE(wave.ttl_and_replay_guard) {
+    using namespace bgmedia::wave;
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    WavePipelineConfig hCfg; hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+    WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    WaveSignalMessage offer, answer;
+    WavePipelineCallbacks hCb;
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) offer = m;
+    };
+    host.setCallbacks(std::move(hCb));
+    WavePipelineCallbacks lCb;
+    lCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Answer) answer = m;
+    };
+    listener.setCallbacks(std::move(lCb));
+
+    CHECK(host.startOffer(1000, 60));
+    // Expired offer must be rejected
+    CHECK(!listener.acceptOffer(offer, 1061));
+    // Valid offer within TTL succeeds
+    CHECK(listener.acceptOffer(offer, 1010));
+    CHECK(host.acceptAnswer(answer, 1011));
+
+    // Replay of End with stale nonce <= lastRemoteNonce (answer.nonce == 1) must be rejected
+    WaveSignalMessage staleEnd;
+    staleEnd.version = 1;
+    staleEnd.type = WaveSignalType::End;
+    staleEnd.sid = offer.sid;
+    staleEnd.iat = 1012;
+    staleEnd.exp = 1072;
+    staleEnd.nonce = answer.nonce;
+    CHECK(!host.handleRemoteSignal(staleEnd, 1012));
+    CHECK(host.state() == WaveSessionState::LiveP2P);
+
+    // Fresh nonce succeeds
+    staleEnd.nonce = answer.nonce + 1;
+    CHECK(host.handleRemoteSignal(staleEnd, 1012));
+    CHECK(host.state() == WaveSessionState::Ended);
 }
