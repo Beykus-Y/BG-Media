@@ -1,20 +1,4 @@
-find_package(Opus QUIET)
-if(NOT Opus_FOUND)
-    find_path(OPUS_INCLUDE_DIR opus/opus.h)
-    find_library(OPUS_LIBRARY NAMES opus)
-    if(OPUS_INCLUDE_DIR AND OPUS_LIBRARY)
-        add_library(Opus::opus UNKNOWN IMPORTED)
-        set_target_properties(Opus::opus PROPERTIES
-            IMPORTED_LOCATION "${OPUS_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${OPUS_INCLUDE_DIR}"
-        )
-        set(Opus_FOUND TRUE)
-    endif()
-endif()
-
-if(NOT Opus_FOUND)
-    message(FATAL_ERROR "BGMEDIA_BUILD_WAVE_OPUS=ON but libopus was not found.")
-endif()
+include(${CMAKE_SOURCE_DIR}/cmake/FindOrFetchOpus.cmake)
 
 add_library(bgmedia_wave_opus STATIC
     src/OpusWaveCodec.cpp

@@ -1,6 +1,10 @@
 #include "bgmedia/wave/OpusWaveCodec.hpp"
 
+#if __has_include(<opus/opus.h>)
 #include <opus/opus.h>
+#else
+#include <opus.h>
+#endif
 
 #include <algorithm>
 

@@ -98,3 +98,15 @@ add_executable(bgmedia_wave_spike
 )
 target_link_libraries(bgmedia_wave_spike PRIVATE bgmedia_core)
 target_compile_options(bgmedia_wave_spike PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+if(BGMEDIA_BUILD_WAVE_WEBRTC)
+    add_executable(bgmedia_wave_p2p_peer
+        wave_p2p_peer/main.cpp
+    )
+    target_link_libraries(bgmedia_wave_p2p_peer PRIVATE bgmedia_wave_webrtc)
+    if(BGMEDIA_BUILD_WAVE_OPUS)
+        target_link_libraries(bgmedia_wave_p2p_peer PRIVATE bgmedia_wave_opus)
+        target_compile_definitions(bgmedia_wave_p2p_peer PRIVATE BGMEDIA_HAVE_WAVE_OPUS=1)
+    endif()
+    target_compile_options(bgmedia_wave_p2p_peer PRIVATE ${BGMEDIA_WARNING_FLAGS})
+endif()
