@@ -199,19 +199,19 @@ bool WaveAudioPipeline::ensureResetCompletedForNewSession() {
     if (!pendingRingReset_.load(std::memory_order_acquire) &&
         !audioPausedForReset_.load(std::memory_order_acquire)) {
         requestOrPerformReset();
-    } else {
-        for (int i = 0; i < 64; ++i) {
-            if (audioInFlight_.load(std::memory_order_acquire) == 0) {
-                break;
-            }
-            std::this_thread::yield();
-        }
+        return !pendingRingReset_.load(std::memory_order_acquire) &&
+               !audioPausedForReset_.load(std::memory_order_acquire);
+    }
+    for (int i = 0; i < 64; ++i) {
         if (audioInFlight_.load(std::memory_order_acquire) == 0) {
-            std::lock_guard<std::mutex> pLock(processMutex_);
-            if (audioInFlight_.load(std::memory_order_acquire) == 0) {
+            std::unique_lock<std::mutex> pLock(processMutex_, std::try_to_lock);
+            if (pLock.owns_lock() &&
+                audioInFlight_.load(std::memory_order_acquire) == 0) {
                 performResetUnderProcessLock();
+                return true;
             }
         }
+        std::this_thread::yield();
     }
     return !pendingRingReset_.load(std::memory_order_acquire) &&
            !audioPausedForReset_.load(std::memory_order_acquire);
@@ -685,13 +685,18 @@ std::size_t WaveAudioPipeline::pullListenerPcm(
 }
 
 void WaveAudioPipeline::process(double currentTimeSeconds) {
+    std::shared_ptr<IWaveTransport> tx;
+    {
+        std::lock_guard<std::mutex> cLock(controlMutex_);
+        tx = transport_;
+    }
+    if (tx) {
+        tx->poll(currentTimeSeconds);
+    }
     std::lock_guard<std::mutex> pLock(processMutex_);
     if (pendingRingReset_.load(std::memory_order_acquire) &&
         audioInFlight_.load(std::memory_order_acquire) == 0) {
         performResetUnderProcessLock();
-    }
-    if (transport_) {
-        transport_->poll(currentTimeSeconds);
     }
     if (config_.role == WaveRole::Host) {
         processHostStep(currentTimeSeconds);

@@ -787,3 +787,56 @@ TEST_CASE(wave.deferred_reset_and_reconnect_no_process) {
     host.process(1.0);
     CHECK(host.stats().packetsSent >= 1u);
 }
+
+TEST_CASE(wave.reentrant_stop_and_restart_from_poll_callback) {
+    using namespace bgmedia::wave;
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    WavePipelineConfig hCfg; hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+    WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    WaveSignalMessage offer, answer;
+    std::vector<WaveSignalMessage> offers;
+    bool didRestart = false;
+    bool restartOk = false;
+
+    WavePipelineCallbacks hCb;
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) {
+            offer = m;
+            offers.push_back(m);
+        }
+    };
+    hCb.onStateChanged = [&](WaveSessionState st, const std::string&) {
+        if (st == WaveSessionState::LiveP2P && !didRestart) {
+            didRestart = true;
+            // Reentrant stop + immediate reconnect from inside transport->poll()
+            // during process() must neither deadlock on processMutex_ nor hang.
+            host.stop(false, 1010);
+            restartOk = host.reconnect(1020);
+        }
+    };
+    host.setCallbacks(std::move(hCb));
+
+    WavePipelineCallbacks lCb;
+    lCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Answer) answer = m;
+    };
+    listener.setCallbacks(std::move(lCb));
+
+    CHECK(host.startOffer(1000));
+    CHECK(listener.acceptOffer(offer, 1001));
+    CHECK(host.acceptAnswer(answer, 1002));
+
+    // Triggers transport->poll() -> onConnected -> onStateChanged(LiveP2P).
+    host.process(0.1);
+
+    CHECK(didRestart);
+    CHECK(restartOk);
+    CHECK(offers.size() == 2u);
+    CHECK(host.state() == WaveSessionState::AwaitingAnswer);
+}
