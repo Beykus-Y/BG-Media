@@ -662,3 +662,53 @@ TEST_CASE(wave.stop_reset_concurrent_stress) {
     audioThread.join();
     workerThread.join();
 }
+
+TEST_CASE(wave.reentrant_callbacks_no_deadlock) {
+    using namespace bgmedia::wave;
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    WavePipelineConfig hCfg; hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+    WavePipelineConfig lCfg; lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    WaveSignalMessage offer;
+    int stateCallbacks = 0;
+    int signalCallbacks = 0;
+    WavePipelineCallbacks hCb;
+    hCb.onStateChanged = [&](WaveSessionState st, const std::string&) {
+        ++stateCallbacks;
+        (void)host.sessionId();
+        (void)host.stats();
+        if (st == WaveSessionState::AwaitingAnswer) {
+            // Reentrant stop() inside onStateChanged must not deadlock!
+            host.stop(false, 1005);
+        }
+    };
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        ++signalCallbacks;
+        (void)host.sessionId();
+        (void)host.stats();
+        if (m.type == WaveSignalType::Offer) {
+            offer = m;
+        }
+    };
+    host.setCallbacks(std::move(hCb));
+
+    CHECK(host.startOffer(1000));
+    CHECK(stateCallbacks >= 2);
+    CHECK(signalCallbacks >= 1);
+    CHECK(host.state() == WaveSessionState::Ended);
+
+    // Also verify listener onOutboundSignal -> sessionId() / stop() reentrancy
+    WavePipelineCallbacks lCb;
+    lCb.onOutboundSignal = [&](const WaveSignalMessage&) {
+        (void)listener.sessionId();
+        listener.stop(false, 1006);
+    };
+    listener.setCallbacks(std::move(lCb));
+    CHECK(listener.acceptOffer(offer, 1001));
+    CHECK(listener.state() == WaveSessionState::Ended);
+}

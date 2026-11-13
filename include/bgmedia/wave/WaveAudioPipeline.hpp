@@ -126,7 +126,9 @@ private:
     void wireTransportCallbacks();
     void processHostStep(double currentTimeSeconds);
     void processListenerStep(double currentTimeSeconds);
-    void quiesceAudioAndResetState();
+    void requestOrPerformReset();
+    void performResetUnderProcessLock();
+    [[nodiscard]] WavePipelineCallbacks snapshotCallbacks() const;
     void publishStatsSnapshot();
 
     WavePipelineConfig config_;
@@ -136,8 +138,11 @@ private:
     WavePipelineCallbacks callbacks_;
 
     mutable std::mutex controlMutex_;
+    mutable std::mutex callbacksMutex_;
+    mutable std::mutex sidMutex_;
     mutable std::mutex processMutex_;
     mutable std::mutex statsMutex_;
+    std::atomic<bool> pendingRingReset_{false};
     WaveStats publishedStats_{};
     std::atomic<bool> audioPausedForReset_{false};
     std::atomic<std::uint32_t> audioInFlight_{0};
