@@ -13,6 +13,7 @@ project(BGMedia
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
+option(BGMEDIA_BUILD_WAVE_OPUS      "Build the optional libopus BG Wave codec adapter" OFF)
 option(BGMEDIA_BUILD_DESKTOP        "Build the SDL3 desktop test application" ON)
 option(BGMEDIA_FETCH_SDL3           "Download SDL3 with FetchContent when not installed" ON)
 option(BGMEDIA_WARNINGS_AS_ERRORS   "Treat compiler warnings as errors" OFF)
@@ -77,6 +78,13 @@ add_library(bgmedia_core STATIC
     src/mix/MixEngine.cpp
     src/mix/MixSession.cpp
     src/mix/MixSync.cpp
+    src/wave/WaveRingBuffer.cpp
+    src/wave/WaveResampler.cpp
+    src/wave/WaveCodec.cpp
+    src/wave/WaveJitterBuffer.cpp
+    src/wave/WaveSignaling.cpp
+    src/wave/WaveTransport.cpp
+    src/wave/WaveAudioPipeline.cpp
 )
 add_library(BGMedia::Core ALIAS bgmedia_core)
 target_include_directories(bgmedia_core
@@ -94,6 +102,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(bgmedia_core PUBLIC Threads::Threads)
 if(MSVC)
     target_compile_definitions(bgmedia_core PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(WIN32)
+    target_link_libraries(bgmedia_core PUBLIC bcrypt)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -158,6 +169,10 @@ target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
 # ---------------------------------------------------------------------------
 if(BGMEDIA_BUILD_MINIAUDIO)
     add_subdirectory(adapters/miniaudio)
+endif()
+
+if(BGMEDIA_BUILD_WAVE_OPUS)
+    add_subdirectory(adapters/wave_opus)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 // One engine owns both decks and the single output clock. Hosts pump render()
 // from one audio callback and call the control methods from the UI thread.
 
+#include "bgmedia/audio/IPcmOutputTap.hpp"
 #include "bgmedia/mix/ITimeStretchProcessor.hpp"
 #include "bgmedia/mix/MixTypes.hpp"
 #include "bgmedia/mix/PcmTrack.hpp"
@@ -75,6 +76,7 @@ public:
     void setOutputLatency(double seconds);
     void setTimeStretch(std::shared_ptr<const ITimeStretchProcessor> processor);
     [[nodiscard]] const ITimeStretchProcessor& timeStretch() const noexcept;
+    void setPcmTap(std::shared_ptr<IPcmOutputTap> tap);
 
     // Audio callback. `output` is interleaved stereo float.
     void render(float* output, std::size_t frames) noexcept;
@@ -205,7 +207,12 @@ private:
     void retireTrack(DeckId deck, std::shared_ptr<const PcmTrack> owner);
     void retireProcessor(
         std::shared_ptr<const ITimeStretchProcessor> owner);
+    struct RetiredTap {
+        std::shared_ptr<IPcmOutputTap> owner;
+        std::uint64_t epoch = 0;
+    };
     void retireStream(std::shared_ptr<ITimeStretchStream> owner);
+    void retireTap(std::shared_ptr<IPcmOutputTap> owner);
     void rebuildStretchStreams();
     void resetStretchStream(DeckId deck, double positionFrames) noexcept;
 
@@ -215,6 +222,8 @@ private:
     std::atomic<const ITimeStretchProcessor*> stretch_{nullptr};
     std::shared_ptr<ITimeStretchStream> streamOwned_[2];
     std::atomic<ITimeStretchStream*> stream_[2]{nullptr, nullptr};
+    std::shared_ptr<IPcmOutputTap> pcmTapOwned_;
+    std::atomic<IPcmOutputTap*> pcmTap_{nullptr};
 
     std::atomic<int> master_{0};
     std::atomic<int> phase_{static_cast<int>(Phase::Idle)};
@@ -231,6 +240,7 @@ private:
     std::vector<RetiredTrack> retiredTracks_[2];
     std::vector<RetiredProcessor> retiredProcessors_;
     std::vector<RetiredStream> retiredStreams_;
+    std::vector<RetiredTap> retiredTaps_;
 
     // Double-buffered plan handoff. The control thread writes only the slot
     // the audio thread is not reading; planSlot_ names the published slot and
