@@ -946,6 +946,8 @@ std::string formatWaveSignalToSdp(const WaveSdpSignal& signal, bool isOffer) {
         << "t=0 0\r\n"
         << "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
         << "c=IN IP4 0.0.0.0\r\n"
+        << "a=mid:audio\r\n"
+        << "a=rtcp-mux\r\n"
         << "a=rtpmap:111 opus/48000/2\r\n"
         << "a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1\r\n"
         << (isOffer ? "a=sendonly\r\n" : "a=recvonly\r\n")

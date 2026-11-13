@@ -26,6 +26,7 @@ add_executable(bgmedia_tests
     test_mix.cpp
     test_ui.cpp
     test_wave.cpp
+    test_wave_real.cpp
 )
 target_link_libraries(bgmedia_tests PRIVATE
     bgmedia_core
@@ -35,6 +36,19 @@ target_link_libraries(bgmedia_tests PRIVATE
 if(TARGET bgmedia_miniaudio)
     target_link_libraries(bgmedia_tests PRIVATE bgmedia_miniaudio)
     target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_MINIAUDIO=1)
+endif()
+if(TARGET bgmedia_wave_opus)
+    target_link_libraries(bgmedia_tests PRIVATE bgmedia_wave_opus)
+    target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_WAVE_OPUS=1)
+endif()
+if(TARGET bgmedia_wave_webrtc)
+    target_link_libraries(bgmedia_tests PRIVATE bgmedia_wave_webrtc)
+    target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_WAVE_WEBRTC=1)
+    if(TARGET bgmedia_wave_p2p_peer)
+        add_dependencies(bgmedia_tests bgmedia_wave_p2p_peer)
+        target_compile_definitions(bgmedia_tests PRIVATE
+            BGMEDIA_WAVE_P2P_PEER_EXE="$<TARGET_FILE:bgmedia_wave_p2p_peer>")
+    endif()
 endif()
 target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3 ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/apps/desktop)
 target_compile_definitions(bgmedia_tests PRIVATE
@@ -53,3 +67,11 @@ foreach(test_name audio analysis cache sync choreography motion timeline warp sy
         LABELS "unit"
     )
 endforeach()
+
+if(TARGET bgmedia_wave_opus OR TARGET bgmedia_wave_webrtc)
+    add_test(NAME bgmedia.wave_real COMMAND bgmedia_tests wave_real.)
+    set_tests_properties(bgmedia.wave_real PROPERTIES
+        TIMEOUT 120
+        LABELS "integration"
+    )
+endif()

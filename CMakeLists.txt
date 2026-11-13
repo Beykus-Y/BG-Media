@@ -14,6 +14,8 @@ option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
 option(BGMEDIA_BUILD_WAVE_OPUS      "Build the optional libopus BG Wave codec adapter" OFF)
+option(BGMEDIA_BUILD_WAVE_WEBRTC    "Build the optional libdatachannel BG Wave P2P transport adapter" OFF)
+option(BGMEDIA_FETCH_WAVE_DEPS      "Download libopus / libdatachannel with FetchContent when not installed" ON)
 option(BGMEDIA_BUILD_DESKTOP        "Build the SDL3 desktop test application" ON)
 option(BGMEDIA_FETCH_SDL3           "Download SDL3 with FetchContent when not installed" ON)
 option(BGMEDIA_WARNINGS_AS_ERRORS   "Treat compiler warnings as errors" OFF)
@@ -173,6 +175,10 @@ endif()
 
 if(BGMEDIA_BUILD_WAVE_OPUS)
     add_subdirectory(adapters/wave_opus)
+endif()
+
+if(BGMEDIA_BUILD_WAVE_WEBRTC)
+    add_subdirectory(adapters/wave_webrtc)
 endif()
 
 # ---------------------------------------------------------------------------

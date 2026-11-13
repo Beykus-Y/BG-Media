@@ -85,4 +85,29 @@ Measured on Windows x64 Release (`core-only` preset):
 - **SDP Subset Boundary:** `parseSdpToWaveSignal` / `formatWaveSignalToSdp` operates on a compact ICE/DTLS subset (`ice-ufrag`, `ice-pwd`, `fingerprint`, `setup`, `candidate`) and omits unrelated SDP attributes (`mid`, `ice-options`, `rtcp-mux`, `raddr`/`rport`, `msid`, etc.). It does **not** claim general SDP equivalence until verified on a live WebRTC peer connection.
 - **Canonical Golden Fixtures:** Byte-level valid (`offer`, `answer`, `cancel`, `end`) and negative (`invalid_*`) fixtures plus a sanitized WebRTC SDP fixture are published in `tests/fixtures/wave_v1/` and verified by `bgmedia.wave`.
 - **Threading Contract:** `onPcmRendered()` / `pullListenerPcm()` are lock-free and allocation-free on the real-time audio thread; `IWaveTransport::onMediaPacket` is thread-safe and enqueues into a bounded (`256`-packet) `inboundQueue_` drained by `process()`; user callbacks are always dispatched with `controlMutex_` unlocked and guarded by `sessionGen_`.
-- **Transport & Codec Status:** `SimulatedWaveTransport` is a deterministic loopback/network simulator for core pipeline and CI verification?**not** proof of real cross-device P2P NAT traversal. A concrete ICE/DTLS-SRTP transport adapter (e.g. `libdatachannel`) and `BGMEDIA_BUILD_WAVE_OPUS=ON` verification against `libopus` are subsequent E0/E2 adapter milestones.
+- **Transport & Codec Status:** `SimulatedWaveTransport` is a deterministic loopback/network simulator for core pipeline and CI verification—**not** proof of real cross-device P2P NAT traversal. The real ICE/DTLS-SRTP transport (`adapters/wave_webrtc`) and `libopus` (`adapters/wave_opus`) are implemented as optional adapters.
+
+## 7. Real WebRTC P2P Transport (`adapters/wave_webrtc`) & BeyGram JNI Contract
+
+- **Build Options:**
+  - `BGMEDIA_BUILD_WAVE_OPUS=ON` (fetches/uses `libopus` 1.5.2, BSD-3-Clause)
+  - `BGMEDIA_BUILD_WAVE_WEBRTC=ON` (fetches/uses `libdatachannel` v0.22.5 + `libjuice` + `libsrtp` + OpenSSL, MPL-2.0)
+  - `BGMEDIA_FETCH_WAVE_DEPS=ON` (enabled by default when adapters are turned on)
+  - `bgmedia_core` remains pure C++20 with `BGMEDIA_BUILD_WAVE_OPUS=OFF` and `BGMEDIA_BUILD_WAVE_WEBRTC=OFF`.
+- **Transport Mechanism (DTLS-SRTP Media Track, NOT DataChannel):**
+  - `WebRtcWaveTransport` uses a WebRTC Audio Media Track (`m=audio 9 UDP/TLS/RTP/SAVPF 111`, `opus/48000/2`, `a=mid:audio`, `a=rtcp-mux`) with `rtc::OpusRtpPacketizer` + `rtc::RtcpSrReporter` on the Host and `rtc::RtcpReceivingSession` on the Listener.
+  - DTLS-SRTP avoids SCTP head-of-line blocking, carries native 16-bit RTP sequence numbers (extended to 32-bit with wraparound) and 48 kHz RTP timestamps directly into `WaveJitterBuffer`, and provides RTCP RTT feedback (`onBitrateFeedback`) to adapt Opus bitrate (96–160 kbps).
+- **Security & Endpoint Identity:**
+  - All media is encrypted end-to-end with DTLS-SRTP; unencrypted UDP is never used.
+  - `disableFingerprintVerification` is kept `false` in `libdatachannel`, and `WebRtcWaveTransport` additionally enforces an exact SHA-256 `remoteFingerprint()` match against the signaling `dtlsFingerprint` when `PeerConnection::State::Connected` is reached (closing and failing on mismatch).
+- **Wire Codec v1 Compatibility:**
+  - Canonical binary wire codec v1 (`offer.bin`, `answer.bin`, `cancel.bin`, `end.bin`) and `https://beygram.beykus.fun/#bgwave-v1.<base64url(payload)>` URIs are unchanged and remain backwards-compatible.
+  - `formatWaveSignalToSdp()` emits `a=mid:audio` and `a=rtcp-mux` (constant for v1 audio track). `WebRtcWaveTransport` caps local gathered candidates to `kWaveMaxCandidates` (32) before encoding.
+- **NAT / CGNAT Limitations (No TURN):**
+  - `libjuice` handles IPv4, IPv6, STUN (`srflx`), and cone/restricted NAT traversal. Because BG Media does not ship or host a TURN relay server, symmetric NAT / strict CGNAT pairs that disallow direct UDP hole-punching will transition to `P2PFailed`, at which point BeyGram should invoke its Telegram Call fallback (`IWaveExternalCallFallback`).
+- **JNI Integration Notes for BeyGram (Claude):**
+  1. Instantiate `OpusWaveCodec(kWaveDefaultBitrateBps)` and `WebRtcWaveTransport(WebRtcTransportConfig{role, stunServers, ...})`, pass both to `WaveAudioPipeline`.
+  2. Call `startOffer(nowUnix)` on Host, send `encodeWaveHttpsFragmentUri(msg)` via TDLib hidden link; on Listener call `decodeWaveUri(uri)` -> `acceptOffer(offer)` -> send Answer URI back -> Host calls `acceptAnswer(answer)`.
+  3. Drive `pipeline.process(nowSec)` periodically (~10–20 ms) off the audio thread; feed captured/mixed PCM via `onPcmRendered()` and read playback PCM via `pullListenerPcm()`.
+  4. On `WaveSessionState::P2PFailed`, trigger Telegram Group/Private Call fallback via `IWaveExternalCallFallback` without re-creating `WaveAudioPipeline`.
+  5. On Android, package `libcrypto`/`libssl` (OpenSSL) or configure `FindOrFetchLibDataChannel` for the Android NDK toolchain (`CMAKE_ANDROID_ARCH_ABI`).
