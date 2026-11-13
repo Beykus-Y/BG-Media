@@ -92,3 +92,9 @@ if(BGMEDIA_BUILD_MINIAUDIO)
         target_link_libraries(bgmedia_motion_diag PRIVATE shell32)
     endif()
 endif()
+
+add_executable(bgmedia_wave_spike
+    wave_spike/main.cpp
+)
+target_link_libraries(bgmedia_wave_spike PRIVATE bgmedia_core)
+target_compile_options(bgmedia_wave_spike PRIVATE ${BGMEDIA_WARNING_FLAGS})

@@ -144,6 +144,15 @@ void MixEngine::retireStream(std::shared_ptr<ITimeStretchStream> owner) {
     retiredStreams_.push_back(RetiredStream{std::move(owner), epoch});
 }
 
+void MixEngine::retireTap(std::shared_ptr<IPcmOutputTap> owner) {
+    if (!owner) {
+        return;
+    }
+    const std::uint64_t epoch =
+        renderEpoch_.load(std::memory_order_acquire) + 1;
+    retiredTaps_.push_back(RetiredTap{std::move(owner), epoch});
+}
+
 void MixEngine::rebuildStretchStreams() {
     for (int i = 0; i < 2; ++i) {
         std::shared_ptr<ITimeStretchStream> previous =
@@ -192,6 +201,12 @@ void MixEngine::reclaimRetired() {
                            return entry.epoch <= epoch;
                        }),
         retiredStreams_.end());
+    retiredTaps_.erase(
+        std::remove_if(retiredTaps_.begin(), retiredTaps_.end(),
+                       [epoch](const RetiredTap& entry) {
+                           return entry.epoch <= epoch;
+                       }),
+        retiredTaps_.end());
 }
 
 
@@ -317,6 +332,14 @@ void MixEngine::setTimeStretch(
     stretch_.store(stretchOwned_.get(), std::memory_order_release);
     rebuildStretchStreams();
     retireProcessor(std::move(previous));
+    reclaimRetired();
+}
+
+void MixEngine::setPcmTap(std::shared_ptr<IPcmOutputTap> tap) {
+    std::shared_ptr<IPcmOutputTap> previous = std::move(pcmTapOwned_);
+    pcmTapOwned_ = std::move(tap);
+    pcmTap_.store(pcmTapOwned_.get(), std::memory_order_release);
+    retireTap(std::move(previous));
     reclaimRetired();
 }
 
@@ -764,6 +787,9 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
     renderEpoch_.fetch_add(1, std::memory_order_acq_rel);
     std::memset(output, 0, frames * 2 * sizeof(float));
     if (frames == 0) {
+        if (IPcmOutputTap* tap = pcmTap_.load(std::memory_order_acquire)) {
+            tap->onPcmRendered(output, frames, outputSampleRate_);
+        }
         publishSnapshot();
         return;
     }
@@ -1330,6 +1356,9 @@ void MixEngine::render(float* output, std::size_t frames) noexcept {
         }
     }
 
+    if (IPcmOutputTap* tap = pcmTap_.load(std::memory_order_acquire)) {
+        tap->onPcmRendered(output, frames, outputSampleRate_);
+    }
     publishSnapshot();
 }
 
