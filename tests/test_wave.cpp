@@ -292,6 +292,248 @@ TEST_CASE(wave.signaling_v1_codec_and_uris) {
     CHECK(!validateWaveSignal(msg, 1763000200, &err)); // expired
 }
 
+TEST_CASE(wave.signaling_field_injection_and_sdp_hardening) {
+    using namespace bgmedia::wave;
+
+    auto makeValidOffer = []() {
+        WaveSignalMessage m;
+        m.version = 1;
+        m.type = WaveSignalType::Offer;
+        m.sid = generateWaveSessionId();
+        m.iat = 1763000000;
+        m.exp = 1763000120;
+        m.nonce = 1;
+        m.signal.iceUfrag = "AbCd12";
+        m.signal.icePwd = "secretPwd12345678";
+        m.signal.dtlsFingerprintAlg = "sha-256";
+        m.signal.dtlsFingerprint =
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+        m.signal.setupRole = WaveDtlsSetupRole::Actpass;
+        m.signal.candidates = {
+            {"1", 1, WaveIceProtocol::Udp, 2122260223u, "192.0.2.10", 50000,
+             WaveIceCandidateType::Host, WaveIceTcpType::None}
+        };
+        return m;
+    };
+
+    std::string err;
+    std::vector<std::uint8_t> bin;
+
+    // 1. Reject control characters and whitespace (SDP injection) across fields
+    {
+        auto m = makeValidOffer();
+        m.signal.iceUfrag = "u\r\na=evil:1";
+        CHECK(!validateWaveSignal(m, 0, &err));
+        CHECK(!encodeWaveSignalBinary(m, bin, &err));
+        CHECK(formatWaveSignalToSdp(m.signal, true).empty());
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.iceUfrag = "u space";
+        CHECK(!validateWaveSignal(m, 0, &err));
+        CHECK(formatWaveSignalToSdp(m.signal, true).empty());
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.icePwd = std::string("pwd\0bad", 7);
+        CHECK(!validateWaveSignal(m, 0, &err));
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.icePwd = "pwd\x7f";
+        CHECK(!validateWaveSignal(m, 0, &err));
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.dtlsFingerprintAlg = "sha-256\n";
+        CHECK(!validateWaveSignal(m, 0, &err));
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.dtlsFingerprint = "AA BB CC";
+        CHECK(!validateWaveSignal(m, 0, &err));
+        CHECK(formatWaveSignalToSdp(m.signal, true).empty());
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.candidates[0].foundation = "1\r\n";
+        CHECK(!validateWaveSignal(m, 0, &err));
+        CHECK(formatWaveSignalToSdp(m.signal, true).empty());
+    }
+    {
+        auto m = makeValidOffer();
+        m.signal.candidates[0].address = "192.0.2.10 evil";
+        CHECK(!validateWaveSignal(m, 0, &err));
+        CHECK(formatWaveSignalToSdp(m.signal, true).empty());
+    }
+
+    // 2. Offer and Answer require non-empty ICE/DTLS fields; Cancel/End allow empty
+    {
+        auto m = makeValidOffer();
+        m.signal.dtlsFingerprint.clear();
+        CHECK(!validateWaveSignal(m, 0, &err));
+        m.type = WaveSignalType::Answer;
+        CHECK(!validateWaveSignal(m, 0, &err));
+        m.type = WaveSignalType::Cancel;
+        m.signal.iceUfrag.clear();
+        m.signal.icePwd.clear();
+        m.signal.candidates.clear();
+        CHECK(validateWaveSignal(m, 0, &err));
+        m.type = WaveSignalType::End;
+        CHECK(validateWaveSignal(m, 0, &err));
+    }
+
+    // 3. Non-canonical base64url trailing bits must be rejected
+    {
+        std::vector<std::uint8_t> decodedBytes;
+        CHECK(base64UrlDecode("AA", decodedBytes, &err));
+        CHECK(decodedBytes.size() == 1u && decodedBytes[0] == 0u);
+        CHECK(!base64UrlDecode("AB", decodedBytes, &err)); // rem==2, low 4 bits non-zero
+
+        CHECK(base64UrlDecode("AAA", decodedBytes, &err));
+        CHECK(decodedBytes.size() == 2u);
+        CHECK(!base64UrlDecode("AAB", decodedBytes, &err)); // rem==3, low 2 bits non-zero
+    }
+
+    // 4. encodeWaveHttpsFragmentUri enforces non-empty https:// baseUrl and URI length bound
+    {
+        const auto m = makeValidOffer();
+        CHECK(encodeWaveHttpsFragmentUri(m, "", &err).empty());
+        CHECK(encodeWaveHttpsFragmentUri(m, "http://beygram.beykus.fun/", &err).empty());
+        CHECK(encodeWaveHttpsFragmentUri(m, "https://", &err).empty());
+        const std::string longBase =
+            "https://beygram.beykus.fun/" + std::string(kWaveMaxUriLength, 'a');
+        CHECK(encodeWaveHttpsFragmentUri(m, longBase, &err).empty());
+    }
+
+    // 5. parseSdpToWaveSignal rejects unknown candidate protocol/type and whitespace,
+    //    and prefers sha-256 over sha-512 when multiple fingerprints exist
+    {
+        WaveSdpSignal parsed;
+        const std::string badProtoSdp =
+            "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:secretPwd12345678\r\n"
+            "a=candidate:1 1 sctp 123 192.0.2.1 5000 typ host\r\n";
+        CHECK(!parseSdpToWaveSignal(badProtoSdp, parsed, &err));
+
+        const std::string badTypeSdp =
+            "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:secretPwd12345678\r\n"
+            "a=candidate:1 1 udp 123 192.0.2.1 5000 typ bogus\r\n";
+        CHECK(!parseSdpToWaveSignal(badTypeSdp, parsed, &err));
+
+        const std::string spaceUfragSdp =
+            "v=0\r\na=ice-ufrag:u bad\r\na=ice-pwd:secretPwd12345678\r\n";
+        CHECK(!parseSdpToWaveSignal(spaceUfragSdp, parsed, &err));
+
+        const std::string fp256 =
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+        const std::string multiFpSdp =
+            "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:secretPwd12345678\r\n"
+            "a=fingerprint:sha-256 " + fp256 + "\r\n"
+            "a=fingerprint:sha-512 11:22:33:44\r\n";
+        CHECK(parseSdpToWaveSignal(multiFpSdp, parsed, &err));
+        CHECK(parsed.dtlsFingerprintAlg == "sha-256");
+        CHECK(parsed.dtlsFingerprint == fp256);
+
+        const std::string reverseMultiFpSdp =
+            "v=0\r\na=ice-ufrag:u\r\na=ice-pwd:secretPwd12345678\r\n"
+            "a=fingerprint:sha-512 11:22:33:44\r\n"
+            "a=fingerprint:sha-256 " + fp256 + "\r\n";
+        CHECK(parseSdpToWaveSignal(reverseMultiFpSdp, parsed, &err));
+        CHECK(parsed.dtlsFingerprintAlg == "sha-256");
+        CHECK(parsed.dtlsFingerprint == fp256);
+    }
+
+    // 6. formatWaveSignalToSdp(signal, false) never emits a=setup:actpass
+    {
+        const auto m = makeValidOffer();
+        const std::string offerSdp = formatWaveSignalToSdp(m.signal, true);
+        CHECK(offerSdp.find("a=setup:actpass\r\n") != std::string::npos);
+
+        const std::string answerSdp = formatWaveSignalToSdp(m.signal, false);
+        CHECK(answerSdp.find("a=setup:actpass") == std::string::npos);
+        CHECK(answerSdp.find("a=setup:active\r\n") != std::string::npos);
+
+        auto passiveSig = m.signal;
+        passiveSig.setupRole = WaveDtlsSetupRole::Passive;
+        const std::string passiveAnswerSdp = formatWaveSignalToSdp(passiveSig, false);
+        CHECK(passiveAnswerSdp.find("a=setup:passive\r\n") != std::string::npos);
+    }
+}
+
+TEST_CASE(wave.pipeline_accept_offer_state_replay_and_overflow) {
+    using namespace bgmedia::wave;
+
+    // 1. int64_t overflow guards in validateWaveSignal and startOffer
+    {
+        WaveSignalMessage m;
+        m.version = 1;
+        m.type = WaveSignalType::Cancel;
+        m.sid = generateWaveSessionId();
+        const std::int64_t maxI64 = std::numeric_limits<std::int64_t>::max();
+        m.iat = maxI64 - 10;
+        m.exp = maxI64;
+        std::string err;
+        CHECK(validateWaveSignal(m, maxI64, &err));
+
+        m.iat = 1000;
+        m.exp = 1100;
+        CHECK(!validateWaveSignal(m, maxI64, &err));
+    }
+
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    WavePipelineConfig hCfg;
+    hCfg.role = WaveRole::Host;
+    WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+
+    WavePipelineConfig lCfg;
+    lCfg.role = WaveRole::Listener;
+    WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(), listTx);
+
+    CHECK(!host.startOffer(std::numeric_limits<std::int64_t>::max(), 120));
+    CHECK(host.state() == WaveSessionState::Idle);
+
+    WaveSignalMessage offer1;
+    WavePipelineCallbacks hCb;
+    hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+        if (m.type == WaveSignalType::Offer) {
+            offer1 = m;
+        }
+    };
+    host.setCallbacks(std::move(hCb));
+
+    CHECK(host.startOffer(1000, 120));
+    CHECK(listener.acceptOffer(offer1, 1001));
+    CHECK(listener.state() == WaveSessionState::LiveP2P);
+
+    // Prepare a second distinct valid offer
+    WaveSignalMessage offer2 = offer1;
+    offer2.sid = generateWaveSessionId();
+    offer2.nonce = offer1.nonce + 1;
+
+    // acceptOffer must reject when Listener is already LiveP2P
+    CHECK(!listener.acceptOffer(offer2, 1002));
+    CHECK(listener.state() == WaveSessionState::LiveP2P);
+
+    // Stop or reset, then replay offer1 within TTL -> must be rejected
+    listener.stop(false, 1005);
+    CHECK(listener.state() == WaveSessionState::Ended);
+    CHECK(!listener.acceptOffer(offer1, 1006));
+
+    listener.reset();
+    CHECK(listener.state() == WaveSessionState::Idle);
+    CHECK(!listener.acceptOffer(offer1, 1007));
+    CHECK(!listener.handleRemoteSignal(offer1, 1008));
+
+    // Fresh offer2 succeeds
+    CHECK(listener.acceptOffer(offer2, 1009));
+    CHECK(listener.state() == WaveSessionState::LiveP2P);
+}
+
 TEST_CASE(wave.pipeline_state_machine_and_fallback) {
     using namespace bgmedia::wave;
 
@@ -579,6 +821,9 @@ TEST_CASE(wave.signaling_security_and_limits) {
     base.nonce = 1;
     base.signal.iceUfrag = "u";
     base.signal.icePwd = "secretpwd12345678";
+    base.signal.dtlsFingerprint =
+        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
+        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
     std::string err;
 
     // Time validation: iat=0, exp=0, exp==iat, TTL>600s, future skew>60s
