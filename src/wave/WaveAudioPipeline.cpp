@@ -21,10 +21,10 @@ std::int64_t resolveTimestamp(std::int64_t nowUnixSeconds) noexcept {
 struct AudioFlightGuard {
     std::atomic<std::uint32_t>& counter;
     explicit AudioFlightGuard(std::atomic<std::uint32_t>& c) noexcept : counter(c) {
-        counter.fetch_add(1, std::memory_order_acq_rel);
+        counter.fetch_add(1, std::memory_order_seq_cst);
     }
     ~AudioFlightGuard() {
-        counter.fetch_sub(1, std::memory_order_release);
+        counter.fetch_sub(1, std::memory_order_seq_cst);
     }
 };
 } // namespace
@@ -50,14 +50,30 @@ WaveAudioPipeline::WaveAudioPipeline(WavePipelineConfig config,
 }
 
 WaveAudioPipeline::~WaveAudioPipeline() {
-    if (transport_) {
-        transport_->setCallbacks({});
-        transport_->close();
+    if (lifecycle_) {
+        std::lock_guard<std::recursive_mutex> gLock(lifecycle_->cbMutex);
+        lifecycle_->alive = false;
     }
-    if (externalCall_) {
-        externalCall_->setCallbacks({});
-        externalCall_->stop();
+    std::shared_ptr<IWaveTransport> tx;
+    {
+        std::lock_guard<std::mutex> cLock(controlMutex_);
+        tx = transport_;
     }
+    std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
+    if (tx) {
+        tx->setCallbacks({});
+        tx->close();
+    }
+    if (ext) {
+        ext->setCallbacks({});
+        ext->stop();
+    }
+}
+
+std::shared_ptr<IExternalCallTransport>
+WaveAudioPipeline::snapshotExternalCall() const {
+    std::lock_guard<std::mutex> lock(externalCallMutex_);
+    return externalCall_;
 }
 
 void WaveAudioPipeline::setCallbacks(WavePipelineCallbacks callbacks) {
@@ -107,52 +123,70 @@ void WaveAudioPipeline::wireTransportCallbacks() {
     if (!transport_) {
         return;
     }
+    std::shared_ptr<LifecycleGuard> guard = lifecycle_;
+    WaveAudioPipeline* self = this;
     WaveTransportCallbacks cb;
-    cb.onStateChanged = [this](WaveTransportState tState,
-                               const std::string& reason) {
+    cb.onStateChanged = [guard, self](WaveTransportState tState,
+                                      const std::string& reason) {
+        std::lock_guard<std::recursive_mutex> gLock(guard->cbMutex);
+        if (!guard->alive) {
+            return;
+        }
         switch (tState) {
         case WaveTransportState::Connected:
-            setState(WaveSessionState::LiveP2P, reason);
+            self->setState(WaveSessionState::LiveP2P, reason);
             break;
         case WaveTransportState::Failed:
-            if (state() != WaveSessionState::Ended &&
-                state() != WaveSessionState::Idle) {
-                setState(WaveSessionState::P2PFailed, reason);
-                emitError(WaveErrorCode::TransportFailed, reason);
+            if (self->state() != WaveSessionState::Ended &&
+                self->state() != WaveSessionState::Idle) {
+                self->setState(WaveSessionState::P2PFailed, reason);
+                self->emitError(WaveErrorCode::TransportFailed, reason);
             }
             break;
         case WaveTransportState::Closed:
-            if (state() == WaveSessionState::LiveP2P ||
-                state() == WaveSessionState::ConnectingP2P) {
-                setState(WaveSessionState::Ended, reason);
+            if (self->state() == WaveSessionState::LiveP2P ||
+                self->state() == WaveSessionState::ConnectingP2P) {
+                self->setState(WaveSessionState::Ended, reason);
             }
             break;
         default:
             break;
         }
     };
-    cb.onLocalSignalReady = [this](const WaveSdpSignal& localSig) {
-        lastLocalSignal_ = localSig;
-        hasLastLocalSignal_ = true;
+    cb.onLocalSignalReady = [guard, self](const WaveSdpSignal& localSig) {
+        std::lock_guard<std::recursive_mutex> gLock(guard->cbMutex);
+        if (!guard->alive) {
+            return;
+        }
+        std::lock_guard<std::mutex> cLock(self->controlMutex_);
+        self->lastLocalSignal_ = localSig;
+        self->hasLastLocalSignal_ = true;
     };
-    cb.onMediaPacket = [this](WaveMediaPacket packet,
-                              double arrivalTimeSeconds) {
-        if (config_.role != WaveRole::Listener ||
-            route() != WaveTransportRoute::P2P) {
+    cb.onMediaPacket = [guard, self](WaveMediaPacket packet,
+                                     double arrivalTimeSeconds) {
+        std::lock_guard<std::recursive_mutex> gLock(guard->cbMutex);
+        if (!guard->alive) {
+            return;
+        }
+        if (self->config_.role != WaveRole::Listener ||
+            self->route() != WaveTransportRoute::P2P) {
             return;
         }
         constexpr std::size_t kMaxInboundPackets = 256;
-        std::lock_guard<std::mutex> iLock(inboundMutex_);
-        if (inboundQueue_.size() >= kMaxInboundPackets) {
-            inboundQueue_.pop_front();
+        std::lock_guard<std::mutex> iLock(self->inboundMutex_);
+        if (self->inboundQueue_.size() >= kMaxInboundPackets) {
+            self->inboundQueue_.pop_front();
         }
-        inboundQueue_.push_back(
+        self->inboundQueue_.push_back(
             InboundPacket{std::move(packet), arrivalTimeSeconds});
     };
     transport_->setCallbacks(std::move(cb));
 }
 
-void WaveAudioPipeline::performResetUnderProcessLock() {
+void WaveAudioPipeline::performResetUnderProcessLock(bool clearStats) {
+    if (!clearStats) {
+        publishStatsSnapshot(true);
+    }
     {
         std::lock_guard<std::mutex> iLock(inboundMutex_);
         inboundQueue_.clear();
@@ -164,58 +198,83 @@ void WaveAudioPipeline::performResetUnderProcessLock() {
     listenerResampler_.reset();
     hostChunk_.clear();
     codec_->reset();
-    nextSequence_ = 0;
-    nextTimestamp48k_ = 0;
-    packetsSent_ = 0;
-    plcFrames_ = 0;
-    bytesSent_ = 0;
-    bytesReceived_ = 0;
-    publishStatsSnapshot();
+    hasPlayoutClock_ = false;
+    nextPlayoutTimeSec_ = 0.0;
+    hostDiscardPending_.store(false, std::memory_order_release);
+    if (clearStats) {
+        nextSequence_ = 0;
+        nextTimestamp48k_ = 0;
+        packetsSent_ = 0;
+        plcFrames_ = 0;
+        bytesSent_ = 0;
+        bytesReceived_ = 0;
+        {
+            std::lock_guard<std::mutex> sLock(statsMutex_);
+            statsFrozenOnStop_ = false;
+        }
+        publishStatsSnapshot(false);
+    }
+    pendingStatsClear_.store(false, std::memory_order_release);
     pendingRingReset_.store(false, std::memory_order_release);
-    audioPausedForReset_.store(false, std::memory_order_release);
+    audioPausedForReset_.store(false, std::memory_order_seq_cst);
 }
 
-void WaveAudioPipeline::requestOrPerformReset() {
-    audioPausedForReset_.store(true, std::memory_order_release);
+void WaveAudioPipeline::requestOrPerformReset(bool clearStats) {
+    if (clearStats) {
+        pendingStatsClear_.store(true, std::memory_order_release);
+    }
+    audioPausedForReset_.store(true, std::memory_order_seq_cst);
     pendingRingReset_.store(true, std::memory_order_release);
     // Bounded wait: never block control/UI thread indefinitely if an audio
     // callback is stalled. If audioInFlight_ or processMutex_ is busy, the
     // reset completes deferred in process() or ensureResetCompletedForNewSession().
     for (int i = 0; i < 64; ++i) {
-        if (audioInFlight_.load(std::memory_order_acquire) == 0) {
+        if (audioInFlight_.load(std::memory_order_seq_cst) == 0) {
             break;
         }
         std::this_thread::yield();
     }
-    if (audioInFlight_.load(std::memory_order_acquire) == 0) {
+    if (audioInFlight_.load(std::memory_order_seq_cst) == 0) {
         std::unique_lock<std::mutex> pLock(processMutex_, std::try_to_lock);
         if (pLock.owns_lock() &&
-            audioInFlight_.load(std::memory_order_acquire) == 0) {
-            performResetUnderProcessLock();
+            audioInFlight_.load(std::memory_order_seq_cst) == 0) {
+            performResetUnderProcessLock(
+                pendingStatsClear_.load(std::memory_order_acquire));
         }
     }
 }
 
 bool WaveAudioPipeline::ensureResetCompletedForNewSession() {
-    if (!pendingRingReset_.load(std::memory_order_acquire) &&
-        !audioPausedForReset_.load(std::memory_order_acquire)) {
-        requestOrPerformReset();
-        return !pendingRingReset_.load(std::memory_order_acquire) &&
-               !audioPausedForReset_.load(std::memory_order_acquire);
-    }
-    for (int i = 0; i < 64; ++i) {
-        if (audioInFlight_.load(std::memory_order_acquire) == 0) {
+    pendingStatsClear_.store(true, std::memory_order_release);
+    audioPausedForReset_.store(true, std::memory_order_seq_cst);
+    pendingRingReset_.store(true, std::memory_order_release);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    for (int attempt = 0;; ++attempt) {
+        if (!pendingRingReset_.load(std::memory_order_acquire) &&
+            !audioPausedForReset_.load(std::memory_order_seq_cst)) {
+            return true;
+        }
+        if (audioInFlight_.load(std::memory_order_seq_cst) == 0) {
             std::unique_lock<std::mutex> pLock(processMutex_, std::try_to_lock);
             if (pLock.owns_lock() &&
-                audioInFlight_.load(std::memory_order_acquire) == 0) {
-                performResetUnderProcessLock();
+                audioInFlight_.load(std::memory_order_seq_cst) == 0) {
+                performResetUnderProcessLock(true);
                 return true;
             }
         }
-        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        if (attempt < 16) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
     }
     return !pendingRingReset_.load(std::memory_order_acquire) &&
-           !audioPausedForReset_.load(std::memory_order_acquire);
+           !audioPausedForReset_.load(std::memory_order_seq_cst);
 }
 
 bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
@@ -284,7 +343,22 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
     if (sessionGen_.load(std::memory_order_acquire) != myGen) {
         return false;
     }
-    if (!tx->startOffer() || !hasLastLocalSignal_) {
+    if (!tx->startOffer()) {
+        if (sessionGen_.load(std::memory_order_acquire) == myGen) {
+            setState(WaveSessionState::P2PFailed, "failed to gather local offer");
+        }
+        return false;
+    }
+    WaveSdpSignal localSig;
+    bool haveLocalSig = false;
+    {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        haveLocalSig = hasLastLocalSignal_;
+        if (haveLocalSig) {
+            localSig = lastLocalSignal_;
+        }
+    }
+    if (!haveLocalSig) {
         if (sessionGen_.load(std::memory_order_acquire) == myGen) {
             setState(WaveSessionState::P2PFailed, "failed to gather local offer");
         }
@@ -303,10 +377,7 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
     msg.caps = kWaveCapOpus48kStereo | kWaveCapDtlsSrtp |
                kWaveCapExternalCallFallback;
     msg.nonce = nonce;
-    {
-        std::lock_guard<std::mutex> lock(controlMutex_);
-        msg.signal = lastLocalSignal_;
-    }
+    msg.signal = std::move(localSig);
 
     setState(WaveSessionState::AwaitingAnswer, "offer ready");
     if (sessionGen_.load(std::memory_order_acquire) != myGen) {
@@ -442,28 +513,43 @@ bool WaveAudioPipeline::acceptAnswer(const WaveSignalMessage& answer,
                   "Only Host role can accept an answer");
         return false;
     }
-    if (state() != WaveSessionState::AwaitingAnswer) {
+    WaveSessionState curState = WaveSessionState::Idle;
+    std::array<std::uint8_t, 16> curSid{};
+    std::shared_ptr<IWaveTransport> tx;
+    std::uint64_t myGen = 0;
+    {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        curState = state();
+        curSid = sessionId();
+        tx = transport_;
+        myGen = sessionGen_.load(std::memory_order_acquire);
+    }
+    if (curState != WaveSessionState::AwaitingAnswer) {
         emitError(WaveErrorCode::InvalidState,
                   "Not awaiting an answer");
         return false;
     }
     const std::int64_t effectiveNow = resolveTimestamp(nowUnixSeconds);
     std::string err;
-    const auto curSid = sessionId();
     if (!validateWaveSignal(answer, effectiveNow, &err) ||
         answer.type != WaveSignalType::Answer || answer.sid != curSid) {
         emitError(WaveErrorCode::SignalingFailed,
                   err.empty() ? "Invalid or mismatched Answer" : err);
         return false;
     }
-    std::shared_ptr<IWaveTransport> tx;
-    std::uint64_t myGen = 0;
+    bool answerStillCurrent = false;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
-        hasLastRemoteNonce_ = true;
-        lastRemoteNonce_ = answer.nonce;
-        tx = transport_;
-        myGen = sessionGen_.load(std::memory_order_acquire);
+        answerStillCurrent = state() == WaveSessionState::AwaitingAnswer &&
+            sessionGen_.load(std::memory_order_acquire) == myGen;
+        if (answerStillCurrent) {
+            hasLastRemoteNonce_ = true;
+            lastRemoteNonce_ = answer.nonce;
+        }
+    }
+    if (!answerStillCurrent) {
+        emitError(WaveErrorCode::InvalidState, "Not awaiting an answer");
+        return false;
     }
     setState(WaveSessionState::ConnectingP2P, "applying answer");
     if (sessionGen_.load(std::memory_order_acquire) != myGen) {
@@ -493,7 +579,6 @@ bool WaveAudioPipeline::handleRemoteSignal(const WaveSignalMessage& msg,
         return acceptAnswer(msg, effectiveNow);
     }
     std::shared_ptr<IWaveTransport> tx;
-    std::shared_ptr<IExternalCallTransport> ext;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         if (msg.sid != sessionId()) {
@@ -505,8 +590,8 @@ bool WaveAudioPipeline::handleRemoteSignal(const WaveSignalMessage& msg,
         lastRemoteNonce_ = msg.nonce;
         hasLastRemoteNonce_ = true;
         tx = transport_;
-        ext = externalCall_;
     }
+    std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
     if (tx) {
         tx->close();
     }
@@ -520,14 +605,15 @@ bool WaveAudioPipeline::handleRemoteSignal(const WaveSignalMessage& msg,
 }
 
 bool WaveAudioPipeline::reconnect(std::int64_t nowUnixSeconds) {
-    if (state() != WaveSessionState::P2PFailed &&
-        state() != WaveSessionState::Ended &&
-        state() != WaveSessionState::Failed) {
-        return false;
-    }
     std::shared_ptr<IWaveTransport> tx;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
+        const WaveSessionState cur = state();
+        if (cur != WaveSessionState::P2PFailed &&
+            cur != WaveSessionState::Ended &&
+            cur != WaveSessionState::Failed) {
+            return false;
+        }
         tx = transport_;
     }
     if (tx) {
@@ -542,10 +628,10 @@ bool WaveAudioPipeline::reconnect(std::int64_t nowUnixSeconds) {
 
 void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
     sessionGen_.fetch_add(1, std::memory_order_acq_rel);
+    pendingStatsClear_.store(false, std::memory_order_release);
     bool shouldEmit = false;
     WaveSignalMessage endMsg;
     std::shared_ptr<IWaveTransport> tx;
-    std::shared_ptr<IExternalCallTransport> ext;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
         const WaveSessionState cur = state();
@@ -573,8 +659,8 @@ void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
             }
         }
         tx = transport_;
-        ext = externalCall_;
     }
+    std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
     if (shouldEmit) {
         const auto cb = snapshotCallbacks();
         if (cb.onOutboundSignal) {
@@ -588,18 +674,19 @@ void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
     if (ext) {
         ext->stop();
     }
-    requestOrPerformReset();
+    requestOrPerformReset(false);
 }
 
 void WaveAudioPipeline::reset() {
     sessionGen_.fetch_add(1, std::memory_order_acq_rel);
     std::shared_ptr<IWaveTransport> tx;
-    std::shared_ptr<IExternalCallTransport> ext;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
+        hasLastLocalSignal_ = false;
+        lastLocalSignal_ = WaveSdpSignal{};
         tx = transport_;
-        ext = externalCall_;
     }
+    std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
     setState(WaveSessionState::Idle, "reset");
     if (tx) {
         tx->close();
@@ -607,7 +694,7 @@ void WaveAudioPipeline::reset() {
     if (ext) {
         ext->stop();
     }
-    requestOrPerformReset();
+    requestOrPerformReset(true);
     {
         std::lock_guard<std::mutex> sLock(sidMutex_);
         sid_.fill(0);
@@ -616,7 +703,16 @@ void WaveAudioPipeline::reset() {
 
 bool WaveAudioPipeline::switchToExternalCallFallback(
     std::shared_ptr<IExternalCallTransport> externalCall) {
-    if (state() != WaveSessionState::P2PFailed) {
+    std::uint64_t myGen = 0;
+    bool validState = false;
+    {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        if (state() == WaveSessionState::P2PFailed) {
+            validState = true;
+            myGen = sessionGen_.load(std::memory_order_acquire);
+        }
+    }
+    if (!validState) {
         emitError(WaveErrorCode::InvalidState,
                   "ExternalCall fallback only allowed from P2PFailed");
         return false;
@@ -628,39 +724,59 @@ bool WaveAudioPipeline::switchToExternalCallFallback(
         return false;
     }
     {
-        std::lock_guard<std::mutex> lock(controlMutex_);
+        std::lock_guard<std::mutex> eLock(externalCallMutex_);
         externalCall_ = externalCall;
     }
+    hostDiscardPending_.store(true, std::memory_order_release);
+
+    std::shared_ptr<LifecycleGuard> guard = lifecycle_;
+    WaveAudioPipeline* self = this;
     ExternalCallCallbacks cb;
-    cb.onStateChanged = [this](ExternalCallState extState,
-                               const std::string& reason) {
+    cb.onStateChanged = [guard, self, myGen](ExternalCallState extState,
+                                             const std::string& reason) {
+        std::lock_guard<std::recursive_mutex> gLock(guard->cbMutex);
+        if (!guard->alive ||
+            self->sessionGen_.load(std::memory_order_acquire) != myGen) {
+            return;
+        }
         switch (extState) {
         case ExternalCallState::Connecting:
-            setState(WaveSessionState::ConnectingTelegramCall, reason);
+            self->setState(WaveSessionState::ConnectingTelegramCall, reason);
             break;
         case ExternalCallState::Live:
-            setState(WaveSessionState::LiveTelegramCall, reason);
+            self->setState(WaveSessionState::LiveTelegramCall, reason);
             break;
         case ExternalCallState::Failed:
-            setState(WaveSessionState::Failed, reason);
-            emitError(WaveErrorCode::FallbackFailed, reason);
+            self->setState(WaveSessionState::Failed, reason);
+            self->emitError(WaveErrorCode::FallbackFailed, reason);
             break;
         case ExternalCallState::Ended:
-            setState(WaveSessionState::Ended, reason);
+            self->setState(WaveSessionState::Ended, reason);
             break;
         default:
             break;
         }
     };
     externalCall->setCallbacks(std::move(cb));
+    if (sessionGen_.load(std::memory_order_acquire) != myGen) {
+        return false;
+    }
     setState(WaveSessionState::OfferingTelegramFallback,
              "offering external call fallback");
+    if (sessionGen_.load(std::memory_order_acquire) != myGen) {
+        return false;
+    }
     setState(WaveSessionState::ConnectingTelegramCall,
              "connecting external call fallback");
+    if (sessionGen_.load(std::memory_order_acquire) != myGen) {
+        return false;
+    }
     if (!externalCall->start()) {
-        setState(WaveSessionState::Failed, "external call start failed");
-        emitError(WaveErrorCode::FallbackFailed,
-                  "External call transport failed to start");
+        if (sessionGen_.load(std::memory_order_acquire) == myGen) {
+            setState(WaveSessionState::Failed, "external call start failed");
+            emitError(WaveErrorCode::FallbackFailed,
+                      "External call transport failed to start");
+        }
         return false;
     }
     return true;
@@ -668,6 +784,9 @@ bool WaveAudioPipeline::switchToExternalCallFallback(
 
 void WaveAudioPipeline::setPublishingEnabled(bool enabled) noexcept {
     publishingEnabled_.store(enabled, std::memory_order_release);
+    if (!enabled) {
+        hostDiscardPending_.store(true, std::memory_order_release);
+    }
 }
 
 void WaveAudioPipeline::setListenerGain(float gain) noexcept {
@@ -686,7 +805,7 @@ void WaveAudioPipeline::onPcmRendered(const float* interleavedStereo,
                                       std::size_t frames,
                                       std::uint32_t sampleRate) noexcept {
     AudioFlightGuard guard(audioInFlight_);
-    if (audioPausedForReset_.load(std::memory_order_acquire) ||
+    if (audioPausedForReset_.load(std::memory_order_seq_cst) ||
         config_.role != WaveRole::Host || !interleavedStereo || frames == 0) {
         return;
     }
@@ -707,7 +826,7 @@ std::size_t WaveAudioPipeline::pullListenerPcm(
     if (!outInterleavedStereo || frames == 0) {
         return 0;
     }
-    if (audioPausedForReset_.load(std::memory_order_acquire) ||
+    if (audioPausedForReset_.load(std::memory_order_seq_cst) ||
         pendingRingReset_.load(std::memory_order_acquire)) {
         std::memset(outInterleavedStereo, 0, frames * 2 * sizeof(float));
         return 0;
@@ -741,21 +860,45 @@ void WaveAudioPipeline::process(double currentTimeSeconds) {
     }
     std::lock_guard<std::mutex> pLock(processMutex_);
     if (pendingRingReset_.load(std::memory_order_acquire) &&
-        audioInFlight_.load(std::memory_order_acquire) == 0) {
-        performResetUnderProcessLock();
+        audioInFlight_.load(std::memory_order_seq_cst) == 0) {
+        performResetUnderProcessLock(
+            pendingStatsClear_.load(std::memory_order_acquire));
     }
     if (config_.role == WaveRole::Host) {
         processHostStep(currentTimeSeconds);
     } else {
         processListenerStep(currentTimeSeconds);
     }
-    publishStatsSnapshot();
+    publishStatsSnapshot(false);
+}
+
+void WaveAudioPipeline::clearHostPendingAudio() {
+    hostChunk_.clear();
+    hostResampler_.reset();
+    std::size_t remaining = hostRing_.availableRead();
+    while (remaining > 0) {
+        const std::size_t chunk = std::min<std::size_t>(remaining, 4096);
+        hostStaging_.resize(chunk * 2);
+        const std::size_t popped = hostRing_.pop(hostStaging_.data(), chunk);
+        if (popped == 0) {
+            break;
+        }
+        remaining -= popped;
+    }
 }
 
 void WaveAudioPipeline::processHostStep(double currentTimeSeconds) {
+    if (!publishingEnabled_.load(std::memory_order_acquire)) {
+        hostDiscardPending_.store(false, std::memory_order_release);
+        clearHostPendingAudio();
+        return;
+    }
+    if (hostDiscardPending_.exchange(false, std::memory_order_acq_rel)) {
+        clearHostPendingAudio();
+    }
+
     const WaveTransportRoute r = route_.load(std::memory_order_acquire);
-    if (r == WaveTransportRoute::None ||
-        !publishingEnabled_.load(std::memory_order_acquire)) {
+    if (r == WaveTransportRoute::None) {
         return;
     }
 
@@ -777,10 +920,13 @@ void WaveAudioPipeline::processHostStep(double currentTimeSeconds) {
     hostResampled_.clear();
     hostResampler_.process(hostStaging_, hostResampled_);
 
-    if (r == WaveTransportRoute::ExternalCall && externalCall_) {
-        externalCall_->pushOutgoingPcm(hostResampled_.data(),
-                                       hostResampled_.size() / 2,
-                                       kWaveSampleRate);
+    if (r == WaveTransportRoute::ExternalCall) {
+        std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
+        if (ext) {
+            ext->pushOutgoingPcm(hostResampled_.data(),
+                                 hostResampled_.size() / 2,
+                                 kWaveSampleRate);
+        }
         return;
     }
 
@@ -799,16 +945,17 @@ void WaveAudioPipeline::processHostStep(double currentTimeSeconds) {
                                          samplesPerFrame);
         if (codec_->encode(frameSpan, encodedPayload_)) {
             WaveMediaPacket pkt;
-            pkt.sequence = nextSequence_++;
+            pkt.sequence = nextSequence_;
             pkt.timestamp48k = nextTimestamp48k_;
             pkt.frameSamples = static_cast<std::uint16_t>(frameSamples);
             pkt.flags = kWavePacketNone;
             pkt.payload = encodedPayload_;
             if (transport_->sendMediaPacket(pkt)) {
+                ++nextSequence_;
+                nextTimestamp48k_ += static_cast<std::uint32_t>(frameSamples);
                 ++packetsSent_;
                 bytesSent_ += pkt.payload.size();
             }
-            nextTimestamp48k_ += static_cast<std::uint32_t>(frameSamples);
         }
         offset += samplesPerFrame;
     }
@@ -822,21 +969,24 @@ void WaveAudioPipeline::processHostStep(double currentTimeSeconds) {
 
 void WaveAudioPipeline::processListenerStep(double currentTimeSeconds) {
     const WaveTransportRoute r = route_.load(std::memory_order_acquire);
-    if (r == WaveTransportRoute::ExternalCall && externalCall_) {
-        const std::size_t wantFrames = kWaveFrameSamples;
-        listenerDecodeBuf_.resize(wantFrames * 2);
-        const std::size_t got = externalCall_->pullIncomingPcm(
-            listenerDecodeBuf_.data(), wantFrames, kWaveSampleRate);
-        if (got > 0) {
-            const std::uint32_t outRate =
-                listenerOutputRate_.load(std::memory_order_acquire);
-            listenerResampler_.configure(kWaveSampleRate, outRate);
-            listenerResampled_.clear();
-            listenerResampler_.process(
-                std::span<const float>(listenerDecodeBuf_.data(), got * 2),
-                listenerResampled_);
-            listenerRing_.push(listenerResampled_.data(),
-                               listenerResampled_.size() / 2, outRate, true);
+    if (r == WaveTransportRoute::ExternalCall) {
+        std::shared_ptr<IExternalCallTransport> ext = snapshotExternalCall();
+        if (ext) {
+            const std::size_t wantFrames = kWaveFrameSamples;
+            listenerDecodeBuf_.resize(wantFrames * 2);
+            const std::size_t got = ext->pullIncomingPcm(
+                listenerDecodeBuf_.data(), wantFrames, kWaveSampleRate);
+            if (got > 0) {
+                const std::uint32_t outRate =
+                    listenerOutputRate_.load(std::memory_order_acquire);
+                listenerResampler_.configure(kWaveSampleRate, outRate);
+                listenerResampled_.clear();
+                listenerResampler_.process(
+                    std::span<const float>(listenerDecodeBuf_.data(), got * 2),
+                    listenerResampled_);
+                listenerRing_.push(listenerResampled_.data(),
+                                   listenerResampled_.size() / 2, outRate, true);
+            }
         }
         return;
     }
@@ -861,11 +1011,57 @@ void WaveAudioPipeline::processListenerStep(double currentTimeSeconds) {
         listenerOutputRate_.load(std::memory_order_acquire);
     listenerResampler_.configure(kWaveSampleRate, outRate);
 
+    const std::uint32_t codecRate = std::max<std::uint32_t>(1, codec_->sampleRate());
+    const double frameDurSec =
+        static_cast<double>(codec_->frameSamples()) / static_cast<double>(codecRate);
+    const std::size_t outFrameFrames = std::max<std::size_t>(
+        1, static_cast<std::size_t>(
+               std::ceil(frameDurSec * static_cast<double>(outRate))));
+    const std::size_t maxLeadFrames = std::max<std::size_t>(
+        outFrameFrames,
+        std::min<std::size_t>(listenerRing_.capacityFrames() / 2,
+                              outFrameFrames * 3));
+    const bool validTime = std::isfinite(currentTimeSeconds);
+
     WaveMediaPacket pkt;
-    while (true) {
+    while (listenerRing_.availableRead() < maxLeadFrames &&
+           listenerRing_.availableWrite() >= (outFrameFrames + 4)) {
+        const bool excessBuffered =
+            jitterBuffer_.queuedCount() > jitterBuffer_.targetDepthFrames();
+        if (validTime) {
+            if (!hasPlayoutClock_) {
+                nextPlayoutTimeSec_ = currentTimeSeconds;
+                hasPlayoutClock_ = true;
+            } else if (currentTimeSeconds + 1.0 < nextPlayoutTimeSec_ ||
+                       currentTimeSeconds - nextPlayoutTimeSec_ >
+                           frameDurSec * 4.0) {
+                nextPlayoutTimeSec_ = currentTimeSeconds;
+            }
+
+            const bool timeDue =
+                (currentTimeSeconds + 1e-9) >= nextPlayoutTimeSec_;
+            const bool needCatchUp =
+                excessBuffered &&
+                listenerRing_.availableRead() < (outFrameFrames * 2);
+            if (!timeDue && !needCatchUp) {
+                break;
+            }
+        } else if (!excessBuffered &&
+                   listenerRing_.availableRead() >= outFrameFrames) {
+            break;
+        }
+
         const auto status = jitterBuffer_.popNext(pkt);
         if (status == WaveJitterBuffer::PopStatus::Buffering) {
+            hasPlayoutClock_ = false;
             break;
+        }
+        if (validTime) {
+            if ((currentTimeSeconds + 1e-9) >= nextPlayoutTimeSec_) {
+                nextPlayoutTimeSec_ += frameDurSec;
+            } else {
+                nextPlayoutTimeSec_ = currentTimeSeconds + frameDurSec;
+            }
         }
         bool decoded = false;
         if (status == WaveJitterBuffer::PopStatus::Packet) {
@@ -881,11 +1077,9 @@ void WaveAudioPipeline::processListenerStep(double currentTimeSeconds) {
                                listenerResampled_.size() / 2, outRate, true);
         }
     }
-
-    (void)currentTimeSeconds;
 }
 
-void WaveAudioPipeline::publishStatsSnapshot() {
+void WaveAudioPipeline::publishStatsSnapshot(bool freezeOnStop) {
     WaveStats s;
     s.packetsSent = packetsSent_;
     s.packetsReceived = jitterBuffer_.packetsReceived();
@@ -903,8 +1097,20 @@ void WaveAudioPipeline::publishStatsSnapshot() {
                            s.jitterMs +
                            static_cast<double>(kWaveFrameDurationMs);
     s.targetBitrateBps = codec_ ? codec_->bitrate() : config_.targetBitrateBps;
+    if (freezeOnStop) {
+        s.ringOverruns = hostRing_.overruns() + listenerRing_.overruns();
+        s.ringUnderruns = hostRing_.underruns() + listenerRing_.underruns();
+        s.clippedSamples =
+            hostRing_.clippedSamples() + listenerRing_.clippedSamples();
+    }
     std::lock_guard<std::mutex> sLock(statsMutex_);
+    if (statsFrozenOnStop_) {
+        return;
+    }
     publishedStats_ = s;
+    if (freezeOnStop) {
+        statsFrozenOnStop_ = true;
+    }
 }
 
 std::array<std::uint8_t, 16> WaveAudioPipeline::sessionId() const noexcept {
@@ -914,14 +1120,18 @@ std::array<std::uint8_t, 16> WaveAudioPipeline::sessionId() const noexcept {
 
 WaveStats WaveAudioPipeline::stats() const {
     WaveStats s;
+    bool frozen = false;
     {
         std::lock_guard<std::mutex> sLock(statsMutex_);
         s = publishedStats_;
+        frozen = statsFrozenOnStop_;
     }
-    s.ringOverruns = hostRing_.overruns() + listenerRing_.overruns();
-    s.ringUnderruns = hostRing_.underruns() + listenerRing_.underruns();
-    s.clippedSamples =
-        hostRing_.clippedSamples() + listenerRing_.clippedSamples();
+    if (!frozen) {
+        s.ringOverruns = hostRing_.overruns() + listenerRing_.overruns();
+        s.ringUnderruns = hostRing_.underruns() + listenerRing_.underruns();
+        s.clippedSamples =
+            hostRing_.clippedSamples() + listenerRing_.clippedSamples();
+    }
     return s;
 }
 

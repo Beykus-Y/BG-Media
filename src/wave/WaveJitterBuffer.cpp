@@ -9,9 +9,16 @@ WaveJitterBuffer::WaveJitterBuffer() : WaveJitterBuffer(Config{}) {}
 
 WaveJitterBuffer::WaveJitterBuffer(Config config)
     : config_(config),
-      slots_(std::max<std::size_t>(8, config.maxSlots)),
-      targetDepthFrames_(std::clamp(config.minDepthFrames, std::size_t{1},
-                                    slots_.size() / 2)) {}
+      slots_(std::max<std::size_t>(8, config.maxSlots)) {
+    const std::size_t maxAllowedDepth = slots_.size() / 2;
+    config_.maxSlots = slots_.size();
+    config_.minDepthFrames =
+        std::clamp<std::size_t>(config_.minDepthFrames, 1, maxAllowedDepth);
+    config_.maxDepthFrames = std::clamp<std::size_t>(
+        config_.maxDepthFrames, config_.minDepthFrames, maxAllowedDepth);
+    config_.frameDurationMs = std::max<std::uint32_t>(1, config_.frameDurationMs);
+    targetDepthFrames_ = config_.minDepthFrames;
+}
 
 void WaveJitterBuffer::reset() {
     for (auto& slot : slots_) {
@@ -23,8 +30,7 @@ void WaveJitterBuffer::reset() {
     nextPlaySeq_ = 0;
     highestSeq_ = 0;
     queuedCount_ = 0;
-    targetDepthFrames_ = std::clamp(config_.minDepthFrames, std::size_t{1},
-                                    slots_.size() / 2);
+    targetDepthFrames_ = config_.minDepthFrames;
     hasPrevTiming_ = false;
     prevArrivalSec_ = 0.0;
     prevTimestamp48k_ = 0;
@@ -38,6 +44,9 @@ void WaveJitterBuffer::reset() {
 
 void WaveJitterBuffer::updateJitterEstimate(std::uint32_t timestamp48k,
                                             double arrivalTimeSeconds) {
+    if (config_.sampleRate == 0 || !std::isfinite(arrivalTimeSeconds)) {
+        return;
+    }
     if (!hasPrevTiming_) {
         hasPrevTiming_ = true;
         prevArrivalSec_ = arrivalTimeSeconds;
@@ -51,6 +60,9 @@ void WaveJitterBuffer::updateJitterEstimate(std::uint32_t timestamp48k,
         (static_cast<double>(tsDelta) / static_cast<double>(config_.sampleRate)) *
         1000.0;
     const double d = std::abs(arrivalDeltaMs - mediaDeltaMs);
+    if (!std::isfinite(d)) {
+        return;
+    }
     jitterMs_ += (d - jitterMs_) / 16.0;
 
     prevArrivalSec_ = arrivalTimeSeconds;
@@ -60,14 +72,15 @@ void WaveJitterBuffer::updateJitterEstimate(std::uint32_t timestamp48k,
         std::max<std::uint32_t>(1, config_.frameDurationMs));
     const std::size_t desired = static_cast<std::size_t>(
         std::ceil((jitterMs_ * 2.0) / frameMs));
-    targetDepthFrames_ = std::clamp(
-        desired, config_.minDepthFrames,
-        std::min(config_.maxDepthFrames, slots_.size() / 2));
+    const std::size_t lo =
+        std::clamp<std::size_t>(config_.minDepthFrames, 1, slots_.size() / 2);
+    const std::size_t hi =
+        std::clamp<std::size_t>(config_.maxDepthFrames, lo, slots_.size() / 2);
+    targetDepthFrames_ = std::clamp(desired, lo, hi);
 }
 
 void WaveJitterBuffer::push(WaveMediaPacket packet, double arrivalTimeSeconds) {
     ++packetsReceived_;
-    updateJitterEstimate(packet.timestamp48k, arrivalTimeSeconds);
 
     if (!initialized_) {
         initialized_ = true;
@@ -94,8 +107,9 @@ void WaveJitterBuffer::push(WaveMediaPacket packet, double arrivalTimeSeconds) {
             primed_ = false;
             hasPrevTiming_ = false;
             jitterMs_ = 0.0;
-            targetDepthFrames_ = std::clamp(config_.minDepthFrames, std::size_t{1}, slots_.size() / 2);
+            targetDepthFrames_ = config_.minDepthFrames;
             nextPlaySeq_ = packet.sequence;
+            highestSeq_ = packet.sequence;
         } else {
             const std::size_t advance =
                 static_cast<std::size_t>(offset) - (slots_.size() / 2);
@@ -110,6 +124,8 @@ void WaveJitterBuffer::push(WaveMediaPacket packet, double arrivalTimeSeconds) {
         ++packetsDuplicate_;
         return;
     }
+
+    updateJitterEstimate(packet.timestamp48k, arrivalTimeSeconds);
 
     const auto diffFromHighest =
         static_cast<std::int32_t>(packet.sequence - highestSeq_);
@@ -137,6 +153,9 @@ void WaveJitterBuffer::advancePlaySeq() noexcept {
         if (queuedCount_ > 0) {
             --queuedCount_;
         }
+        ++packetsDroppedLate_;
+    } else {
+        ++packetsLost_;
     }
     ++nextPlaySeq_;
 }

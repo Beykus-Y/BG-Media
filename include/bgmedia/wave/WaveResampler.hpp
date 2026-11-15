@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -29,7 +30,9 @@ private:
     std::uint32_t inputRate_ = 48000;
     std::uint32_t outputRate_ = 48000;
     double phase_ = 0.0;
-    std::vector<float> history_; // interleaved stereo carry-over frames
+    std::array<float, 8> history_{};       // 4 stereo carry-over frames
+    std::array<float, 4> prefilterPrev_{}; // 2 raw stereo frames for downsampling LPF
+    std::vector<float> filteredScratch_;   // reusable buffer (no steady-state alloc)
 };
 
 } // namespace bgmedia::wave

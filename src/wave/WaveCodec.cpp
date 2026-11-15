@@ -60,11 +60,13 @@ bool Pcm16WaveCodec::decodePlc(std::span<float> outInterleavedPcm) {
     if (outInterleavedPcm.size() != expectedSamples) {
         return false;
     }
-    ++plcStreak_;
-    const float atten = std::pow(0.5f, static_cast<float>(plcStreak_));
+    if (plcStreak_ < 64) {
+        ++plcStreak_;
+    }
     if (plcStreak_ > 6) {
         std::fill(outInterleavedPcm.begin(), outInterleavedPcm.end(), 0.0f);
     } else {
+        const float atten = std::pow(0.5f, static_cast<float>(plcStreak_));
         for (std::size_t i = 0; i < expectedSamples; ++i) {
             outInterleavedPcm[i] = lastDecoded_[i] * atten;
         }

@@ -11,6 +11,7 @@
 #include "bgmedia/wave/WaveSignaling.hpp"
 #include "bgmedia/wave/WaveTransport.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -1084,4 +1085,354 @@ TEST_CASE(wave.reentrant_stop_and_restart_from_poll_callback) {
     CHECK(restartOk);
     CHECK(offers.size() == 2u);
     CHECK(host.state() == WaveSessionState::AwaitingAnswer);
+}
+
+TEST_CASE(wave.jitter_buffer_retention_interleaved_10ms_process) {
+    using namespace bgmedia::wave;
+
+    class ManualListenerTransport final : public IWaveTransport {
+    public:
+        void setCallbacks(WaveTransportCallbacks callbacks) override {
+            cb_ = std::move(callbacks);
+        }
+        bool startOffer() override { return false; }
+        bool acceptOffer(const WaveSdpSignal& /*remoteOffer*/) override {
+            state_ = WaveTransportState::Gathering;
+            if (cb_.onLocalSignalReady) {
+                WaveSdpSignal sig;
+                sig.iceUfrag = "listufrag";
+                sig.icePwd = "listpassword1234567890";
+                sig.dtlsFingerprintAlg = "sha-256";
+                sig.dtlsFingerprint =
+                    "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:"
+                    "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF";
+                sig.setupRole = WaveDtlsSetupRole::Active;
+                cb_.onLocalSignalReady(sig);
+            }
+            state_ = WaveTransportState::Connected;
+            if (cb_.onStateChanged) {
+                cb_.onStateChanged(WaveTransportState::Connected, "connected");
+            }
+            return true;
+        }
+        bool applyAnswer(const WaveSdpSignal& /*remoteAnswer*/) override {
+            return false;
+        }
+        bool sendMediaPacket(const WaveMediaPacket& /*packet*/) override {
+            return false;
+        }
+        void close() override {
+            state_ = WaveTransportState::Closed;
+        }
+        void poll(double /*currentTimeSeconds*/) override {}
+        WaveTransportState state() const noexcept override { return state_; }
+
+        void injectPacket(WaveMediaPacket pkt, double arrivalTimeSeconds) {
+            if (cb_.onMediaPacket) {
+                cb_.onMediaPacket(std::move(pkt), arrivalTimeSeconds);
+            }
+        }
+
+    private:
+        WaveTransportCallbacks cb_;
+        WaveTransportState state_ = WaveTransportState::Idle;
+    };
+
+    auto listTx = std::make_shared<ManualListenerTransport>();
+    WavePipelineConfig lCfg;
+    lCfg.role = WaveRole::Listener;
+    lCfg.jitterConfig.minDepthFrames = 2;
+    lCfg.jitterConfig.maxDepthFrames = 6;
+    auto codec = std::make_shared<Pcm16WaveCodec>();
+    WaveAudioPipeline listener(lCfg, codec, listTx);
+
+    WaveSignalMessage offer;
+    offer.version = kWaveSignalVersion;
+    offer.type = WaveSignalType::Offer;
+    offer.sid = generateWaveSessionId();
+    offer.iat = 1763000000;
+    offer.exp = 1763000120;
+    offer.nonce = 1;
+    offer.signal.iceUfrag = "hostufrag";
+    offer.signal.icePwd = "hostpassword1234567890";
+    offer.signal.dtlsFingerprintAlg = "sha-256";
+    offer.signal.dtlsFingerprint =
+        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
+        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+    offer.signal.setupRole = WaveDtlsSetupRole::Actpass;
+
+    CHECK(listener.acceptOffer(offer, 1763000001));
+    CHECK(listener.state() == WaveSessionState::LiveP2P);
+
+    auto makeEncodedPkt = [&](std::uint32_t seq) {
+        std::vector<float> pcm(kWaveFrameSamples * 2, 0.25f);
+        std::vector<std::uint8_t> encoded;
+        CHECK(codec->encode(pcm, encoded));
+        WaveMediaPacket pkt;
+        pkt.sequence = seq;
+        pkt.timestamp48k = seq * static_cast<std::uint32_t>(kWaveFrameSamples);
+        pkt.frameSamples = static_cast<std::uint16_t>(kWaveFrameSamples);
+        pkt.payload = std::move(encoded);
+        return pkt;
+    };
+
+    std::vector<float> pulled(480 * 2, 0.0f);
+    // Interleaved 20ms packet arrival (with seq 2 delayed by 10ms behind seq 3)
+    // and 10ms process() ticks: jitter buffer must retain target depth so seq 2
+    // arrives in time without triggering MissingPlc / packet loss.
+    listTx->injectPacket(makeEncodedPkt(0), 0.000);
+    listener.process(0.000);
+    listener.process(0.010);
+
+    listTx->injectPacket(makeEncodedPkt(1), 0.020);
+    listener.process(0.020);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+    listener.process(0.030);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+
+    listTx->injectPacket(makeEncodedPkt(3), 0.040); // seq 2 delayed
+    listener.process(0.040);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+
+    listTx->injectPacket(makeEncodedPkt(2), 0.050); // arrives 10ms later
+    listener.process(0.050);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+
+    listTx->injectPacket(makeEncodedPkt(4), 0.060);
+    listener.process(0.060);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+    listener.process(0.070);
+    (void)listener.pullListenerPcm(pulled.data(), 480, 48000);
+
+    listTx->injectPacket(makeEncodedPkt(5), 0.080);
+    listener.process(0.080);
+
+    const WaveStats ls = listener.stats();
+    CHECK(ls.packetsReceived == 6u);
+    CHECK(ls.packetsLost == 0u);
+    CHECK(ls.plcFrames == 0u);
+    CHECK(ls.packetsReordered == 1u);
+}
+
+TEST_CASE(wave.jitter_buffer_edge_cases) {
+    using namespace bgmedia::wave;
+
+    auto makePkt = [](std::uint32_t seq) {
+        WaveMediaPacket p;
+        p.sequence = seq;
+        p.timestamp48k = seq * 960;
+        p.payload = {1, 2, 3, 4};
+        return p;
+    };
+
+    // 1. sampleRate = 0 and invalid min/max depth sanitization
+    {
+        WaveJitterBuffer::Config cfg;
+        cfg.sampleRate = 0;
+        cfg.minDepthFrames = 0;
+        cfg.maxDepthFrames = 0;
+        WaveJitterBuffer jb(cfg);
+        CHECK(jb.targetDepthFrames() >= 1u);
+        jb.push(makePkt(0), 0.000);
+        jb.push(makePkt(1), 0.050);
+        jb.push(makePkt(2), 0.120);
+        CHECK(std::isfinite(jb.jitterMs()));
+        CHECK_NEAR(jb.jitterMs(), 0.0, 1e-9);
+    }
+
+    // 2. minDepthFrames > maxDepthFrames sanitized without clamp UB
+    {
+        WaveJitterBuffer::Config cfg;
+        cfg.minDepthFrames = 8;
+        cfg.maxDepthFrames = 2;
+        WaveJitterBuffer jb(cfg);
+        CHECK(jb.targetDepthFrames() == 8u);
+        jb.push(makePkt(0), 0.000);
+        jb.push(makePkt(1), 0.020);
+        CHECK(jb.targetDepthFrames() == 8u);
+    }
+
+    // 3. NaN/Inf arrivalTimeSeconds ignored cleanly
+    {
+        WaveJitterBuffer jb;
+        jb.push(makePkt(0), 0.000);
+        jb.push(makePkt(1), 0.020);
+        jb.push(makePkt(2), std::numeric_limits<double>::quiet_NaN());
+        jb.push(makePkt(3), std::numeric_limits<double>::infinity());
+        CHECK(std::isfinite(jb.jitterMs()));
+        CHECK_NEAR(jb.jitterMs(), 0.0, 1e-9);
+    }
+
+    // 4. Late and duplicate packets do not inflate jitterMs
+    {
+        WaveJitterBuffer::Config cfg;
+        cfg.minDepthFrames = 2;
+        cfg.maxDepthFrames = 8;
+        WaveJitterBuffer jb(cfg);
+        jb.push(makePkt(0), 0.000);
+        jb.push(makePkt(1), 0.020);
+        jb.push(makePkt(2), 0.040);
+        CHECK_NEAR(jb.jitterMs(), 0.0, 1e-9);
+
+        WaveMediaPacket out;
+        CHECK(jb.popNext(out) == WaveJitterBuffer::PopStatus::Packet);
+        CHECK(out.sequence == 0u);
+
+        // Late packet with huge arrival delay must not affect jitterMs
+        jb.push(makePkt(0), 5.000);
+        CHECK(jb.packetsDroppedLate() == 1u);
+        CHECK_NEAR(jb.jitterMs(), 0.0, 1e-9);
+
+        // Duplicate packet with huge arrival delay must not affect jitterMs
+        jb.push(makePkt(1), 10.000);
+        CHECK(jb.packetsDuplicate() == 1u);
+        CHECK_NEAR(jb.jitterMs(), 0.0, 1e-9);
+    }
+
+    // 5. advancePlaySeq accounts for skipped occupied and gap slots
+    {
+        WaveJitterBuffer::Config cfg;
+        cfg.maxSlots = 16;
+        cfg.minDepthFrames = 2;
+        cfg.maxDepthFrames = 4;
+        WaveJitterBuffer jb(cfg);
+        jb.push(makePkt(0), 0.000);
+        jb.push(makePkt(1), 0.020);
+        // offset = 20 (>= 16, < 32) -> advance = 20 - 8 = 12 (skips seq 0..11)
+        jb.push(makePkt(20), 0.400);
+        CHECK(jb.packetsDroppedLate() == 2u); // occupied seq 0, 1
+        CHECK(jb.packetsLost() == 10u);       // gap seq 2..11
+    }
+}
+
+TEST_CASE(wave.resampler_downsampling_prefilter_and_streaming) {
+    using namespace bgmedia::wave;
+
+    // 1. Streaming 96kHz -> 48kHz passband (1 kHz) in chunks including small <4 frame chunks
+    {
+        WaveStereoResampler resampler;
+        resampler.configure(96000, 48000);
+        CHECK(!resampler.isBypass());
+
+        const std::size_t totalInFrames = 9600; // 100 ms @ 96 kHz
+        std::vector<float> in(totalInFrames * 2);
+        for (std::size_t i = 0; i < totalInFrames; ++i) {
+            const float v =
+                0.5f * std::sin(2.0f * 3.14159265f * 1000.0f *
+                                static_cast<float>(i) / 96000.0f);
+            in[i * 2] = v;
+            in[i * 2 + 1] = -v;
+        }
+
+        std::vector<float> out;
+        std::size_t pos = 0;
+        const std::size_t chunkSizes[] = {2, 3, 955, 960, 1920};
+        std::size_t cIdx = 0;
+        while (pos < totalInFrames) {
+            const std::size_t take =
+                std::min(chunkSizes[cIdx % 5], totalInFrames - pos);
+            resampler.process(
+                std::span<const float>(in.data() + pos * 2, take * 2), out);
+            pos += take;
+            ++cIdx;
+        }
+
+        const std::size_t outFrames = out.size() / 2;
+        CHECK(outFrames > 4770u && outFrames < 4820u);
+        double energy = 0.0;
+        for (float s : out) {
+            CHECK(std::isfinite(s));
+            CHECK(s >= -1.0f && s <= 1.0f);
+            energy += static_cast<double>(s) * s;
+        }
+        CHECK(energy > 500.0);
+    }
+
+    // 2. Anti-aliasing 3-tap [0.25, 0.5, 0.25] prefilter attenuates fs_in/2 Nyquist tone
+    {
+        WaveStereoResampler resampler;
+        resampler.configure(96000, 48000);
+        const std::size_t frames = 2000;
+        std::vector<float> nyquistIn(frames * 2);
+        for (std::size_t i = 0; i < frames; ++i) {
+            const float v = (i % 2 == 0) ? 0.8f : -0.8f;
+            nyquistIn[i * 2] = v;
+            nyquistIn[i * 2 + 1] = v;
+        }
+        std::vector<float> nyquistOut;
+        resampler.process(nyquistIn, nyquistOut);
+        const std::size_t outFrames = nyquistOut.size() / 2;
+        CHECK(outFrames > 900u);
+        float maxSteady = 0.0f;
+        for (std::size_t i = 16; i < outFrames; ++i) {
+            maxSteady = std::max(maxSteady, std::abs(nyquistOut[i * 2]));
+            maxSteady = std::max(maxSteady, std::abs(nyquistOut[i * 2 + 1]));
+        }
+        CHECK(maxSteady < 0.01f);
+    }
+}
+
+TEST_CASE(wave.pipeline_stack_lifetime_and_final_stats_after_stop) {
+    using namespace bgmedia::wave;
+
+    auto hostTx = std::make_shared<SimulatedWaveTransport>();
+    auto listTx = std::make_shared<SimulatedWaveTransport>();
+    SimulatedWaveTransport::linkPeers(*hostTx, *listTx);
+
+    {
+        WavePipelineConfig hCfg;
+        hCfg.role = WaveRole::Host;
+        WaveAudioPipeline host(hCfg, std::make_shared<Pcm16WaveCodec>(), hostTx);
+
+        WavePipelineConfig lCfg;
+        lCfg.role = WaveRole::Listener;
+        WaveAudioPipeline listener(lCfg, std::make_shared<Pcm16WaveCodec>(),
+                                   listTx);
+
+        WaveSignalMessage offer, answer;
+        WavePipelineCallbacks hCb;
+        hCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+            if (m.type == WaveSignalType::Offer) offer = m;
+        };
+        host.setCallbacks(std::move(hCb));
+        WavePipelineCallbacks lCb;
+        lCb.onOutboundSignal = [&](const WaveSignalMessage& m) {
+            if (m.type == WaveSignalType::Answer) answer = m;
+        };
+        listener.setCallbacks(std::move(lCb));
+
+        CHECK(host.startOffer(1000));
+        CHECK(listener.acceptOffer(offer, 1001));
+        CHECK(host.acceptAnswer(answer, 1002));
+
+        std::vector<float> pcm(kWaveFrameSamples * 2, 0.25f);
+        std::vector<float> out(kWaveFrameSamples * 2, 0.0f);
+        double t = 0.0;
+        for (int step = 0; step < 6; ++step) {
+            host.onPcmRendered(pcm.data(), kWaveFrameSamples, kWaveSampleRate);
+            host.process(t);
+            listener.process(t);
+            (void)listener.pullListenerPcm(out.data(), kWaveFrameSamples,
+                                           kWaveSampleRate);
+            t += 0.020;
+        }
+
+        host.stop(true, 1005);
+        listener.stop(false, 1005);
+
+        // Final stats must remain readable after stop().
+        CHECK(host.stats().packetsSent >= 5u);
+        CHECK(host.stats().bytesSent > 0u);
+        CHECK(listener.stats().packetsReceived >= 4u);
+        CHECK(listener.stats().bytesReceived > 0u);
+
+        host.reset();
+        CHECK(host.stats().packetsSent == 0u);
+    }
+
+    // Transports outlive stack-allocated pipelines: poll/close must be safe.
+    hostTx->poll(1.0);
+    listTx->poll(1.0);
+    hostTx->close();
+    listTx->close();
 }
