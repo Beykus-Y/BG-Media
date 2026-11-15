@@ -13,12 +13,14 @@
 #include "bgmedia/wave/WebRtcWaveTransport.hpp"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -184,6 +186,52 @@ TEST_CASE(wave_real.opus_stereo_48k_and_plc) {
         CHECK(codec.decodePlc(plc));
         CHECK(computeRms(plc) > 0.01);
     }
+}
+
+TEST_CASE(wave_real.opus_error_and_bitrate_bounds) {
+    using namespace bgmedia::wave;
+
+    OpusWaveCodec lowCodec(1000u);
+    CHECK(lowCodec.isReady());
+    CHECK(lowCodec.bitrate() == kWaveMinBitrateBps);
+
+    OpusWaveCodec highCodec(1000000u);
+    CHECK(highCodec.isReady());
+    CHECK(highCodec.bitrate() == kWaveMaxBitrateBps);
+
+    lowCodec.setBitrate(0u);
+    CHECK(lowCodec.bitrate() == kWaveMinBitrateBps);
+    lowCodec.setBitrate(999999u);
+    CHECK(lowCodec.bitrate() == kWaveMaxBitrateBps);
+    lowCodec.setBitrate(144000u);
+    CHECK(lowCodec.bitrate() == 144000u);
+    lowCodec.setPacketLossPercent(-10);
+    lowCodec.setPacketLossPercent(200);
+
+    std::vector<std::uint8_t> encoded;
+    std::vector<float> badPcm(16, 0.0f);
+    CHECK(!lowCodec.encode(badPcm, encoded));
+
+    std::vector<float> decoded(kWaveFrameSamples * 2, 0.0f);
+    std::vector<float> shortOut(32, 0.0f);
+    CHECK(!lowCodec.decode({}, decoded));
+    std::vector<std::uint8_t> oversized(5000, 0xAAu);
+    CHECK(!lowCodec.decode(oversized, decoded));
+    CHECK(!lowCodec.decodePlc(shortOut));
+    CHECK(!lowCodec.decodeFec({}, decoded));
+    CHECK(!lowCodec.decodeFec(oversized, decoded));
+
+    double phase = 0.0;
+    std::vector<float> pcm;
+    generateStereoSine(pcm, kWaveFrameSamples, phase);
+    CHECK(lowCodec.encode(pcm, encoded));
+    CHECK(!lowCodec.decode(encoded, shortOut));
+    CHECK(!lowCodec.decodeFec(encoded, shortOut));
+    CHECK(lowCodec.decode(encoded, decoded));
+
+    lowCodec.reset();
+    CHECK(lowCodec.encode(pcm, encoded));
+    CHECK(lowCodec.decode(encoded, decoded));
 }
 #endif
 
@@ -406,6 +454,8 @@ TEST_CASE(wave_real.webrtc_tampered_fingerprint_rejected) {
     }
 
     CHECK(!hostTx->remoteFingerprintVerified());
+    CHECK(hostTx->state() == WaveTransportState::Failed);
+    CHECK(host.state() == WaveSessionState::P2PFailed);
     CHECK(host.state() != WaveSessionState::LiveP2P);
 }
 
@@ -540,6 +590,142 @@ TEST_CASE(wave_real.rtp_sequence_rollover_reordered) {
             CHECK(popped.sequence == want);
         }
     }
+}
+
+TEST_CASE(wave_real.rtp_sequence_initial_backward_wraparound) {
+    using namespace bgmedia::wave;
+
+    {
+        RtpSequenceUnwrapper u;
+        CHECK(u.unwrap(0) == 0u);
+        CHECK(u.unwrap(65535) == 0xFFFFFFFFu);
+        CHECK(u.cycles == 0u);
+        CHECK(u.maxSeq16 == 0u);
+        CHECK(u.unwrap(65534) == 0xFFFFFFFEu);
+        CHECK(u.cycles == 0u);
+        CHECK(u.unwrap(1) == 1u);
+        CHECK(u.cycles == 0u);
+        CHECK(u.maxSeq16 == 1u);
+        CHECK(u.unwrap(2) == 2u);
+    }
+
+    {
+        RtpSequenceUnwrapper u;
+        WaveJitterBuffer jb;
+        const std::vector<std::uint16_t> inSeqs = {0, 65535, 1, 2, 3};
+        for (std::size_t i = 0; i < inSeqs.size(); ++i) {
+            WaveMediaPacket pkt;
+            pkt.sequence = u.unwrap(inSeqs[i]);
+            pkt.timestamp48k = pkt.sequence * static_cast<std::uint32_t>(kWaveFrameSamples);
+            pkt.payload = {static_cast<std::uint8_t>(i + 1)};
+            jb.push(std::move(pkt), static_cast<double>(i) * 0.02);
+        }
+        CHECK(jb.packetsDroppedLate() == 1u);
+        for (std::uint32_t want = 0; want <= 3; ++want) {
+            WaveMediaPacket popped;
+            CHECK(jb.popNext(popped) == WaveJitterBuffer::PopStatus::Packet);
+            CHECK(popped.sequence == want);
+        }
+    }
+}
+
+TEST_CASE(wave_real.rtp_header_parser_bounds_and_padding) {
+    using namespace bgmedia::wave;
+
+    auto makeBaseRtp = [](std::uint8_t flags0,
+                          std::uint8_t flags1,
+                          std::uint16_t seq,
+                          std::uint32_t ts,
+                          std::uint32_t ssrc) {
+        std::vector<std::uint8_t> pkt(12, 0);
+        pkt[0] = flags0;
+        pkt[1] = flags1;
+        pkt[2] = static_cast<std::uint8_t>((seq >> 8) & 0xFFu);
+        pkt[3] = static_cast<std::uint8_t>(seq & 0xFFu);
+        pkt[4] = static_cast<std::uint8_t>((ts >> 24) & 0xFFu);
+        pkt[5] = static_cast<std::uint8_t>((ts >> 16) & 0xFFu);
+        pkt[6] = static_cast<std::uint8_t>((ts >> 8) & 0xFFu);
+        pkt[7] = static_cast<std::uint8_t>(ts & 0xFFu);
+        pkt[8] = static_cast<std::uint8_t>((ssrc >> 24) & 0xFFu);
+        pkt[9] = static_cast<std::uint8_t>((ssrc >> 16) & 0xFFu);
+        pkt[10] = static_cast<std::uint8_t>((ssrc >> 8) & 0xFFu);
+        pkt[11] = static_cast<std::uint8_t>(ssrc & 0xFFu);
+        return pkt;
+    };
+
+    ParsedRtpPacket parsed;
+
+    // Truncated packet (< 12 bytes) and wrong version.
+    CHECK(!parseRtpPacket({}, parsed));
+    std::vector<std::uint8_t> tooShort(11, 0x80u);
+    CHECK(!parseRtpPacket(tooShort, parsed));
+    auto wrongVer = makeBaseRtp(0x40u, 111u, 1u, 960u, 0x11223344u);
+    CHECK(!parseRtpPacket(wrongVer, parsed));
+
+    // Valid minimal v2 packet with marker + payload.
+    auto valid = makeBaseRtp(0x80u, static_cast<std::uint8_t>(0x80u | 111u),
+                             42u, 40320u, 0xAABBCCDDu);
+    valid.push_back(0x01u);
+    valid.push_back(0x02u);
+    valid.push_back(0x03u);
+    CHECK(parseRtpPacket(valid, parsed));
+    CHECK(parsed.payloadType == 111u);
+    CHECK(parsed.marker);
+    CHECK(parsed.sequence == 42u);
+    CHECK(parsed.timestamp == 40320u);
+    CHECK(parsed.ssrc == 0xAABBCCDDu);
+    CHECK(parsed.payloadOffset == 12u);
+    CHECK(parsed.payloadSize == 3u);
+
+    // CSRC bounds check (CC = 2 -> needs 20 bytes).
+    auto badCsrc = makeBaseRtp(0x82u, 111u, 1u, 0u, 1u);
+    badCsrc.resize(16, 0u);
+    CHECK(!parseRtpPacket(badCsrc, parsed));
+
+    // Extension bit set with truncated extension header (< baseHdr + 4).
+    auto truncExt = makeBaseRtp(0x90u, 111u, 1u, 0u, 1u);
+    truncExt.push_back(0xBEu);
+    truncExt.push_back(0xDEu);
+    CHECK(!parseRtpPacket(truncExt, parsed));
+
+    // Extension length exceeds packet bounds.
+    auto oobExt = makeBaseRtp(0x90u, 111u, 1u, 0u, 1u);
+    oobExt.push_back(0xBEu);
+    oobExt.push_back(0xDEu);
+    oobExt.push_back(0x00u);
+    oobExt.push_back(0x0Au); // 10 * 4 = 40 bytes extension body
+    oobExt.resize(20, 0u);
+    CHECK(!parseRtpPacket(oobExt, parsed));
+
+    // Valid extension (1 word = 4 bytes after 4-byte ext header = 8 bytes).
+    auto validExt = makeBaseRtp(0x90u, 111u, 7u, 960u, 0x12345678u);
+    validExt.insert(validExt.end(), {0xBEu, 0xDEu, 0x00u, 0x01u, 0xAAu, 0xBBu, 0xCCu, 0xDDu});
+    validExt.insert(validExt.end(), {0x11u, 0x22u, 0x33u, 0x44u, 0x55u});
+    CHECK(parseRtpPacket(validExt, parsed));
+    CHECK(parsed.payloadOffset == 20u);
+    CHECK(parsed.payloadSize == 5u);
+
+    // Malformed padding: no padding byte, zero padLen, and padLen > remaining.
+    auto emptyPad = makeBaseRtp(0xA0u, 111u, 1u, 0u, 1u);
+    CHECK(!parseRtpPacket(emptyPad, parsed));
+
+    auto zeroPad = makeBaseRtp(0xA0u, 111u, 1u, 0u, 1u);
+    zeroPad.insert(zeroPad.end(), {0x10u, 0x00u});
+    CHECK(!parseRtpPacket(zeroPad, parsed));
+
+    auto overPad = makeBaseRtp(0xA0u, 111u, 1u, 0u, 1u);
+    overPad.insert(overPad.end(), {0x10u, 0x05u});
+    CHECK(!parseRtpPacket(overPad, parsed));
+
+    // Valid CSRC(1) + Extension(1 word) + Padding(2 bytes) + 4 payload bytes.
+    auto combined = makeBaseRtp(0xB1u, 111u, 99u, 1920u, 0xCAFEBABEu);
+    combined.insert(combined.end(), {0x00u, 0x00u, 0x00u, 0x01u}); // 1 CSRC
+    combined.insert(combined.end(), {0xBEu, 0xDEu, 0x00u, 0x01u, 0xAAu, 0xBBu, 0xCCu, 0xDDu}); // Ext
+    combined.insert(combined.end(), {0x01u, 0x02u, 0x03u, 0x04u}); // Payload
+    combined.insert(combined.end(), {0x00u, 0x02u}); // 2 bytes padding
+    CHECK(parseRtpPacket(combined, parsed));
+    CHECK(parsed.payloadOffset == 24u);
+    CHECK(parsed.payloadSize == 4u);
 }
 
 TEST_CASE(wave_real.ice_candidate_selection_and_budget) {

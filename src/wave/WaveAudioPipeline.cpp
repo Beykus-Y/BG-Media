@@ -2,10 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
-#include <thread>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <thread>
 
 namespace bgmedia::wave {
 namespace {
@@ -283,6 +284,16 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
                   "Only Host role can start an offer");
         return false;
     }
+    const std::int64_t ts = resolveTimestamp(nowUnixSeconds);
+    const std::int64_t rawTtl =
+        ttlSeconds > 0 ? ttlSeconds : config_.defaultOfferTtlSeconds;
+    const std::int64_t ttl =
+        std::clamp<std::int64_t>(rawTtl, 1, kWaveMaxSignalTtlSeconds);
+    if (ts <= 0 || ts > std::numeric_limits<std::int64_t>::max() - ttl) {
+        emitError(WaveErrorCode::InvalidArgument,
+                  "Offer timestamp out of range");
+        return false;
+    }
     std::shared_ptr<IWaveTransport> tx;
     std::array<std::uint8_t, 16> newSid{};
     std::uint64_t nonce = 0;
@@ -357,11 +368,6 @@ bool WaveAudioPipeline::startOffer(std::int64_t nowUnixSeconds,
         return false;
     }
 
-    const std::int64_t ts = resolveTimestamp(nowUnixSeconds);
-    const std::int64_t rawTtl =
-        ttlSeconds > 0 ? ttlSeconds : config_.defaultOfferTtlSeconds;
-    const std::int64_t ttl =
-        std::clamp<std::int64_t>(rawTtl, 1, kWaveMaxSignalTtlSeconds);
     WaveSignalMessage msg;
     msg.version = kWaveSignalVersion;
     msg.type = WaveSignalType::Offer;
@@ -392,8 +398,9 @@ bool WaveAudioPipeline::acceptOffer(const WaveSignalMessage& offer,
                   "Only Listener role can accept an offer");
         return false;
     }
+    const std::int64_t effectiveNow = resolveTimestamp(nowUnixSeconds);
     std::string err;
-    if (!validateWaveSignal(offer, nowUnixSeconds, &err) ||
+    if (!validateWaveSignal(offer, effectiveNow, &err) ||
         offer.type != WaveSignalType::Offer) {
         emitError(WaveErrorCode::SignalingFailed,
                   err.empty() ? "Invalid Offer message" : err);
@@ -402,10 +409,32 @@ bool WaveAudioPipeline::acceptOffer(const WaveSignalMessage& offer,
     std::shared_ptr<IWaveTransport> tx;
     std::uint64_t nonce = 0;
     std::uint64_t myGen = 0;
+    bool badState = false;
+    bool replayedOffer = false;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
-        tx = transport_;
-        if (tx) {
+        const WaveSessionState cur = state();
+        const bool stateAllowed =
+            (cur == WaveSessionState::Idle ||
+             cur == WaveSessionState::Ended ||
+             cur == WaveSessionState::P2PFailed ||
+             cur == WaveSessionState::Failed);
+        if (!stateAllowed) {
+            badState = true;
+        } else {
+            replayedOffer = std::any_of(
+                acceptedOfferHistory_.begin(), acceptedOfferHistory_.end(),
+                [&](const AcceptedOfferRecord& rec) {
+                    return rec.sid == offer.sid && rec.nonce == offer.nonce;
+                });
+        }
+        if (!badState && !replayedOffer && transport_) {
+            tx = transport_;
+            if (acceptedOfferHistory_.size() >= kMaxAcceptedOfferHistory) {
+                acceptedOfferHistory_.pop_front();
+            }
+            acceptedOfferHistory_.push_back(
+                AcceptedOfferRecord{offer.sid, offer.nonce});
             {
                 std::lock_guard<std::mutex> sLock(sidMutex_);
                 sid_ = offer.sid;
@@ -416,6 +445,15 @@ bool WaveAudioPipeline::acceptOffer(const WaveSignalMessage& offer,
             nonce = nextNonce_++;
             myGen = sessionGen_.fetch_add(1, std::memory_order_acq_rel) + 1;
         }
+    }
+    if (badState) {
+        emitError(WaveErrorCode::InvalidState,
+                  "Cannot accept offer from current state");
+        return false;
+    }
+    if (replayedOffer) {
+        emitError(WaveErrorCode::SignalingFailed, "Replayed offer signal");
+        return false;
     }
     if (!tx) {
         emitError(WaveErrorCode::TransportFailed, "No P2P transport configured");
@@ -453,7 +491,7 @@ bool WaveAudioPipeline::acceptOffer(const WaveSignalMessage& offer,
             ans.version = kWaveSignalVersion;
             ans.type = WaveSignalType::Answer;
             ans.sid = offer.sid;
-            ans.iat = resolveTimestamp(nowUnixSeconds);
+            ans.iat = effectiveNow;
             ans.exp = offer.exp;
             ans.caps = kWaveCapOpus48kStereo | kWaveCapDtlsSrtp |
                        kWaveCapExternalCallFallback;
@@ -491,23 +529,27 @@ bool WaveAudioPipeline::acceptAnswer(const WaveSignalMessage& answer,
                   "Not awaiting an answer");
         return false;
     }
+    const std::int64_t effectiveNow = resolveTimestamp(nowUnixSeconds);
     std::string err;
-    if (!validateWaveSignal(answer, nowUnixSeconds, &err) ||
+    if (!validateWaveSignal(answer, effectiveNow, &err) ||
         answer.type != WaveSignalType::Answer || answer.sid != curSid) {
         emitError(WaveErrorCode::SignalingFailed,
                   err.empty() ? "Invalid or mismatched Answer" : err);
         return false;
     }
+    bool answerStillCurrent = false;
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
-        if (state() != WaveSessionState::AwaitingAnswer ||
-            sessionGen_.load(std::memory_order_acquire) != myGen) {
-            emitError(WaveErrorCode::InvalidState,
-                      "Not awaiting an answer");
-            return false;
+        answerStillCurrent = state() == WaveSessionState::AwaitingAnswer &&
+            sessionGen_.load(std::memory_order_acquire) == myGen;
+        if (answerStillCurrent) {
+            hasLastRemoteNonce_ = true;
+            lastRemoteNonce_ = answer.nonce;
         }
-        hasLastRemoteNonce_ = true;
-        lastRemoteNonce_ = answer.nonce;
+    }
+    if (!answerStillCurrent) {
+        emitError(WaveErrorCode::InvalidState, "Not awaiting an answer");
+        return false;
     }
     setState(WaveSessionState::ConnectingP2P, "applying answer");
     if (sessionGen_.load(std::memory_order_acquire) != myGen) {
@@ -524,16 +566,17 @@ bool WaveAudioPipeline::acceptAnswer(const WaveSignalMessage& answer,
 
 bool WaveAudioPipeline::handleRemoteSignal(const WaveSignalMessage& msg,
                                            std::int64_t nowUnixSeconds) {
+    const std::int64_t effectiveNow = resolveTimestamp(nowUnixSeconds);
     std::string err;
-    if (!validateWaveSignal(msg, nowUnixSeconds, &err)) {
+    if (!validateWaveSignal(msg, effectiveNow, &err)) {
         emitError(WaveErrorCode::SignalingFailed, err);
         return false;
     }
     if (msg.type == WaveSignalType::Offer) {
-        return acceptOffer(msg, nowUnixSeconds);
+        return acceptOffer(msg, effectiveNow);
     }
     if (msg.type == WaveSignalType::Answer) {
-        return acceptAnswer(msg, nowUnixSeconds);
+        return acceptAnswer(msg, effectiveNow);
     }
     std::shared_ptr<IWaveTransport> tx;
     {
@@ -599,15 +642,21 @@ void WaveAudioPipeline::stop(bool emitEndSignal, std::int64_t nowUnixSeconds) {
              cur == WaveSessionState::LiveP2P)) {
             shouldEmit = true;
             const std::int64_t ts = resolveTimestamp(nowUnixSeconds);
-            endMsg.version = kWaveSignalVersion;
-            endMsg.type = (cur == WaveSessionState::Offering ||
-                           cur == WaveSessionState::AwaitingAnswer)
-                              ? WaveSignalType::Cancel
-                              : WaveSignalType::End;
-            endMsg.sid = sessionId();
-            endMsg.iat = ts;
-            endMsg.exp = ts + 60;
-            endMsg.nonce = nextNonce_++;
+            constexpr std::int64_t kMaxInt64 =
+                std::numeric_limits<std::int64_t>::max();
+            if (ts <= 0 || ts >= kMaxInt64) {
+                shouldEmit = false;
+            } else {
+                endMsg.version = kWaveSignalVersion;
+                endMsg.type = (cur == WaveSessionState::Offering ||
+                               cur == WaveSessionState::AwaitingAnswer)
+                                  ? WaveSignalType::Cancel
+                                  : WaveSignalType::End;
+                endMsg.sid = sessionId();
+                endMsg.iat = ts;
+                endMsg.exp = (ts > kMaxInt64 - 60) ? kMaxInt64 : (ts + 60);
+                endMsg.nonce = nextNonce_++;
+            }
         }
         tx = transport_;
     }

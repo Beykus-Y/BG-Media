@@ -57,6 +57,9 @@ public:
     void setCallbacks(WavePipelineCallbacks callbacks);
 
     // Signaling & lifecycle control.
+    // For acceptOffer/acceptAnswer/handleRemoteSignal, nowUnixSeconds <= 0
+    // resolves to wall-clock time (system_clock::now()) so TTL expiry checks
+    // are never bypassed.
     bool startOffer(std::int64_t nowUnixSeconds,
                     std::int64_t ttlSeconds = 0);
     bool acceptOffer(const WaveSignalMessage& offer,
@@ -181,6 +184,12 @@ private:
     std::uint64_t nextNonce_ = 1;
     std::uint64_t lastRemoteNonce_ = 0;
     bool hasLastRemoteNonce_ = false;
+    struct AcceptedOfferRecord {
+        std::array<std::uint8_t, 16> sid{};
+        std::uint64_t nonce = 0;
+    };
+    static constexpr std::size_t kMaxAcceptedOfferHistory = 32;
+    std::deque<AcceptedOfferRecord> acceptedOfferHistory_;
     WaveSdpSignal lastLocalSignal_{};
     bool hasLastLocalSignal_ = false;
 

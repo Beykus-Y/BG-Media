@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #if defined(_WIN32)
 #include <windows.h>
@@ -279,12 +280,101 @@ std::string formatIpv6(const std::array<std::uint8_t, 16>& ip) {
     return oss.str();
 }
 
+bool hasControlOrWhitespace(std::string_view s) noexcept {
+    for (const unsigned char ch : s) {
+        if (ch <= 0x20u || ch >= 0x7Fu) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool validateSdpSignalFields(const WaveSdpSignal& sig,
+                             bool requireOfferAnswerFields,
+                             std::string* error) {
+    if (requireOfferAnswerFields &&
+        (sig.iceUfrag.empty() || sig.icePwd.empty() ||
+         sig.dtlsFingerprintAlg.empty() || sig.dtlsFingerprint.empty())) {
+        setError(error,
+                 "Offer/Answer signal missing required ICE or DTLS fields");
+        return false;
+    }
+    if (sig.iceUfrag.size() > kMaxStringFieldBytes ||
+        sig.icePwd.size() > kMaxStringFieldBytes ||
+        sig.dtlsFingerprintAlg.size() > kMaxStringFieldBytes ||
+        sig.dtlsFingerprint.size() > kMaxStringFieldBytes) {
+        setError(error, "Signal string field exceeds maximum length");
+        return false;
+    }
+    if (hasControlOrWhitespace(sig.iceUfrag) ||
+        hasControlOrWhitespace(sig.icePwd) ||
+        hasControlOrWhitespace(sig.dtlsFingerprintAlg) ||
+        hasControlOrWhitespace(sig.dtlsFingerprint)) {
+        setError(error,
+                 "Signal field contains invalid control or whitespace characters");
+        return false;
+    }
+    switch (sig.setupRole) {
+    case WaveDtlsSetupRole::Actpass:
+    case WaveDtlsSetupRole::Active:
+    case WaveDtlsSetupRole::Passive:
+        break;
+    default:
+        setError(error, "Invalid DTLS setup role");
+        return false;
+    }
+    if (sig.candidates.size() > kWaveMaxCandidates) {
+        setError(error, "Too many ICE candidates");
+        return false;
+    }
+    for (const auto& c : sig.candidates) {
+        if (c.foundation.empty() ||
+            c.foundation.size() > kMaxStringFieldBytes ||
+            c.address.empty() || c.address.size() > kMaxStringFieldBytes ||
+            c.port == 0 || c.component == 0 ||
+            hasControlOrWhitespace(c.foundation) ||
+            hasControlOrWhitespace(c.address)) {
+            setError(error, "Invalid ICE candidate");
+            return false;
+        }
+        switch (c.protocol) {
+        case WaveIceProtocol::Udp:
+        case WaveIceProtocol::Tcp:
+            break;
+        default:
+            setError(error, "Unknown ICE candidate protocol");
+            return false;
+        }
+        switch (c.type) {
+        case WaveIceCandidateType::Host:
+        case WaveIceCandidateType::Srflx:
+        case WaveIceCandidateType::Prflx:
+        case WaveIceCandidateType::Relay:
+            break;
+        default:
+            setError(error, "Unknown ICE candidate type");
+            return false;
+        }
+        switch (c.tcpType) {
+        case WaveIceTcpType::None:
+        case WaveIceTcpType::Active:
+        case WaveIceTcpType::Passive:
+        case WaveIceTcpType::So:
+            break;
+        default:
+            setError(error, "Unknown ICE TCP type");
+            return false;
+        }
+    }
+    return true;
+}
+
 bool parseSha256FingerprintHex(std::string_view fp,
                                std::array<std::uint8_t, 32>& out) {
     std::size_t byteIdx = 0;
     std::size_t pos = 0;
     while (pos < fp.size() && byteIdx < 32) {
-        if (fp[pos] == ':' || fp[pos] == ' ') {
+        if (fp[pos] == ':') {
             ++pos;
             continue;
         }
@@ -443,32 +533,18 @@ bool validateWaveSignal(const WaveSignalMessage& msg,
             setError(error, "Signal has expired");
             return false;
         }
-        if (msg.iat > nowUnixSeconds + kWaveMaxClockSkewSeconds) {
+        constexpr std::int64_t kMaxInt64 =
+            std::numeric_limits<std::int64_t>::max();
+        if (nowUnixSeconds <= kMaxInt64 - kWaveMaxClockSkewSeconds &&
+            msg.iat > nowUnixSeconds + kWaveMaxClockSkewSeconds) {
             setError(error, "Signal iat exceeds allowed future clock skew");
             return false;
         }
     }
-    if (msg.signal.iceUfrag.size() > kMaxStringFieldBytes ||
-        msg.signal.icePwd.size() > kMaxStringFieldBytes ||
-        msg.signal.dtlsFingerprintAlg.size() > kMaxStringFieldBytes ||
-        msg.signal.dtlsFingerprint.size() > kMaxStringFieldBytes) {
-        setError(error, "Signal string field exceeds maximum length");
-        return false;
-    }
-    if (msg.signal.candidates.size() > kWaveMaxCandidates) {
-        setError(error, "Too many ICE candidates");
-        return false;
-    }
-    for (const auto& c : msg.signal.candidates) {
-        if (c.foundation.empty() ||
-            c.foundation.size() > kMaxStringFieldBytes ||
-            c.address.empty() || c.address.size() > kMaxStringFieldBytes ||
-            c.port == 0 || c.component == 0) {
-            setError(error, "Invalid ICE candidate");
-            return false;
-        }
-    }
-    return true;
+    const bool requireOfferAnswerFields =
+        (msg.type == WaveSignalType::Offer ||
+         msg.type == WaveSignalType::Answer);
+    return validateSdpSignalFields(msg.signal, requireOfferAnswerFields, error);
 }
 
 bool encodeWaveSignalBinary(const WaveSignalMessage& msg,
@@ -762,6 +838,10 @@ bool base64UrlDecode(std::string_view encoded,
             setError(error, "Invalid base64url tail");
             return false;
         }
+        if ((v1 & 0x0F) != 0) {
+            setError(error, "Non-zero trailing bits in base64url tail");
+            return false;
+        }
         outBytes.push_back(
             static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
     } else if (rem == 3) {
@@ -770,6 +850,10 @@ bool base64UrlDecode(std::string_view encoded,
         const int v2 = decodeChar(static_cast<unsigned char>(encoded[i + 2]));
         if (v0 < 0 || v1 < 0 || v2 < 0) {
             setError(error, "Invalid base64url tail");
+            return false;
+        }
+        if ((v2 & 0x03) != 0) {
+            setError(error, "Non-zero trailing bits in base64url tail");
             return false;
         }
         outBytes.push_back(
@@ -785,26 +869,37 @@ std::string encodeWaveUri(const WaveSignalMessage& msg, std::string* error) {
     if (!encodeWaveSignalBinary(msg, bytes, error)) {
         return {};
     }
-    return "bg://wave/v1/" + base64UrlEncode(bytes);
+    std::string out = "bg://wave/v1/" + base64UrlEncode(bytes);
+    if (out.size() > kWaveMaxUriLength) {
+        setError(error, "Encoded BG Wave URI exceeds maximum length");
+        return {};
+    }
+    return out;
 }
 
 std::string encodeWaveHttpsFragmentUri(const WaveSignalMessage& msg,
                                        std::string_view baseUrl,
                                        std::string* error) {
+    if (baseUrl.size() <= 8 || !baseUrl.starts_with("https://") ||
+        hasControlOrWhitespace(baseUrl)) {
+        setError(error, "Base URL must be a non-empty https:// URL");
+        return {};
+    }
     std::vector<std::uint8_t> bytes;
     if (!encodeWaveSignalBinary(msg, bytes, error)) {
         return {};
     }
     std::string out(baseUrl);
-    if (out.empty()) {
-        out = "https://beygram.beykus.fun/";
-    }
     if (out.find('#') == std::string::npos) {
         out += "#bgwave-v1.";
     } else {
         out += "bgwave-v1.";
     }
     out += base64UrlEncode(bytes);
+    if (out.size() > kWaveMaxUriLength) {
+        setError(error, "Encoded BG Wave URI exceeds maximum length");
+        return {};
+    }
     return out;
 }
 
@@ -841,8 +936,9 @@ bool decodeWaveUri(std::string_view uri, WaveSignalMessage& outMsg,
 
 bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
                           std::string* error) {
-    if (sdp.empty() || sdp.size() > kWaveMaxSdpBytes) {
-        setError(error, "SDP empty or exceeds maximum size");
+    if (sdp.empty() || sdp.size() > kWaveMaxSdpBytes ||
+        sdp.find('\0') != std::string_view::npos) {
+        setError(error, "SDP empty, contains null byte, or exceeds maximum size");
         return false;
     }
     WaveSdpSignal sig;
@@ -862,9 +958,24 @@ bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
         } else if (line.starts_with("a=fingerprint:")) {
             const std::string_view rest = line.substr(14);
             const std::size_t sp = rest.find(' ');
-            if (sp != std::string_view::npos) {
-                sig.dtlsFingerprintAlg = std::string(rest.substr(0, sp));
-                sig.dtlsFingerprint = std::string(rest.substr(sp + 1));
+            if (sp == std::string_view::npos) {
+                setError(error, "Malformed SDP fingerprint attribute");
+                return false;
+            }
+            const std::string_view alg = rest.substr(0, sp);
+            const std::string_view fp = rest.substr(sp + 1);
+            if (alg.empty() || fp.empty() ||
+                hasControlOrWhitespace(alg) || hasControlOrWhitespace(fp)) {
+                setError(error,
+                         "Invalid characters in SDP fingerprint attribute");
+                return false;
+            }
+            const bool haveSha256 =
+                !sig.dtlsFingerprint.empty() &&
+                sig.dtlsFingerprintAlg == "sha-256";
+            if (!haveSha256 || alg == "sha-256") {
+                sig.dtlsFingerprintAlg = std::string(alg);
+                sig.dtlsFingerprint = std::string(fp);
             }
         } else if (line.starts_with("a=setup:")) {
             const std::string_view role = line.substr(8);
@@ -902,10 +1013,13 @@ bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
             c.address = std::move(addr);
             c.port = static_cast<std::uint16_t>(port);
 
-            if (proto == "tcp" || proto == "TCP") {
+            if (proto == "udp" || proto == "UDP") {
+                c.protocol = WaveIceProtocol::Udp;
+            } else if (proto == "tcp" || proto == "TCP") {
                 c.protocol = WaveIceProtocol::Tcp;
             } else {
-                c.protocol = WaveIceProtocol::Udp;
+                setError(error, "Unsupported ICE candidate protocol");
+                return false;
             }
 
             if (typVal == "host") {
@@ -916,6 +1030,9 @@ bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
                 c.type = WaveIceCandidateType::Prflx;
             } else if (typVal == "relay") {
                 c.type = WaveIceCandidateType::Relay;
+            } else {
+                setError(error, "Unsupported ICE candidate type");
+                return false;
             }
 
             std::string tok;
@@ -934,11 +1051,17 @@ bool parseSdpToWaveSignal(std::string_view sdp, WaveSdpSignal& outSignal,
         setError(error, "SDP missing required ICE ufrag/pwd");
         return false;
     }
+    if (!validateSdpSignalFields(sig, false, error)) {
+        return false;
+    }
     outSignal = std::move(sig);
     return true;
 }
 
 std::string formatWaveSignalToSdp(const WaveSdpSignal& signal, bool isOffer) {
+    if (!validateSdpSignalFields(signal, false, nullptr)) {
+        return {};
+    }
     std::ostringstream oss;
     oss << "v=0\r\n"
         << "o=- 0 2 IN IP4 127.0.0.1\r\n"
@@ -959,9 +1082,12 @@ std::string formatWaveSignalToSdp(const WaveSdpSignal& signal, bool isOffer) {
             << signal.dtlsFingerprint << "\r\n";
     }
 
-    const char* setupStr = "actpass";
-    if (signal.setupRole == WaveDtlsSetupRole::Active) setupStr = "active";
-    else if (signal.setupRole == WaveDtlsSetupRole::Passive) setupStr = "passive";
+    const char* setupStr = isOffer ? "actpass" : "active";
+    if (signal.setupRole == WaveDtlsSetupRole::Active) {
+        setupStr = "active";
+    } else if (signal.setupRole == WaveDtlsSetupRole::Passive) {
+        setupStr = "passive";
+    }
     oss << "a=setup:" << setupStr << "\r\n";
 
     for (const auto& c : signal.candidates) {

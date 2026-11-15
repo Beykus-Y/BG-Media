@@ -2,6 +2,7 @@
 
 #include "bgmedia/wave/WaveCodec.hpp"
 
+#include <atomic>
 #include <memory>
 
 namespace bgmedia::wave {
@@ -37,10 +38,14 @@ public:
     [[nodiscard]] bool decode(std::span<const std::uint8_t> payload,
                               std::span<float> outInterleavedPcm) override;
     [[nodiscard]] bool decodePlc(std::span<float> outInterleavedPcm) override;
+    // Decodes an in-band FEC frame from `nextPayload` when the preceding
+    // packet was lost.
+    [[nodiscard]] bool decodeFec(std::span<const std::uint8_t> nextPayload,
+                                 std::span<float> outInterleavedPcm);
 
     void setBitrate(std::uint32_t bps) override;
     [[nodiscard]] std::uint32_t bitrate() const noexcept override {
-        return bitrateBps_;
+        return bitrateBps_.load(std::memory_order_acquire);
     }
     void setPacketLossPercent(int lossPercent) override;
     void reset() override;
@@ -48,7 +53,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    std::uint32_t bitrateBps_ = kWaveDefaultBitrateBps;
+    std::atomic<std::uint32_t> bitrateBps_{kWaveDefaultBitrateBps};
 };
 
 } // namespace bgmedia::wave

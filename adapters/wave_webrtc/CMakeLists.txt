@@ -1,4 +1,4 @@
-include(${CMAKE_SOURCE_DIR}/cmake/FindOrFetchLibDataChannel.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/FindOrFetchLibDataChannel.cmake)
 
 add_library(bgmedia_wave_webrtc STATIC
     src/WebRtcWaveTransport.cpp

@@ -1,4 +1,4 @@
-include(${CMAKE_SOURCE_DIR}/cmake/FindOrFetchOpus.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/FindOrFetchOpus.cmake)
 
 add_library(bgmedia_wave_opus STATIC
     src/OpusWaveCodec.cpp
