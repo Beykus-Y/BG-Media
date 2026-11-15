@@ -240,6 +240,75 @@ bool selectCompactIceCandidates(
     return !outSignal.candidates.empty();
 }
 
+bool parseRtpPacket(std::span<const std::uint8_t> data,
+                    ParsedRtpPacket& outPacket) noexcept {
+    constexpr std::size_t kRtpFixedHeaderBytes = 12;
+    if (data.size() < kRtpFixedHeaderBytes) {
+        return false;
+    }
+
+    const std::uint8_t b0 = data[0];
+    const std::uint8_t version = static_cast<std::uint8_t>((b0 >> 6) & 0x03u);
+    if (version != 2) {
+        return false;
+    }
+    const bool hasPadding = ((b0 >> 5) & 0x01u) != 0;
+    const bool hasExtension = ((b0 >> 4) & 0x01u) != 0;
+    const std::size_t csrcCount = static_cast<std::size_t>(b0 & 0x0Fu);
+
+    const std::size_t baseHdr = kRtpFixedHeaderBytes + csrcCount * 4u;
+    if (baseHdr > data.size()) {
+        return false;
+    }
+
+    std::size_t hdrSize = baseHdr;
+    if (hasExtension) {
+        if (baseHdr + 4u > data.size()) {
+            return false;
+        }
+        const std::size_t extWords =
+            (static_cast<std::size_t>(data[baseHdr + 2u]) << 8) |
+            static_cast<std::size_t>(data[baseHdr + 3u]);
+        const std::size_t extBytes = 4u + extWords * 4u;
+        if (extBytes > data.size() - baseHdr) {
+            return false;
+        }
+        hdrSize = baseHdr + extBytes;
+    }
+
+    std::size_t payloadEnd = data.size();
+    if (hasPadding) {
+        if (hdrSize >= payloadEnd) {
+            return false;
+        }
+        const std::size_t padLen = static_cast<std::size_t>(data.back());
+        if (padLen == 0 || padLen > (payloadEnd - hdrSize)) {
+            return false;
+        }
+        payloadEnd -= padLen;
+    }
+
+    const std::uint8_t b1 = data[1];
+    outPacket.marker = ((b1 >> 7) & 0x01u) != 0;
+    outPacket.payloadType = static_cast<std::uint8_t>(b1 & 0x7Fu);
+    outPacket.sequence = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(data[2]) << 8) |
+        static_cast<std::uint16_t>(data[3]));
+    outPacket.timestamp =
+        (static_cast<std::uint32_t>(data[4]) << 24) |
+        (static_cast<std::uint32_t>(data[5]) << 16) |
+        (static_cast<std::uint32_t>(data[6]) << 8) |
+        static_cast<std::uint32_t>(data[7]);
+    outPacket.ssrc =
+        (static_cast<std::uint32_t>(data[8]) << 24) |
+        (static_cast<std::uint32_t>(data[9]) << 16) |
+        (static_cast<std::uint32_t>(data[10]) << 8) |
+        static_cast<std::uint32_t>(data[11]);
+    outPacket.payloadOffset = hdrSize;
+    outPacket.payloadSize = payloadEnd - hdrSize;
+    return true;
+}
+
 struct WebRtcWaveTransport::Impl
     : public std::enable_shared_from_this<WebRtcWaveTransport::Impl> {
     explicit Impl(WebRtcTransportConfig cfg) : config(std::move(cfg)) {}
@@ -259,19 +328,87 @@ struct WebRtcWaveTransport::Impl
             if (gen != generation.load(std::memory_order_acquire)) {
                 return;
             }
-            if (state.load(std::memory_order_acquire) == next) {
+            const WaveTransportState cur =
+                state.load(std::memory_order_acquire);
+            if (cur == next) {
+                return;
+            }
+            // Keep terminal Failed/Closed sticky for this generation so a
+            // subsequent PeerConnection::State::Closed after peer->close() on
+            // failure cannot overwrite Failed with Closed.
+            if (cur == WaveTransportState::Failed ||
+                cur == WaveTransportState::Closed || failedGen == gen) {
                 return;
             }
             state.store(next, std::memory_order_release);
+            if (next == WaveTransportState::Failed) {
+                failedGen = gen;
+            }
             if (next == WaveTransportState::Connected ||
                 next == WaveTransportState::Failed ||
                 next == WaveTransportState::Closed) {
                 connectTimerActive = false;
             }
+            if (next == WaveTransportState::Failed ||
+                next == WaveTransportState::Closed) {
+                iceDisconnected = false;
+                peerDisconnected = false;
+                disconnectTimerActive = false;
+            }
             cb = callbacks.onStateChanged;
         }
         if (cb && gen == generation.load(std::memory_order_acquire)) {
             cb(next, reason);
+        }
+    }
+
+    void updateDisconnectedFlag(std::uint64_t gen, bool isIce,
+                                bool disconnected) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (gen != generation.load(std::memory_order_acquire)) {
+            return;
+        }
+        const WaveTransportState cur = state.load(std::memory_order_acquire);
+        if (cur == WaveTransportState::Failed ||
+            cur == WaveTransportState::Closed || failedGen == gen) {
+            return;
+        }
+        if (isIce) {
+            iceDisconnected = disconnected;
+        } else {
+            peerDisconnected = disconnected;
+        }
+        const bool anyDisconnected = iceDisconnected || peerDisconnected;
+        if (anyDisconnected && !disconnectTimerActive) {
+            disconnectStartTime_ = std::chrono::steady_clock::now();
+            disconnectTimerActive = true;
+        } else if (!anyDisconnected) {
+            disconnectTimerActive = false;
+        }
+    }
+
+    void closeCurrentPeer(std::uint64_t gen) {
+        std::shared_ptr<rtc::PeerConnection> oldPc;
+        std::shared_ptr<rtc::Track> oldTrack;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (gen == 0 || gen != generation.load(std::memory_order_acquire)) {
+                return;
+            }
+            oldPc = std::move(pc);
+            oldTrack = std::move(track);
+            packetizer.reset();
+            srReporter.reset();
+            rtcpSession.reset();
+            rtpConfig.reset();
+        }
+        if (oldTrack) {
+            oldTrack->resetCallbacks();
+            oldTrack->close();
+        }
+        if (oldPc) {
+            oldPc->resetCallbacks();
+            oldPc->close();
         }
     }
 
@@ -292,8 +429,16 @@ struct WebRtcWaveTransport::Impl
             gatheringComplete = false;
             gatheredCandidates.clear();
             expectedRemoteFingerprint.clear();
+            selectedCandidateSummary.clear();
             remoteFingerprintVerified.store(false, std::memory_order_release);
+            hasExpectedRemoteSsrc = false;
+            expectedRemoteSsrc = 0;
             connectTimerActive = false;
+            iceDisconnected = false;
+            peerDisconnected = false;
+            disconnectTimerActive = false;
+            lastFeedbackTime = -1.0;
+            failedGen = 0;
             seqUnwrapper.reset();
             if (emitClosedState &&
                 state.load(std::memory_order_acquire) !=
@@ -322,11 +467,16 @@ struct WebRtcWaveTransport::Impl
 
     rtc::Configuration buildRtcConfig() const {
         rtc::Configuration rtcCfg;
-        for (const auto& s : config.stunServers) {
-            if (!s.empty()) {
-                rtcCfg.iceServers.emplace_back(s);
+        auto appendIceServers = [&](const std::vector<std::string>& servers) {
+            for (const auto& s : servers) {
+                if (!s.empty()) {
+                    rtcCfg.iceServers.emplace_back(s);
+                }
             }
-        }
+        };
+        appendIceServers(config.stunServers);
+        appendIceServers(config.turnServers);
+        appendIceServers(config.iceServers);
         rtcCfg.enableIceTcp = config.enableIceTcp;
         rtcCfg.disableAutoNegotiation = true;
         if (config.portRangeBegin > 0 &&
@@ -378,8 +528,10 @@ struct WebRtcWaveTransport::Impl
                 self->setState(gen, WaveTransportState::Failed,
                                "ICE connectivity check failed");
             } else if (ist == rtc::PeerConnection::IceState::Disconnected) {
-                self->setState(gen, WaveTransportState::Failed,
-                               "ICE connection lost");
+                self->updateDisconnectedFlag(gen, true, true);
+            } else if (ist == rtc::PeerConnection::IceState::Connected ||
+                       ist == rtc::PeerConnection::IceState::Completed) {
+                self->updateDisconnectedFlag(gen, true, false);
             }
         });
 
@@ -418,14 +570,15 @@ struct WebRtcWaveTransport::Impl
                 if (!fpOk) {
                     self->remoteFingerprintVerified.store(
                         false, std::memory_order_release);
-                    peerRef->close();
                     self->setState(gen, WaveTransportState::Failed,
                                    "DTLS fingerprint verification failed");
+                    peerRef->close();
                     return;
                 }
 
                 self->remoteFingerprintVerified.store(
                     true, std::memory_order_release);
+                self->updateDisconnectedFlag(gen, false, false);
 
                 rtc::Candidate localCand;
                 rtc::Candidate remoteCand;
@@ -447,17 +600,26 @@ struct WebRtcWaveTransport::Impl
                 break;
             }
             case rtc::PeerConnection::State::Disconnected:
-                self->setState(gen, WaveTransportState::Failed,
-                               "peer connection disconnected");
+                self->updateDisconnectedFlag(gen, false, true);
                 break;
             case rtc::PeerConnection::State::Failed:
                 self->setState(gen, WaveTransportState::Failed,
                                "peer connection failed");
                 break;
-            case rtc::PeerConnection::State::Closed:
-                self->setState(gen, WaveTransportState::Closed,
-                               "peer connection closed");
+            case rtc::PeerConnection::State::Closed: {
+                bool isFailed = false;
+                {
+                    std::lock_guard<std::mutex> lock(self->mutex);
+                    isFailed = (self->failedGen == gen) ||
+                               (self->state.load(std::memory_order_acquire) ==
+                                WaveTransportState::Failed);
+                }
+                if (!isFailed) {
+                    self->setState(gen, WaveTransportState::Closed,
+                                   "peer connection closed");
+                }
                 break;
+            }
             default:
                 break;
             }
@@ -490,17 +652,12 @@ struct WebRtcWaveTransport::Impl
                 if (gen != self->generation.load(std::memory_order_acquire)) {
                     return;
                 }
-                if (data.size() < sizeof(rtc::RtpHeader)) {
-                    return;
-                }
-                const auto* rtp =
-                    reinterpret_cast<const rtc::RtpHeader*>(data.data());
-                if (rtp->version() != 2 || rtp->payloadType() != 111) {
-                    return;
-                }
-                const std::size_t hdrSize =
-                    rtp->getSize() + rtp->getExtensionHeaderSize();
-                if (hdrSize > data.size()) {
+                const std::span<const std::uint8_t> raw(
+                    reinterpret_cast<const std::uint8_t*>(data.data()),
+                    data.size());
+                ParsedRtpPacket rtp;
+                if (!parseRtpPacket(raw, rtp) || rtp.payloadType != 111 ||
+                    rtp.payloadSize == 0 || rtp.ssrc == 0) {
                     return;
                 }
 
@@ -512,7 +669,13 @@ struct WebRtcWaveTransport::Impl
                         self->generation.load(std::memory_order_acquire)) {
                         return;
                     }
-                    seq32 = self->seqUnwrapper.unwrap(rtp->seqNumber());
+                    if (!self->hasExpectedRemoteSsrc) {
+                        self->expectedRemoteSsrc = rtp.ssrc;
+                        self->hasExpectedRemoteSsrc = true;
+                    } else if (rtp.ssrc != self->expectedRemoteSsrc) {
+                        return;
+                    }
+                    seq32 = self->seqUnwrapper.unwrap(rtp.sequence);
                     cb = self->callbacks.onMediaPacket;
                 }
 
@@ -521,15 +684,12 @@ struct WebRtcWaveTransport::Impl
                 }
                 WaveMediaPacket pkt;
                 pkt.sequence = seq32;
-                pkt.timestamp48k = rtp->timestamp();
+                pkt.timestamp48k = rtp.timestamp;
                 pkt.frameSamples = static_cast<std::uint16_t>(kWaveFrameSamples);
-                pkt.flags = rtp->marker() ? kWavePacketDiscontinuity
-                                          : kWavePacketNone;
-                const auto* body =
-                    reinterpret_cast<const std::uint8_t*>(data.data()) +
-                    hdrSize;
-                const std::size_t bodySize = data.size() - hdrSize;
-                pkt.payload.assign(body, body + bodySize);
+                pkt.flags = rtp.marker ? kWavePacketDiscontinuity
+                                       : kWavePacketNone;
+                const std::uint8_t* body = raw.data() + rtp.payloadOffset;
+                pkt.payload.assign(body, body + rtp.payloadSize);
 
                 const double arrivalSec =
                     std::chrono::duration<double>(
@@ -594,43 +754,101 @@ struct WebRtcWaveTransport::Impl
     bool startOffer() {
         shutdown(false);
         std::uint64_t gen = 0;
-        std::shared_ptr<rtc::PeerConnection> peer;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            gen = generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-            gatheringComplete = false;
-            gatheredCandidates.clear();
-            expectedRemoteFingerprint.clear();
-            selectedCandidateSummary.clear();
-            remoteFingerprintVerified.store(false, std::memory_order_release);
-            ssrc = generateRandomSsrc();
-            state.store(WaveTransportState::Gathering,
-                        std::memory_order_release);
+        std::uint32_t localSsrc = 0;
+        rtc::Configuration rtcCfg;
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                gen = generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+                gatheringComplete = false;
+                gatheredCandidates.clear();
+                expectedRemoteFingerprint.clear();
+                selectedCandidateSummary.clear();
+                remoteFingerprintVerified.store(false,
+                                                std::memory_order_release);
+                hasExpectedRemoteSsrc = false;
+                expectedRemoteSsrc = 0;
+                iceDisconnected = false;
+                peerDisconnected = false;
+                disconnectTimerActive = false;
+                lastFeedbackTime = -1.0;
+                failedGen = 0;
+                ssrc = generateRandomSsrc();
+                localSsrc = ssrc;
+                state.store(WaveTransportState::Idle,
+                            std::memory_order_release);
+                rtcCfg = buildRtcConfig();
+            }
 
-            peer = std::make_shared<rtc::PeerConnection>(buildRtcConfig());
-            pc = peer;
+            auto peer = std::make_shared<rtc::PeerConnection>(rtcCfg);
             attachPeerCallbacks(peer, gen);
 
             rtc::Description::Audio media("audio",
                                           rtc::Description::Direction::SendOnly);
             media.addOpusCodec(111);
-            media.addSSRC(ssrc, "bgwave-audio");
-            track = peer->addTrack(media);
+            media.addSSRC(localSsrc, "bgwave-audio");
+            auto localTrack = peer->addTrack(media);
 
-            rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
-                ssrc, "bgwave-audio", std::uint8_t{111},
+            auto localRtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+                localSsrc, "bgwave-audio", std::uint8_t{111},
                 std::uint32_t{48000});
-            packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtpConfig);
-            srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
-            packetizer->addToChain(srReporter);
-            track->setMediaHandler(packetizer);
+            auto localPacketizer =
+                std::make_shared<rtc::OpusRtpPacketizer>(localRtpConfig);
+            auto localSrReporter =
+                std::make_shared<rtc::RtcpSrReporter>(localRtpConfig);
+            auto localRtcpSession =
+                std::make_shared<rtc::RtcpReceivingSession>();
+            localPacketizer->addToChain(localSrReporter);
+            localPacketizer->addToChain(localRtcpSession);
+            localTrack->setMediaHandler(localPacketizer);
+
+            bool committed = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (gen == generation.load(std::memory_order_acquire)) {
+                    pc = peer;
+                    track = localTrack;
+                    rtpConfig = std::move(localRtpConfig);
+                    packetizer = std::move(localPacketizer);
+                    srReporter = std::move(localSrReporter);
+                    rtcpSession = std::move(localRtcpSession);
+                    committed = true;
+                }
+            }
+            if (!committed) {
+                localTrack->resetCallbacks();
+                localTrack->close();
+                peer->resetCallbacks();
+                peer->close();
+                return false;
+            }
+
+            setState(gen, WaveTransportState::Gathering,
+                     "gathering ICE candidates");
+            if (gen != generation.load(std::memory_order_acquire)) {
+                return false;
+            }
+            peer->setLocalDescription(rtc::Description::Type::Offer);
+        } catch (const std::exception& e) {
+            if (gen != 0) {
+                setState(gen, WaveTransportState::Failed,
+                         std::string("failed to start offer: ") + e.what());
+            }
+            closeCurrentPeer(gen);
+            return false;
+        } catch (...) {
+            if (gen != 0) {
+                setState(gen, WaveTransportState::Failed,
+                         "failed to start offer");
+            }
+            closeCurrentPeer(gen);
+            return false;
         }
 
-        setState(gen, WaveTransportState::Gathering, "gathering ICE candidates");
-        peer->setLocalDescription(rtc::Description::Type::Offer);
         if (!waitForGatheringAndEmitSignal(gen)) {
             setState(gen, WaveTransportState::Failed,
                      "ICE gathering produced no usable candidates");
+            closeCurrentPeer(gen);
             return false;
         }
         return true;
@@ -648,37 +866,71 @@ struct WebRtcWaveTransport::Impl
 
         shutdown(false);
         std::uint64_t gen = 0;
-        std::shared_ptr<rtc::PeerConnection> peer;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            gen = generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-            gatheringComplete = false;
-            gatheredCandidates.clear();
-            expectedRemoteFingerprint = fpHex;
-            selectedCandidateSummary.clear();
-            remoteFingerprintVerified.store(false, std::memory_order_release);
-            seqUnwrapper.reset();
-            state.store(WaveTransportState::Gathering,
-                        std::memory_order_release);
-
-            peer = std::make_shared<rtc::PeerConnection>(buildRtcConfig());
-            pc = peer;
-            attachPeerCallbacks(peer, gen);
-        }
-
-        setState(gen, WaveTransportState::Gathering, "gathering ICE answer");
-        const std::string offerSdp = formatWaveSignalToSdp(remoteOffer, true);
+        rtc::Configuration rtcCfg;
         try {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                gen = generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+                gatheringComplete = false;
+                gatheredCandidates.clear();
+                expectedRemoteFingerprint = fpHex;
+                selectedCandidateSummary.clear();
+                remoteFingerprintVerified.store(false,
+                                                std::memory_order_release);
+                hasExpectedRemoteSsrc = false;
+                expectedRemoteSsrc = 0;
+                iceDisconnected = false;
+                peerDisconnected = false;
+                disconnectTimerActive = false;
+                lastFeedbackTime = -1.0;
+                failedGen = 0;
+                seqUnwrapper.reset();
+                state.store(WaveTransportState::Idle,
+                            std::memory_order_release);
+                rtcCfg = buildRtcConfig();
+            }
+
+            auto peer = std::make_shared<rtc::PeerConnection>(rtcCfg);
+            attachPeerCallbacks(peer, gen);
+
+            bool committed = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (gen == generation.load(std::memory_order_acquire)) {
+                    pc = peer;
+                    committed = true;
+                }
+            }
+            if (!committed) {
+                peer->resetCallbacks();
+                peer->close();
+                return false;
+            }
+
+            setState(gen, WaveTransportState::Gathering,
+                     "gathering ICE answer");
+            if (gen != generation.load(std::memory_order_acquire)) {
+                return false;
+            }
+            const std::string offerSdp =
+                formatWaveSignalToSdp(remoteOffer, true);
             peer->setRemoteDescription(
                 rtc::Description(offerSdp, rtc::Description::Type::Offer));
             peer->setLocalDescription(rtc::Description::Type::Answer);
         } catch (const std::exception& e) {
-            setState(gen, WaveTransportState::Failed,
-                     std::string("failed to apply remote offer: ") + e.what());
+            if (gen != 0) {
+                setState(gen, WaveTransportState::Failed,
+                         std::string("failed to accept remote offer: ") +
+                             e.what());
+            }
+            closeCurrentPeer(gen);
             return false;
         } catch (...) {
-            setState(gen, WaveTransportState::Failed,
-                     "failed to apply remote offer");
+            if (gen != 0) {
+                setState(gen, WaveTransportState::Failed,
+                         "failed to accept remote offer");
+            }
+            closeCurrentPeer(gen);
             return false;
         }
 
@@ -692,6 +944,7 @@ struct WebRtcWaveTransport::Impl
         if (!waitForGatheringAndEmitSignal(gen)) {
             setState(gen, WaveTransportState::Failed,
                      "ICE answer gathering produced no usable candidates");
+            closeCurrentPeer(gen);
             return false;
         }
         return true;
@@ -728,6 +981,10 @@ struct WebRtcWaveTransport::Impl
         try {
             peer->setRemoteDescription(
                 rtc::Description(answerSdp, rtc::Description::Type::Answer));
+        } catch (const std::exception& e) {
+            setState(gen, WaveTransportState::Failed,
+                     std::string("failed to apply remote answer: ") + e.what());
+            return false;
         } catch (...) {
             setState(gen, WaveTransportState::Failed,
                      "failed to apply remote answer");
@@ -767,6 +1024,7 @@ struct WebRtcWaveTransport::Impl
         std::shared_ptr<rtc::PeerConnection> peer;
         std::uint64_t gen = 0;
         bool timedOut = false;
+        bool disconnectTimedOut = false;
         std::function<void(std::uint32_t)> bitrateCb;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -774,16 +1032,30 @@ struct WebRtcWaveTransport::Impl
             peer = pc;
             const WaveTransportState cur =
                 state.load(std::memory_order_acquire);
+            const auto now = std::chrono::steady_clock::now();
             if (connectTimerActive &&
                 (cur == WaveTransportState::Gathering ||
                  cur == WaveTransportState::Connecting)) {
                 const auto elapsedMs =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - connectStartTime_)
+                        now - connectStartTime_)
                         .count();
                 if (elapsedMs > config.connectTimeoutMs) {
                     connectTimerActive = false;
                     timedOut = true;
+                }
+            }
+            if (!timedOut && disconnectTimerActive &&
+                (cur == WaveTransportState::Connected ||
+                 cur == WaveTransportState::Connecting)) {
+                const auto discElapsedMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - disconnectStartTime_)
+                        .count();
+                if (discElapsedMs >
+                    std::max(0, config.disconnectGraceTimeoutMs)) {
+                    disconnectTimerActive = false;
+                    disconnectTimedOut = true;
                 }
             }
             if (cur == WaveTransportState::Connected &&
@@ -795,11 +1067,19 @@ struct WebRtcWaveTransport::Impl
             }
         }
         if (timedOut) {
+            setState(gen, WaveTransportState::Failed,
+                     "ICE/DTLS connection timeout");
             if (peer) {
                 peer->close();
             }
+            return;
+        }
+        if (disconnectTimedOut) {
             setState(gen, WaveTransportState::Failed,
-                     "ICE/DTLS connection timeout");
+                     "ICE/peer connection disconnected timeout");
+            if (peer) {
+                peer->close();
+            }
             return;
         }
         if (bitrateCb && peer) {
@@ -835,9 +1115,16 @@ struct WebRtcWaveTransport::Impl
     std::string expectedRemoteFingerprint;
     std::string selectedCandidateSummary;
     std::uint32_t ssrc = 0x42475731u;
+    bool hasExpectedRemoteSsrc = false;
+    std::uint32_t expectedRemoteSsrc = 0;
     RtpSequenceUnwrapper seqUnwrapper;
     std::chrono::steady_clock::time_point connectStartTime_{};
     bool connectTimerActive = false;
+    std::chrono::steady_clock::time_point disconnectStartTime_{};
+    bool iceDisconnected = false;
+    bool peerDisconnected = false;
+    bool disconnectTimerActive = false;
+    std::uint64_t failedGen = 0;
     double lastFeedbackTime = -1.0;
 };
 
