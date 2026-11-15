@@ -3,9 +3,11 @@
 #include "bgmedia/wave/WaveSignaling.hpp"
 #include "bgmedia/wave/WaveTypes.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -80,7 +82,7 @@ public:
     void close() override;
     void poll(double currentTimeSeconds) override;
     [[nodiscard]] WaveTransportState state() const noexcept override {
-        return state_;
+        return state_.load(std::memory_order_acquire);
     }
 
     void setProfile(SimulatedNetworkProfile profile);
@@ -91,12 +93,13 @@ private:
         WaveMediaPacket packet;
     };
 
-    void deliverInbound(WaveMediaPacket packet, double sendTimeSeconds);
+    bool deliverInbound(WaveMediaPacket packet, double sendTimeSeconds);
     void setState(WaveTransportState next, const std::string& reason = {});
 
+    mutable std::mutex mutex_;
     SimulatedNetworkProfile profile_;
     WaveTransportCallbacks callbacks_;
-    WaveTransportState state_ = WaveTransportState::Idle;
+    std::atomic<WaveTransportState> state_{WaveTransportState::Idle};
     SimulatedWaveTransport* peer_ = nullptr;
     double lastTimeSeconds_ = 0.0;
     std::uint64_t rngState_ = 0;

@@ -10,6 +10,7 @@
 #include "bgmedia/wave/WaveTransport.hpp"
 #include "bgmedia/wave/WaveTypes.hpp"
 
+#include <array>
 #include <atomic>
 #include <deque>
 #include <cstddef>
@@ -127,24 +128,35 @@ private:
     void wireTransportCallbacks();
     void processHostStep(double currentTimeSeconds);
     void processListenerStep(double currentTimeSeconds);
-    void requestOrPerformReset();
+    void requestOrPerformReset(bool clearStats);
     [[nodiscard]] bool ensureResetCompletedForNewSession();
-    void performResetUnderProcessLock();
+    void performResetUnderProcessLock(bool clearStats);
+    void clearHostPendingAudio();
+    [[nodiscard]] std::shared_ptr<IExternalCallTransport> snapshotExternalCall() const;
     [[nodiscard]] WavePipelineCallbacks snapshotCallbacks() const;
-    void publishStatsSnapshot();
+    void publishStatsSnapshot(bool freezeOnStop = false);
+
+    struct LifecycleGuard {
+        std::recursive_mutex cbMutex;
+        bool alive = true;
+    };
 
     WavePipelineConfig config_;
     std::shared_ptr<IWaveAudioCodec> codec_;
     std::shared_ptr<IWaveTransport> transport_;
     std::shared_ptr<IExternalCallTransport> externalCall_;
     WavePipelineCallbacks callbacks_;
+    std::shared_ptr<LifecycleGuard> lifecycle_ = std::make_shared<LifecycleGuard>();
 
     mutable std::mutex controlMutex_;
+    mutable std::mutex externalCallMutex_;
     mutable std::mutex callbacksMutex_;
     mutable std::mutex sidMutex_;
     mutable std::mutex processMutex_;
     mutable std::mutex statsMutex_;
     std::atomic<bool> pendingRingReset_{false};
+    std::atomic<bool> pendingStatsClear_{false};
+    std::atomic<bool> hostDiscardPending_{false};
     std::atomic<std::uint64_t> sessionGen_{0};
     struct InboundPacket {
         WaveMediaPacket packet;
@@ -153,6 +165,9 @@ private:
     mutable std::mutex inboundMutex_;
     std::deque<InboundPacket> inboundQueue_;
     WaveStats publishedStats_{};
+    bool statsFrozenOnStop_ = false;
+    bool hasPlayoutClock_ = false;
+    double nextPlayoutTimeSec_ = 0.0;
     std::atomic<bool> audioPausedForReset_{false};
     std::atomic<std::uint32_t> audioInFlight_{0};
     std::atomic<WaveSessionState> state_{WaveSessionState::Idle};

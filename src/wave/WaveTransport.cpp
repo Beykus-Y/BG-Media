@@ -45,41 +45,68 @@ SimulatedWaveTransport::SimulatedWaveTransport(SimulatedNetworkProfile profile)
       rngState_(profile.seed ? profile.seed : 0x57415645ULL) {}
 
 SimulatedWaveTransport::~SimulatedWaveTransport() {
-    if (peer_ && peer_->peer_ == this) {
-        peer_->peer_ = nullptr;
+    SimulatedWaveTransport* peer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        peer = peer_;
+        peer_ = nullptr;
+    }
+    if (peer && peer != this) {
+        std::lock_guard<std::mutex> peerLock(peer->mutex_);
+        if (peer->peer_ == this) {
+            peer->peer_ = nullptr;
+        }
     }
 }
 
 void SimulatedWaveTransport::linkPeers(SimulatedWaveTransport& a,
                                        SimulatedWaveTransport& b) {
+    if (&a == &b) {
+        std::lock_guard<std::mutex> lock(a.mutex_);
+        a.peer_ = &b;
+        return;
+    }
+    std::scoped_lock lock(a.mutex_, b.mutex_);
     a.peer_ = &b;
     b.peer_ = &a;
 }
 
 void SimulatedWaveTransport::setCallbacks(WaveTransportCallbacks callbacks) {
+    std::lock_guard<std::mutex> lock(mutex_);
     callbacks_ = std::move(callbacks);
 }
 
 void SimulatedWaveTransport::setProfile(SimulatedNetworkProfile profile) {
+    std::lock_guard<std::mutex> lock(mutex_);
     profile_ = profile;
 }
 
 void SimulatedWaveTransport::setState(WaveTransportState next,
                                       const std::string& reason) {
-    if (state_ == next) {
-        return;
+    std::function<void(WaveTransportState, const std::string&)> cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_.load(std::memory_order_relaxed) == next) {
+            return;
+        }
+        state_.store(next, std::memory_order_release);
+        cb = callbacks_.onStateChanged;
     }
-    state_ = next;
-    if (callbacks_.onStateChanged) {
-        callbacks_.onStateChanged(next, reason);
+    if (cb) {
+        cb(next, reason);
     }
 }
 
 bool SimulatedWaveTransport::startOffer() {
     setState(WaveTransportState::Gathering, "gathering simulated ICE");
     setState(WaveTransportState::Connecting, "awaiting answer");
-    if (callbacks_.onLocalSignalReady) {
-        callbacks_.onLocalSignalReady(makeSimulatedLocalSignal(true));
+    std::function<void(const WaveSdpSignal&)> sigCb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sigCb = callbacks_.onLocalSignalReady;
+    }
+    if (sigCb) {
+        sigCb(makeSimulatedLocalSignal(true));
     }
     return true;
 }
@@ -90,10 +117,17 @@ bool SimulatedWaveTransport::acceptOffer(const WaveSdpSignal& remoteOffer) {
         return false;
     }
     setState(WaveTransportState::Gathering, "gathering simulated ICE");
-    if (callbacks_.onLocalSignalReady) {
-        callbacks_.onLocalSignalReady(makeSimulatedLocalSignal(false));
+    std::function<void(const WaveSdpSignal&)> sigCb;
+    bool failOnConnect = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sigCb = callbacks_.onLocalSignalReady;
+        failOnConnect = profile_.failOnConnect;
     }
-    if (profile_.failOnConnect) {
+    if (sigCb) {
+        sigCb(makeSimulatedLocalSignal(false));
+    }
+    if (failOnConnect) {
         setState(WaveTransportState::Failed, "simulated NAT traversal failure");
         return false;
     }
@@ -106,7 +140,12 @@ bool SimulatedWaveTransport::applyAnswer(const WaveSdpSignal& remoteAnswer) {
         setState(WaveTransportState::Failed, "invalid remote answer");
         return false;
     }
-    if (profile_.failOnConnect) {
+    bool failOnConnect = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failOnConnect = profile_.failOnConnect;
+    }
+    if (failOnConnect) {
         setState(WaveTransportState::Failed, "simulated NAT traversal failure");
         return false;
     }
@@ -115,20 +154,32 @@ bool SimulatedWaveTransport::applyAnswer(const WaveSdpSignal& remoteAnswer) {
 }
 
 bool SimulatedWaveTransport::sendMediaPacket(const WaveMediaPacket& packet) {
-    if (state_ != WaveTransportState::Connected || !peer_ ||
-        peer_->state_ != WaveTransportState::Connected) {
-        return false;
+    SimulatedWaveTransport* peer = nullptr;
+    double sendTime = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_.load(std::memory_order_relaxed) !=
+                WaveTransportState::Connected ||
+            !peer_) {
+            return false;
+        }
+        peer = peer_;
+        sendTime = lastTimeSeconds_;
     }
-    peer_->deliverInbound(packet, lastTimeSeconds_);
-    return true;
+    return peer->deliverInbound(packet, sendTime);
 }
 
-void SimulatedWaveTransport::deliverInbound(WaveMediaPacket packet,
+bool SimulatedWaveTransport::deliverInbound(WaveMediaPacket packet,
                                             double sendTimeSeconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_.load(std::memory_order_relaxed) !=
+        WaveTransportState::Connected) {
+        return false;
+    }
     if (profile_.lossPercent > 0.0) {
         const double r = nextUniform01(rngState_) * 100.0;
         if (r < profile_.lossPercent) {
-            return;
+            return true;
         }
     }
 
@@ -148,31 +199,52 @@ void SimulatedWaveTransport::deliverInbound(WaveMediaPacket packet,
     pending.deliverAtSeconds = sendTimeSeconds + (delayMs / 1000.0);
     pending.packet = std::move(packet);
     inboundQueue_.push_back(std::move(pending));
+    return true;
 }
 
 void SimulatedWaveTransport::poll(double currentTimeSeconds) {
-    lastTimeSeconds_ = currentTimeSeconds;
-    if (inboundQueue_.empty()) {
-        return;
-    }
-    std::vector<PendingPacket> remaining;
-    remaining.reserve(inboundQueue_.size());
-    for (auto& item : inboundQueue_) {
-        if (item.deliverAtSeconds <= currentTimeSeconds + 1e-9) {
-            if (callbacks_.onMediaPacket) {
-                callbacks_.onMediaPacket(std::move(item.packet),
-                                         currentTimeSeconds);
+    std::vector<WaveMediaPacket> ready;
+    std::function<void(WaveMediaPacket, double)> onMedia;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastTimeSeconds_ = currentTimeSeconds;
+        if (inboundQueue_.empty()) {
+            return;
+        }
+        std::vector<PendingPacket> remaining;
+        remaining.reserve(inboundQueue_.size());
+        for (auto& item : inboundQueue_) {
+            if (item.deliverAtSeconds <= currentTimeSeconds + 1e-9) {
+                ready.push_back(std::move(item.packet));
+            } else {
+                remaining.push_back(std::move(item));
             }
-        } else {
-            remaining.push_back(std::move(item));
+        }
+        inboundQueue_.swap(remaining);
+        onMedia = callbacks_.onMediaPacket;
+    }
+    if (onMedia) {
+        for (auto& pkt : ready) {
+            onMedia(std::move(pkt), currentTimeSeconds);
         }
     }
-    inboundQueue_.swap(remaining);
 }
 
 void SimulatedWaveTransport::close() {
-    inboundQueue_.clear();
-    setState(WaveTransportState::Closed, "closed");
+    std::function<void(WaveTransportState, const std::string&)> cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        inboundQueue_.clear();
+        if (state_.load(std::memory_order_relaxed) ==
+            WaveTransportState::Closed) {
+            return;
+        }
+        state_.store(WaveTransportState::Closed, std::memory_order_release);
+        cb = callbacks_.onStateChanged;
+    }
+    if (cb) {
+        cb(WaveTransportState::Closed, "closed");
+    }
 }
 
 } // namespace bgmedia::wave
