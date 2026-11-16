@@ -351,6 +351,17 @@ void MixSession::startWorkerIfNeeded() {
         }
     }
     std::lock_guard lock(mutex_);
+    // The logical queue may contain thousands of paths. Only the two deck
+    // slots may own prepared PCM (including a worker result not yet collected).
+    // Loaded items retain their Ready state until transition completion.
+    constexpr std::size_t kPreparedSlots = 2;
+    const auto occupied = std::count_if(items_.begin(), items_.end(),
+        [](const Item& item) {
+            return item.audio != nullptr || item.state == QueueState::Preparing;
+        });
+    if (static_cast<std::size_t>(occupied) >= kPreparedSlots) {
+        return;
+    }
     for (Item& item : items_) {
         if (item.state == QueueState::Pending) {
             item.state = QueueState::Preparing;

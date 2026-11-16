@@ -1002,6 +1002,50 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(!snap.decks[1].playing);
 }
 
+TEST_CASE("mix.session_long_queue_bounds_preparation_until_deck_retires") {
+    MixEngine engine(kRate);
+    std::atomic<int> calls{0};
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    for (int i = 0; i < 100; ++i) {
+        session.addTrack("track-" + std::to_string(i) + ".wav");
+    }
+    CHECK(pump.waitForDecks(2));
+    for (int i = 0; i < 50; ++i) {
+        pump.once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    auto before = session.snapshot();
+    CHECK(before.queue.size() == 100);
+    CHECK(calls.load(std::memory_order_relaxed) == 2);
+    session.setTransitionType(TransitionType::DirectCut);
+    session.play();
+    pump.forSeconds(0.05);
+    const auto completed = engine.completedTransitions();
+    session.next();
+    bool refilled = false;
+    for (int i = 0; i < 800 && !refilled; ++i) {
+        pump.once();
+        const auto snapshot = engine.snapshot();
+        refilled = snapshot.completedTransitions > completed &&
+                   snapshot.decks[0].loaded && snapshot.decks[1].loaded &&
+                   calls.load(std::memory_order_relaxed) >= 3;
+        if (!refilled) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    CHECK(refilled);
+    for (int i = 0; i < 50; ++i) {
+        pump.once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    CHECK(calls.load(std::memory_order_relaxed) == 3);
+}
+
 TEST_CASE("mix.session_refilled_deck_stays_stopped") {
     // Finding #1: refilling the outgoing deck after a handover used to start it
     // immediately at full independent gain alongside the playing master.
