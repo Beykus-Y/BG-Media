@@ -1062,6 +1062,9 @@ TEST_CASE("mix.session_long_queue_bounds_preparation_until_deck_retires") {
     }
     auto before = session.snapshot();
     CHECK(before.queue.size() == 100);
+    CHECK(before.preparedCount == 2);
+    CHECK(before.preparingCount == 0);
+    CHECK(before.preparedPcmBytes >= 2ull * 8 * kRate * 2 * sizeof(float));
     CHECK(calls.load(std::memory_order_relaxed) == 2);
     session.setTransitionType(TransitionType::DirectCut);
     session.play();

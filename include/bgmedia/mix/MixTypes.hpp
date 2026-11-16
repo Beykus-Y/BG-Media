@@ -438,6 +438,12 @@ struct QueueItemStatus {
 struct MixSessionSnapshot {
     MixSnapshot engine;
     std::vector<QueueItemStatus> queue;
+    // Capacities of prepared queue buffers and unpublished completed jobs;
+    // retired deck ownership reported separately (may overlap with queue buffers).
+    std::uint64_t preparedPcmBytes = 0;
+    std::uint64_t retiredPcmBytes = 0;
+    std::uint32_t preparedCount = 0;
+    std::uint32_t preparingCount = 0;
     bool transitionAvailable = false;
     bool preparingNext = false;
     std::string preparingName;

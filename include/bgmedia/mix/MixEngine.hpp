@@ -72,6 +72,8 @@ public:
     // reference. Tracks replaced by loadDeck()/clearDeck() are retained until
     // the render epoch proves that at least one callback started afterwards.
     void reclaimRetired();
+    // Control-thread only. Bytes retained until the render epoch acknowledges retirement.
+    [[nodiscard]] std::uint64_t retiredPcmBytes() const noexcept;
 
     void setOutputLatency(double seconds);
     void setTimeStretch(std::shared_ptr<const ITimeStretchProcessor> processor);

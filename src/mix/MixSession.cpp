@@ -350,6 +350,9 @@ void MixSession::installDeck(DeckId deck, const Item& item) {
 }
 
 void MixSession::startWorkerIfNeeded() {
+    // A cleared or retired deck may still own PCM until a render callback acknowledges it.
+    // Do not start preparing a third allocation while that old ownership is pending.
+    if (clearDecksRequested_ || engine_.retiredPcmBytes() != 0) return;
     {
         std::lock_guard lock(jobMutex_);
         if (jobActive_ || jobRunning_.load(std::memory_order_acquire)) {
@@ -1012,11 +1015,20 @@ MixSessionSnapshot MixSession::snapshot() const {
     out.engine = engine_.snapshot();
     std::lock_guard lock(mutex_);
     out.queue.reserve(items_.size());
+    out.retiredPcmBytes = engine_.retiredPcmBytes();
+    for (const auto& job : completed_) {
+        if (job.prepared.audio) out.preparedPcmBytes += static_cast<std::uint64_t>(job.prepared.audio->samples.capacity()) * sizeof(float);
+    }
     const std::uint64_t loaded[2] = {
         out.engine.decks[0].trackId,
         out.engine.decks[1].trackId,
     };
     for (const Item& item : items_) {
+        if (item.audio) {
+            ++out.preparedCount;
+            out.preparedPcmBytes += static_cast<std::uint64_t>(item.audio->samples.capacity()) * sizeof(float);
+        }
+        if (item.state == QueueState::Preparing) ++out.preparingCount;
         QueueItemStatus status;
         status.id = item.id;
         status.displayName = item.name;

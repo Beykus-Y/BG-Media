@@ -179,6 +179,16 @@ void MixEngine::resetStretchStream(DeckId deck,
     }
 }
 
+std::uint64_t MixEngine::retiredPcmBytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const auto& deck : retiredTracks_) {
+        for (const auto& entry : deck) {
+            if (entry.owner) bytes += static_cast<std::uint64_t>(entry.owner->samples.capacity()) * sizeof(float);
+        }
+    }
+    return bytes;
+}
+
 void MixEngine::reclaimRetired() {
     const std::uint64_t epoch = renderEpoch_.load(std::memory_order_acquire);
     for (auto& retired : retiredTracks_) {
