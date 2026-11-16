@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <stdexcept>
 
 namespace bgmedia::mix {
 namespace {
@@ -28,7 +29,11 @@ MixSession::MixSession(MixEngine& engine, MixPrepareCallback prepare,
 }
 
 MixSession::~MixSession() {
-    stop_.store(true, std::memory_order_release);
+    {
+        // Publish the wait predicate under its mutex, avoiding a missed wakeup.
+        std::lock_guard lock(jobMutex_);
+        stop_.store(true, std::memory_order_release);
+    }
     jobCv_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
@@ -400,19 +405,23 @@ void MixSession::workerLoop() {
         bool ok = false;
         try {
             ok = prepare_(
-            path, prepared, error, [this](float progress, std::string_view stage) {
-                preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
-                                         std::memory_order_relaxed);
-                if (!stage.empty()) {
-                    std::lock_guard lock(mutex_);
-                    preparingStage_ = std::string(stage);
-                }
-            });
-        if (ok && prepared.audio && prepared.analysis && !prepared.features) {
-            MixFeatureExtractor extractor;
-            prepared.features = std::make_shared<const MixFeatureMap>(
-                extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
-        }
+                path, prepared, error, [this](float progress, std::string_view stage) {
+                    if (stop_.load(std::memory_order_acquire)) {
+                        throw std::runtime_error("mix preparation cancelled");
+                    }
+                    preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
+                                             std::memory_order_relaxed);
+                    if (!stage.empty()) {
+                        std::lock_guard lock(mutex_);
+                        preparingStage_ = std::string(stage);
+                    }
+                });
+            if (stop_.load(std::memory_order_acquire)) return;
+            if (ok && prepared.audio && prepared.analysis && !prepared.features) {
+                MixFeatureExtractor extractor;
+                prepared.features = std::make_shared<const MixFeatureMap>(
+                    extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+            }
         } catch (const std::exception& e) {
             ok = false;
             prepared = {};
@@ -422,6 +431,7 @@ void MixSession::workerLoop() {
             prepared = {};
             error = "track preparation threw an unknown exception";
         }
+        if (stop_.load(std::memory_order_acquire)) return;
         {
             std::lock_guard lock(mutex_);
             completed_.push_back({id, ok, std::move(prepared), std::move(error)});

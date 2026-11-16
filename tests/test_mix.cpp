@@ -22,6 +22,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -1000,6 +1001,26 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(snap.master == DeckId::A);
     CHECK(snap.decks[0].playing);
     CHECK(!snap.decks[1].playing);
+}
+
+TEST_CASE("mix.session_preparation_exception_does_not_kill_worker") {
+    MixEngine engine(kRate);
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        if (path.filename() == "bad.wav") throw std::runtime_error("decode failed");
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    const auto bad = session.addTrack("bad.wav");
+    session.addTrack("good.wav");
+    REQUIRE(pump.waitForDecks(1));
+    const auto snapshot = session.snapshot();
+    const auto failed = std::find_if(snapshot.queue.begin(), snapshot.queue.end(),
+        [bad](const auto& item) { return item.id == bad; });
+    REQUIRE(failed != snapshot.queue.end());
+    CHECK(failed->state == bgmedia::mix::QueueState::Failed);
 }
 
 TEST_CASE("mix.pcm_consuming_conversion_matches_const_path") {
