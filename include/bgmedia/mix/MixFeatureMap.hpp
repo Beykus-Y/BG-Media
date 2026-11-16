@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -344,7 +345,8 @@ class IVocalActivityDetector;
 class MixFeatureExtractor {
 public:
     explicit MixFeatureExtractor(MixFeatureConfig config = {},
-                                 const IVocalActivityDetector* customVocalDetector = nullptr);
+                                 const IVocalActivityDetector* customVocalDetector = nullptr,
+                                 std::function<void()> checkpoint = {});
 
     [[nodiscard]] const MixFeatureConfig& config() const noexcept { return config_; }
 
@@ -398,6 +400,7 @@ private:
 
     MixFeatureConfig config_;
     const IVocalActivityDetector* customVocalDetector_ = nullptr;
+    std::function<void()> checkpoint_;
 };
 
 } // namespace bgmedia::mix

@@ -124,7 +124,9 @@ bool prepareMixTrack(const std::filesystem::path& path,
     if (cachedFeatures) {
         *features = std::move(*cachedFeatures);
     } else {
-        mix::MixFeatureExtractor extractor(options.features);
+        mix::MixFeatureExtractor extractor(options.features, nullptr, [&] {
+            report(progress, 0.82f, "building feature map");
+        });
         *features = extractor.extract(decoded.audio, pcm, *analysis);
         if (options.useCache && !options.cacheDirectory.empty() &&
             features->valid()) {

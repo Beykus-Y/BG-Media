@@ -428,7 +428,7 @@ void MixSession::workerLoop() {
                 });
             checkpoint();
             if (ok && prepared.audio && prepared.analysis && !prepared.features) {
-                MixFeatureExtractor extractor;
+                MixFeatureExtractor extractor({}, nullptr, checkpoint);
                 prepared.features = std::make_shared<const MixFeatureMap>(
                     extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
             }
