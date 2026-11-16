@@ -1003,6 +1003,42 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(!snap.decks[1].playing);
 }
 
+TEST_CASE("mix.session_remove_preparing_track_cancels_without_poisoning_next") {
+    using namespace std::chrono_literals;
+    MixEngine engine(kRate);
+    std::atomic<bool> started{false};
+    std::atomic<bool> cancelled{false};
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        if (path.filename() == "cancel.wav") {
+            started.store(true);
+            for (int i = 0; i < 500; ++i) {
+                try {
+                    progress(0.1f, "decoding");
+                } catch (const std::exception&) {
+                    cancelled.store(true);
+                    throw;
+                }
+                std::this_thread::sleep_for(2ms);
+            }
+        }
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    const auto id = session.addTrack("cancel.wav");
+    for (int i = 0; i < 500 && !started.load(); ++i) {
+        pump.once();
+        std::this_thread::sleep_for(2ms);
+    }
+    REQUIRE(started.load());
+    CHECK(session.removeTrack(id));
+    session.addTrack("replacement.wav");
+    REQUIRE(pump.waitForDecks(1));
+    CHECK(cancelled.load());
+}
+
 TEST_CASE("mix.session_preparation_exception_does_not_kill_worker") {
     MixEngine engine(kRate);
     const auto prepare = makeTestPrepare();

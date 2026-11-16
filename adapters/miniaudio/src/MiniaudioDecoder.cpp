@@ -101,13 +101,14 @@ DecodeResult MiniaudioDecoder::decode(const std::filesystem::path& path,
             samples.resize(nextSize);
             std::copy_n(block.data(), static_cast<std::size_t>(framesRead) * channels,
                         samples.data() + oldSize);
-            if (progress && haveLength) {
-                progress(std::clamp(
+            // Even an unknown-length stream must reach a cancellation checkpoint.
+            if (progress) {
+                const float fraction = haveLength ? std::clamp(
                              static_cast<float>(
                                  static_cast<double>(samples.size() / channels) /
                                  static_cast<double>(lengthFrames)),
-                             0.0f, 1.0f),
-                         "decoding audio");
+                             0.0f, 1.0f) : 0.0f;
+                progress(fraction, "decoding audio");
             }
         }
         if (result == MA_AT_END) {

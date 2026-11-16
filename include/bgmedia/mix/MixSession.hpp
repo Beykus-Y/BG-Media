@@ -214,6 +214,8 @@ private:
     std::condition_variable jobCv_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> jobRunning_{false};
+    // Track IDs are monotonic: cancellation cannot target a replacement job.
+    std::atomic<std::uint64_t> cancelledJobId_{0};
     bool jobActive_ = false;
     std::uint64_t jobId_ = 0;
     std::filesystem::path jobPath_;

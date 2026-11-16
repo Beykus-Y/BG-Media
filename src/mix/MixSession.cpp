@@ -97,6 +97,7 @@ bool MixSession::removeTrack(std::uint64_t id) {
     if (it == items_.end()) {
         return false;
     }
+    if (preparingId_ == id) cancelledJobId_.store(id, std::memory_order_release);
     items_.erase(it);
     return true;
 }
@@ -105,6 +106,7 @@ void MixSession::clearQueue() {
     stopAll();
     {
         std::lock_guard lock(mutex_);
+        if (preparingId_ != 0) cancelledJobId_.store(preparingId_, std::memory_order_release);
         items_.clear();
         currentId_ = 0;
         preview_ = {};
@@ -406,12 +408,17 @@ void MixSession::workerLoop() {
         PreparedMixTrack prepared;
         std::string error;
         bool ok = false;
+        const auto checkpoint = [this, id] {
+            if (stop_.load(std::memory_order_acquire) ||
+                cancelledJobId_.load(std::memory_order_acquire) == id) {
+                throw std::runtime_error("mix preparation cancelled");
+            }
+        };
         try {
+            checkpoint();
             ok = prepare_(
-                path, prepared, error, [this](float progress, std::string_view stage) {
-                    if (stop_.load(std::memory_order_acquire)) {
-                        throw std::runtime_error("mix preparation cancelled");
-                    }
+                path, prepared, error, [this, checkpoint](float progress, std::string_view stage) {
+                    checkpoint();
                     preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
                                              std::memory_order_relaxed);
                     if (!stage.empty()) {
@@ -419,12 +426,13 @@ void MixSession::workerLoop() {
                         preparingStage_ = std::string(stage);
                     }
                 });
-            if (stop_.load(std::memory_order_acquire)) return;
+            checkpoint();
             if (ok && prepared.audio && prepared.analysis && !prepared.features) {
                 MixFeatureExtractor extractor;
                 prepared.features = std::make_shared<const MixFeatureMap>(
                     extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
             }
+            checkpoint();
         } catch (const std::exception& e) {
             ok = false;
             prepared = {};
