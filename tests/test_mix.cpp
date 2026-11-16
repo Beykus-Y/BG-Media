@@ -1003,6 +1003,28 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(!snap.decks[1].playing);
 }
 
+TEST_CASE("mix.session_rejects_track_exceeding_pcm_admission_budget") {
+    MixEngine engine(kRate);
+    const auto prepare = makeTestPrepare();
+    constexpr std::uint64_t allowed = 1024 * 1024;
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        return prepare(path, out, error, std::move(progress));
+    }, MixPlanner{}, bgmedia::mix::MixPcmBudget{allowed, allowed * 2, allowed * 3});
+    SessionPump pump{engine, session};
+    const auto id = session.addTrack("too-large.wav");
+    session.addTrack("short-good.wav");
+    REQUIRE(pump.waitForDecks(1));
+    const auto snapshot = session.snapshot();
+    CHECK(snapshot.pcmBudgetBytes == allowed * 3);
+    CHECK(snapshot.preparedPcmBytes <= allowed);
+    const auto failed = std::find_if(snapshot.queue.begin(), snapshot.queue.end(),
+        [id](const auto& row) { return row.id == id; });
+    REQUIRE(failed != snapshot.queue.end());
+    CHECK(failed->state == bgmedia::mix::QueueState::Failed);
+}
+
 TEST_CASE("mix.session_remove_preparing_track_cancels_without_poisoning_next") {
     using namespace std::chrono_literals;
     MixEngine engine(kRate);

@@ -22,10 +22,18 @@ std::string fileNameOf(const std::filesystem::path& path) {
 } // namespace
 
 MixSession::MixSession(MixEngine& engine, MixPrepareCallback prepare,
-                       MixPlanner planner)
-    : engine_(engine), prepare_(std::move(prepare)), planner_(std::move(planner)) {
-    worker_ = std::thread([this] { workerLoop(); });
+                       MixPlanner planner, MixPcmBudget pcmBudget)
+    : engine_(engine), prepare_(std::move(prepare)), planner_(std::move(planner)),
+      pcmBudget_(pcmBudget) {
+    if (pcmBudget_.sessionBudgetBytes != 0 &&
+        (pcmBudget_.maxTrackBytes == 0 ||
+         pcmBudget_.preparationReserveBytes < pcmBudget_.maxTrackBytes ||
+         pcmBudget_.preparationReserveBytes > pcmBudget_.sessionBudgetBytes ||
+         pcmBudget_.maxTrackBytes > pcmBudget_.sessionBudgetBytes - pcmBudget_.preparationReserveBytes)) {
+        throw std::invalid_argument("PCM budget cannot hold a current track plus one preparation");
+    }
     applyStretchQuality();
+    worker_ = std::thread([this] { workerLoop(); });
 }
 
 MixSession::~MixSession() {
@@ -370,8 +378,17 @@ void MixSession::startWorkerIfNeeded() {
         [](const Item& item) {
             return item.audio != nullptr || item.state == QueueState::Preparing;
         });
-    if (static_cast<std::size_t>(occupied) >= kPreparedSlots) {
+    if (static_cast<std::size_t>(occupied) >= kPreparedSlots || !completed_.empty()) {
         return;
+    }
+    if (pcmBudget_.sessionBudgetBytes != 0) {
+        auto remaining = pcmBudget_.sessionBudgetBytes - pcmBudget_.preparationReserveBytes;
+        for (const auto& item : items_) {
+            if (!item.audio) continue;
+            const auto bytes = static_cast<std::uint64_t>(item.audio->samples.capacity()) * sizeof(float);
+            if (bytes > remaining) return;
+            remaining -= bytes;
+        }
     }
     for (Item& item : items_) {
         if (item.state == QueueState::Pending) {
@@ -427,6 +444,12 @@ void MixSession::workerLoop() {
                     }
                 });
             checkpoint();
+            if (ok && prepared.audio && pcmBudget_.maxTrackBytes != 0 &&
+                prepared.audio->samples.capacity() > pcmBudget_.maxTrackBytes / sizeof(float)) {
+                ok = false;
+                prepared = {};
+                error = "prepared track exceeds the PCM budget";
+            }
             if (ok && prepared.audio && prepared.analysis && !prepared.features) {
                 MixFeatureExtractor extractor({}, nullptr, checkpoint);
                 prepared.features = std::make_shared<const MixFeatureMap>(
@@ -1024,6 +1047,11 @@ MixSessionSnapshot MixSession::snapshot() const {
     std::lock_guard lock(mutex_);
     out.queue.reserve(items_.size());
     out.retiredPcmBytes = engine_.retiredPcmBytes();
+    out.pcmBudgetBytes = pcmBudget_.sessionBudgetBytes;
+    // Until collection the reservation includes unpublished worker output. This
+    // counter is a planning bound, not measured memory; do not add it to an
+    // already accounted completed result as if both were separate allocations.
+    if (preparingId_ != 0 && completed_.empty()) out.preparationReservedBytes = pcmBudget_.preparationReserveBytes;
     for (const auto& job : completed_) {
         if (job.prepared.audio) out.preparedPcmBytes += static_cast<std::uint64_t>(job.prepared.audio->samples.capacity()) * sizeof(float);
     }

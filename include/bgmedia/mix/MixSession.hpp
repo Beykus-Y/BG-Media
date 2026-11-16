@@ -37,10 +37,18 @@ using MixPrepareCallback = std::function<bool(
     const std::filesystem::path&, PreparedMixTrack&, std::string& error,
     std::function<void(float, std::string_view)> progress)>;
 
+// Optional host-provided admission budget for full-track PCM. A preparation
+// callback must honor its reservation; this cannot account for arbitrary DSP allocations.
+struct MixPcmBudget {
+    std::uint64_t maxTrackBytes = 0; // 0 = no per-track limit
+    std::uint64_t preparationReserveBytes = 0;
+    std::uint64_t sessionBudgetBytes = 0; // 0 = no byte admission limit
+};
+
 class MixSession {
 public:
     MixSession(MixEngine& engine, MixPrepareCallback prepare,
-               MixPlanner planner = MixPlanner{});
+               MixPlanner planner = MixPlanner{}, MixPcmBudget pcmBudget = {});
     ~MixSession();
 
     MixSession(const MixSession&) = delete;
@@ -169,6 +177,7 @@ private:
     MixEngine& engine_;
     MixPrepareCallback prepare_;
     MixPlanner planner_;
+    const MixPcmBudget pcmBudget_;
 
     mutable std::mutex mutex_;  // protects items_ and preview_/status strings
     std::vector<Item> items_;

@@ -80,7 +80,9 @@ DecodeResult MiniaudioDecoder::decode(const std::filesystem::path& path,
         samples.reserve(static_cast<std::size_t>(lengthFrames) * channels);
     }
 
-    const auto blockFrames = std::min<ma_uint64>(kBlockFrames, maxFrames);
+    // Bound the decoder scratch vector independently of the channel count.
+    const auto scratchFrames = std::max<ma_uint64>(1, 65536u / channels);
+    const auto blockFrames = std::min({kBlockFrames, static_cast<ma_uint64>(maxFrames), scratchFrames});
     std::vector<float> block(static_cast<std::size_t>(blockFrames) * channels);
     ma_uint64 framesRead = 0;
     while (true) {

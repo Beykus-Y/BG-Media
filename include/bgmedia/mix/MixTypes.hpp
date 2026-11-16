@@ -442,6 +442,8 @@ struct MixSessionSnapshot {
     // retired deck ownership reported separately (may overlap with queue buffers).
     std::uint64_t preparedPcmBytes = 0;
     std::uint64_t retiredPcmBytes = 0;
+    std::uint64_t preparationReservedBytes = 0;
+    std::uint64_t pcmBudgetBytes = 0;
     std::uint32_t preparedCount = 0;
     std::uint32_t preparingCount = 0;
     bool transitionAvailable = false;
