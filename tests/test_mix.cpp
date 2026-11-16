@@ -1059,6 +1059,34 @@ TEST_CASE("mix.session_preparation_exception_does_not_kill_worker") {
     CHECK(failed->state == bgmedia::mix::QueueState::Failed);
 }
 
+TEST_CASE("mix.pcm_consuming_multichannel_folds_without_another_source_buffer") {
+    AudioData audio;
+    audio.sampleRate = 48000;
+    audio.channels = 5;
+    audio.samples = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f,
+                     -0.1f, -0.2f, -0.3f, -0.4f, -0.5f};
+    auto expected = PcmTrack::fromAudio(audio, 48000);
+    const auto* storage = audio.samples.data();
+    auto actual = PcmTrack::fromAudio(std::move(audio), 48000);
+    CHECK(actual.samples == expected.samples);
+    CHECK(actual.samples.data() == storage);
+}
+
+TEST_CASE("mix.pcm_resampler_can_cancel_in_inner_loop") {
+    auto track = dcTrack(1.0, 0.2f, 2, 44100);
+    int checkpoints = 0;
+    bool cancelled = false;
+    try {
+        (void)PcmTrack::resampled(*track, 48000, [&] {
+            if (++checkpoints >= 40) throw std::runtime_error("cancel");
+        });
+    } catch (const std::runtime_error&) {
+        cancelled = true;
+    }
+    CHECK(cancelled);
+    CHECK(checkpoints == 40);
+}
+
 TEST_CASE("mix.pcm_consuming_conversion_matches_const_path") {
     AudioData audio;
     audio.sampleRate = 44100;

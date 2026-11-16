@@ -6,6 +6,7 @@
 #include "bgmedia/audio/AudioData.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace bgmedia::mix {
@@ -36,13 +37,15 @@ struct PcmTrack {
     static PcmTrack fromAudio(const AudioData& audio, std::uint32_t targetRate,
                               std::string* error = nullptr);
 
-    // Consumes the decoded vector when its channel layout already fits the mixer.
+    // Consumes the decoded vector, folding multichannel material in place.
     static PcmTrack fromAudio(AudioData&& audio, std::uint32_t targetRate,
-                              std::string* error = nullptr);
+                              std::string* error = nullptr,
+                              const std::function<void()>& checkpoint = {});
 
     // Band-limited sample-rate conversion (polyphase windowed sinc). Returns
     // a copy when the rates already match.
-    static PcmTrack resampled(const PcmTrack& source, std::uint32_t targetRate);
+    static PcmTrack resampled(const PcmTrack& source, std::uint32_t targetRate,
+                              const std::function<void()>& checkpoint = {});
 };
 
 } // namespace bgmedia::mix

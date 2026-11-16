@@ -143,7 +143,9 @@ bool prepareMixTrack(const std::filesystem::path& path,
     report(progress, 0.90f, "preparing mixer audio");
     std::string trackError;
     auto track = std::make_shared<mix::PcmTrack>(mix::PcmTrack::fromAudio(
-        std::move(decoded.audio), options.targetSampleRate, &trackError));
+        std::move(decoded.audio), options.targetSampleRate, &trackError, [&] {
+            report(progress, 0.90f, "preparing mixer audio");
+        }));
     if (!track->valid()) {
         error = "Could not prepare mixer audio: " + trackError;
         return false;
