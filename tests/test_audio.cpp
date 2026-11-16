@@ -235,6 +235,17 @@ TEST_CASE(audio.wav_streaming_sizes_and_rf64) {
 }
 
 #if defined(BGMEDIA_HAVE_MINIAUDIO) && BGMEDIA_HAVE_MINIAUDIO
+TEST_CASE(audio.miniaudio_respects_configured_pcm_limit) {
+    using namespace bgmedia;
+    const auto path = tempPath("budget.wav");
+    writeCustomWav(path, 1, 2, 48000, 16, std::vector<std::uint8_t>(4096, 0));
+    MiniaudioDecoder small(8191);
+    CHECK(!small.decode(path).ok);
+    MiniaudioDecoder exact(8192);
+    const auto decoded = exact.decode(path);
+    REQUIRE(decoded.ok);
+    CHECK(decoded.audio.samples.size() * sizeof(float) == 8192);
+}
 TEST_CASE(audio.miniaudio_decodes_wav_mp3_flac) {
     using namespace bgmedia;
     const std::filesystem::path fixtureDir = BGMEDIA_TEST_FIXTURE_DIR;

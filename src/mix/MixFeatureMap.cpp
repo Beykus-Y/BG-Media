@@ -1021,8 +1021,10 @@ WindowFeatureSummary MixFeatureMap::summarizeWindow(double start,
 }
 
 MixFeatureExtractor::MixFeatureExtractor(
-    MixFeatureConfig config, const IVocalActivityDetector* customVocalDetector)
-    : config_(std::move(config)), customVocalDetector_(customVocalDetector) {
+    MixFeatureConfig config, const IVocalActivityDetector* customVocalDetector,
+    std::function<void()> checkpoint)
+    : config_(std::move(config)), customVocalDetector_(customVocalDetector),
+      checkpoint_(std::move(checkpoint)) {
     config_.frameStepSeconds = std::clamp(config_.frameStepSeconds, 0.04, 0.50);
     config_.lowBandMaxHz = std::clamp(config_.lowBandMaxHz, 60.0, 400.0);
     config_.midBandMaxHz = std::clamp(config_.midBandMaxHz, 1200.0, 8000.0);
@@ -1129,6 +1131,7 @@ MixFeatureMap MixFeatureExtractor::extract(const AudioData& audio,
 MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
                                                    const PcmBuffer& pcm,
                                                    const AnalysisResult& analysis) const {
+    if (checkpoint_) checkpoint_();
     if (!pcm.valid()) {
         return buildFromAnalysisOnly(analysis);
     }
@@ -1211,6 +1214,7 @@ MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
     float samplePeak = 0.0f;
 
     for (int f = 0; f < frameCount; ++f) {
+        if (checkpoint_ && (f % 16 == 0)) checkpoint_();
         const std::size_t s0 = static_cast<std::size_t>(f) * static_cast<std::size_t>(stepSamples);
         const std::size_t s1 = std::min(totalSamples, s0 + static_cast<std::size_t>(stepSamples));
         const std::size_t count = std::max<std::size_t>(1, s1 - s0);
@@ -1399,6 +1403,7 @@ MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
     std::vector<float> rmsValues(static_cast<std::size_t>(frameCount), 0.0f);
 
     for (int f = 0; f < frameCount; ++f) {
+        if (checkpoint_ && (f % 16 == 0)) checkpoint_();
         const int centerSample = static_cast<int>(
             std::lround(map.frames[static_cast<std::size_t>(f)].time * sr));
         const int startSample = centerSample - fftSize / 2;
@@ -1577,6 +1582,7 @@ MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
         }
     }
 
+    if (checkpoint_) checkpoint_();
     computeAudibleBoundsAndActivity(map, analysis, config_);
 
     const InterleavedAudioView stereoAudio =
@@ -1589,7 +1595,7 @@ MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
             pcm, stereoAudio, analysis, map.frames, actualStep);
         applyVocalDetection(map, voc);
     } else if (config_.vocalDetector == VocalDetectorKind::MusicVocalModel) {
-        MusicVocalDetector detector;
+        MusicVocalDetector detector(checkpoint_);
         const VocalDetectionOutput voc =
             detector.detect(pcm, stereoAudio, analysis, map.frames, actualStep);
         applyVocalDetection(map, voc);
@@ -1599,13 +1605,16 @@ MixFeatureMap MixFeatureExtractor::extractFromView(InterleavedAudioView source,
         map.vocal.meanConfidence = 0.30f;
     }
 
+    if (checkpoint_) checkpoint_();
     buildBarsPhrasesAndCues(map, analysis, config_);
+    if (checkpoint_) checkpoint_();
 
     if (config_.harmonicAnalyzeVersion > 0) {
         HarmonicAnalyzer harmonic;
-        harmonic.analyze(pcm, map);
+        harmonic.analyze(pcm, map, checkpoint_);
     }
 
+    if (checkpoint_) checkpoint_();
     return map;
 }
 

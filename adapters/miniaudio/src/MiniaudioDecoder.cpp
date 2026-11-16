@@ -5,13 +5,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace bgmedia {
 namespace {
 
-constexpr std::size_t kMaxDecodedBytes = 1024ull * 1024ull * 1024ull; // 1 GiB
 constexpr ma_uint64 kBlockFrames = 8192;
 
 std::string lowerExtension(const std::filesystem::path& path) {
@@ -56,10 +56,11 @@ DecodeResult MiniaudioDecoder::decode(const std::filesystem::path& path,
                                      ma_result_description(initResult));
     }
 
+    const auto close = [](ma_decoder* ptr) { ma_decoder_uninit(ptr); };
+    const std::unique_ptr<ma_decoder, decltype(close)> guard(&decoder, close);
     const ma_uint32 channels = decoder.outputChannels;
     const ma_uint32 sampleRate = decoder.outputSampleRate;
     if (channels == 0 || sampleRate == 0) {
-        ma_decoder_uninit(&decoder);
         return DecodeResult::failure("decoder reported invalid channels or sample rate");
     }
 
@@ -68,47 +69,54 @@ DecodeResult MiniaudioDecoder::decode(const std::filesystem::path& path,
         ma_decoder_get_length_in_pcm_frames(&decoder, &lengthFrames) == MA_SUCCESS &&
         lengthFrames > 0;
 
+    const std::size_t maxFloats = maxDecodedBytes_ / sizeof(float);
+    const std::size_t maxFrames = maxFloats / channels;
+    if (maxFrames == 0) return DecodeResult::failure("decoded audio exceeds the in-memory limit");
     std::vector<float> samples;
     if (haveLength) {
-        const std::uint64_t estimated =
-            static_cast<std::uint64_t>(lengthFrames) * channels;
-        const std::uint64_t maxFloats = kMaxDecodedBytes / sizeof(float);
-        if (estimated > maxFloats) {
-            ma_decoder_uninit(&decoder);
+        if (lengthFrames > maxFrames) {
             return DecodeResult::failure("audio file is too large for the in-memory decoder");
         }
-        samples.reserve(static_cast<std::size_t>(estimated));
+        samples.reserve(static_cast<std::size_t>(lengthFrames) * channels);
     }
 
-    std::vector<float> block(static_cast<std::size_t>(kBlockFrames) * channels);
+    // Bound the decoder scratch vector independently of the channel count.
+    const auto scratchFrames = std::max<ma_uint64>(1, 65536u / channels);
+    const auto blockFrames = std::min({kBlockFrames, static_cast<ma_uint64>(maxFrames), scratchFrames});
+    std::vector<float> block(static_cast<std::size_t>(blockFrames) * channels);
     ma_uint64 framesRead = 0;
     while (true) {
         framesRead = 0;
         const ma_result result = ma_decoder_read_pcm_frames(
-            &decoder, block.data(), kBlockFrames, &framesRead);
+            &decoder, block.data(), blockFrames, &framesRead);
         if (framesRead > 0) {
             const std::size_t oldSize = samples.size();
-            if (oldSize + framesRead * channels > kMaxDecodedBytes / sizeof(float)) {
-                ma_decoder_uninit(&decoder);
+            if (framesRead > (maxFloats - oldSize) / channels) {
                 return DecodeResult::failure("decoded audio exceeds the in-memory limit");
             }
-            samples.resize(oldSize + static_cast<std::size_t>(framesRead) * channels);
+            const std::size_t nextSize = oldSize + static_cast<std::size_t>(framesRead) * channels;
+            if (nextSize > samples.capacity()) {
+                // Bound geometric vector growth even when file length was unknown or inaccurate.
+                const auto growth = samples.capacity() + std::min(samples.capacity(), maxFloats - samples.capacity());
+                samples.reserve(std::max(nextSize, growth));
+            }
+            samples.resize(nextSize);
             std::copy_n(block.data(), static_cast<std::size_t>(framesRead) * channels,
                         samples.data() + oldSize);
-            if (progress && haveLength) {
-                progress(std::clamp(
+            // Even an unknown-length stream must reach a cancellation checkpoint.
+            if (progress) {
+                const float fraction = haveLength ? std::clamp(
                              static_cast<float>(
                                  static_cast<double>(samples.size() / channels) /
                                  static_cast<double>(lengthFrames)),
-                             0.0f, 1.0f),
-                         "decoding audio");
+                             0.0f, 1.0f) : 0.0f;
+                progress(fraction, "decoding audio");
             }
         }
         if (result == MA_AT_END) {
             break;
         }
         if (result != MA_SUCCESS) {
-            ma_decoder_uninit(&decoder);
             return DecodeResult::failure(
                 std::string("miniaudio decoding error: ") + ma_result_description(result));
         }
@@ -117,7 +125,6 @@ DecodeResult MiniaudioDecoder::decode(const std::filesystem::path& path,
         }
     }
 
-    ma_decoder_uninit(&decoder);
 
     if (samples.empty()) {
         return DecodeResult::failure("decoder produced no audio samples");

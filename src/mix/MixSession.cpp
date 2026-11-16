@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
+#include <stdexcept>
 
 namespace bgmedia::mix {
 namespace {
@@ -20,14 +22,26 @@ std::string fileNameOf(const std::filesystem::path& path) {
 } // namespace
 
 MixSession::MixSession(MixEngine& engine, MixPrepareCallback prepare,
-                       MixPlanner planner)
-    : engine_(engine), prepare_(std::move(prepare)), planner_(std::move(planner)) {
-    worker_ = std::thread([this] { workerLoop(); });
+                       MixPlanner planner, MixPcmBudget pcmBudget)
+    : engine_(engine), prepare_(std::move(prepare)), planner_(std::move(planner)),
+      pcmBudget_(pcmBudget) {
+    if (pcmBudget_.sessionBudgetBytes != 0 &&
+        (pcmBudget_.maxTrackBytes == 0 ||
+         pcmBudget_.preparationReserveBytes < pcmBudget_.maxTrackBytes ||
+         pcmBudget_.preparationReserveBytes > pcmBudget_.sessionBudgetBytes ||
+         pcmBudget_.maxTrackBytes > pcmBudget_.sessionBudgetBytes - pcmBudget_.preparationReserveBytes)) {
+        throw std::invalid_argument("PCM budget cannot hold a current track plus one preparation");
+    }
     applyStretchQuality();
+    worker_ = std::thread([this] { workerLoop(); });
 }
 
 MixSession::~MixSession() {
-    stop_.store(true, std::memory_order_release);
+    {
+        // Publish the wait predicate under its mutex, avoiding a missed wakeup.
+        std::lock_guard lock(jobMutex_);
+        stop_.store(true, std::memory_order_release);
+    }
     jobCv_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
@@ -91,6 +105,7 @@ bool MixSession::removeTrack(std::uint64_t id) {
     if (it == items_.end()) {
         return false;
     }
+    if (preparingId_ == id) cancelledJobId_.store(id, std::memory_order_release);
     items_.erase(it);
     return true;
 }
@@ -99,6 +114,7 @@ void MixSession::clearQueue() {
     stopAll();
     {
         std::lock_guard lock(mutex_);
+        if (preparingId_ != 0) cancelledJobId_.store(preparingId_, std::memory_order_release);
         items_.clear();
         currentId_ = 0;
         preview_ = {};
@@ -344,6 +360,9 @@ void MixSession::installDeck(DeckId deck, const Item& item) {
 }
 
 void MixSession::startWorkerIfNeeded() {
+    // A cleared or retired deck may still own PCM until a render callback acknowledges it.
+    // Do not start preparing a third allocation while that old ownership is pending.
+    if (clearDecksRequested_ || engine_.retiredPcmBytes() != 0) return;
     {
         std::lock_guard lock(jobMutex_);
         if (jobActive_ || jobRunning_.load(std::memory_order_acquire)) {
@@ -351,6 +370,26 @@ void MixSession::startWorkerIfNeeded() {
         }
     }
     std::lock_guard lock(mutex_);
+    // The logical queue may contain thousands of paths. Only the two deck
+    // slots may own prepared PCM (including a worker result not yet collected).
+    // Loaded items retain their Ready state until transition completion.
+    constexpr std::size_t kPreparedSlots = 2;
+    const auto occupied = std::count_if(items_.begin(), items_.end(),
+        [](const Item& item) {
+            return item.audio != nullptr || item.state == QueueState::Preparing;
+        });
+    if (static_cast<std::size_t>(occupied) >= kPreparedSlots || !completed_.empty()) {
+        return;
+    }
+    if (pcmBudget_.sessionBudgetBytes != 0) {
+        auto remaining = pcmBudget_.sessionBudgetBytes - pcmBudget_.preparationReserveBytes;
+        for (const auto& item : items_) {
+            if (!item.audio) continue;
+            const auto bytes = static_cast<std::uint64_t>(item.audio->samples.capacity()) * sizeof(float);
+            if (bytes > remaining) return;
+            remaining -= bytes;
+        }
+    }
     for (Item& item : items_) {
         if (item.state == QueueState::Pending) {
             item.state = QueueState::Preparing;
@@ -385,20 +424,48 @@ void MixSession::workerLoop() {
         }
         PreparedMixTrack prepared;
         std::string error;
-        const bool ok = prepare_(
-            path, prepared, error, [this](float progress, std::string_view stage) {
-                preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
-                                         std::memory_order_relaxed);
-                if (!stage.empty()) {
-                    std::lock_guard lock(mutex_);
-                    preparingStage_ = std::string(stage);
-                }
-            });
-        if (ok && prepared.audio && prepared.analysis && !prepared.features) {
-            MixFeatureExtractor extractor;
-            prepared.features = std::make_shared<const MixFeatureMap>(
-                extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+        bool ok = false;
+        const auto checkpoint = [this, id] {
+            if (stop_.load(std::memory_order_acquire) ||
+                cancelledJobId_.load(std::memory_order_acquire) == id) {
+                throw std::runtime_error("mix preparation cancelled");
+            }
+        };
+        try {
+            checkpoint();
+            ok = prepare_(
+                path, prepared, error, [this, checkpoint](float progress, std::string_view stage) {
+                    checkpoint();
+                    preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
+                                             std::memory_order_relaxed);
+                    if (!stage.empty()) {
+                        std::lock_guard lock(mutex_);
+                        preparingStage_ = std::string(stage);
+                    }
+                });
+            checkpoint();
+            if (ok && prepared.audio && pcmBudget_.maxTrackBytes != 0 &&
+                prepared.audio->samples.capacity() > pcmBudget_.maxTrackBytes / sizeof(float)) {
+                ok = false;
+                prepared = {};
+                error = "prepared track exceeds the PCM budget";
+            }
+            if (ok && prepared.audio && prepared.analysis && !prepared.features) {
+                MixFeatureExtractor extractor({}, nullptr, checkpoint);
+                prepared.features = std::make_shared<const MixFeatureMap>(
+                    extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+            }
+            checkpoint();
+        } catch (const std::exception& e) {
+            ok = false;
+            prepared = {};
+            error = e.what();
+        } catch (...) {
+            ok = false;
+            prepared = {};
+            error = "track preparation threw an unknown exception";
         }
+        if (stop_.load(std::memory_order_acquire)) return;
         {
             std::lock_guard lock(mutex_);
             completed_.push_back({id, ok, std::move(prepared), std::move(error)});
@@ -979,11 +1046,25 @@ MixSessionSnapshot MixSession::snapshot() const {
     out.engine = engine_.snapshot();
     std::lock_guard lock(mutex_);
     out.queue.reserve(items_.size());
+    out.retiredPcmBytes = engine_.retiredPcmBytes();
+    out.pcmBudgetBytes = pcmBudget_.sessionBudgetBytes;
+    // Until collection the reservation includes unpublished worker output. This
+    // counter is a planning bound, not measured memory; do not add it to an
+    // already accounted completed result as if both were separate allocations.
+    if (preparingId_ != 0 && completed_.empty()) out.preparationReservedBytes = pcmBudget_.preparationReserveBytes;
+    for (const auto& job : completed_) {
+        if (job.prepared.audio) out.preparedPcmBytes += static_cast<std::uint64_t>(job.prepared.audio->samples.capacity()) * sizeof(float);
+    }
     const std::uint64_t loaded[2] = {
         out.engine.decks[0].trackId,
         out.engine.decks[1].trackId,
     };
     for (const Item& item : items_) {
+        if (item.audio) {
+            ++out.preparedCount;
+            out.preparedPcmBytes += static_cast<std::uint64_t>(item.audio->samples.capacity()) * sizeof(float);
+        }
+        if (item.state == QueueState::Preparing) ++out.preparingCount;
         QueueItemStatus status;
         status.id = item.id;
         status.displayName = item.name;

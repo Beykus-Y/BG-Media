@@ -22,6 +22,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -1000,6 +1001,177 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(snap.master == DeckId::A);
     CHECK(snap.decks[0].playing);
     CHECK(!snap.decks[1].playing);
+}
+
+TEST_CASE("mix.session_rejects_track_exceeding_pcm_admission_budget") {
+    MixEngine engine(kRate);
+    const auto prepare = makeTestPrepare();
+    constexpr std::uint64_t allowed = 1024 * 1024;
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        return prepare(path, out, error, std::move(progress));
+    }, MixPlanner{}, bgmedia::mix::MixPcmBudget{allowed, allowed * 2, allowed * 3});
+    SessionPump pump{engine, session};
+    const auto id = session.addTrack("too-large.wav");
+    session.addTrack("short-good.wav");
+    REQUIRE(pump.waitForDecks(1));
+    const auto snapshot = session.snapshot();
+    CHECK(snapshot.pcmBudgetBytes == allowed * 3);
+    CHECK(snapshot.preparedPcmBytes <= allowed);
+    const auto failed = std::find_if(snapshot.queue.begin(), snapshot.queue.end(),
+        [id](const auto& row) { return row.id == id; });
+    REQUIRE(failed != snapshot.queue.end());
+    CHECK(failed->state == bgmedia::mix::QueueState::Failed);
+}
+
+TEST_CASE("mix.session_remove_preparing_track_cancels_without_poisoning_next") {
+    using namespace std::chrono_literals;
+    MixEngine engine(kRate);
+    std::atomic<bool> started{false};
+    std::atomic<bool> cancelled{false};
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        if (path.filename() == "cancel.wav") {
+            started.store(true);
+            for (int i = 0; i < 500; ++i) {
+                try {
+                    progress(0.1f, "decoding");
+                } catch (const std::exception&) {
+                    cancelled.store(true);
+                    throw;
+                }
+                std::this_thread::sleep_for(2ms);
+            }
+        }
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    const auto id = session.addTrack("cancel.wav");
+    for (int i = 0; i < 500 && !started.load(); ++i) {
+        pump.once();
+        std::this_thread::sleep_for(2ms);
+    }
+    REQUIRE(started.load());
+    CHECK(session.removeTrack(id));
+    session.addTrack("replacement.wav");
+    REQUIRE(pump.waitForDecks(1));
+    CHECK(cancelled.load());
+}
+
+TEST_CASE("mix.session_preparation_exception_does_not_kill_worker") {
+    MixEngine engine(kRate);
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        if (path.filename() == "bad.wav") throw std::runtime_error("decode failed");
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    const auto bad = session.addTrack("bad.wav");
+    session.addTrack("good.wav");
+    REQUIRE(pump.waitForDecks(1));
+    const auto snapshot = session.snapshot();
+    const auto failed = std::find_if(snapshot.queue.begin(), snapshot.queue.end(),
+        [bad](const auto& item) { return item.id == bad; });
+    REQUIRE(failed != snapshot.queue.end());
+    CHECK(failed->state == bgmedia::mix::QueueState::Failed);
+}
+
+TEST_CASE("mix.pcm_consuming_multichannel_folds_without_another_source_buffer") {
+    AudioData audio;
+    audio.sampleRate = 48000;
+    audio.channels = 5;
+    audio.samples = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f,
+                     -0.1f, -0.2f, -0.3f, -0.4f, -0.5f};
+    auto expected = PcmTrack::fromAudio(audio, 48000);
+    const auto* storage = audio.samples.data();
+    auto actual = PcmTrack::fromAudio(std::move(audio), 48000);
+    CHECK(actual.samples == expected.samples);
+    CHECK(actual.samples.data() == storage);
+}
+
+TEST_CASE("mix.pcm_resampler_can_cancel_in_inner_loop") {
+    auto track = dcTrack(1.0, 0.2f, 2, 44100);
+    int checkpoints = 0;
+    bool cancelled = false;
+    try {
+        (void)PcmTrack::resampled(*track, 48000, [&] {
+            if (++checkpoints >= 40) throw std::runtime_error("cancel");
+        });
+    } catch (const std::runtime_error&) {
+        cancelled = true;
+    }
+    CHECK(cancelled);
+    CHECK(checkpoints == 40);
+}
+
+TEST_CASE("mix.pcm_consuming_conversion_matches_const_path") {
+    AudioData audio;
+    audio.sampleRate = 44100;
+    audio.channels = 2;
+    audio.samples = {0.25f, -0.5f, 1.5f, -2.0f, 0.1f, 0.3f, 0.4f, 0.6f};
+    const auto expected = PcmTrack::fromAudio(audio, 48000);
+    auto copy = audio;
+    const auto actual = PcmTrack::fromAudio(std::move(copy), 48000);
+    CHECK(actual.samples == expected.samples);
+    CHECK(actual.sampleRate == expected.sampleRate);
+    CHECK(actual.channels == expected.channels);
+    const auto* original = audio.samples.data();
+    const auto sameRate = PcmTrack::fromAudio(std::move(audio), 44100);
+    CHECK(sameRate.samples.data() == original);
+    CHECK_NEAR(sameRate.samples[2], 1.0, 1e-6);
+    CHECK_NEAR(sameRate.samples[3], -1.0, 1e-6);
+}
+
+TEST_CASE("mix.session_long_queue_bounds_preparation_until_deck_retires") {
+    MixEngine engine(kRate);
+    std::atomic<int> calls{0};
+    const auto prepare = makeTestPrepare();
+    MixSession session(engine, [&](const std::filesystem::path& path,
+                                   PreparedMixTrack& out, std::string& error,
+                                   std::function<void(float, std::string_view)> progress) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        return prepare(path, out, error, std::move(progress));
+    });
+    SessionPump pump{engine, session};
+    for (int i = 0; i < 100; ++i) {
+        session.addTrack("track-" + std::to_string(i) + ".wav");
+    }
+    CHECK(pump.waitForDecks(2));
+    for (int i = 0; i < 50; ++i) {
+        pump.once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    auto before = session.snapshot();
+    CHECK(before.queue.size() == 100);
+    CHECK(before.preparedCount == 2);
+    CHECK(before.preparingCount == 0);
+    CHECK(before.preparedPcmBytes >= 2ull * 8 * kRate * 2 * sizeof(float));
+    CHECK(calls.load(std::memory_order_relaxed) == 2);
+    session.setTransitionType(TransitionType::DirectCut);
+    session.play();
+    pump.forSeconds(0.05);
+    const auto completed = engine.completedTransitions();
+    session.next();
+    bool refilled = false;
+    for (int i = 0; i < 800 && !refilled; ++i) {
+        pump.once();
+        const auto snapshot = engine.snapshot();
+        refilled = snapshot.completedTransitions > completed &&
+                   snapshot.decks[0].loaded && snapshot.decks[1].loaded &&
+                   calls.load(std::memory_order_relaxed) >= 3;
+        if (!refilled) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    CHECK(refilled);
+    for (int i = 0; i < 50; ++i) {
+        pump.once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    CHECK(calls.load(std::memory_order_relaxed) == 3);
 }
 
 TEST_CASE("mix.session_refilled_deck_stays_stopped") {

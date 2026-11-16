@@ -121,8 +121,10 @@ void MixEngine::retireTrack(DeckId deck,
     // pointer has returned before this object may be destroyed.
     const std::uint64_t epoch =
         renderEpoch_.load(std::memory_order_acquire) + 1;
+    const auto bytes = static_cast<std::uint64_t>(owner->samples.capacity()) * sizeof(float);
     retiredTracks_[deckIndex(deck)].push_back(
         RetiredTrack{std::move(owner), epoch});
+    retiredPcmBytes_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void MixEngine::retireProcessor(
@@ -179,14 +181,22 @@ void MixEngine::resetStretchStream(DeckId deck,
     }
 }
 
+std::uint64_t MixEngine::retiredPcmBytes() const noexcept {
+    return retiredPcmBytes_.load(std::memory_order_relaxed);
+}
+
 void MixEngine::reclaimRetired() {
     const std::uint64_t epoch = renderEpoch_.load(std::memory_order_acquire);
     for (auto& retired : retiredTracks_) {
         retired.erase(
             std::remove_if(retired.begin(), retired.end(),
-                           [epoch](const RetiredTrack& entry) {
-                               return entry.epoch <= epoch;
-                           }),
+                           [this, epoch](const RetiredTrack& entry) {
+                                if (entry.epoch > epoch) return false;
+                                if (entry.owner) retiredPcmBytes_.fetch_sub(
+                                    static_cast<std::uint64_t>(entry.owner->samples.capacity()) * sizeof(float),
+                                    std::memory_order_relaxed);
+                                return true;
+                            }),
             retired.end());
     }
     retiredProcessors_.erase(

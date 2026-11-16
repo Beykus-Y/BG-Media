@@ -26,7 +26,7 @@ public:
     // Extracts per-frame dominant pitch class & harmonic salience, local
     // phrase/bar harmonic segments, and global key/mode/tonalness summary.
     void analyze(const PcmBuffer& monoPcm,
-                 MixFeatureMap& map) const;
+                 MixFeatureMap& map, const std::function<void()>& checkpoint = {}) const;
 
     // Correlates a 12-bin chroma vector against 24 major/minor tonal profiles.
     static void estimateKeyFromChroma(const std::array<float, 12>& chroma,

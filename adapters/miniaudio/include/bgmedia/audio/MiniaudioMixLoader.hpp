@@ -8,6 +8,7 @@
 #include "bgmedia/mix/MixSession.hpp"
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -22,6 +23,9 @@ struct MixTrackLoadOptions {
     bool useCache = true;
     // Mixer working rate. Audio is resampled once, during preparation.
     std::uint32_t targetSampleRate = 48000;
+    // Per-buffer limits for decoded source and mixer output. Hosts with tight
+    // memory budgets can reject oversized tracks before analysing them.
+    std::size_t maxPcmBytes = 1024ull * 1024ull * 1024ull;
 };
 
 using MixLoadProgress =

@@ -72,6 +72,8 @@ public:
     // reference. Tracks replaced by loadDeck()/clearDeck() are retained until
     // the render epoch proves that at least one callback started afterwards.
     void reclaimRetired();
+    // Atomic diagnostic: bytes retained until the render epoch acknowledges retirement.
+    [[nodiscard]] std::uint64_t retiredPcmBytes() const noexcept;
 
     void setOutputLatency(double seconds);
     void setTimeStretch(std::shared_ptr<const ITimeStretchProcessor> processor);
@@ -238,6 +240,7 @@ private:
     // and time-stretch processors.
     std::atomic<std::uint64_t> renderEpoch_{0};
     std::vector<RetiredTrack> retiredTracks_[2];
+    std::atomic<std::uint64_t> retiredPcmBytes_{0};
     std::vector<RetiredProcessor> retiredProcessors_;
     std::vector<RetiredStream> retiredStreams_;
     std::vector<RetiredTap> retiredTaps_;

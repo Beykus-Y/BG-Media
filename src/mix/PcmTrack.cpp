@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace bgmedia::mix {
 namespace {
@@ -73,7 +74,48 @@ PcmTrack PcmTrack::fromAudio(const AudioData& audio, std::uint32_t targetRate,
     return resampled(track, targetRate);
 }
 
-PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
+PcmTrack PcmTrack::fromAudio(AudioData&& audio, std::uint32_t targetRate,
+                             std::string* error, const std::function<void()>& checkpoint) {
+    if (!audio.valid() || audio.frameCount() < 2) {
+        return fromAudio(static_cast<const AudioData&>(audio), targetRate, error);
+    }
+    if (checkpoint) checkpoint();
+    PcmTrack track;
+    track.sampleRate = audio.sampleRate;
+    const auto sourceChannels = audio.channels;
+    const auto frames = audio.frameCount();
+    track.channels = std::min(sourceChannels, 2u);
+    track.samples = std::move(audio.samples);
+    if (sourceChannels <= 2) {
+        for (std::size_t i = 0; i < track.samples.size(); ++i) {
+            if (checkpoint && (i % 65536 == 0)) checkpoint();
+            track.samples[i] = sanitize(track.samples[i]);
+        }
+    } else {
+        // Read both channel groups before overwriting the current frame.
+        // The two-channel output never overwrites input for a later frame.
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            if (checkpoint && (frame % 32768 == 0)) checkpoint();
+            float stereo[2]{};
+            int counts[2]{};
+            for (std::uint32_t c = 0; c < sourceChannels; ++c) {
+                stereo[c % 2] += sanitize(track.samples[frame * sourceChannels + c]);
+                ++counts[c % 2];
+            }
+            for (std::uint32_t c = 0; c < 2; ++c) {
+                track.samples[frame * 2 + c] = stereo[c] / static_cast<float>(counts[c]);
+            }
+        }
+        track.samples.resize(frames * 2);
+    }
+    if (checkpoint) checkpoint();
+    if (targetRate == 0 || targetRate == track.sampleRate) return track;
+    return resampled(track, targetRate, checkpoint);
+}
+
+PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate,
+                              const std::function<void()>& checkpoint) {
+    if (checkpoint) checkpoint();
     if (targetRate == 0 || source.sampleRate == 0 || source.channels == 0 ||
         targetRate == source.sampleRate || source.samples.empty()) {
         return source;
@@ -112,6 +154,7 @@ PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
     // table[phase][tap]: tap t reads source index base - halfWidth + 1 + t.
     std::vector<float> table(static_cast<std::size_t>(kPhases + 1) * width);
     for (int ph = 0; ph <= kPhases; ++ph) {
+        if (checkpoint && (ph % 16 == 0)) checkpoint();
         const double frac = static_cast<double>(ph) / kPhases;
         double sum = 0.0;
         for (int t = 0; t < width; ++t) {
@@ -137,6 +180,7 @@ PcmTrack PcmTrack::resampled(const PcmTrack& source, std::uint32_t targetRate) {
 
     const double step = 1.0 / ratio;
     for (std::size_t i = 0; i < outFrames; ++i) {
+        if (checkpoint && (i % 4096 == 0)) checkpoint();
         const double pos = static_cast<double>(i) * step;
         const auto base = static_cast<long long>(std::floor(pos));
         const double fracPos = (pos - static_cast<double>(base)) * kPhases;

@@ -398,7 +398,7 @@ std::string HarmonicAnalyzer::keyName(int keyIndex, bool isMinor) {
 }
 
 void HarmonicAnalyzer::analyze(const PcmBuffer& monoPcm,
-                               MixFeatureMap& map) const {
+                               MixFeatureMap& map, const std::function<void()>& checkpoint) const {
     const std::size_t n = map.frames.size();
     map.info.harmonicAnalyzeVersion = kVersion;
     if (n == 0 || !monoPcm.valid()) {
@@ -428,6 +428,7 @@ void HarmonicAnalyzer::analyze(const PcmBuffer& monoPcm,
     double globalWeight = 0.0;
 
     for (std::size_t f = 0; f < n; ++f) {
+        if (checkpoint && (f % 16 == 0)) checkpoint();
         MixFeatureFrame& frame = map.frames[f];
         frameChromas[f].fill(0.0f);
         if (!frame.active || frame.rms < 1e-5f) {

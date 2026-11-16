@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace bgmedia::mix {
 
@@ -51,6 +52,8 @@ public:
 // syllabic envelope continuity, and stereo center (Mid/Side) focus.
 class MusicVocalDetector final : public IVocalActivityDetector {
 public:
+    explicit MusicVocalDetector(std::function<void()> checkpoint = {})
+        : checkpoint_(std::move(checkpoint)) {}
     static constexpr std::uint32_t kModelVersion = 1;
     static constexpr std::uint64_t kModelChecksum = 0x4247564F434D444CULL; // "BGVOCMDL"
 
@@ -70,6 +73,8 @@ public:
         const AnalysisResult& analysis,
         const std::vector<MixFeatureFrame>& frames,
         double frameStepSeconds) const override;
+private:
+    std::function<void()> checkpoint_;
 };
 
 // Computes vocal activity directly from a pre-separated vocal stem buffer.

@@ -207,6 +207,7 @@ VocalDetectionOutput MusicVocalDetector::detect(
     std::vector<float> f0Track(n, 0.0f);
 
     for (std::size_t f = 0; f < n; ++f) {
+        if (checkpoint_ && (f % 16 == 0)) checkpoint_();
         const MixFeatureFrame& frame = frames[f];
         if (!frame.active || frame.rms < 1e-5f) {
             rawScores[f] = 0.0f;
