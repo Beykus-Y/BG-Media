@@ -36,6 +36,10 @@ struct PcmTrack {
     static PcmTrack fromAudio(const AudioData& audio, std::uint32_t targetRate,
                               std::string* error = nullptr);
 
+    // Consumes the decoded vector when its channel layout already fits the mixer.
+    static PcmTrack fromAudio(AudioData&& audio, std::uint32_t targetRate,
+                              std::string* error = nullptr);
+
     // Band-limited sample-rate conversion (polyphase windowed sinc). Returns
     // a copy when the rates already match.
     static PcmTrack resampled(const PcmTrack& source, std::uint32_t targetRate);

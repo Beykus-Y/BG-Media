@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace bgmedia::mix {
 namespace {
@@ -70,6 +71,19 @@ PcmTrack PcmTrack::fromAudio(const AudioData& audio, std::uint32_t targetRate,
     if (targetRate == track.sampleRate) {
         return track;
     }
+    return resampled(track, targetRate);
+}
+
+PcmTrack PcmTrack::fromAudio(AudioData&& audio, std::uint32_t targetRate, std::string* error) {
+    if (!audio.valid() || audio.frameCount() < 2 || audio.channels > 2) {
+        return fromAudio(static_cast<const AudioData&>(audio), targetRate, error);
+    }
+    PcmTrack track;
+    track.sampleRate = audio.sampleRate;
+    track.channels = audio.channels;
+    track.samples = std::move(audio.samples);
+    for (float& sample : track.samples) sample = sanitize(sample);
+    if (targetRate == 0 || targetRate == track.sampleRate) return track;
     return resampled(track, targetRate);
 }
 

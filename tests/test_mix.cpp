@@ -1002,6 +1002,24 @@ TEST_CASE("mix.engine_cancel_after_handover_restores_master") {
     CHECK(!snap.decks[1].playing);
 }
 
+TEST_CASE("mix.pcm_consuming_conversion_matches_const_path") {
+    AudioData audio;
+    audio.sampleRate = 44100;
+    audio.channels = 2;
+    audio.samples = {0.25f, -0.5f, 1.5f, -2.0f, 0.1f, 0.3f, 0.4f, 0.6f};
+    const auto expected = PcmTrack::fromAudio(audio, 48000);
+    auto copy = audio;
+    const auto actual = PcmTrack::fromAudio(std::move(copy), 48000);
+    CHECK(actual.samples == expected.samples);
+    CHECK(actual.sampleRate == expected.sampleRate);
+    CHECK(actual.channels == expected.channels);
+    const auto* original = audio.samples.data();
+    const auto sameRate = PcmTrack::fromAudio(std::move(audio), 44100);
+    CHECK(sameRate.samples.data() == original);
+    CHECK_NEAR(sameRate.samples[2], 1.0, 1e-6);
+    CHECK_NEAR(sameRate.samples[3], -1.0, 1e-6);
+}
+
 TEST_CASE("mix.session_long_queue_bounds_preparation_until_deck_retires") {
     MixEngine engine(kRate);
     std::atomic<int> calls{0};

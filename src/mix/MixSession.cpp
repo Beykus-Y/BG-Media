@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 
 namespace bgmedia::mix {
 namespace {
@@ -396,7 +397,9 @@ void MixSession::workerLoop() {
         }
         PreparedMixTrack prepared;
         std::string error;
-        const bool ok = prepare_(
+        bool ok = false;
+        try {
+            ok = prepare_(
             path, prepared, error, [this](float progress, std::string_view stage) {
                 preparingProgress_.store(std::clamp(progress, 0.0f, 1.0f),
                                          std::memory_order_relaxed);
@@ -409,6 +412,15 @@ void MixSession::workerLoop() {
             MixFeatureExtractor extractor;
             prepared.features = std::make_shared<const MixFeatureMap>(
                 extractor.extractFromTrack(*prepared.audio, *prepared.analysis));
+        }
+        } catch (const std::exception& e) {
+            ok = false;
+            prepared = {};
+            error = e.what();
+        } catch (...) {
+            ok = false;
+            prepared = {};
+            error = "track preparation threw an unknown exception";
         }
         {
             std::lock_guard lock(mutex_);

@@ -49,8 +49,8 @@ bool prepareMixTrack(const std::filesystem::path& path,
     }
 
     report(progress, 0.02f, "decoding audio");
-    MiniaudioDecoder decoder;
-    const DecodeResult decoded = decoder.decode(
+    MiniaudioDecoder decoder(options.maxPcmBytes);
+    DecodeResult decoded = decoder.decode(
         path, [&](float fraction, std::string_view stage) {
             report(progress, 0.02f + 0.18f * fraction, stage);
         });
@@ -59,8 +59,16 @@ bool prepareMixTrack(const std::filesystem::path& path,
         return false;
     }
 
+    const auto rate = options.targetSampleRate == 0 ? decoded.audio.sampleRate : options.targetSampleRate;
+    const auto channels = std::min(decoded.audio.channels, 2u);
+    const long double estimatedFrames = static_cast<long double>(decoded.audio.frameCount()) * rate / decoded.audio.sampleRate;
+    const auto maxFrames = options.maxPcmBytes / sizeof(float) / channels;
+    if (estimatedFrames + 0.5L >= static_cast<long double>(maxFrames) + 1.0L || maxFrames == 0) {
+        error = "mixer PCM exceeds the in-memory limit";
+        return false;
+    }
     std::string pcmError;
-    const PcmBuffer pcm = PcmBuffer::fromAudio(decoded.audio, &pcmError);
+    PcmBuffer pcm = PcmBuffer::fromAudio(decoded.audio, &pcmError);
     if (!pcm.valid()) {
         error = "Could not prepare PCM: " + pcmError;
         return false;
@@ -127,10 +135,13 @@ bool prepareMixTrack(const std::filesystem::path& path,
         }
     }
 
+    // Analysis and feature caches are finished: release the full mono buffer
+    // before any mixer output allocation.
+    pcm = {};
     report(progress, 0.90f, "preparing mixer audio");
     std::string trackError;
     auto track = std::make_shared<mix::PcmTrack>(mix::PcmTrack::fromAudio(
-        decoded.audio, options.targetSampleRate, &trackError));
+        std::move(decoded.audio), options.targetSampleRate, &trackError));
     if (!track->valid()) {
         error = "Could not prepare mixer audio: " + trackError;
         return false;
