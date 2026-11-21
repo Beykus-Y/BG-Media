@@ -1,5 +1,9 @@
 #include "bgmedia/video/FFmpeg.hpp"
 #include "bgmedia/video/Playback.hpp"
+#include "AsyncPlayback.hpp"
+#ifdef BGMEDIA_TOK_EXPLORE
+#include "bg_tok_explore.h"
+#endif
 #ifdef BGMEDIA_TOK_FIXTURE
 #include "bgmedia/video/DiskCache.hpp"
 #include "bg_tok_fixture.h"
@@ -12,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
@@ -112,11 +117,22 @@ private:
 
 class Player {
 public:
-    Player(SDL_Renderer* renderer, SDL_AudioStream* audio, bool preload, std::filesystem::path tokCache)
+    Player(SDL_Renderer* renderer, SDL_AudioStream* audio, bool preload, std::filesystem::path tokCache, bool explore, bool asynchronous)
         : output_(renderer, audio),
           playback_(std::make_shared<FFmpegProvider>(), [](const Media& media) { return openFFmpeg(media); },
                     output_, preload ? PlaybackOptions{} : PlaybackOptions{.preparationBytes = 0}),
-          renderer_(renderer), tokCache_(std::move(tokCache)) {}
+          renderer_(renderer), tokCache_(std::move(tokCache)) {
+        if (asynchronous || explore)
+            async_ = std::make_unique<AsyncPlayback>(std::make_shared<FFmpegProvider>(), [](const Media& media) { return openFFmpeg(media); }, output_, preload ? PlaybackOptions{} : PlaybackOptions{.preparationBytes = 0});
+#ifdef BGMEDIA_TOK_EXPLORE
+        if (explore) {
+            exploreHost_.reset(bg_tok_explore_create(std::getenv("BG_TOK_LIVE_PROXY"), 120));
+            if (!exploreHost_) exploreError_ = "Could not create Explore host";
+        }
+#else
+        if (explore) exploreError_ = "Explore support was not built";
+#endif
+    }
     void load(std::vector<std::filesystem::path> files) {
         files_ = files;
         std::vector<Media> queue;
@@ -145,7 +161,7 @@ public:
                 MediaId id{"bg-tok-fixture", account_, std::to_string(i)};
                 queue.push_back({id, {}, cache->wrap({id, revision}, DiskPolicy::hostManaged, source)});
             }
-            playback_.setQueue(std::move(queue));
+            setQueue(std::move(queue));
             host_ = std::move(host);
             cache_ = std::move(cache);
             return;
@@ -155,15 +171,26 @@ public:
 #endif
         for (auto& file : files)
             queue.push_back({{"local", "", std::to_string(queue.size())}, std::move(file)});
-        playback_.setQueue(std::move(queue));
+        setQueue(std::move(queue));
     }
-    void move(int direction) { if (direction < 0) playback_.previous(); else playback_.next(); }
+    void setQueue(std::vector<Media> queue) {
+        queueSize_ = queue.size(); selected_ = 0;
+        if (async_) async_->setQueue(std::move(queue)); else playback_.setQueue(std::move(queue));
+    }
+    void move(int direction) {
+        if (async_) {
+            if (direction < 0 && selected_ > 0) --selected_;
+            else if (direction > 0 && selected_ + 1 < queueSize_) ++selected_;
+            else return;
+            async_->select(selected_);
+        } else if (direction < 0) playback_.previous(); else playback_.next();
+    }
     void pause() {
         const auto state = snapshot().state;
-        if (state == PlaybackState::playing || state == PlaybackState::buffering) playback_.pause();
-        else playback_.play();
+        if (state == PlaybackState::playing || state == PlaybackState::buffering) { if (async_) async_->pause(); else playback_.pause(); }
+        else { if (async_) async_->play(); else playback_.play(); }
     }
-    void stop() { playback_.stop(); }
+    void stop() { if (async_) async_->stop(); else playback_.stop(); }
     void switchAccount() {
 #ifdef BGMEDIA_TOK_FIXTURE
         if (!host_ || !cache_ || files_.empty()) return;
@@ -174,18 +201,43 @@ public:
         load(files_);
 #endif
     }
-    void seek(double seconds) { playback_.seek(seconds); }
+    void seek(double seconds) { if (async_) async_->seek(seconds); else playback_.seek(seconds); }
     void seekFraction(double fraction) {
         const auto duration = snapshot().info.duration;
         if (duration > 0) seek(fraction * duration);
     }
     void update() {
-        playback_.update();
+#ifdef BGMEDIA_TOK_EXPLORE
+        if (exploreHost_ && !exploreLoaded_ && exploreError_.empty()) {
+            const int state = bg_tok_explore_status(exploreHost_.get());
+            if (state == 1) {
+                std::vector<Media> queue;
+                for (std::size_t i = 0; i < bg_tok_explore_count(exploreHost_.get()); ++i) {
+                    bg_tok_explore_range range{};
+                    if (bg_tok_explore_open(exploreHost_.get(), i, &range) != 0) { exploreError_ = "Explore source unavailable"; break; }
+                    std::shared_ptr<ByteSource> source;
+                    try { source = adoptRangeSource({range.context, range.length, range.read_at, range.release}); }
+                    catch (...) { range.release(range.context); throw; }
+                    queue.push_back({{"tiktok", "public", std::to_string(i)}, {}, std::move(source)});
+                }
+                if (exploreError_.empty() && !queue.empty()) { setQueue(std::move(queue)); exploreLoaded_ = true; }
+                else if (exploreError_.empty()) exploreError_ = "Explore page is empty";
+            } else if (state == 2 || state == 3) exploreError_ = "Explore unavailable or cancelled";
+        }
+#endif
+        if (async_) async_->pump(); else playback_.update();
         const auto state = snapshot();
         peakBuffers_ = std::max(peakBuffers_, state.bufferedBytes + output_.textureBytes());
     }
     void draw(bool force);
-    PlaybackSnapshot snapshot() const { return playback_.snapshot(); }
+    PlaybackSnapshot snapshot() const {
+        auto result = async_ ? async_->snapshot() : playback_.snapshot();
+        if (!exploreError_.empty()) { result.state = PlaybackState::error; result.error = exploreError_; }
+#ifdef BGMEDIA_TOK_EXPLORE
+        else if (exploreHost_ && !exploreLoaded_) result.state = PlaybackState::buffering;
+#endif
+        return result;
+    }
     double position() const { return snapshot().position; }
     std::size_t peakBuffers() const { return peakBuffers_; }
     std::uint64_t providerCalls() const {
@@ -212,6 +264,13 @@ private:
     Clock::time_point lastDraw_{}, lastMemorySample_{};
     std::filesystem::path tokCache_;
     std::vector<std::filesystem::path> files_;
+    std::string exploreError_;
+    std::size_t queueSize_ = 0, selected_ = 0;
+#ifdef BGMEDIA_TOK_EXPLORE
+    std::unique_ptr<bg_tok_explore, decltype(&bg_tok_explore_destroy)> exploreHost_{nullptr, bg_tok_explore_destroy};
+    bool exploreLoaded_ = false;
+#endif
+    std::unique_ptr<AsyncPlayback> async_;
 #ifdef BGMEDIA_TOK_FIXTURE
     std::string account_ = "demo-a";
     std::shared_ptr<bg_tok_fixture> host_;
@@ -319,20 +378,24 @@ int run(int argc, char** argv) {
     bool verify = false;
     bool preload = true;
     bool stress = false;
+    bool explore = false, asynchronous = false, verifyAsync = false;
     std::filesystem::path tokCache;
     std::vector<std::filesystem::path> paths;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--verify") verify = true;
+        else if (arg == "--verify-async") { verify = true; asynchronous = true; verifyAsync = true; }
         else if (arg == "--no-preload") preload = false;
         else if (arg == "--stress") stress = true;
+        else if (arg == "--explore") explore = true;
+        else if (arg == "--async") asynchronous = true;
         else if (arg == "--tok-cache" && i + 1 < argc) tokCache = argv[++i];
         else paths.emplace_back(argv[i]);
     }
-    Player player(renderer.get(), audio.get(), preload, tokCache);
+    Player player(renderer.get(), audio.get(), preload, tokCache, explore, asynchronous);
     if (verify && paths.size() != 3) throw std::runtime_error("--verify requires three short MP4 files");
     if (!paths.empty()) player.load(std::move(paths));
-    if (verify && stress) {
+    if (verify && stress && !asynchronous && !explore) {
         for (int i = 0; i < 12; ++i) {
             player.move(1);
             player.move(1);
@@ -351,6 +414,7 @@ int run(int argc, char** argv) {
     unsigned verified = 0;
     bool testedPause = false;
     bool testedSeek = false;
+    bool asyncResumed = false;
     double pausePosition = 0;
     Clock::time_point pauseUntil;
     std::vector<std::filesystem::path> dropped;
@@ -420,6 +484,23 @@ int run(int argc, char** argv) {
             if (playback.state == PlaybackState::error)
                 throw std::runtime_error("playback verification failed: " + playback.error);
             if (Clock::now() > deadline) throw std::runtime_error("playback verification timed out");
+            if (verifyAsync) {
+                if (!testedPause && playback.position > 0.15 && playback.state == PlaybackState::playing) {
+                    player.pause(); testedPause = true;
+                } else if (testedPause && !testedSeek && playback.state == PlaybackState::paused) {
+                    player.seek(0.50); testedSeek = true;
+                } else if (testedSeek && !asyncResumed && playback.state == PlaybackState::paused && std::abs(playback.position - 0.50) < 0.001) {
+                    player.pause(); asyncResumed = true;
+                }
+                if (playback.state == PlaybackState::ended) {
+                    if (!asyncResumed || playback.presentedFrames < 3 || playback.submittedAudioFrames < 1000)
+                        throw std::runtime_error("async video/audio verification failed");
+                    if (++verified == 3) return 0;
+                    player.move(1);
+                }
+                SDL_Delay(4);
+                continue;
+            }
             if (!testedPause && player.position() > 0.15) {
                 pausePosition = player.position();
                 pauseUntil = Clock::now() + std::chrono::milliseconds(120);
