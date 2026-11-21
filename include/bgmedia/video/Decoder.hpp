@@ -40,6 +40,8 @@ public:
     virtual VideoInfo info() const = 0;
     virtual Decoded step() = 0;
     virtual void seek(double seconds) = 0;
+    // The consumer can return storage once it has finished uploading a frame.
+    virtual void recycle(VideoFrame&&) {}
     // Bytes in converted frames held inside this adapter. Codec and demuxer
     // working memory are measured separately via process RSS.
     virtual std::size_t bufferedBytes() const noexcept = 0;

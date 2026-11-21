@@ -46,7 +46,12 @@ public:
     VideoInfo info() const override { return info_; }
     Decoded step() override;
     void seek(double seconds) override;
-    std::size_t bufferedBytes() const noexcept override { return bufferedBytes_; }
+    std::size_t bufferedBytes() const noexcept override { return bufferedBytes_ + recycledVideo_.capacity(); }
+    void recycle(VideoFrame&& frame) override {
+        // Keep at most one allocation from this decoder for the next conversion.
+        if (frame.rgba.capacity() <= static_cast<std::size_t>(maxPixels) * 4)
+            recycledVideo_ = std::move(frame.rgba);
+    }
     void prime(std::size_t budget);
     void finishOpening() { token_ = {}; deadline_ = Clock::time_point::max(); }
 
@@ -76,6 +81,7 @@ private:
     double origin_ = 0;
     std::deque<Decoded> buffered_;
     std::size_t bufferedBytes_ = 0;
+    std::vector<std::uint8_t> recycledVideo_;
     std::size_t conversionBudget_ = std::numeric_limits<std::size_t>::max();
 };
 
@@ -105,10 +111,12 @@ FFmpegDecoder::FFmpegDecoder(const Media& media, std::stop_token token)
     format_.reset(context);
     check(result, "open MP4");
     check(avformat_find_stream_info(format_.get(), nullptr), "read stream info");
+    if (interrupt(this)) throw std::runtime_error("opening MP4 interrupted");
     video_ = openTrack(AVMEDIA_TYPE_VIDEO, true);
     audio_ = openTrack(AVMEDIA_TYPE_AUDIO, false);
     if (format_->start_time != AV_NOPTS_VALUE)
         origin_ = static_cast<double>(format_->start_time) / AV_TIME_BASE;
+    if (std::abs(origin_) > 1e9) throw std::runtime_error("unsupported container timeline");
     info_.width = video_.codec->width;
     info_.height = video_.codec->height;
     info_.fps = av_q2d(av_guess_frame_rate(format_.get(), video_.stream, nullptr));
@@ -149,8 +157,9 @@ VideoFrame FFmpegDecoder::convertVideo(double pts) {
     if (!scaler_) throw std::runtime_error("cannot convert video pixel format");
     const auto size = static_cast<std::size_t>(width) * height * 4;
     if (size > conversionBudget_) throw std::runtime_error("video frame exceeds preparation budget");
-    VideoFrame out{pts, width, height, {}};
-    out.rgba.resize(size);
+    VideoFrame out{pts, width, height, std::move(recycledVideo_)};
+    if (out.rgba.capacity() < size) out.rgba = std::vector<std::uint8_t>(size);
+    else out.rgba.resize(size);
     std::uint8_t* planes[] = {out.rgba.data(), nullptr, nullptr, nullptr};
     int strides[] = {width * 4, 0, 0, 0};
     check(sws_scale(scaler_.get(), frame_->data, frame_->linesize, 0, height, planes, strides),
@@ -243,6 +252,10 @@ Decoded FFmpegDecoder::read() {
     check(result, "read media packet");
     for (auto* track : {&video_, &audio_}) {
         if (track->stream && packet_->stream_index == track->stream->index) {
+            if ((packet_->flags & AV_PKT_FLAG_CORRUPT) != 0) {
+                av_packet_unref(packet_.get());
+                throw std::runtime_error("corrupt media packet");
+            }
             const int sent = avcodec_send_packet(track->codec.get(), packet_.get());
             av_packet_unref(packet_.get());
             check(sent, "submit media packet");

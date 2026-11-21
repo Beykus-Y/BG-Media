@@ -16,6 +16,15 @@ struct Oversized final : Provider {
         return result;
     }
 };
+struct IgnoresCancellation final : Provider {
+    std::atomic<bool> entered{false}, release{false}, returned{false};
+    Prepared prepare(const Media& m, std::size_t, std::stop_token) override {
+        entered = true;
+        while (!release) std::this_thread::sleep_for(1ms);
+        returned = true;
+        return {m.id, {}, {}};
+    }
+};
 struct Blocking final : Provider {
     std::atomic<bool> entered{false}, cancelled{false};
     Prepared prepare(const Media& m, std::size_t, std::stop_token token) override {
@@ -33,7 +42,7 @@ template<class F> void waitFor(F f) {
     CHECK(f());
 }
 int main() {
-    auto path = std::filesystem::temp_directory_path() / "bgmedia-video-feed-test.bin";
+    auto path = std::filesystem::current_path() / "bgmedia-video-feed-test.bin";
     { std::ofstream out(path, std::ios::binary); out << "0123456789"; }
     std::vector<Media> queue;
     for (int i = 0; i < 4; ++i) queue.push_back({{"provider", "account", std::to_string(i)}, path});
@@ -71,6 +80,29 @@ int main() {
         feed.setQueue(queue);
         waitFor([&] { return feed.snapshot().preparation == Preparation::error; });
         CHECK(!feed.snapshot().next);
+    }
+    {
+        auto provider = std::make_shared<IgnoresCancellation>();
+        std::weak_ptr<Provider> workerOwner = provider;
+        auto feed = std::make_unique<Feed>(provider, 4);
+        feed->setQueue(queue);
+        waitFor([&] { return provider->entered.load(); });
+        std::jthread watchdog([provider](std::stop_token token) {
+            const auto end = std::chrono::steady_clock::now() + 1s;
+            while (!token.stop_requested() && std::chrono::steady_clock::now() < end)
+                std::this_thread::sleep_for(1ms);
+            if (!token.stop_requested()) provider->release = true;
+        });
+        const auto start = std::chrono::steady_clock::now();
+        feed.reset();
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        CHECK(!provider->returned);
+        provider->release = true;
+        watchdog.request_stop();
+        watchdog.join();
+        provider.reset();
+        waitFor([&] { return workerOwner.expired(); });
+        CHECK(elapsed < 500ms);
     }
     std::filesystem::remove(path);
 }

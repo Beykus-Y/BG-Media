@@ -9,8 +9,13 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace {
 using namespace bgmedia::video;
@@ -21,6 +26,16 @@ constexpr std::size_t videoQueueBudget = 64 * MiB;
 constexpr std::size_t maxVideoFrame = 3840 * 2160 * 4;
 constexpr int audioFrameBytes = AudioFrame::channels * sizeof(float);
 constexpr int audioBytesPerSecond = AudioFrame::sampleRate * audioFrameBytes;
+
+std::size_t residentBytes() {
+#ifdef __linux__
+    std::ifstream statm("/proc/self/statm");
+    std::size_t total = 0, resident = 0;
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize > 0 && statm >> total >> resident) return resident * static_cast<std::size_t>(pageSize);
+#endif
+    return 0;
+}
 
 void require(bool ok) {
     if (!ok) throw std::runtime_error(SDL_GetError());
@@ -49,21 +64,24 @@ void SDLCALL picked(void* userdata, const char* const* files, int) {
 
 class Player {
 public:
-    Player(SDL_Renderer* renderer, SDL_AudioStream* audio)
-        : renderer_(renderer), audio_(audio) {}
+    Player(SDL_Renderer* renderer, SDL_AudioStream* audio, bool preload)
+        : feed_(std::make_shared<FFmpegProvider>(), preload ? preparationBudget : 0),
+          renderer_(renderer), audio_(audio) {}
     void load(std::vector<std::filesystem::path> files);
     void select(std::size_t);
     void move(int direction);
     void pause();
     void stop();
     void seek(double);
+    void seekFraction(double fraction) { if (info_.duration > 0) seek(fraction * info_.duration); }
     void update();
-    void draw();
+    void draw(bool force);
     std::string status() const;
     bool finished() const { return ended_ && frames_.empty() && queuedAudio() == 0; }
-    bool buffered() const { return started_; }
+    bool stopped() const { return stopped_; }
     double position() const { return position_; }
     std::size_t presented() const { return presented_; }
+    std::size_t peakBuffers() const { return peakBuffers_; }
     std::size_t audioFrames() const { return audioFrames_; }
     double maxVideoLag() const { return maxVideoLag_; }
     const std::string& error() const { return error_; }
@@ -75,8 +93,9 @@ private:
     void present(VideoFrame&);
     void fail(const std::exception&);
     void updateClock(Clock::time_point now);
+    std::size_t bufferBytes(const Snapshot&) const;
 
-    Feed feed_{std::make_shared<FFmpegProvider>(), preparationBudget};
+    Feed feed_;
     std::unique_ptr<Decoder> decoder_;
     SDL_Renderer* renderer_;
     SDL_AudioStream* audio_;
@@ -84,12 +103,14 @@ private:
     std::deque<VideoFrame> frames_;
     std::optional<AudioFrame> pendingAudio_;
     std::size_t videoBytes_ = 0, presented_ = 0, audioFrames_ = 0, queueSize_ = 0, fpsFrames_ = 0;
-    std::size_t index_ = 0;
+    std::size_t index_ = 0, peakBuffers_ = 0, rss_ = 0;
     int width_ = 0, height_ = 0;
     VideoInfo info_;
     bool paused_ = false, stopped_ = false, ended_ = false, started_ = false, warm_ = false;
     double position_ = 0, target_ = 0, audioEnd_ = 0, fps_ = 0, maxVideoLag_ = 0;
-    Clock::time_point lastTick_, switchStart_, fpsStart_;
+    Clock::time_point lastTick_, switchStart_, fpsStart_, lastMemorySample_{};
+    bool firstFramePending_ = false, pictureDirty_ = true;
+    Clock::time_point lastDraw_{};
     std::string filename_, error_;
 };
 
@@ -102,7 +123,8 @@ void Player::reset(double seconds) {
     fps_ = maxVideoLag_ = 0;
     target_ = position_ = audioEnd_ = seconds;
     texture_.reset();
-    ended_ = started_ = false;
+    pictureDirty_ = true;
+    ended_ = started_ = firstFramePending_ = false;
     lastTick_ = fpsStart_ = Clock::now();
 }
 
@@ -232,6 +254,9 @@ void Player::update() {
             } else if (auto* audio = std::get_if<AudioFrame>(&decoded)) {
                 pendingAudio_ = std::move(*audio);
             } else if (std::holds_alternative<EndOfStream>(decoded)) {
+                if (target_ == 0 && presented_ == 0 && frames_.empty())
+                    throw std::runtime_error("no decodable video frames");
+                require(SDL_FlushAudioStream(audio_));
                 ended_ = true;
             }
         }
@@ -245,6 +270,7 @@ void Player::update() {
         if (paused_ && presented_ == 0 && !frames_.empty()) {
             present(frames_.front());
             videoBytes_ -= frames_.front().rgba.capacity();
+            decoder_->recycle(std::move(frames_.front()));
             frames_.pop_front();
         }
         while (!frames_.empty() && frames_.front().pts <= position_ + 0.008) {
@@ -252,7 +278,9 @@ void Player::update() {
             frames_.pop_front();
             videoBytes_ -= frame.rgba.capacity();
             if (frames_.empty() || frames_.front().pts > position_ + 0.008) present(frame);
+            decoder_->recycle(std::move(frame));
         }
+        peakBuffers_ = std::max(peakBuffers_, bufferBytes(feed_.snapshot()));
         const auto elapsed = std::chrono::duration<double>(now - fpsStart_).count();
         if (elapsed >= 0.5) {
             fps_ = static_cast<double>(fpsFrames_) / elapsed;
@@ -272,12 +300,17 @@ void Player::present(VideoFrame& frame) {
     }
     require(SDL_UpdateTexture(texture_.get(), nullptr, frame.rgba.data(), width_ * 4));
     maxVideoLag_ = std::max(maxVideoLag_, std::abs(position_ - frame.pts));
-    if (presented_++ == 0) {
-        const auto latency = std::chrono::duration<double, std::milli>(Clock::now() - switchStart_).count();
-        std::printf("%zu %s first-frame-ms=%.2f\n", index_ + 1, warm_ ? "warm" : "cold", latency);
-        std::fflush(stdout);
-    }
+    if (presented_++ == 0) firstFramePending_ = true;
+    pictureDirty_ = true;
     ++fpsFrames_;
+}
+
+std::size_t Player::bufferBytes(const Snapshot& snapshot) const {
+    return videoBytes_ + static_cast<std::size_t>(queuedAudio()) +
+        (pendingAudio_ ? pendingAudio_->samples.capacity() * sizeof(float) : 0) +
+        (decoder_ ? decoder_->bufferedBytes() : 0) +
+        (texture_ ? static_cast<std::size_t>(width_) * height_ * 4 : 0) +
+        (snapshot.next ? snapshot.next->bytes : 0);
 }
 
 std::string Player::status() const {
@@ -287,21 +320,27 @@ std::string Player::status() const {
         snapshot.preparation == Preparation::error ? "error" : "-";
     const char* state = stopped_ ? "stopped" : finished() ? "ended" :
         paused_ ? "paused" : !started_ ? "buffering" : "playing";
-    const auto bytes = videoBytes_ + static_cast<std::size_t>(queuedAudio()) +
-        (pendingAudio_ ? pendingAudio_->samples.capacity() * sizeof(float) : 0) +
-        (decoder_ ? decoder_->bufferedBytes() : 0) +
-        (texture_ ? static_cast<std::size_t>(width_) * height_ * 4 : 0) +
-        (snapshot.next ? snapshot.next->bytes : 0);
     char text[256]{};
     std::snprintf(text, sizeof(text), "%zu/%zu  %s  %.2f / %.2fs  %.1f / %.1f FPS  next %s  buffers %.2f MiB",
         index_ + (queueSize_ > 0), queueSize_, state, position_, info_.duration, fps_, info_.fps,
-        next, static_cast<double>(bytes) / MiB);
+        next, static_cast<double>(bufferBytes(snapshot)) / MiB);
     if (!error_.empty()) return error_;
     if (!decoder_) return "Open MP4 files to play";
-    return text;
+    if (!rss_) return text;
+    char memory[32]{};
+    std::snprintf(memory, sizeof(memory), "  RSS %.1f MiB", static_cast<double>(rss_) / MiB);
+    return std::string(text) + memory;
 }
 
-void Player::draw() {
+void Player::draw(bool force) {
+    const auto now = Clock::now();
+    if (!force && !pictureDirty_ && now - lastDraw_ < std::chrono::milliseconds(100)) return;
+    lastDraw_ = now;
+    pictureDirty_ = false;
+    if (now - lastMemorySample_ >= std::chrono::milliseconds(500)) {
+        rss_ = residentBytes();
+        lastMemorySample_ = now;
+    }
     int w = 0, h = 0;
     require(SDL_GetRenderOutputSize(renderer_, &w, &h));
     SDL_SetRenderDrawColor(renderer_, 15, 18, 24, 255);
@@ -327,6 +366,12 @@ void Player::draw() {
     SDL_RenderDebugText(renderer_, 16, contentHeight + 42, "O Open files   Space Pause/Play   S Stop");
     SDL_RenderDebugText(renderer_, 16, contentHeight + 59, "N / P Next / Previous   Left / Right Seek");
     require(SDL_RenderPresent(renderer_));
+    if (firstFramePending_) {
+        firstFramePending_ = false;
+        const auto latency = std::chrono::duration<double, std::milli>(Clock::now() - switchStart_).count();
+        std::printf("%zu %s first-frame-ms=%.2f\n", index_ + 1, warm_ ? "warm" : "cold", latency);
+        std::fflush(stdout);
+    }
 }
 
 int run(int argc, char** argv) {
@@ -343,13 +388,34 @@ int run(int argc, char** argv) {
         SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr),
         SDL_DestroyAudioStream);
     require(static_cast<bool>(audio));
-    Player player(renderer.get(), audio.get());
     auto dialog = std::make_shared<Dialog>();
-    const bool verify = argc > 1 && std::string_view(argv[1]) == "--verify";
+    bool verify = false;
+    bool preload = true;
+    bool stress = false;
     std::vector<std::filesystem::path> paths;
-    for (int i = verify ? 2 : 1; i < argc; ++i) paths.emplace_back(argv[i]);
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        if (arg == "--verify") verify = true;
+        else if (arg == "--no-preload") preload = false;
+        else if (arg == "--stress") stress = true;
+        else paths.emplace_back(argv[i]);
+    }
+    Player player(renderer.get(), audio.get(), preload);
     if (verify && paths.size() != 3) throw std::runtime_error("--verify requires three short MP4 files");
     if (!paths.empty()) player.load(std::move(paths));
+    if (verify && stress) {
+        for (int i = 0; i < 12; ++i) {
+            player.move(1);
+            player.move(1);
+            player.move(-1);
+            player.move(-1);
+        }
+        player.stop();
+        player.update();
+        if (!player.stopped() || player.position() != 0)
+            throw std::runtime_error("stop did not reset position");
+        player.pause();
+    }
 
     const auto deadline = Clock::now() + std::chrono::seconds(15);
     unsigned verified = 0;
@@ -357,10 +423,30 @@ int run(int argc, char** argv) {
     bool testedSeek = false;
     double pausePosition = 0;
     Clock::time_point pauseUntil;
+    std::vector<std::filesystem::path> dropped;
     while (true) {
+        bool redraw = false;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) return verify ? 1 : 0;
+            if (event.type == SDL_EVENT_WINDOW_EXPOSED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+                redraw = true;
+            if (event.type == SDL_EVENT_DROP_BEGIN) dropped.clear();
+            if (event.type == SDL_EVENT_DROP_FILE && event.drop.data)
+                dropped.emplace_back(std::u8string(reinterpret_cast<const char8_t*>(event.drop.data)));
+            if (event.type == SDL_EVENT_DROP_COMPLETE && !dropped.empty()) {
+                player.load(std::move(dropped));
+                dropped.clear();
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+                int width = 0, height = 0;
+                require(SDL_GetRenderOutputSize(renderer.get(), &width, &height));
+                float x = 0, y = 0;
+                require(SDL_RenderCoordinatesFromWindow(renderer.get(), event.button.x, event.button.y, &x, &y));
+                const float rail = std::max(0.0f, height - 95.0f) + 8;
+                if (width > 32 && x >= 16 && x <= width - 16 && y >= rail - 6 && y <= rail + 11)
+                    player.seekFraction((x - 16) / (width - 32));
+            }
             if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) continue;
             switch (event.key.key) {
             case SDLK_ESCAPE: return verify ? 1 : 0;
@@ -397,7 +483,7 @@ int run(int argc, char** argv) {
             if (!error.empty()) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Open MP4", error.c_str(), window.get());
         }
         player.update();
-        player.draw();
+        player.draw(redraw);
         if (verify) {
             if (!player.error().empty() || Clock::now() > deadline)
                 throw std::runtime_error("playback verification failed or timed out");
@@ -420,13 +506,16 @@ int run(int argc, char** argv) {
                     throw std::runtime_error("video, audio, or presentation timing verification failed");
                 std::printf("clip=%u presented=%zu audio-samples/channel=%zu position=%.3f max-video-clock-error-ms=%.2f\n",
                     verified + 1, player.presented(), player.audioFrames(), player.position(), player.maxVideoLag() * 1000);
-                if (++verified == 3) return 0;
-                if (player.feed().snapshot().preparation != Preparation::ready)
+                if (++verified == 3) {
+                    std::printf("peak-accounted-buffers-mib=%.2f\n", static_cast<double>(player.peakBuffers()) / MiB);
+                    return 0;
+                }
+                if (preload && player.feed().snapshot().preparation != Preparation::ready)
                     throw std::runtime_error("next decoder was not ready");
                 player.move(1);
             }
         }
-        SDL_Delay(2);
+        SDL_Delay(4);
     }
 }
 }
