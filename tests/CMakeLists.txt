@@ -83,3 +83,33 @@ if(TARGET bgmedia_video)
     add_test(NAME bgmedia.video_feed COMMAND bgmedia_video_tests)
     set_tests_properties(bgmedia.video_feed PROPERTIES TIMEOUT 30 LABELS unit)
 endif()
+
+if(TARGET bgmedia_video_ffmpeg)
+    find_program(BGMEDIA_FFMPEG_EXECUTABLE ffmpeg)
+    find_program(BGMEDIA_FFPROBE_EXECUTABLE ffprobe)
+    if(BGMEDIA_FFMPEG_EXECUTABLE AND BGMEDIA_FFPROBE_EXECUTABLE)
+        add_executable(bgmedia_video_ffmpeg_tests test_video_ffmpeg.cpp)
+        target_link_libraries(bgmedia_video_ffmpeg_tests PRIVATE BGMedia::VideoFFmpeg)
+        target_compile_options(bgmedia_video_ffmpeg_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
+        set(video_fixtures "${CMAKE_CURRENT_BINARY_DIR}/video-fixtures")
+        add_test(NAME bgmedia.video_fixtures COMMAND "${CMAKE_COMMAND}"
+            "-DFFMPEG=${BGMEDIA_FFMPEG_EXECUTABLE}" "-DOUTPUT=${video_fixtures}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/VideoFixtures.cmake")
+        set_tests_properties(bgmedia.video_fixtures PROPERTIES FIXTURES_SETUP video_mp4 TIMEOUT 30)
+        add_test(NAME bgmedia.video_mp4 COMMAND bgmedia_video_ffmpeg_tests "${video_fixtures}")
+        set_tests_properties(bgmedia.video_mp4 PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 15)
+        add_test(NAME bgmedia.video_packet_timestamps COMMAND "${BGMEDIA_FFPROBE_EXECUTABLE}"
+            -v error -select_streams v:0 -show_entries packet=pts_time,dts_time
+            -of csv=p=0 "${video_fixtures}/1.mp4")
+        set_tests_properties(bgmedia.video_packet_timestamps PROPERTIES FIXTURES_REQUIRED video_mp4
+            PASS_REGULAR_EXPRESSION "0\\.000000,-0\\.080000" TIMEOUT 10)
+        if(TARGET bgmedia_video_demo)
+            add_test(NAME bgmedia.video_demo COMMAND bgmedia_video_demo --verify
+                "${video_fixtures}/1.mp4" "${video_fixtures}/2.mp4" "${video_fixtures}/3.mp4")
+            set_tests_properties(bgmedia.video_demo PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 20
+                ENVIRONMENT "SDL_VIDEODRIVER=offscreen;SDL_AUDIODRIVER=dummy;SDL_RENDER_DRIVER=software")
+        endif()
+    else()
+        message(STATUS "Video fixtures require ffmpeg (libx264/AAC) and ffprobe executables")
+    endif()
+endif()

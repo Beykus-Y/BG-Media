@@ -11,7 +11,7 @@ using namespace std::chrono_literals;
 #define CHECK(x) do { if (!(x)) { std::cerr << "failed: " << #x << " line " << __LINE__ << '\n'; std::exit(1); } } while (false)
 struct Oversized final : Provider {
     Prepared prepare(const Media& m, std::size_t limit, std::stop_token) override {
-        Prepared result{m.id, {}};
+        Prepared result{m.id, {}, {}};
         result.prefix.reserve(limit + 1);
         return result;
     }
@@ -24,7 +24,7 @@ struct Blocking final : Provider {
             while (!token.stop_requested()) std::this_thread::sleep_for(1ms);
             cancelled = true;
         }
-        return {m.id, {}};
+        return {m.id, {}, {}};
     }
 };
 template<class F> void waitFor(F f) {

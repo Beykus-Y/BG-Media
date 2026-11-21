@@ -1,5 +1,7 @@
 #pragma once
 
+#include "bgmedia/video/Decoder.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -23,13 +25,15 @@ struct Prepared {
     MediaId id;
     // Bounded prefix owned by this object; this is not a decoded frame.
     std::vector<std::byte> prefix;
+    std::unique_ptr<Decoder> decoder;
 };
 
 class Provider {
 public:
     virtual ~Provider() = default;
     // Called on the worker thread. Implementations must honor stop requests and
-    // bound both their allocation and blocking operations. Exceptions are errors.
+    // bound both their allocation and blocking operations. Stop callbacks must
+    // be nonblocking and must not call back into Feed. Exceptions are errors.
     virtual Prepared prepare(const Media&, std::size_t maxBytes, std::stop_token) = 0;
 };
 
@@ -66,8 +70,15 @@ public:
     void setBudget(std::size_t);
     void close();
     Snapshot snapshot() const;
+    // Select and transfer the matching prepared decoder in one operation.
+    // A valid selection without a prepared decoder returns an empty payload.
+    struct Selection {
+        Media media;
+        std::unique_ptr<Decoder> decoder;
+    };
+    std::optional<Selection> activate(std::size_t);
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 }
