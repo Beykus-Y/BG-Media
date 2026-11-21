@@ -28,3 +28,6 @@ With tests enabled, `ctest --test-dir build -R bgmedia.video_tok_integration
 video/audio flow, pause, seek, preloading and rapid navigation. Dummy audio
 checks submitted samples, not physical speaker output. It starts with a clean
 test-owned cache, so it also verifies calls to the Rust provider.
+
+Set `BG_TOK_FIXTURE_BYTES_PER_SECOND=131072` to simulate per-request transfer
+delay in the test provider. This does not measure a real network connection.

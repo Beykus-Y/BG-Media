@@ -133,6 +133,11 @@ if(TARGET bgmedia_video_ffmpeg)
                     "-DCACHE=${CMAKE_CURRENT_BINARY_DIR}/tok-integration-cache"
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/TokIntegration.cmake")
                 set_tests_properties(bgmedia.video_tok_integration PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 30 LABELS integration)
+                add_test(NAME bgmedia.video_tok_throttled COMMAND "${CMAKE_COMMAND}"
+                    "-DDEMO=$<TARGET_FILE:bgmedia_video_demo>" "-DFIXTURES=${video_fixtures}"
+                    "-DCACHE=${CMAKE_CURRENT_BINARY_DIR}/tok-throttle-cache" "-DRATE=131072"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/TokIntegration.cmake")
+                set_tests_properties(bgmedia.video_tok_throttled PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 30 LABELS integration)
             endif()
         endif()
     else()

@@ -1,5 +1,8 @@
 # This directory is owned by this test under the CMake build tree.
 file(REMOVE_RECURSE "${CACHE}")
+if(RATE)
+    set(ENV{BG_TOK_FIXTURE_BYTES_PER_SECOND} "${RATE}")
+endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy SDL_RENDER_DRIVER=software
     "${DEMO}" --verify --stress --tok-cache "${CACHE}"
