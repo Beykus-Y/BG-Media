@@ -1,5 +1,9 @@
 #include "bgmedia/video/FFmpeg.hpp"
 #include "bgmedia/video/Playback.hpp"
+#ifdef BGMEDIA_TOK_FIXTURE
+#include "bgmedia/video/DiskCache.hpp"
+#include "bg_tok_fixture.h"
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -106,13 +110,46 @@ private:
 
 class Player {
 public:
-    Player(SDL_Renderer* renderer, SDL_AudioStream* audio, bool preload)
+    Player(SDL_Renderer* renderer, SDL_AudioStream* audio, bool preload, std::filesystem::path tokCache)
         : output_(renderer, audio),
           playback_(std::make_shared<FFmpegProvider>(), [](const Media& media) { return openFFmpeg(media); },
                     output_, preload ? PlaybackOptions{} : PlaybackOptions{.preparationBytes = 0}),
-          renderer_(renderer) {}
+          renderer_(renderer), tokCache_(std::move(tokCache)) {}
     void load(std::vector<std::filesystem::path> files) {
         std::vector<Media> queue;
+#ifdef BGMEDIA_TOK_FIXTURE
+        if (!tokCache_.empty()) {
+            std::vector<std::string> names;
+            std::vector<const char*> pointers;
+            for (const auto& file : files) names.push_back(file.string());
+            for (const auto& name : names) pointers.push_back(name.c_str());
+            std::shared_ptr<bg_tok_fixture> host(bg_tok_fixture_create(pointers.data(), pointers.size()), bg_tok_fixture_destroy);
+            if (!host || bg_tok_fixture_count(host.get()) != files.size()) throw std::runtime_error("BG Tok fixture open failed");
+            auto cache = cache_ ? cache_ : std::make_shared<DiskCache>(tokCache_);
+            for (std::size_t i = 0; i < files.size(); ++i) {
+                bg_tok_fixture_range range{};
+                if (bg_tok_fixture_open(host.get(), i, &range) != 0) throw std::runtime_error("BG Tok source open failed");
+                bg_video_range_v1 callbacks{range.context, range.length, range.read_at, range.release};
+                std::shared_ptr<ByteSource> source;
+                try { source = adoptRangeSource(callbacks); }
+                catch (...) { range.release(range.context); throw; }
+                const auto size = bg_tok_fixture_revision(host.get(), i, nullptr, 0);
+                if (!size || size > 4096) throw std::runtime_error("BG Tok source revision unavailable");
+                std::string revision(size, '\0');
+                if (bg_tok_fixture_revision(host.get(), i, revision.data(), revision.size()) != size)
+                    throw std::runtime_error("BG Tok source revision changed");
+                revision.pop_back();
+                MediaId id{"bg-tok-fixture", "demo", std::to_string(i)};
+                queue.push_back({id, {}, cache->wrap({id, revision}, DiskPolicy::hostManaged, source)});
+            }
+            playback_.setQueue(std::move(queue));
+            host_ = std::move(host);
+            cache_ = std::move(cache);
+            return;
+        }
+#else
+        if (!tokCache_.empty()) throw std::runtime_error("BG Tok fixture support was not built");
+#endif
         for (auto& file : files)
             queue.push_back({{"local", "", std::to_string(queue.size())}, std::move(file)});
         playback_.setQueue(std::move(queue));
@@ -138,6 +175,13 @@ public:
     PlaybackSnapshot snapshot() const { return playback_.snapshot(); }
     double position() const { return snapshot().position; }
     std::size_t peakBuffers() const { return peakBuffers_; }
+    std::uint64_t providerCalls() const {
+#ifdef BGMEDIA_TOK_FIXTURE
+        return host_ ? bg_tok_fixture_read_calls(host_.get()) : 0;
+#else
+        return 0;
+#endif
+    }
 private:
     std::string status(const PlaybackSnapshot&) const;
     SdlOutput output_;
@@ -145,6 +189,11 @@ private:
     SDL_Renderer* renderer_;
     std::size_t rss_ = 0, peakBuffers_ = 0;
     Clock::time_point lastDraw_{}, lastMemorySample_{};
+    std::filesystem::path tokCache_;
+#ifdef BGMEDIA_TOK_FIXTURE
+    std::shared_ptr<bg_tok_fixture> host_;
+    std::shared_ptr<DiskCache> cache_;
+#endif
 };
 
 std::string Player::status(const PlaybackSnapshot& snapshot) const {
@@ -166,10 +215,14 @@ std::string Player::status(const PlaybackSnapshot& snapshot) const {
         snapshot.feed.current.value_or(0) + 1, snapshot.queueSize, state, snapshot.position, snapshot.info.duration,
         snapshot.presentationFps, snapshot.info.fps, next,
         static_cast<double>(snapshot.bufferedBytes + output_.textureBytes()) / MiB);
-    if (!rss_) return text;
+    std::string result = text;
+#ifdef BGMEDIA_TOK_FIXTURE
+    if (host_ && cache_) result += "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
+#endif
+    if (!rss_) return result;
     char memory[32]{};
     std::snprintf(memory, sizeof(memory), "  RSS %.1f MiB", static_cast<double>(rss_) / MiB);
-    return std::string(text) + memory;
+    return result + memory;
 }
 
 void Player::draw(bool force) {
@@ -233,15 +286,17 @@ int run(int argc, char** argv) {
     bool verify = false;
     bool preload = true;
     bool stress = false;
+    std::filesystem::path tokCache;
     std::vector<std::filesystem::path> paths;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--verify") verify = true;
         else if (arg == "--no-preload") preload = false;
         else if (arg == "--stress") stress = true;
+        else if (arg == "--tok-cache" && i + 1 < argc) tokCache = argv[++i];
         else paths.emplace_back(argv[i]);
     }
-    Player player(renderer.get(), audio.get(), preload);
+    Player player(renderer.get(), audio.get(), preload, tokCache);
     if (verify && paths.size() != 3) throw std::runtime_error("--verify requires three short MP4 files");
     if (!paths.empty()) player.load(std::move(paths));
     if (verify && stress) {
@@ -349,6 +404,9 @@ int run(int argc, char** argv) {
                 std::printf("clip=%u presented=%zu audio-samples/channel=%zu position=%.3f max-video-clock-error-ms=%.2f\n",
                     verified + 1, playback.presentedFrames, playback.submittedAudioFrames, player.position(), playback.maxPresentationError * 1000);
                 if (++verified == 3) {
+                    if (!tokCache.empty() && player.providerCalls() == 0)
+                        throw std::runtime_error("BG Tok provider was not called");
+                    if (!tokCache.empty()) std::printf("bg-tok-read-calls=%llu\n", static_cast<unsigned long long>(player.providerCalls()));
                     std::printf("peak-accounted-buffers-mib=%.2f\n", static_cast<double>(player.peakBuffers()) / MiB);
                     return 0;
                 }

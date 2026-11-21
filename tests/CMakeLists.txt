@@ -121,6 +121,13 @@ if(TARGET bgmedia_video_ffmpeg)
                 "${video_fixtures}/1.mp4" "${video_fixtures}/2.mp4" "${video_fixtures}/3.mp4")
             set_tests_properties(bgmedia.video_demo PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 20
                 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;SDL_RENDER_DRIVER=software")
+            if(BGMEDIA_TOK_FIXTURE_ROOT AND BGMEDIA_TOK_FIXTURE_LIB)
+                add_test(NAME bgmedia.video_tok_integration COMMAND "${CMAKE_COMMAND}"
+                    "-DDEMO=$<TARGET_FILE:bgmedia_video_demo>" "-DFIXTURES=${video_fixtures}"
+                    "-DCACHE=${CMAKE_CURRENT_BINARY_DIR}/tok-integration-cache"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/TokIntegration.cmake")
+                set_tests_properties(bgmedia.video_tok_integration PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 30 LABELS integration)
+            endif()
         endif()
     else()
         message(STATUS "Video fixtures require ffmpeg (libx264/AAC) and ffprobe executables")
