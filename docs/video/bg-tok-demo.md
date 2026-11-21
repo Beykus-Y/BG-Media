@@ -18,7 +18,8 @@ build/bin/bgmedia_video_demo --tok-cache /private/cache/directory one.mp4 two.mp
 
 The cache directory must be private to the user and not shared with another
 cache process. Inputs must not be modified during use. Space pauses, N/P
-navigate, and arrows seek. Fixture source identities use Linux file metadata,
+navigate, arrows seek, and A switches between two test accounts after
+cancelling the previous session and clearing its cache. Fixture source identities use Linux file metadata,
 not cryptographic hashes; this is appropriate only for immutable test inputs.
 The Rust fixture library is separate from the production Rust core.
 

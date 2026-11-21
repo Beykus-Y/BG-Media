@@ -116,6 +116,7 @@ public:
                     output_, preload ? PlaybackOptions{} : PlaybackOptions{.preparationBytes = 0}),
           renderer_(renderer), tokCache_(std::move(tokCache)) {}
     void load(std::vector<std::filesystem::path> files) {
+        files_ = files;
         std::vector<Media> queue;
 #ifdef BGMEDIA_TOK_FIXTURE
         if (!tokCache_.empty()) {
@@ -139,7 +140,7 @@ public:
                 if (bg_tok_fixture_revision(host.get(), i, revision.data(), revision.size()) != size)
                     throw std::runtime_error("BG Tok source revision changed");
                 revision.pop_back();
-                MediaId id{"bg-tok-fixture", "demo", std::to_string(i)};
+                MediaId id{"bg-tok-fixture", account_, std::to_string(i)};
                 queue.push_back({id, {}, cache->wrap({id, revision}, DiskPolicy::hostManaged, source)});
             }
             playback_.setQueue(std::move(queue));
@@ -161,6 +162,16 @@ public:
         else playback_.play();
     }
     void stop() { playback_.stop(); }
+    void switchAccount() {
+#ifdef BGMEDIA_TOK_FIXTURE
+        if (!host_ || !cache_ || files_.empty()) return;
+        bg_tok_fixture_cancel(host_.get());
+        playback_.close();
+        cache_->clearAccount("bg-tok-fixture", account_);
+        account_ = account_ == "demo-a" ? "demo-b" : "demo-a";
+        load(files_);
+#endif
+    }
     void seek(double seconds) { playback_.seek(seconds); }
     void seekFraction(double fraction) {
         const auto duration = snapshot().info.duration;
@@ -190,7 +201,9 @@ private:
     std::size_t rss_ = 0, peakBuffers_ = 0;
     Clock::time_point lastDraw_{}, lastMemorySample_{};
     std::filesystem::path tokCache_;
+    std::vector<std::filesystem::path> files_;
 #ifdef BGMEDIA_TOK_FIXTURE
+    std::string account_ = "demo-a";
     std::shared_ptr<bg_tok_fixture> host_;
     std::shared_ptr<DiskCache> cache_;
 #endif
@@ -259,6 +272,9 @@ void Player::draw(bool force) {
     SDL_RenderDebugText(renderer_, 16, contentHeight + 25, status(playback).c_str());
     SDL_RenderDebugText(renderer_, 16, contentHeight + 42, "O Open files   Space Pause/Play   S Stop");
     SDL_RenderDebugText(renderer_, 16, contentHeight + 59, "N / P Next / Previous   Left / Right Seek");
+#ifdef BGMEDIA_TOK_FIXTURE
+    if (host_) SDL_RenderDebugText(renderer_, 16, contentHeight + 76, "A Switch test account (clears old account cache)");
+#endif
     require(SDL_RenderPresent(renderer_));
     if (output_.firstFramePending) {
         output_.firstFramePending = false;
@@ -311,6 +327,7 @@ int run(int argc, char** argv) {
         if (player.snapshot().state != PlaybackState::stopped || player.position() != 0)
             throw std::runtime_error("stop did not reset position");
         player.pause();
+        if (!tokCache.empty()) player.switchAccount();
     }
 
     const auto deadline = Clock::now() + std::chrono::seconds(15);
@@ -350,6 +367,7 @@ int run(int argc, char** argv) {
             case SDLK_S: player.stop(); break;
             case SDLK_N: player.move(1); break;
             case SDLK_P: player.move(-1); break;
+            case SDLK_A: player.switchAccount(); break;
             case SDLK_LEFT: player.seek(player.position() - 5); break;
             case SDLK_RIGHT: player.seek(player.position() + 5); break;
             case SDLK_O: {
