@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
             expected = read(*a);
             check(bg_tok_fixture_read_calls(host.get()) == 1, "initial provider read");
             check(read(*a) == expected && bg_tok_fixture_read_calls(host.get()) == 1, "cache reuse");
+            check(cache.reusedBytes() == expected.size(), "cache reuse byte count");
             auto b = cache.wrap(bob, DiskPolicy::hostManaged, raw);
             check(read(*b) == expected && bg_tok_fixture_read_calls(host.get()) == 2, "account isolation");
             const auto before = cache.storedBytes();
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
             auto b = cache.wrap(bob, DiskPolicy::hostManaged, raw);
             bg_tok_fixture_cancel(host.get());
             check(read(*a) == expected && read(*b) == expected, "offline cached reads");
+            check(cache.reusedBytes() == 2 * expected.size(), "offline reused byte count");
             check(bg_tok_fixture_read_calls(host.get()) == 3, "offline fetched provider");
             cache.clearAccount("fixture", "alice");
             try { read(*a); throw std::runtime_error("cleared account remained readable"); }

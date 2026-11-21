@@ -31,6 +31,8 @@ public:
     void clearAccount(const std::string& provider, const std::string& account);
     void clear();
     std::uint64_t storedBytes() const;
+    // Bytes served from existing cached blocks since this cache was opened.
+    std::uint64_t reusedBytes() const;
 
 private:
     struct Impl;

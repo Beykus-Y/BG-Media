@@ -117,6 +117,7 @@ struct DiskCache::Impl : std::enable_shared_from_this<Impl> {
     DiskCacheLimits limits;
     std::map<Account, std::weak_ptr<Scope>> scopes;
     std::uint64_t tick = 0;
+    std::uint64_t reused = 0;
 };
 
 DiskCache::Impl::Impl(const std::filesystem::path& directory, DiskCacheLimits budget) : limits(budget) {
@@ -329,6 +330,7 @@ struct DiskCache::Impl::Source final : ByteSource {
             std::vector<std::uint8_t> bytes;
             try { bytes = cache->get(key, *scope, block, length); }
             catch (const DiskError&) {}
+            const bool hit = !bytes.empty();
             if (bytes.empty()) {
                 bytes.resize(length);
                 input->readAt(block, bytes, request);
@@ -343,6 +345,7 @@ struct DiskCache::Impl::Source final : ByteSource {
                 cache->checkScope(*scope);
                 checkRead(request);
                 std::copy_n(bytes.data() + skip, count, output.data());
+                if (hit) cache->reused += std::min<std::uint64_t>(count, std::numeric_limits<std::uint64_t>::max() - cache->reused);
             }
             output = output.subspan(count);
             offset += count;
@@ -388,6 +391,11 @@ void DiskCache::clear() { impl_->purge({}, {}); }
 std::uint64_t DiskCache::storedBytes() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->usage();
+}
+
+std::uint64_t DiskCache::reusedBytes() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->reused;
 }
 
 }

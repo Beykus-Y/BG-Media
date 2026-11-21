@@ -195,6 +195,13 @@ public:
         return 0;
 #endif
     }
+    std::uint64_t reusedBytes() const {
+#ifdef BGMEDIA_TOK_FIXTURE
+        return cache_ ? cache_->reusedBytes() : 0;
+#else
+        return 0;
+#endif
+    }
 private:
     std::string status(const PlaybackSnapshot&) const;
     SdlOutput output_;
@@ -233,7 +240,7 @@ std::string Player::status(const PlaybackSnapshot& snapshot) const {
     std::string result = text;
     if (output_.firstFrameMs > 0) result += "  first frame " + std::to_string(static_cast<int>(output_.firstFrameMs)) + " ms";
 #ifdef BGMEDIA_TOK_FIXTURE
-    if (host_ && cache_) result += "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
+    if (host_ && cache_) result += "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  reused " + std::to_string(reusedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
 #endif
     if (!rss_) return result;
     char memory[32]{};
@@ -430,6 +437,7 @@ int run(int argc, char** argv) {
                     if (!tokCache.empty() && player.providerCalls() == 0)
                         throw std::runtime_error("BG Tok provider was not called");
                     if (!tokCache.empty()) std::printf("bg-tok-read-calls=%llu\n", static_cast<unsigned long long>(player.providerCalls()));
+                    if (!tokCache.empty()) std::printf("cache-reused-bytes=%llu\n", static_cast<unsigned long long>(player.reusedBytes()));
                     std::printf("peak-accounted-buffers-mib=%.2f\n", static_cast<double>(player.peakBuffers()) / MiB);
                     return 0;
                 }
