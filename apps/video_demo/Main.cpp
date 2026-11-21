@@ -204,6 +204,7 @@ public:
     }
 private:
     std::string status(const PlaybackSnapshot&) const;
+    std::string cacheStatus() const;
     SdlOutput output_;
     Playback playback_;
     SDL_Renderer* renderer_;
@@ -239,13 +240,17 @@ std::string Player::status(const PlaybackSnapshot& snapshot) const {
         static_cast<double>(snapshot.bufferedBytes + output_.textureBytes()) / MiB);
     std::string result = text;
     if (output_.firstFrameMs > 0) result += "  first frame " + std::to_string(static_cast<int>(output_.firstFrameMs)) + " ms";
-#ifdef BGMEDIA_TOK_FIXTURE
-    if (host_ && cache_) result += "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  reused " + std::to_string(reusedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
-#endif
     if (!rss_) return result;
     char memory[32]{};
     std::snprintf(memory, sizeof(memory), "  RSS %.1f MiB", static_cast<double>(rss_) / MiB);
     return result + memory;
+}
+
+std::string Player::cacheStatus() const {
+#ifdef BGMEDIA_TOK_FIXTURE
+    if (host_ && cache_) return "Account " + account_ + "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  reused " + std::to_string(reusedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
+#endif
+    return {};
 }
 
 void Player::draw(bool force) {
@@ -262,7 +267,7 @@ void Player::draw(bool force) {
     require(SDL_GetRenderOutputSize(renderer_, &w, &h));
     SDL_SetRenderDrawColor(renderer_, 15, 18, 24, 255);
     require(SDL_RenderClear(renderer_));
-    const float contentHeight = std::max(0.0f, h - 95.0f);
+    const float contentHeight = std::max(0.0f, h - 112.0f);
     if (output_.texture && output_.visible && contentHeight > 0) {
         const float scale = std::min(static_cast<float>(w) / output_.width, contentHeight / output_.height);
         const SDL_FRect dst{(w - output_.width * scale) / 2, (contentHeight - output_.height * scale) / 2,
@@ -280,10 +285,11 @@ void Player::draw(bool force) {
     }
     SDL_SetRenderDrawColor(renderer_, 228, 236, 247, 255);
     SDL_RenderDebugText(renderer_, 16, contentHeight + 25, status(playback).c_str());
-    SDL_RenderDebugText(renderer_, 16, contentHeight + 42, "O Open files   Space Pause/Play   S Stop");
-    SDL_RenderDebugText(renderer_, 16, contentHeight + 59, "N / P Next / Previous   Left / Right Seek");
+    SDL_RenderDebugText(renderer_, 16, contentHeight + 42, cacheStatus().c_str());
+    SDL_RenderDebugText(renderer_, 16, contentHeight + 59, "O Open files   Space Pause/Play   S Stop");
+    SDL_RenderDebugText(renderer_, 16, contentHeight + 76, "N / P Next / Previous   Left / Right Seek");
 #ifdef BGMEDIA_TOK_FIXTURE
-    if (host_) SDL_RenderDebugText(renderer_, 16, contentHeight + 76, "A Switch test account (clears old account cache)");
+    if (host_) SDL_RenderDebugText(renderer_, 16, contentHeight + 93, "A Switch test account (clears old account cache)");
 #endif
     require(SDL_RenderPresent(renderer_));
     if (output_.firstFramePending) {
@@ -367,7 +373,7 @@ int run(int argc, char** argv) {
                 require(SDL_GetRenderOutputSize(renderer.get(), &width, &height));
                 float x = 0, y = 0;
                 require(SDL_RenderCoordinatesFromWindow(renderer.get(), event.button.x, event.button.y, &x, &y));
-                const float rail = std::max(0.0f, height - 95.0f) + 8;
+                const float rail = std::max(0.0f, height - 112.0f) + 8;
                 if (width > 32 && x >= 16 && x <= width - 16 && y >= rail - 6 && y <= rail + 11)
                     player.seekFraction((x - 16) / (width - 32));
             }
