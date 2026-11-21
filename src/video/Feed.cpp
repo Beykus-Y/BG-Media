@@ -9,9 +9,13 @@
 
 namespace bgmedia::video {
 Prepared LocalProvider::prepare(const Media& media, std::size_t limit, std::stop_token stop) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(media.localPath, ec))
+        throw std::runtime_error("local media is not a regular file");
     std::ifstream input(media.localPath, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open local media");
     Prepared result{media.id, {}};
+    result.prefix.reserve(limit);
     constexpr std::size_t chunk = 16384;
     while (result.prefix.size() < limit && !stop.stop_requested()) {
         const auto count = std::min(chunk, limit - result.prefix.size());
@@ -33,6 +37,7 @@ struct Feed::Impl {
     std::vector<Media> queue;
     std::size_t budget;
     Snapshot state;
+    std::unique_ptr<Prepared> prepared;
     std::uint64_t generation = 0;
     bool pending = false;
     bool quitting = false;
@@ -44,6 +49,7 @@ struct Feed::Impl {
         cancellation = std::stop_source{};
         ++generation;
         state.next.reset();
+        prepared.reset();
         state.error.clear();
         pending = state.current && *state.current + 1 < queue.size() && budget > 0;
         state.preparation = pending ? Preparation::loading : Preparation::idle;
@@ -60,18 +66,19 @@ struct Feed::Impl {
             auto version = generation;
             pending = false;
             lock.unlock();
-            std::shared_ptr<Prepared> result;
+            std::unique_ptr<Prepared> result;
             std::string error;
-            try { result = std::make_shared<Prepared>(provider->prepare(item, bytes, token)); }
+            try { result = std::make_unique<Prepared>(provider->prepare(item, bytes, token)); }
             catch (const std::exception& e) { error = e.what(); }
             catch (...) { error = "provider failed"; }
             lock.lock();
             if (version != generation || token.stop_requested()) continue;
-            if (result && (result->id != item.id || result->prefix.size() > bytes)) {
+            if (result && (result->id != item.id || result->prefix.capacity() > bytes)) {
                 result.reset();
                 error = "provider violated preparation contract";
             }
-            state.next = std::move(result);
+            prepared = std::move(result);
+            if (prepared) state.next = PreparedInfo{prepared->id, prepared->prefix.size()};
             state.error = std::move(error);
             state.preparation = state.next ? Preparation::ready : Preparation::error;
         }

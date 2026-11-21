@@ -9,6 +9,13 @@
 using namespace bgmedia::video;
 using namespace std::chrono_literals;
 #define CHECK(x) do { if (!(x)) { std::cerr << "failed: " << #x << " line " << __LINE__ << '\n'; std::exit(1); } } while (false)
+struct Oversized final : Provider {
+    Prepared prepare(const Media& m, std::size_t limit, std::stop_token) override {
+        Prepared result{m.id, {}};
+        result.prefix.reserve(limit + 1);
+        return result;
+    }
+};
 struct Blocking final : Provider {
     std::atomic<bool> entered{false}, cancelled{false};
     Prepared prepare(const Media& m, std::size_t, std::stop_token token) override {
@@ -35,12 +42,14 @@ int main() {
         feed.setQueue(queue);
         waitFor([&] { return feed.snapshot().preparation == Preparation::ready; });
         auto snapshot = feed.snapshot();
-        CHECK(snapshot.next->id.value == "1"); CHECK(snapshot.next->prefix.size() == 4);
+        CHECK(snapshot.next->id.value == "1"); CHECK(snapshot.next->bytes == 4);
         CHECK(feed.next()); CHECK(feed.previous()); CHECK(!feed.previous()); CHECK(!feed.select(99));
         feed.setBudget(0); CHECK(feed.snapshot().preparation == Preparation::idle);
+        // Retaining the old metadata does not keep the prepared byte buffer alive.
+        CHECK(snapshot.next->bytes == 4);
         feed.setBudget(20);
         waitFor([&] { return feed.snapshot().preparation == Preparation::ready; });
-        CHECK(feed.snapshot().next->prefix.size() == 10);
+        CHECK(feed.snapshot().next->bytes == 10);
         feed.close(); CHECK(!feed.snapshot().current); CHECK(!feed.snapshot().next);
         queue[1].localPath = path.string() + ".missing";
         feed.setQueue(queue);
@@ -56,6 +65,12 @@ int main() {
         std::thread a([&] { for (int i=0;i<1000;++i) feed.select(2); });
         std::thread b([&] { for (int i=0;i<1000;++i) (void)feed.snapshot(); });
         a.join(); b.join(); feed.close();
+    }
+    {
+        Feed feed(std::make_shared<Oversized>(), 4);
+        feed.setQueue(queue);
+        waitFor([&] { return feed.snapshot().preparation == Preparation::error; });
+        CHECK(!feed.snapshot().next);
     }
     std::filesystem::remove(path);
 }

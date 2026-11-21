@@ -3,9 +3,8 @@
 Enable `BGMEDIA_BUILD_VIDEO` and link `BGMedia::Video`. This initial component
 preserves provider order and asynchronously reads a bounded prefix of the next
 local file. It does not decode, play, report views, implement a disk cache, or
-provide a complete provider ABI. `Snapshot::next` is a shared immutable object:
-the host may retain it across navigation, and that retained memory is outside
-the feed's budget. Release snapshots promptly when reducing memory use. Budget
+provide a complete provider ABI. `Snapshot::next` contains metadata only;
+retaining snapshots does not retain prepared file data. Budget
 zero disables preparation. The worker runs one provider call at a time. A new
 selection, queue, budget, or close requests cancellation and discards stale
 results. Destruction joins the worker; providers must make blocking operations

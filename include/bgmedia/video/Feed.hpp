@@ -40,11 +40,15 @@ public:
 };
 
 enum class Preparation { idle, loading, ready, error };
+struct PreparedInfo {
+    MediaId id;
+    std::size_t bytes = 0;
+};
 struct Snapshot {
     std::optional<std::size_t> current;
     Preparation preparation = Preparation::idle;
     std::string error;
-    std::shared_ptr<const Prepared> next;
+    std::optional<PreparedInfo> next;
 };
 
 // Thread safe. The provider must outlive in-flight calls (shared ownership).
