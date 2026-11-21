@@ -1,4 +1,5 @@
 #include "bgmedia/video/FFmpeg.hpp"
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -75,6 +76,42 @@ int main(int argc, char** argv) {
         }
         CHECK(std::abs(first - 1.0) < 0.001); // previous keyframe, then the player trims to target
         decodeAll(*decoder, false);
+    }
+    {
+        struct Host {
+            std::shared_ptr<ByteSource> file;
+            std::atomic<int>* reads;
+            std::atomic<bool>* released;
+        };
+        std::atomic<int> reads{0};
+        std::atomic<bool> released{false};
+        auto file = openFileByteSource(queue[0].localPath);
+        auto* host = new Host{file, &reads, &released};
+        bg_video_range_v1 raw{host, file->size(),
+            [](void* opaque, std::uint64_t offset, std::uint8_t* output, std::size_t count,
+               std::uint32_t timeout, int (*cancelled)(void*), void* cancel) -> int {
+                auto& context = *static_cast<Host*>(opaque);
+                if (cancelled(cancel)) return BG_VIDEO_RANGE_CANCELLED;
+                ++*context.reads;
+                try {
+                    context.file->readAt(offset, {output, count},
+                        {{}, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout)});
+                    return BG_VIDEO_RANGE_OK;
+                } catch (...) { return BG_VIDEO_RANGE_IO; }
+            },
+            [](void* opaque) {
+                std::unique_ptr<Host> context(static_cast<Host*>(opaque));
+                *context->released = true;
+            }};
+        {
+            Media streamed{queue[0].id, {}, adoptRangeSource(raw)};
+            auto decoder = openFFmpeg(streamed);
+            decodeAll(*decoder, true);
+            decoder->seek(0);
+            decodeAll(*decoder, true);
+            CHECK(reads >= 2 && !released);
+        }
+        CHECK(released);
     }
     constexpr auto budget = 512 * 1024;
     Feed feed(std::make_shared<FFmpegProvider>(), budget);

@@ -169,7 +169,7 @@ target_compile_features(bgmedia_rig PUBLIC cxx_std_20)
 target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
 if(BGMEDIA_BUILD_VIDEO)
-    add_library(bgmedia_video STATIC src/video/Feed.cpp src/video/Playback.cpp)
+    add_library(bgmedia_video STATIC src/video/ByteSource.cpp src/video/Feed.cpp src/video/Playback.cpp)
     add_library(BGMedia::Video ALIAS bgmedia_video)
     target_include_directories(bgmedia_video PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

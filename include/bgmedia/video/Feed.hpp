@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bgmedia/video/ByteSource.hpp"
 #include "bgmedia/video/Decoder.hpp"
 
 #include <cstddef>
@@ -20,6 +21,7 @@ struct MediaId {
 struct Media {
     MediaId id;
     std::filesystem::path localPath;
+    std::shared_ptr<ByteSource> bytes{}; // Takes precedence over localPath.
 };
 struct Prepared {
     MediaId id;

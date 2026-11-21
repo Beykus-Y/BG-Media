@@ -92,22 +92,26 @@ checks cancellation and a two-second deadline during open, probing and
 preparation. Those checks cannot interrupt an OS call already blocked in a
 filesystem driver. Playback and cold open currently run on the SDL thread.
 
-## BG Tok integration boundary
+## Streaming from BG Tok
 
-BG Tok PR #3 provides ordered recommendations, account and content IDs, and
-`MediaDelivery::open` for cancellable byte ranges. A future host adapter should
-keep the account scope in `MediaId.account` and map each content ID to its
-stable item identity. Expiring source handles belong to the provider; refreshing
-a handle with the same source ID must preserve the item's position in the feed.
+BG Media keeps the feed in host-supplied order. Use the provider/account/item
+tuple in `MediaId` and keep source credentials in BG Tok. The host resolves a
+specific immutable representation and verifies its length. It can convert
+BG Tok's range callback table with `adoptRangeSource`, then pass it in
+`Media.bytes`. FFmpeg uses a seekable custom AVIO stream for this item. The
+existing `FFmpegProvider` prepares streamed and local items with the same
+generation cancellation. File ownership stays with the host.
 
-A remote decoder needs a seekable byte source over BG Tok ranges. The bridge
-should offer time-bounded open/read/seek/close, distinguish EOF, cancellation,
-expiry and I/O failure, and propagate the preparation generation's cancellation
-to the Rust operation. Read into caller-owned buffers with explicit byte
-limits. BG Video owns scheduling, buffered frames and any future shared disk
-cache. BG Tok owns source resolution, refresh and source-specific reporting.
-The current `Media.localPath` is the local path for this demo. It is not a
-remote byte source or a stable C ABI.
+The versioned C table uses exact offset reads, a caller-owned output buffer,
+per-read timeout and a cancellation callback. The host releases the opaque
+context after reads finish. BG Media never requests more than 1 MiB from a
+range callback. BG Tok can refresh an expired handle, but the host must create
+a new representation revision if source bytes change. Host applications must
+run synchronous stream I/O off the UI thread and forward their account session's
+cancellation. The range callback does not emit playback events.
+
+This path supports seekable self-contained MP4 with a verified length. It has
+been exercised with BG Tok's synthetic provider carrying a real H.264/AAC MP4.
 
 The verified backend is software decoding on Linux. Hardware decoding needs a
 device and measurements for frame transfer or native surface presentation.

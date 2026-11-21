@@ -33,6 +33,13 @@ struct FreePointer {
     void operator()(T* ptr) const { Free(&ptr); }
 };
 
+struct FreeIO {
+    void operator()(AVIOContext* context) const {
+        av_freep(&context->buffer);
+        avio_context_free(&context);
+    }
+};
+
 struct Track {
     std::unique_ptr<AVCodecContext, FreePointer<AVCodecContext, avcodec_free_context>> codec;
     AVStream* stream = nullptr;
@@ -60,6 +67,8 @@ private:
         auto& self = *static_cast<FFmpegDecoder*>(opaque);
         return self.token_.stop_requested() || Clock::now() >= self.deadline_;
     }
+    static int readAt(void*, std::uint8_t*, int) noexcept;
+    static std::int64_t seekBytes(void*, std::int64_t, int) noexcept;
     Track openTrack(AVMediaType type, bool required);
     Decoded read();
     Decoded convert(Track&);
@@ -69,6 +78,10 @@ private:
 
     std::stop_token token_;
     Clock::time_point deadline_;
+    std::shared_ptr<ByteSource> source_;
+    std::shared_ptr<void> sourcePin_;
+    std::uint64_t offset_ = 0;
+    std::unique_ptr<AVIOContext, FreeIO> io_;
     std::unique_ptr<AVFormatContext, FreePointer<AVFormatContext, avformat_close_input>> format_;
     Track video_, audio_;
     std::unique_ptr<AVPacket, FreePointer<AVPacket, av_packet_free>> packet_{av_packet_alloc()};
@@ -85,27 +98,79 @@ private:
     std::size_t conversionBudget_ = std::numeric_limits<std::size_t>::max();
 };
 
+int FFmpegDecoder::readAt(void* opaque, std::uint8_t* buffer, int count) noexcept {
+    auto& self = *static_cast<FFmpegDecoder*>(opaque);
+    if (interrupt(&self)) return AVERROR_EXIT;
+    if (count <= 0) return AVERROR(EINVAL);
+    const auto size = std::min<std::uint64_t>({static_cast<std::uint64_t>(count), self.source_->size() - self.offset_, 1024 * 1024});
+    if (!size) return AVERROR_EOF;
+    try {
+        self.source_->readAt(self.offset_, {buffer, static_cast<std::size_t>(size)},
+            {self.token_, std::min(self.deadline_, Clock::now() + std::chrono::seconds(2))});
+    } catch (const ReadError& error) {
+        if (error.status() == BG_VIDEO_RANGE_CANCELLED) return AVERROR_EXIT;
+        if (error.status() == BG_VIDEO_RANGE_TIMEOUT) return AVERROR(ETIMEDOUT);
+        return AVERROR(EIO);
+    } catch (...) { return AVERROR(EIO); }
+    self.offset_ += size;
+    return static_cast<int>(size);
+}
+
+std::int64_t FFmpegDecoder::seekBytes(void* opaque, std::int64_t offset, int whence) noexcept {
+    auto& self = *static_cast<FFmpegDecoder*>(opaque);
+    const auto size = static_cast<std::int64_t>(self.source_->size());
+    if (whence == AVSEEK_SIZE) return size;
+    if (interrupt(&self)) return AVERROR_EXIT;
+    std::int64_t base = 0;
+    switch (whence & ~AVSEEK_FORCE) {
+    case SEEK_SET: break;
+    case SEEK_CUR: base = static_cast<std::int64_t>(self.offset_); break;
+    case SEEK_END: base = size; break;
+    default: return AVERROR(EINVAL);
+    }
+    if (offset < -base || offset > size - base) return AVERROR(EINVAL);
+    self.offset_ = static_cast<std::uint64_t>(base + offset);
+    return base + offset;
+}
+
 FFmpegDecoder::FFmpegDecoder(const Media& media, std::stop_token token)
-    : token_(token), deadline_(Clock::now() + std::chrono::seconds(2)) {
+    : token_(token), deadline_(Clock::now() + std::chrono::seconds(2)), source_(media.bytes) {
     std::error_code ec;
-    if (interrupt(this) || !std::filesystem::is_regular_file(media.localPath, ec))
-        throw std::runtime_error("expected a regular local MP4 file");
+    if (interrupt(this)) throw std::runtime_error("opening MP4 interrupted");
     if (!packet_ || !frame_) throw std::bad_alloc();
+    std::u8string path;
+    if (source_) {
+        sourcePin_ = source_->pin();
+        if (source_->size() == 0 || source_->size() > std::numeric_limits<std::int64_t>::max())
+            throw std::runtime_error("invalid MP4 source length");
+        constexpr int bufferBytes = 64 * 1024;
+        auto* buffer = static_cast<std::uint8_t*>(av_malloc(bufferBytes));
+        if (!buffer) throw std::bad_alloc();
+        io_.reset(avio_alloc_context(buffer, bufferBytes, 0, this, readAt, nullptr, seekBytes));
+        if (!io_) {
+            av_free(buffer);
+            throw std::bad_alloc();
+        }
+    } else {
+        if (!std::filesystem::is_regular_file(media.localPath, ec))
+            throw std::runtime_error("expected a regular local MP4 file");
+        path = std::filesystem::absolute(media.localPath, ec).u8string();
+        if (ec) throw std::runtime_error("cannot resolve local media path");
+    }
     auto* context = avformat_alloc_context();
     if (!context) throw std::bad_alloc();
     context->interrupt_callback = {interrupt, this};
     context->probesize = 2 * 1024 * 1024;
     context->max_analyze_duration = 2 * AV_TIME_BASE;
     context->max_streams = 32;
-    const auto path = std::filesystem::absolute(media.localPath, ec).u8string();
-    if (ec) {
-        avformat_free_context(context);
-        throw std::runtime_error("cannot resolve local media path");
+    if (io_) {
+        context->pb = io_.get();
+        context->flags |= AVFMT_FLAG_CUSTOM_IO;
     }
     AVDictionary* options = nullptr;
     av_dict_set(&options, "protocol_whitelist", "file", 0);
     av_dict_set(&options, "enable_drefs", "0", 0);
-    const int result = avformat_open_input(&context, reinterpret_cast<const char*>(path.c_str()),
+    const int result = avformat_open_input(&context, io_ ? nullptr : reinterpret_cast<const char*>(path.c_str()),
                                            av_find_input_format("mov"), &options);
     av_dict_free(&options);
     format_.reset(context);
