@@ -1,0 +1,8 @@
+find_package(SQLite3 3.35 REQUIRED)
+if(NOT TARGET SQLite3::SQLite3)
+    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
+add_library(bgmedia_video_cache STATIC DiskCache.cpp)
+add_library(BGMedia::VideoCache ALIAS bgmedia_video_cache)
+target_link_libraries(bgmedia_video_cache PUBLIC bgmedia_video PRIVATE SQLite3::SQLite3)
+target_compile_options(bgmedia_video_cache PRIVATE ${BGMEDIA_WARNING_FLAGS})

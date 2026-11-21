@@ -113,6 +113,29 @@ cancellation. The range callback does not emit playback events.
 This path supports seekable self-contained MP4 with a verified length. It has
 been exercised with BG Tok's synthetic provider carrying a real H.264/AAC MP4.
 
+## Disk cache
+
+Build with `-DBGMEDIA_BUILD_VIDEO_CACHE=ON` and SQLite 3.35 or later, and link
+`BGMedia::VideoCache`. Pass the returned `DiskCache::wrap` source in
+`Media.bytes`. A host must choose `DiskPolicy::hostManaged` only for an
+immutable representation authorized for persistent caching. Use `noStore` for
+protected, view-once, unclassified and TDLib-owned files. Do not put URLs,
+credentials or access tokens in cache keys.
+
+The cache uses a private app-owned directory and a single open owner per
+database. It stores aligned 64 KiB ranges, checks stored lengths and checksums
+on read, and can serve resident ranges offline. SQLite transactions group
+insertion and LRU eviction so interrupted writes roll back. Global, provider
+and provider/account quotas count payload separately from SQLite file and
+journal overhead. FFmpeg pins active and preloaded sources; when pins prevent
+admission, the current read still uses the origin. A missing range is filled
+from the origin without holding the cache lock.
+
+On logout, cancel the provider session and call `clearAccount(provider,
+account)`. This removes that scope's ranges and invalidates its existing
+cached handles. `clear()` removes all scopes. Data already handed to a decoder
+or renderer is owned by that consumer; the host also closes playback on logout.
+
 The verified backend is software decoding on Linux. Hardware decoding needs a
 device and measurements for frame transfer or native surface presentation.
 Windows and mobile playback need separate validation.

@@ -12,6 +12,7 @@ project(BGMedia
 # ---------------------------------------------------------------------------
 option(BGMEDIA_BUILD_VIDEO          "Build the optional BG Video feed component" OFF)
 option(BGMEDIA_BUILD_VIDEO_FFMPEG   "Build the optional FFmpeg video adapter" OFF)
+option(BGMEDIA_BUILD_VIDEO_CACHE    "Build the optional SQLite video range cache" OFF)
 option(BGMEDIA_BUILD_VIDEO_DEMO     "Build the SDL3 video player demo" OFF)
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
@@ -178,6 +179,13 @@ if(BGMEDIA_BUILD_VIDEO)
     target_compile_options(bgmedia_video PRIVATE ${BGMEDIA_WARNING_FLAGS})
     target_link_libraries(bgmedia_video PUBLIC Threads::Threads)
     install(TARGETS bgmedia_video EXPORT BGMediaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+if(BGMEDIA_BUILD_VIDEO_CACHE)
+    if(NOT BGMEDIA_BUILD_VIDEO)
+        message(FATAL_ERROR "BGMEDIA_BUILD_VIDEO_CACHE requires BGMEDIA_BUILD_VIDEO")
+    endif()
+    add_subdirectory(adapters/video_cache)
 endif()
 
 if(BGMEDIA_BUILD_VIDEO_FFMPEG)
