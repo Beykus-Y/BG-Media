@@ -75,3 +75,11 @@ if(TARGET bgmedia_wave_opus OR TARGET bgmedia_wave_webrtc)
         LABELS "integration"
     )
 endif()
+
+if(TARGET bgmedia_video)
+    add_executable(bgmedia_video_tests test_video_feed.cpp)
+    target_link_libraries(bgmedia_video_tests PRIVATE bgmedia_video)
+    target_compile_options(bgmedia_video_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    add_test(NAME bgmedia.video_feed COMMAND bgmedia_video_tests)
+    set_tests_properties(bgmedia.video_feed PROPERTIES TIMEOUT 30 LABELS unit)
+endif()

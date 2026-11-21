@@ -10,6 +10,7 @@ project(BGMedia
 # Build options. The core is dependency-free and is always buildable on its
 # own; adapters and the desktop harness are optional.
 # ---------------------------------------------------------------------------
+option(BGMEDIA_BUILD_VIDEO          "Build the optional BG Video feed component" OFF)
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
@@ -164,6 +165,18 @@ target_include_directories(bgmedia_rig
 target_link_libraries(bgmedia_rig PUBLIC bgmedia_core bgmedia_vrm)
 target_compile_features(bgmedia_rig PUBLIC cxx_std_20)
 target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
+
+if(BGMEDIA_BUILD_VIDEO)
+    add_library(bgmedia_video STATIC src/video/Feed.cpp)
+    add_library(BGMedia::Video ALIAS bgmedia_video)
+    target_include_directories(bgmedia_video PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(bgmedia_video PUBLIC cxx_std_20)
+    target_compile_options(bgmedia_video PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    target_link_libraries(bgmedia_video PUBLIC Threads::Threads)
+    install(TARGETS bgmedia_video EXPORT BGMediaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 # ---------------------------------------------------------------------------
 # Adapters: miniaudio decoding only. Playback belongs to the host application,
