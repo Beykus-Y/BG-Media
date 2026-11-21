@@ -122,6 +122,12 @@ if(TARGET bgmedia_video_ffmpeg)
             set_tests_properties(bgmedia.video_demo PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 20
                 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;SDL_RENDER_DRIVER=software")
             if(BGMEDIA_TOK_FIXTURE_ROOT AND BGMEDIA_TOK_FIXTURE_LIB)
+                add_executable(bgmedia_video_tok_cache_tests test_video_tok_cache.cpp)
+                target_include_directories(bgmedia_video_tok_cache_tests PRIVATE "${BGMEDIA_TOK_FIXTURE_ROOT}/crates/bg-tok-fixture-ffi/include")
+                target_link_libraries(bgmedia_video_tok_cache_tests PRIVATE BGMedia::VideoCache "${BGMEDIA_TOK_FIXTURE_LIB}" ${CMAKE_DL_LIBS} m)
+                target_compile_options(bgmedia_video_tok_cache_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
+                add_test(NAME bgmedia.video_tok_cache COMMAND bgmedia_video_tok_cache_tests "${video_fixtures}/1.mp4" "${CMAKE_CURRENT_BINARY_DIR}/tok-cache-test")
+                set_tests_properties(bgmedia.video_tok_cache PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 15 LABELS integration)
                 add_test(NAME bgmedia.video_tok_integration COMMAND "${CMAKE_COMMAND}"
                     "-DDEMO=$<TARGET_FILE:bgmedia_video_demo>" "-DFIXTURES=${video_fixtures}"
                     "-DCACHE=${CMAKE_CURRENT_BINARY_DIR}/tok-integration-cache"
