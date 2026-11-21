@@ -35,6 +35,24 @@ and **Left/Right** to seek by five seconds. Click the timeline to seek to a
 position. The footer shows presentation and source FPS, playback position, next
 clip preparation status, tracked buffer use and process RSS on Linux.
 
+## Embed playback
+
+Link `BGMedia::Video` in the source tree (or `BGMedia::bgmedia_video` from the
+installed `BGMediaTargets.cmake`) and include `bgmedia/video/Playback.hpp`. Construct
+`Playback` with a provider for background preparation, a factory for opening a
+cold decoder, and a host implementation of `PlaybackOutput`. The output must
+outlive the player. It consumes or copies video frames and audio spans during
+the callback. Its queue depth is expressed in stereo PCM sample frames at 48
+kHz. A platform using an audio callback should use its own synchronized queue
+and expose that backlog to the playback thread.
+
+Submit the ordered media with `setQueue` and call `update` regularly from the
+same thread that handles commands. `snapshot` reports the selected item,
+playback and preparation states, position, and buffer use. Hosts can pass
+monotonic timestamps to `update` to drive the scheduler from their own loop.
+The library owns seeking, pause/resume, queue transitions and A/V scheduling.
+SDL supplies only audio output, frame upload, and the demo UI.
+
 ## Playback and ownership
 
 `Feed::activate(index)` selects a clip and transfers its prepared decoder if
@@ -46,8 +64,8 @@ failed preparation can be retried as a cold open. The user can navigate past
 an unreadable file.
 
 The decoder returns presentation timestamps in seconds relative to the container
-start. Libav reorders frames and SDL displays them against the playback clock.
-The clock uses submitted PCM time minus the SDL stream backlog, with monotonic
+start. Libav reorders frames and Playback schedules them against the playback clock.
+The clock uses submitted PCM time minus the output's reported backlog, with monotonic
 time when the stream has no queued PCM. This estimates presentation at the SDL
 device boundary. Latency in the OS mixer and physical output device remains
 outside that measurement. Seek flushes the decoder and SDL audio stream, decodes
@@ -104,7 +122,8 @@ tones in order. CTest additionally exercised pause/resume, stop, seek, 48 rapid
 switches, malformed and empty inputs, cancellation, and the shutdown deadline
 with an uncooperative test provider.
 
-The measurement starts at item selection and ends after SDL submits the first
+The original Linux proof of concept was measured before extracting the playback
+library. The measurement starts at item selection and ends after SDL submits the first
 decoded frame. It excludes display scanout and device latency. These are
 two-second local H.264/AAC clips at 25 FPS. The 180p numbers use six transitions
 per mode. The 1080p numbers use two transitions per mode.
