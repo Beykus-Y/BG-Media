@@ -45,6 +45,7 @@ int main() {
             decoder->seek(0.5);
             bool afterSeek = false;
             for (int steps = 0; steps < 2000; ++steps) {
+                if (std::chrono::steady_clock::now() - started > 30s) throw std::runtime_error("seek timed out");
                 auto decoded = decoder->step();
                 if (std::holds_alternative<VideoFrame>(decoded)) { afterSeek = true; break; }
                 if (std::holds_alternative<EndOfStream>(decoded)) break;
