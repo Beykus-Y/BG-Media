@@ -526,7 +526,8 @@ const auto& a = report.result;
 - Скорость в демо меняет питч (линейный resampler), это не time-stretch.
 - Задержка вывода оценивается по периодам устройства; есть ручной trim.
 - In-memory decoder ограничен 1 GiB; очень длинные файлы — следующий этап.
-- Android/iOS, BG Video, BG Effects и BeyGram ещё не подключены.
+- Опциональный BG Video Demo воспроизводит локальные MP4 через FFmpeg и SDL3. [Сборка и запуск](docs/video/feed.md).
+- Android/iOS, BG Effects и BeyGram ещё не подключены.
 
 ## Лицензии
 

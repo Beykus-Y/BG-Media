@@ -10,6 +10,10 @@ project(BGMedia
 # Build options. The core is dependency-free and is always buildable on its
 # own; adapters and the desktop harness are optional.
 # ---------------------------------------------------------------------------
+option(BGMEDIA_BUILD_VIDEO          "Build the optional BG Video feed component" OFF)
+option(BGMEDIA_BUILD_VIDEO_FFMPEG   "Build the optional FFmpeg video adapter" OFF)
+option(BGMEDIA_BUILD_VIDEO_CACHE    "Build the optional SQLite video range cache" OFF)
+option(BGMEDIA_BUILD_VIDEO_DEMO     "Build the SDL3 video player demo" OFF)
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
@@ -165,6 +169,32 @@ target_link_libraries(bgmedia_rig PUBLIC bgmedia_core bgmedia_vrm)
 target_compile_features(bgmedia_rig PUBLIC cxx_std_20)
 target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
+if(BGMEDIA_BUILD_VIDEO)
+    add_library(bgmedia_video STATIC src/video/ByteSource.cpp src/video/Feed.cpp src/video/Playback.cpp)
+    add_library(BGMedia::Video ALIAS bgmedia_video)
+    target_include_directories(bgmedia_video PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(bgmedia_video PUBLIC cxx_std_20)
+    target_compile_options(bgmedia_video PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    target_link_libraries(bgmedia_video PUBLIC Threads::Threads)
+    install(TARGETS bgmedia_video EXPORT BGMediaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+if(BGMEDIA_BUILD_VIDEO_CACHE)
+    if(NOT BGMEDIA_BUILD_VIDEO)
+        message(FATAL_ERROR "BGMEDIA_BUILD_VIDEO_CACHE requires BGMEDIA_BUILD_VIDEO")
+    endif()
+    add_subdirectory(adapters/video_cache)
+endif()
+
+if(BGMEDIA_BUILD_VIDEO_FFMPEG)
+    if(NOT BGMEDIA_BUILD_VIDEO)
+        message(FATAL_ERROR "BGMEDIA_BUILD_VIDEO_FFMPEG requires BGMEDIA_BUILD_VIDEO")
+    endif()
+    add_subdirectory(adapters/video_ffmpeg)
+endif()
+
 # ---------------------------------------------------------------------------
 # Adapters: miniaudio decoding only. Playback belongs to the host application,
 # which keeps the engine independent from any particular audio output API.
@@ -205,21 +235,30 @@ if(BGMEDIA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-if(BGMEDIA_BUILD_TESTS AND BUILD_TESTING)
-    add_subdirectory(tests)
-endif()
 
 # ---------------------------------------------------------------------------
 # Desktop harness: SDL3 UI + miniaudio playback. This target is the only place
 # that knows about a window, a mouse or a sound card.
 # ---------------------------------------------------------------------------
+if(BGMEDIA_BUILD_DESKTOP OR BGMEDIA_BUILD_VIDEO_DEMO)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindOrFetchSDL3.cmake)
+endif()
+if(BGMEDIA_BUILD_VIDEO_DEMO)
+    if(NOT BGMEDIA_BUILD_VIDEO_FFMPEG)
+        message(FATAL_ERROR "BGMEDIA_BUILD_VIDEO_DEMO requires BGMEDIA_BUILD_VIDEO_FFMPEG")
+    endif()
+    add_subdirectory(apps/video_demo)
+endif()
 if(BGMEDIA_BUILD_DESKTOP)
     if(NOT BGMEDIA_BUILD_MINIAUDIO)
         message(FATAL_ERROR "BGMEDIA_BUILD_DESKTOP requires BGMEDIA_BUILD_MINIAUDIO")
     endif()
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindOrFetchSDL3.cmake)
     add_subdirectory(adapters/sdlgpu)
     add_subdirectory(apps/desktop)
+endif()
+
+if(BGMEDIA_BUILD_TESTS AND BUILD_TESTING)
+    add_subdirectory(tests)
 endif()
 
 # ---------------------------------------------------------------------------

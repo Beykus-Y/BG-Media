@@ -70,7 +70,7 @@ bgmedia_rig
 | Модуль | Назначение | Текущее состояние |
 |---|---|---|
 | **BG Audio** | декодирование, аудиовыход, микширование | decode adapter; воспроизведение в host-приложении |
-| **BG Video** | видео-треки и синхронизация кадров | не реализовано (точки расширения есть) |
+| **BG Video** | очередь локальных MP4, декодер и синхронизация вывода | опциональный FFmpeg/SDL3 demo, [сборка и контракт](video/feed.md) |
 | **BG Beat** | BPM, удары, onset, бас, тишина | `bgmedia_core/analysis` |
 | **BG Motion 2.0** | хореография, cues, CharacterPose | `bgmedia_core/choreography` |
 | **BG Motion 3.0** | авторские клипы, BeatClock, расписание, Auto | `bgmedia_rig/motion3` |
