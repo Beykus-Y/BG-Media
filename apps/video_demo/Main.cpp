@@ -93,6 +93,7 @@ public:
         firstFramePending = visible = false;
         dirty = true;
         switchStart = Clock::now();
+        firstFrameMs = 0;
     }
 
     std::size_t textureBytes() const {
@@ -102,6 +103,7 @@ public:
     std::unique_ptr<SDL_Texture, decltype(&SDL_DestroyTexture)> texture{nullptr, SDL_DestroyTexture};
     int width = 0, height = 0;
     bool firstFramePending = false, visible = false, dirty = true;
+    double firstFrameMs = 0;
     Clock::time_point switchStart{};
 private:
     SDL_Renderer* renderer_;
@@ -229,6 +231,7 @@ std::string Player::status(const PlaybackSnapshot& snapshot) const {
         snapshot.presentationFps, snapshot.info.fps, next,
         static_cast<double>(snapshot.bufferedBytes + output_.textureBytes()) / MiB);
     std::string result = text;
+    if (output_.firstFrameMs > 0) result += "  first frame " + std::to_string(static_cast<int>(output_.firstFrameMs)) + " ms";
 #ifdef BGMEDIA_TOK_FIXTURE
     if (host_ && cache_) result += "  cache " + std::to_string(cache_->storedBytes() / 1024) + " KiB  requests " + std::to_string(providerCalls());
 #endif
@@ -279,6 +282,7 @@ void Player::draw(bool force) {
     if (output_.firstFramePending) {
         output_.firstFramePending = false;
         const auto latency = std::chrono::duration<double, std::milli>(Clock::now() - output_.switchStart).count();
+        output_.firstFrameMs = latency;
         std::printf("%zu %s first-frame-ms=%.2f\n", playback.feed.current.value_or(0) + 1, playback.preparedDecoder ? "warm" : "cold", latency);
         std::fflush(stdout);
     }
