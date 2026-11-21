@@ -122,7 +122,6 @@ void Player::reset(double seconds) {
     videoBytes_ = presented_ = audioFrames_ = fpsFrames_ = 0;
     fps_ = maxVideoLag_ = 0;
     target_ = position_ = audioEnd_ = seconds;
-    texture_.reset();
     pictureDirty_ = true;
     ended_ = started_ = firstFramePending_ = false;
     lastTick_ = fpsStart_ = Clock::now();
@@ -161,6 +160,7 @@ void Player::move(int direction) {
 
 void Player::fail(const std::exception& error) {
     decoder_.reset();
+    texture_.reset();
     reset(0);
     error_ = error.what();
     std::fprintf(stderr, "%s: %s\n", filename_.c_str(), error_.c_str());
@@ -251,6 +251,7 @@ void Player::update() {
                 if (video->pts + 0.001 < target_) continue;
                 videoBytes_ += video->rgba.capacity();
                 frames_.push_back(std::move(*video));
+                if (presented_ == 0 && frames_.front().pts <= position_ + 0.008) break;
             } else if (auto* audio = std::get_if<AudioFrame>(&decoded)) {
                 pendingAudio_ = std::move(*audio);
             } else if (std::holds_alternative<EndOfStream>(decoded)) {
@@ -346,7 +347,7 @@ void Player::draw(bool force) {
     SDL_SetRenderDrawColor(renderer_, 15, 18, 24, 255);
     require(SDL_RenderClear(renderer_));
     const float contentHeight = std::max(0.0f, h - 95.0f);
-    if (texture_ && contentHeight > 0) {
+    if (texture_ && presented_ > 0 && contentHeight > 0) {
         const float scale = std::min(static_cast<float>(w) / width_, contentHeight / height_);
         const SDL_FRect dst{(w - width_ * scale) / 2, (contentHeight - height_ * scale) / 2,
                             width_ * scale, height_ * scale};
