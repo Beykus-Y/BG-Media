@@ -117,6 +117,10 @@ if(TARGET bgmedia_video_ffmpeg)
         set_tests_properties(bgmedia.video_packet_timestamps PROPERTIES FIXTURES_REQUIRED video_mp4
             PASS_REGULAR_EXPRESSION "0\\.000000,-0\\.080000" TIMEOUT 10)
         if(TARGET bgmedia_video_demo)
+            add_test(NAME bgmedia.video_async_demo COMMAND bgmedia_video_demo --verify-async
+                "${video_fixtures}/1.mp4" "${video_fixtures}/2.mp4" "${video_fixtures}/3.mp4")
+            set_tests_properties(bgmedia.video_async_demo PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 20
+                ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;SDL_RENDER_DRIVER=software")
             add_test(NAME bgmedia.video_demo COMMAND bgmedia_video_demo --verify --stress
                 "${video_fixtures}/1.mp4" "${video_fixtures}/2.mp4" "${video_fixtures}/3.mp4")
             set_tests_properties(bgmedia.video_demo PROPERTIES FIXTURES_REQUIRED video_mp4 TIMEOUT 20
@@ -143,4 +147,13 @@ if(TARGET bgmedia_video_ffmpeg)
     else()
         message(STATUS "Video fixtures require ffmpeg (libx264/AAC) and ffprobe executables")
     endif()
+endif()
+
+if(TARGET bgmedia_video_demo_async)
+    add_executable(bgmedia_video_async_tests test_video_async.cpp)
+    target_include_directories(bgmedia_video_async_tests PRIVATE "${CMAKE_SOURCE_DIR}/apps/video_demo")
+    target_link_libraries(bgmedia_video_async_tests PRIVATE bgmedia_video_demo_async)
+    target_compile_options(bgmedia_video_async_tests PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    add_test(NAME bgmedia.video_async COMMAND bgmedia_video_async_tests)
+    set_tests_properties(bgmedia.video_async PROPERTIES TIMEOUT 10 LABELS unit)
 endif()
