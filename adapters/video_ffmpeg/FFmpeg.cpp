@@ -20,6 +20,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr int maxPixels = 3840 * 2160;
+// SIMD pixel converters can write past the last visible pixel.
+constexpr std::size_t pixelPadding = 64;
 
 void check(int result, const char* operation) {
     if (result >= 0) return;
@@ -56,7 +58,7 @@ public:
     std::size_t bufferedBytes() const noexcept override { return bufferedBytes_ + recycledVideo_.capacity(); }
     void recycle(VideoFrame&& frame) override {
         // Keep at most one allocation from this decoder for the next conversion.
-        if (frame.rgba.capacity() <= static_cast<std::size_t>(maxPixels) * 4)
+        if (frame.rgba.capacity() <= static_cast<std::size_t>(maxPixels) * 4 + pixelPadding)
             recycledVideo_ = std::move(frame.rgba);
     }
     void prime(std::size_t budget);
@@ -221,14 +223,15 @@ VideoFrame FFmpegDecoder::convertVideo(double pts) {
         SWS_BILINEAR, nullptr, nullptr, nullptr));
     if (!scaler_) throw std::runtime_error("cannot convert video pixel format");
     const auto size = static_cast<std::size_t>(width) * height * 4;
-    if (size > conversionBudget_) throw std::runtime_error("video frame exceeds preparation budget");
+    if (size + pixelPadding > conversionBudget_) throw std::runtime_error("video frame exceeds preparation budget");
     VideoFrame out{pts, width, height, std::move(recycledVideo_)};
-    if (out.rgba.capacity() < size) out.rgba = std::vector<std::uint8_t>(size);
-    else out.rgba.resize(size);
+    if (out.rgba.capacity() < size + pixelPadding) out.rgba = std::vector<std::uint8_t>(size + pixelPadding);
+    else out.rgba.resize(size + pixelPadding);
     std::uint8_t* planes[] = {out.rgba.data(), nullptr, nullptr, nullptr};
     int strides[] = {width * 4, 0, 0, 0};
     check(sws_scale(scaler_.get(), frame_->data, frame_->linesize, 0, height, planes, strides),
           "convert video frame");
+    out.rgba.resize(size);
     return out;
 }
 

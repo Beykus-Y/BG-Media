@@ -28,7 +28,7 @@ enum class PlaybackState { idle, buffering, playing, paused, stopped, ended, err
 struct PlaybackOptions {
     std::size_t preparationBytes = 40 * 1024 * 1024;
     std::size_t videoQueueBytes = 64 * 1024 * 1024;
-    std::size_t maxVideoFrameBytes = 3840 * 2160 * 4;
+    std::size_t maxVideoFrameBytes = 3840 * 2160 * 4 + 64;
 };
 
 struct PlaybackSnapshot {

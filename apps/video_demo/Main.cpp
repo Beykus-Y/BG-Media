@@ -382,8 +382,9 @@ int run(int argc, char** argv) {
         player.draw(redraw);
         if (verify) {
             const auto playback = player.snapshot();
-            if (playback.state == PlaybackState::error || Clock::now() > deadline)
-                throw std::runtime_error("playback verification failed or timed out");
+            if (playback.state == PlaybackState::error)
+                throw std::runtime_error("playback verification failed: " + playback.error);
+            if (Clock::now() > deadline) throw std::runtime_error("playback verification timed out");
             if (!testedPause && player.position() > 0.15) {
                 pausePosition = player.position();
                 pauseUntil = Clock::now() + std::chrono::milliseconds(120);

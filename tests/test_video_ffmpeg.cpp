@@ -58,6 +58,21 @@ void decodeAll(Decoder& decoder, bool checkCounts) {
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     const std::filesystem::path dir(argv[1]);
+    {
+        auto decoder = openFFmpeg({{"local", "", "portrait"}, dir / "portrait.mp4"});
+        int frames = 0;
+        for (int step = 0; step < 100; ++step) {
+            auto decoded = decoder->step();
+            if (auto* frame = std::get_if<VideoFrame>(&decoded)) {
+                CHECK(frame->width == 1080 && frame->height == 1920);
+                CHECK(frame->rgba.size() == 1080 * 1920 * 4);
+                CHECK(frame->rgba[3] == 255);
+                ++frames;
+                decoder->recycle(std::move(*frame));
+            } else if (std::holds_alternative<EndOfStream>(decoded)) break;
+        }
+        CHECK(frames == 5);
+    }
     std::vector<Media> queue;
     for (const char* name : {"1", "2", "3", "broken", "empty"})
         queue.push_back({{"local", "", name}, dir / (std::string(name) + ".mp4")});
