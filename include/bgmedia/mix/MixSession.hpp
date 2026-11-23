@@ -173,6 +173,8 @@ private:
         std::chrono::steady_clock::time_point since{};
     };
     void applyManualRequest();
+    void restoreAfterFailedSwitch(const ManualRequest& req, DeckId outgoing,
+                                  const std::string& reason);
     [[nodiscard]] Item* findItem(std::uint64_t id);
     [[nodiscard]] const Item* findItem(std::uint64_t id) const;
     void workerLoop();

@@ -980,9 +980,10 @@ void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
 }
 
 namespace {
-// Upper bound for waiting on the hard stop to settle before a manual switch
-// is forced through. The callback normally settles within one or two blocks.
-constexpr auto kManualSettleTimeout = std::chrono::milliseconds(250);
+// How long a manual switch waits for the hard stop to settle (decks silent,
+// engine idle) before giving up. Loads are rejected while the old track is
+// audible, so the switch is never forced; the normal settle is a few blocks.
+constexpr auto kManualGiveUpTimeout = std::chrono::milliseconds(2000);
 }
 
 MixSession::ManualSelectResult MixSession::manualSelect(std::uint64_t queueItemId) {
@@ -1055,6 +1056,24 @@ MixSession::ManualSelectResult MixSession::manualNext() {
     return manualSelect(candidate);
 }
 
+void MixSession::restoreAfterFailedSwitch(const ManualRequest& req,
+                                          DeckId outgoing,
+                                          const std::string& reason) {
+    // The hard stop already dropped the old track's play request. Resume it
+    // so a failed switch does not leave the engine silently paused.
+    const MixSnapshot snap = engine_.snapshot();
+    if (!req.paused && snap.decks[deckIndex(outgoing)].loaded) {
+        engine_.setMaster(outgoing);
+        engine_.play(outgoing);
+    }
+    engine_.setPaused(req.paused);
+    std::lock_guard lock(mutex_);
+    manual_.active = false;
+    lastError_ = reason;
+    status_ = reason;
+    planDirty_ = true;
+}
+
 void MixSession::applyManualRequest() {
     ManualRequest req;
     {
@@ -1065,16 +1084,20 @@ void MixSession::applyManualRequest() {
         req = manual_;
     }
     const MixSnapshot snap = engine_.snapshot();
+    const DeckId outgoing = snap.master;
     const bool settled = snap.phase == TransitionPhase::Idle &&
                          !snap.decks[0].playing && !snap.decks[1].playing;
-    const bool timedOut = std::chrono::steady_clock::now() - req.since >= kManualSettleTimeout;
-    if (!settled && !timedOut) {
+    if (!settled) {
+        if (std::chrono::steady_clock::now() - req.since < kManualGiveUpTimeout) {
+            return;  // keep waiting; the engine rejects loads until it settles
+        }
+        restoreAfterFailedSwitch(req, outgoing,
+                                 "Manual track switch timed out; resumed the previous track");
         return;
     }
 
-    const DeckId outgoing = snap.master;
-    const std::uint64_t outgoingId = snap.decks[deckIndex(outgoing)].trackId;
     DeckId target = DeckId::A;
+    std::string failure;
     {
         std::lock_guard lock(mutex_);
         if (snap.decks[0].loaded && snap.decks[0].trackId == req.id) {
@@ -1087,23 +1110,23 @@ void MixSession::applyManualRequest() {
             target = otherDeck(outgoing);
             Item* item = findItem(req.id);
             if (!item || !item->audio) {
-                manual_.active = false;
-                lastError_ = "Manual switch target is no longer available";
-                status_ = lastError_;
-                return;
+                failure = "Manual switch target is no longer available";
+            } else {
+                // Direct engine load: installDeck() ignores a rejected load
+                // (busy deck) and would leave the previous track in place.
+                const double bpm = item->analysis ? item->analysis->bpm : 0.0;
+                if (!engine_.loadDeck(target, item->audio, item->id, bpm)) {
+                    failure = "Could not load " + item->name + " into a free deck";
+                } else {
+                    status_ = "Loaded " + item->name;
+                    planDirty_ = true;
+                }
             }
-            // Direct engine load: installDeck() ignores a rejected load
-            // (busy deck) and would leave the previous track in place.
-            const double bpm = item->analysis ? item->analysis->bpm : 0.0;
-            if (!engine_.loadDeck(target, item->audio, item->id, bpm)) {
-                manual_.active = false;
-                lastError_ = "Could not load " + item->name + " into a free deck";
-                status_ = lastError_;
-                return;
-            }
-            status_ = "Loaded " + item->name;
-            planDirty_ = true;
         }
+    }
+    if (!failure.empty()) {
+        restoreAfterFailedSwitch(req, outgoing, failure);
+        return;
     }
 
     const DeckId other = otherDeck(target);
@@ -1112,9 +1135,12 @@ void MixSession::applyManualRequest() {
     engine_.play(target);
     engine_.setMaster(target);
     engine_.setPaused(req.paused);
-    autoPlay_ = true;
+    if (!req.paused) {
+        autoPlay_ = true;
+    }
 
     std::lock_guard lock(mutex_);
+    const std::uint64_t outgoingId = snap.decks[deckIndex(outgoing)].trackId;
     if (outgoingId != 0 && outgoingId != req.id) {
         if (Item* old = findItem(outgoingId)) {
             old->state = QueueState::Played;
