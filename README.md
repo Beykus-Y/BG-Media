@@ -453,6 +453,7 @@ bgmedia_core
    ├── cache     : content+config key, checksum, schema version
    └── CharacterPose (нормализованный контракт для 2D/3D)
 
+bgmedia_vox (отдельно от core, без SDL) → офлайн-улучшение голоса BG Vox
 bgmedia_vrm (cgltf/stb_image, без SDL) → VrmModel/humanoid/bind pose
 bgmedia_rig (без SDL) → BG Motion 3.1 DancePlayer
                        → MusicalTimeline + time warp → ClipPose
@@ -574,3 +575,10 @@ build/windows/bin/bgmedia_desktop.exe --vrm models/Model1.vrm --3d ^
 
 Полное описание, ограничения и измеренные результаты — в
 `docs/BG_MOTION_3_2.md`.
+
+## BG Vox — улучшение голосовых сообщений
+
+Отдельная библиотека `bgmedia_vox` (опция `BGMEDIA_BUILD_VOX`, по умолчанию ON,
+не зависит от `bgmedia_core`): офлайн-шумоподавление, компрессия, нормализация и
+лимитер для записанного PCM, режимы Off / Natural / Strong, fail-open. Инструмент
+A/B: `bgmedia_vox_enhance`. Подробнее: [docs/BG_VOX.md](docs/BG_VOX.md).

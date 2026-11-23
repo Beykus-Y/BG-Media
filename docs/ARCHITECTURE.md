@@ -458,3 +458,10 @@ BG Motion 3.2 adds three stages after the 3.1 clip sampler and before skinning:
 3. SecondaryDynamics simulates VRM 0.x spring chains (hair, coat/skirt, supported soft-tissue chains) on the final retargeted node globals, then the renderer builds skinning matrices.
 
 The musical chain (BG Beat -> BG Sync -> BG Motion) is unchanged. Procedural choreography bakes a model-independent gmotion.clip v2, so runtime sampling remains a pure function of musical time. See docs/BG_MOTION_3_2.md.
+
+## BG Vox (P1 Enhance)
+
+`bgmedia_vox` — отдельная библиотека (`BGMEDIA_BUILD_VOX`, по умолчанию ON), не
+зависящая от `bgmedia_core`: офлайн-улучшение голоса из готового PCM
+(fail-open, без работы в realtime-потоке). Хост владеет записью, Opus и UI.
+Подробности и контракт: [BG_VOX.md](BG_VOX.md).

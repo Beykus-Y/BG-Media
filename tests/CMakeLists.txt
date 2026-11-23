@@ -50,6 +50,11 @@ if(TARGET bgmedia_wave_webrtc)
             BGMEDIA_WAVE_P2P_PEER_EXE="$<TARGET_FILE:bgmedia_wave_p2p_peer>")
     endif()
 endif()
+if(TARGET bgmedia_vox)
+    target_sources(bgmedia_tests PRIVATE test_vox.cpp)
+    target_link_libraries(bgmedia_tests PRIVATE bgmedia_vox)
+    target_compile_definitions(bgmedia_tests PRIVATE BGMEDIA_HAVE_VOX=1)
+endif()
 target_include_directories(bgmedia_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src/motion3 ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/apps/desktop)
 target_compile_definitions(bgmedia_tests PRIVATE
     BGMEDIA_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
@@ -67,6 +72,11 @@ foreach(test_name audio analysis cache sync choreography motion timeline warp sy
         LABELS "unit"
     )
 endforeach()
+
+if(TARGET bgmedia_vox)
+    add_test(NAME bgmedia.vox COMMAND bgmedia_tests vox.)
+    set_tests_properties(bgmedia.vox PROPERTIES TIMEOUT 120 LABELS "unit")
+endif()
 
 if(TARGET bgmedia_wave_opus OR TARGET bgmedia_wave_webrtc)
     add_test(NAME bgmedia.wave_real COMMAND bgmedia_tests wave_real.)
