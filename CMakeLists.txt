@@ -181,6 +181,10 @@ if(BGMEDIA_BUILD_VOX)
         src/vox/VoxTranscribe.cpp
         src/vox/VoxTranscribeCapi.cpp
         src/vox/VoxResample.cpp
+        src/vox/VoxLyricsText.cpp
+        src/vox/VoxLyricsVocal.cpp
+        src/vox/VoxLyricsAlign.cpp
+        src/vox/VoxLyricsCapi.cpp
     )
     add_library(BGMedia::Vox ALIAS bgmedia_vox)
     target_include_directories(bgmedia_vox

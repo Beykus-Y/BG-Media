@@ -332,4 +332,155 @@ inline double pauseSnrDb(const Scenario& sc, const std::vector<float>& y) {
     return maskedRmsDb(y, sc.speechMask) - maskedRmsDb(y, sc.pauseMask);
 }
 
+// ---- music-like signals for BG Vox Lyrics -------------------------------------
+
+// Drum-like bed at 120 bpm: a 55 Hz decaying kick on every beat, a noise snare
+// on beats 2 and 4, noise hats on the 8ths; optionally a sustained harmonic pad
+// (a chord of 3 saw-ish notes) that sits in the vocal band, the hard case for
+// a harmonicity-based detector. Unit RMS.
+inline std::vector<float> makeDrumBed(std::uint32_t sampleRate, double seconds,
+                                      std::uint64_t seed, bool withPad = false) {
+    const double sr = static_cast<double>(sampleRate);
+    const std::size_t n = static_cast<std::size_t>(seconds * sr);
+    std::vector<float> x(n, 0.0f);
+    Rng rng(seed);
+    const double beat = 0.5;
+    for (std::size_t b = 0; static_cast<double>(b) * beat < seconds; ++b) {
+        const std::size_t t0 = static_cast<std::size_t>(static_cast<double>(b) * beat * sr);
+        // kick: 55 Hz sine, fast pitch drop, 180 ms decay
+        for (std::size_t i = 0; i < static_cast<std::size_t>(0.18 * sr) && t0 + i < n; ++i) {
+            const double t = static_cast<double>(i) / sr;
+            const double f = 55.0 + 60.0 * std::exp(-t / 0.02);
+            x[t0 + i] += static_cast<float>(0.9 * std::exp(-t / 0.06) *
+                                            std::sin(2.0 * kPi * f * t));
+        }
+        if (b % 2 == 1) {  // snare: noise burst + 180 Hz body
+            for (std::size_t i = 0; i < static_cast<std::size_t>(0.2 * sr) && t0 + i < n; ++i) {
+                const double t = static_cast<double>(i) / sr;
+                x[t0 + i] += static_cast<float>(std::exp(-t / 0.05) *
+                                                (0.5 * rng.gauss() + 0.3 * std::sin(2.0 * kPi * 180.0 * t)));
+            }
+        }
+        for (int h = 0; h < 2; ++h) {  // hats: differentiated noise
+            const std::size_t th = t0 + static_cast<std::size_t>(h * 0.5 * beat * sr);
+            double prev = 0.0;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(0.04 * sr) && th + i < n; ++i) {
+                const double t = static_cast<double>(i) / sr;
+                const double g = rng.gauss();
+                x[th + i] += static_cast<float>(0.25 * std::exp(-t / 0.012) * (g - prev));
+                prev = g;
+            }
+        }
+    }
+    if (withPad) {
+        const double notes[3] = {146.83, 185.0, 220.0};
+        for (double f0 : notes) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const double t = static_cast<double>(i) / sr;
+                double v = 0.0;
+                for (int h = 1; h <= 8; ++h) {
+                    v += std::sin(2.0 * kPi * f0 * h * t) / h;
+                }
+                x[i] += static_cast<float>(0.22 * v);
+            }
+        }
+    }
+    scaleToRms(x, 1.0);
+    return x;
+}
+
+struct VoiceSpan {
+    double startSec;
+    double endSec;
+};
+
+struct MusicSignal {
+    std::vector<float> samples;  // mono
+    std::vector<VoiceSpan> spans;  // where the "singer" is active
+};
+
+// A "sung" lead over the drum bed: legato notes of 0.4-0.9 s on a pentatonic
+// scale (200-450 Hz) with 5.5 Hz vibrato (about +-0.5 semitone), 14 harmonics
+// shaped by two formants. The voice RMS inside the spans is `voiceToBedDb`
+// relative to the bed RMS. Whole signal is scaled to peak 0.8.
+inline MusicSignal makeSungMusic(std::uint32_t sampleRate, double seconds,
+                                 const std::vector<VoiceSpan>& spans, std::uint64_t seed,
+                                 double voiceToBedDb = 0.0, bool withPad = false) {
+    const double sr = static_cast<double>(sampleRate);
+    MusicSignal out;
+    out.spans = spans;
+    out.samples = makeDrumBed(sampleRate, seconds, seed, withPad);
+    const std::size_t n = out.samples.size();
+    std::vector<float> voice(n, 0.0f);
+    Rng rng(seed + 1000);
+    const double scale[5] = {1.0, 1.122, 1.260, 1.498, 1.682};
+    for (const VoiceSpan& sp : spans) {
+        double t = sp.startSec;
+        double phase = 0.0;
+        while (t < sp.endSec) {
+            const double len = std::min(rng.range(0.4, 0.9), sp.endSec - t);
+            const double f0 = 200.0 * scale[static_cast<int>(rng.range(0.0, 4.999))] *
+                              (rng.uniform() < 0.3 ? 2.0 : 1.0);
+            const double f1 = rng.range(400.0, 800.0);
+            const double f2 = rng.range(1200.0, 2400.0);
+            const std::size_t i0 = static_cast<std::size_t>(t * sr);
+            const std::size_t i1 = std::min(n, static_cast<std::size_t>((t + len) * sr));
+            for (std::size_t i = i0; i < i1; ++i) {
+                const double tt = static_cast<double>(i) / sr;
+                const double f = f0 * (1.0 + 0.03 * std::sin(2.0 * kPi * 5.5 * tt));
+                phase += 2.0 * kPi * f / sr;
+                if (phase > 2.0 * kPi) {
+                    phase -= 2.0 * kPi;
+                }
+                double v = 0.0;
+                for (int h = 1; h <= 14; ++h) {
+                    const double fh = h * f;
+                    if (fh > 0.45 * sr) {
+                        break;
+                    }
+                    const double g = std::exp(-0.5 * std::pow((fh - f1) / 150.0, 2.0)) +
+                                     0.6 * std::exp(-0.5 * std::pow((fh - f2) / 250.0, 2.0)) + 0.05;
+                    v += g / static_cast<double>(h) * std::sin(h * phase);
+                }
+                const double rel = static_cast<double>(i - i0) / static_cast<double>(i1 - i0);
+                const double env = std::min({1.0, rel / 0.03, (1.0 - rel) / 0.03});  // legato edges
+                voice[i] = static_cast<float>(v * std::max(0.05, env));
+            }
+            t += len;
+        }
+        // edge fades of the whole span (a singer breathes in and out)
+        const std::size_t a = static_cast<std::size_t>(sp.startSec * sr);
+        const std::size_t b = std::min(n, static_cast<std::size_t>(sp.endSec * sr));
+        const std::size_t fade = static_cast<std::size_t>(0.03 * sr);
+        for (std::size_t k = 0; k < fade && a + k < b; ++k) {
+            voice[a + k] *= static_cast<float>(k) / static_cast<float>(fade);
+        }
+        for (std::size_t k = 0; k < fade && b > k && b - k > a; ++k) {
+            voice[b - 1 - k] *= static_cast<float>(k) / static_cast<float>(fade);
+        }
+    }
+    // voice RMS over its spans
+    double ss = 0.0;
+    std::size_t cnt = 0;
+    for (const VoiceSpan& sp : spans) {
+        const std::size_t a = static_cast<std::size_t>(sp.startSec * sr);
+        const std::size_t b = std::min(n, static_cast<std::size_t>(sp.endSec * sr));
+        for (std::size_t i = a; i < b; ++i) {
+            ss += static_cast<double>(voice[i]) * voice[i];
+            ++cnt;
+        }
+    }
+    const double vr = cnt ? std::sqrt(ss / static_cast<double>(cnt)) : 1.0;
+    const double gain = std::pow(10.0, voiceToBedDb / 20.0) / std::max(vr, 1e-9);
+    float peak = 1e-9f;
+    for (std::size_t i = 0; i < n; ++i) {
+        out.samples[i] += static_cast<float>(gain * voice[i]);
+        peak = std::max(peak, std::fabs(out.samples[i]));
+    }
+    for (float& v : out.samples) {
+        v *= 0.8f / peak;
+    }
+    return out;
+}
+
 } // namespace bgmedia::voxsynth
