@@ -7,9 +7,11 @@
  * model) that the host destroys with bgm_vox_asr_free(). bgm_vox_transcribe_s16()
  * returns a result handle that the host destroys with bgm_vox_transcript_free().
  * Strings returned by accessors are owned by the result handle and stay valid
- * until it is freed. One backend handle must not be used by two threads at the
- * same time (calls on the same handle are serialised internally, the second
- * caller waits). The text is a MACHINE transcript: always label it as such. */
+ * until it is freed. A backend handle must not be used concurrently from two
+ * threads: the host serialises calls on one handle (it may create one handle per
+ * thread instead). Calling bgm_vox_asr_free() while a transcribe on that handle
+ * is still in flight is undefined behaviour; cancel, wait for the call to
+ * return, then free. The text is a MACHINE transcript: always label it as such. */
 
 #include <stddef.h>
 #include <stdint.h>

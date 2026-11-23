@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -22,7 +23,10 @@ using namespace bgmedia::voxsynth;
 // Deterministic stand-in for an ASR engine. Records every chunk it is given.
 class FakeBackend final : public IVoxAsrBackend {
 public:
-    enum class Mode { Simple, Probe, Tiling };
+    enum class Mode { Simple, Probe, Tiling, Custom };
+    // Mode::Custom: fills `out` for call `index` of a chunk lasting `dur` seconds.
+    std::function<void(int index, double dur, std::vector<VoxSegment>& out)> custom;
+    bool translation = false;
     Mode mode = Mode::Simple;
     std::uint32_t rate = 16000;
     std::vector<float> confidences = {0.9f};  // cycled per segment
@@ -49,6 +53,7 @@ public:
         i.approxRamBytes = 1234;
         i.modelFileBytes = 99;
         i.multilingual = true;
+        i.supportsTranslation = translation;
         return i;
     }
 
@@ -95,6 +100,8 @@ public:
             add(0.1, 0.3, "a" + k);
             add(5.0, 6.0, "b" + k);
             add(dur - 0.3, dur - 0.1, "c" + k);
+        } else if (mode == Mode::Custom) {
+            custom(index, dur, out);
         } else {
             add(0.0, dur + 50.0, "huge" + k);   // runs past the chunk and the recording
             add(-3.0, 0.5, "neg" + k);          // starts before the chunk
@@ -612,4 +619,118 @@ TEST_CASE(vox_transcribe.capi_without_backend) {
     bgm_vox_transcript_free(nullptr);
     bgm_vox_asr_free(nullptr);
     CHECK(bgm_vox_asr_info(nullptr, nullptr, nullptr) != 0);
+}
+
+TEST_CASE(vox_transcribe.padding_hallucinations_are_dropped) {
+    FakeBackend fake;
+    fake.mode = FakeBackend::Mode::Custom;
+    fake.custom = [](int, double dur, std::vector<VoxSegment>& out) {
+        VoxSegment real;
+        real.startSec = 1.0;
+        real.endSec = 2.0;
+        real.text = "real";
+        VoxWord w1;
+        w1.text = "real";
+        w1.startSec = 1.0;
+        w1.endSec = 2.0;
+        VoxWord w2;  // word that starts in the padding
+        w2.text = "ghost";
+        w2.startSec = dur + 0.2;
+        w2.endSec = dur + 0.5;
+        real.words = {w1, w2};
+        out.push_back(real);
+        VoxSegment ghost;  // starts exactly at / after the real end
+        ghost.startSec = dur;
+        ghost.endSec = dur + 0.4;
+        ghost.text = "Thanks for watching";
+        out.push_back(ghost);
+        VoxSegment later = ghost;
+        later.startSec = dur + 0.3;
+        later.endSec = dur + 0.9;
+        out.push_back(later);
+    };
+    const auto pcm = speechPcm(2.5, 21);
+    auto t = run(fake, pcm);
+    CHECK(t.status == VoxTranscribeStatus::Ok);
+    CHECK(t.segments.size() == 1);
+    CHECK(t.segments[0].text == "real");
+    CHECK(t.segments[0].words.size() == 1);
+}
+
+TEST_CASE(vox_transcribe.translation_requires_backend_support) {
+    const auto pcm = speechPcm(2.5, 22);
+    VoxTranscribeOptions o;
+    o.translateToEnglish = true;
+    FakeBackend no;
+    auto t = run(no, pcm, 16000, 1, o);
+    CHECK(t.status == VoxTranscribeStatus::InvalidInput);
+    CHECK(no.calls.empty());
+    FakeBackend yes;
+    yes.translation = true;
+    t = run(yes, pcm, 16000, 1, o);
+    CHECK(t.status == VoxTranscribeStatus::Ok);
+}
+
+TEST_CASE(vox_transcribe.overlap_tail_kept_when_new_chunk_has_nothing_past_handover) {
+    FakeBackend fake;
+    fake.mode = FakeBackend::Mode::Custom;
+    fake.custom = [](int index, double dur, std::vector<VoxSegment>& out) {
+        auto add = [&](double a, double b, const std::string& text) {
+            VoxSegment s;
+            s.startSec = a;
+            s.endSec = b;
+            s.text = text + std::to_string(index);
+            s.confidence = 0.9f;
+            out.push_back(std::move(s));
+        };
+        if (index == 0) {
+            add(0.1, 0.3, "a");
+            add(dur - 0.3, dur - 0.1, "tail");
+        } else if (index == 1) {
+            add(0.0, 0.1, "dup");  // entirely inside the overlap, before the handover
+        } else {
+            add(5.0, 6.0, "b");
+        }
+    };
+    const auto pcm = noPausePcm(70.0);
+    VoxTranscribeOptions o;
+    o.chunkSeconds = 30.0;
+    auto t = run(fake, pcm, 16000, 1, o);
+    CHECK(t.status == VoxTranscribeStatus::Ok);
+    std::vector<std::string> texts;
+    for (const auto& s : t.segments) {
+        texts.push_back(s.text);
+    }
+    const std::vector<std::string> expected = {"a0", "tail0", "b2"};
+    CHECK(texts == expected);
+}
+
+TEST_CASE(vox_transcribe.invalid_utf8_is_replaced) {
+    FakeBackend fake;
+    fake.mode = FakeBackend::Mode::Custom;
+    fake.custom = [](int, double, std::vector<VoxSegment>& out) {
+        VoxSegment a;
+        a.startSec = 0.5;
+        a.endSec = 1.0;
+        a.text = std::string("ok \xD0\xBF\xD1\x80 caf\xC3");       // truncated 2-byte tail
+        VoxWord w;
+        w.text = "x\xE2\x82";                                          // truncated 3-byte
+        w.startSec = 0.5;
+        w.endSec = 0.8;
+        a.words = {w};
+        out.push_back(a);
+        VoxSegment b;
+        b.startSec = 1.0;
+        b.endSec = 1.5;
+        b.text = std::string("\xA9 \xC0\xAF \xED\xA0\x80 fin");   // stray cont., overlong, surrogate
+        out.push_back(b);
+    };
+    const auto pcm = speechPcm(2.5, 23);
+    auto t = run(fake, pcm);
+    CHECK(t.status == VoxTranscribeStatus::Ok);
+    CHECK(t.segments.size() == 2);
+    CHECK(t.segments[0].text == "ok \xD0\xBF\xD1\x80 caf\xEF\xBF\xBD");
+    CHECK(t.segments[0].words.size() == 1);
+    CHECK(t.segments[0].words[0].text == "x\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(t.segments[1].text == "\xEF\xBF\xBD \xEF\xBF\xBD\xEF\xBF\xBD \xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD fin");
 }

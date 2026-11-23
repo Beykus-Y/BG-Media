@@ -13,6 +13,16 @@ target_include_directories(bgmedia_vox_whisper
         ${PROJECT_SOURCE_DIR}/src/vox
 )
 target_link_libraries(bgmedia_vox_whisper PUBLIC bgmedia_vox PRIVATE whisper)
+# Treat the upstream whisper/ggml headers as system headers so that strict
+# warning flags (/W4 /WX, -Werror) do not fail on code we do not own.
+foreach(_bgm_dep whisper ggml)
+    if(TARGET ${_bgm_dep})
+        get_target_property(_bgm_inc ${_bgm_dep} INTERFACE_INCLUDE_DIRECTORIES)
+        if(_bgm_inc)
+            target_include_directories(bgmedia_vox_whisper SYSTEM PRIVATE ${_bgm_inc})
+        endif()
+    endif()
+endforeach()
 target_compile_features(bgmedia_vox_whisper PUBLIC cxx_std_20)
 target_compile_options(bgmedia_vox_whisper PRIVATE ${BGMEDIA_WARNING_FLAGS})
 if(MSVC)

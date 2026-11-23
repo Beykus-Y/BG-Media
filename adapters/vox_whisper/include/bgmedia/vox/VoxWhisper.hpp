@@ -14,10 +14,8 @@ namespace bgmedia::vox {
 struct VoxWhisperConfig {
     // UTF-8 path to a ggml whisper model (ggml-tiny.bin, ggml-base.bin, ...).
     // Downloading, verifying and deleting model files is the host's job.
-    // Note: whisper.cpp opens the file with fopen(), so on Windows a path with
-    // characters outside the active code page may fail to load even though the
-    // existence check (std::filesystem) succeeded; keep model files in an
-    // ASCII path there.
+    // whisper.cpp (v1.9.5) converts the UTF-8 path to a wide path on Windows
+    // before opening it, so non-ASCII model paths are supported.
     std::string modelPath;
     bool useGpu = false;  // CPU by default; GPU only if whisper.cpp was built with it
     int threads = 0;      // 0 = min(4, hardware concurrency)

@@ -98,6 +98,24 @@ bool writeJson(const std::string& path, const VoxTranscript& t) {
     return static_cast<bool>(f);
 }
 
+// A blank line ends an SRT cue, so collapse any run of line breaks in the text.
+std::string srtText(const std::string& text) {
+    std::string out;
+    bool pendingBreak = false;
+    for (char ch : text) {
+        if (ch == '\n' || ch == '\r') {
+            pendingBreak = true;
+            continue;
+        }
+        if (pendingBreak && !out.empty()) {
+            out += '\n';
+        }
+        pendingBreak = false;
+        out += ch;
+    }
+    return out;
+}
+
 bool writeSrt(const std::string& path, const VoxTranscript& t) {
     std::ofstream f(path);
     if (!f) {
@@ -107,7 +125,7 @@ bool writeSrt(const std::string& path, const VoxTranscript& t) {
     for (const VoxSegment& s : t.segments) {
         f << ++index << "\n"
           << srtTime(s.startSec) << " --> " << srtTime(s.endSec) << "\n"
-          << s.text << "\n\n";
+          << srtText(s.text) << "\n\n";
     }
     return static_cast<bool>(f);
 }

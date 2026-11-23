@@ -49,8 +49,9 @@ struct VoxTranscribeOptions {
     // the detected language is then fixed for the remaining chunks so a long
     // message does not flip between languages.
     std::string language;
-    // Ask the backend to translate to English instead of transcribing. Only
-    // honoured when the backend reports supportsTranslation.
+    // Ask the backend to translate to English instead of transcribing. The
+    // frontend returns InvalidInput when the backend does not report
+    // supportsTranslation.
     bool translateToEnglish = false;
     // Fill VoxSegment::words (only if the backend supports it; costs CPU).
     bool wordTimestamps = false;
@@ -60,7 +61,8 @@ struct VoxTranscribeOptions {
     int threads = 0;
     // Target chunk length (clamped to 2..600 s). Audio longer than this is cut
     // at the quietest pause in the last half of the window; only when no pause
-    // exists the cut is hard, with a short overlap that is de-duplicated.
+    // exists the cut is hard, with a short overlap; duplicates from it are
+    // suppressed in the common case (not guaranteed).
     double chunkSeconds = 30.0;
     // Optional text that biases the decoder (names, jargon). Backend-specific.
     std::string initialPrompt;

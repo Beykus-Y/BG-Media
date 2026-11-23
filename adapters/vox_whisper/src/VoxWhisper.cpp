@@ -127,8 +127,9 @@ public:
         p.progress_callback = &progressCallback;
         p.progress_callback_user_data = &cb;
 
-        // whisper needs at least 1 s of audio; pad short chunks with silence (the
-        // frontend clamps the resulting timestamps back to the real duration).
+        // whisper.cpp rejects input shorter than 100 ms, and very short clips decode
+        // poorly; pad short chunks with silence to ~1.1 s. The frontend drops
+        // segments that start in the padding and clamps the rest to the real duration.
         const std::size_t minFrames = 16000 + 1600;
         std::vector<float> padded;
         const float* data = mono;
@@ -237,6 +238,23 @@ std::unique_ptr<IVoxAsrBackend> createWhisperBackend(const VoxWhisperConfig& con
         }
         return std::unique_ptr<IVoxAsrBackend>();
     };
+    // Used from catch blocks of this noexcept function: never throws (the message
+    // is dropped when even the small string cannot be allocated).
+    auto failLiteral = [&](VoxTranscribeStatus st, const char* msg) noexcept {
+        try {
+            if (error != nullptr) {
+                *error = msg;
+            }
+        } catch (...) {
+            if (error != nullptr) {
+                error->clear();
+            }
+        }
+        if (status != nullptr) {
+            *status = st;
+        }
+        return std::unique_ptr<IVoxAsrBackend>();
+    };
     try {
         if (config.modelPath.empty()) {
             return fail(VoxTranscribeStatus::ModelUnavailable, "model path is empty");
@@ -254,7 +272,12 @@ std::unique_ptr<IVoxAsrBackend> createWhisperBackend(const VoxWhisperConfig& con
         }
         whisper_context_params cp = whisper_context_default_params();
         cp.use_gpu = config.useGpu;
-        whisper_context* ctx = whisper_init_from_file_with_params(config.modelPath.c_str(), cp);
+        // Owned here until the backend takes over, so a throw below cannot leak it.
+        struct CtxFree {
+            void operator()(whisper_context* c) const noexcept { whisper_free(c); }
+        };
+        std::unique_ptr<whisper_context, CtxFree> ctx(
+            whisper_init_from_file_with_params(config.modelPath.c_str(), cp));
         if (ctx == nullptr) {
             return fail(VoxTranscribeStatus::ModelUnavailable,
                         "whisper.cpp could not load the model (corrupt, truncated or unsupported "
@@ -266,15 +289,17 @@ std::unique_ptr<IVoxAsrBackend> createWhisperBackend(const VoxWhisperConfig& con
         }
         const std::u8string stem8 = path.stem().u8string();
         std::string name(reinterpret_cast<const char*>(stem8.data()), stem8.size());
-        auto backend = std::make_unique<WhisperBackend>(ctx, name, bytes, threads);
+        auto backend = std::make_unique<WhisperBackend>(ctx.get(), name, bytes, threads);
+        ctx.release();  // the backend owns the context now
         if (status != nullptr) {
             *status = VoxTranscribeStatus::Ok;
         }
         return backend;
     } catch (const std::bad_alloc&) {
-        return fail(VoxTranscribeStatus::OutOfMemory, "out of memory while loading the model");
+        return failLiteral(VoxTranscribeStatus::OutOfMemory, "out of memory while loading the model");
     } catch (...) {
-        return fail(VoxTranscribeStatus::InternalError, "unexpected exception while loading the model");
+        return failLiteral(VoxTranscribeStatus::InternalError,
+                           "unexpected exception while loading the model");
     }
 }
 

@@ -42,6 +42,55 @@ std::string trimmed(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
+// Replaces invalid UTF-8 (stray continuation bytes, truncated or overlong
+// sequences, surrogates, > U+10FFFF) with U+FFFD. whisper may split a multibyte
+// character across two segments, so segment text is not always valid UTF-8.
+std::string sanitizeUtf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+    const std::size_t n = s.size();
+    std::size_t i = 0;
+    auto cont = [&](std::size_t k) { return k < n && (p[k] & 0xC0u) == 0x80u; };
+    while (i < n) {
+        const unsigned char c = p[i];
+        std::size_t len = 0;
+        if (c < 0x80) {
+            len = 1;
+        } else if (c >= 0xC2 && c <= 0xDF && cont(i + 1)) {
+            len = 2;
+        } else if (c >= 0xE0 && c <= 0xEF && cont(i + 1) && cont(i + 2)) {
+            const unsigned cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu);
+            if (cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF)) {
+                len = 3;
+            }
+        } else if (c >= 0xF0 && c <= 0xF4 && cont(i + 1) && cont(i + 2) && cont(i + 3)) {
+            const unsigned cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) |
+                                ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu);
+            if (cp >= 0x10000 && cp <= 0x10FFFF) {
+                len = 4;
+            }
+        }
+        if (len == 0) {
+            out += "\xEF\xBF\xBD";
+            ++i;
+        } else {
+            out.append(s, i, len);
+            i += len;
+        }
+    }
+    return out;
+}
+
+// Assigns a status detail without ever throwing (callers are noexcept).
+void setDetail(VoxTranscript& res, const char* text) noexcept {
+    try {
+        res.detail = text;
+    } catch (...) {
+        res.detail.clear();
+    }
+}
+
 struct Exit {
     VoxTranscribeStatus status;
     const char* detail;
@@ -157,8 +206,17 @@ void sanitizeSegments(std::vector<VoxSegment>& segs, double chunkStartSec, doubl
         t = std::min(std::max(t, 0.0), chunkDurSec);
         return std::min(t + chunkStartSec, audioSec);
     };
+    // Whisper pads short chunks with silence and may hallucinate text there; such
+    // segments start at or after the real end of the chunk and are dropped
+    // (before clamping would turn them into zero-length segments at the end).
+    constexpr double kEndEps = 0.01;
+    const double cutoff = chunkDurSec - kEndEps;
+    auto pastEnd = [&](double t) { return std::isfinite(t) && t >= cutoff; };
+    segs.erase(std::remove_if(segs.begin(), segs.end(),
+                              [&](const VoxSegment& s) { return pastEnd(s.startSec); }),
+               segs.end());
     for (VoxSegment& s : segs) {
-        s.text = trimmed(s.text);
+        s.text = trimmed(sanitizeUtf8(s.text));
         const double a = fixTime(s.startSec);
         const double b = fixTime(s.endSec);
         s.startSec = std::min(a, b);
@@ -171,8 +229,8 @@ void sanitizeSegments(std::vector<VoxSegment>& segs, double chunkStartSec, doubl
         std::vector<VoxWord> words;
         words.reserve(s.words.size());
         for (VoxWord& w : s.words) {
-            w.text = trimmed(w.text);
-            if (w.text.empty()) {
+            w.text = trimmed(sanitizeUtf8(w.text));
+            if (w.text.empty() || pastEnd(w.startSec)) {
                 continue;
             }
             const double wa = fixTime(w.startSec);
@@ -192,7 +250,13 @@ void sanitizeSegments(std::vector<VoxSegment>& segs, double chunkStartSec, doubl
     });
 }
 
-void run(IVoxAsrBackend* backend, const float* in, std::size_t frames, VoxPcmFormat format,
+inline bool sampleOk(float v) { return std::isfinite(v); }
+inline bool sampleOk(std::int16_t) { return true; }
+inline float sampleToFloat(float v) { return v; }
+inline float sampleToFloat(std::int16_t v) { return static_cast<float>(v) / 32768.0f; }
+
+template <typename Sample>
+void run(IVoxAsrBackend* backend, const Sample* in, std::size_t frames, VoxPcmFormat format,
          const VoxTranscribeOptions& options, const VoxCancelToken* cancel,
          const VoxProgressFn& progressFn, VoxTranscript& res) {
     auto cancelled = [&]() { return cancel != nullptr && cancel->isCancelled(); };
@@ -226,19 +290,24 @@ void run(IVoxAsrBackend* backend, const float* in, std::size_t frames, VoxPcmFor
         throw Exit{VoxTranscribeStatus::BackendError, "backend sample rate outside 8000..48000"};
     }
     res.backendName = backend->name() != nullptr ? backend->name() : "";
-    res.modelName = backend->info().modelName;
+    const VoxAsrBackendInfo backendInfo = backend->info();
+    res.modelName = backendInfo.modelName;
+    if (options.translateToEnglish && !backendInfo.supportsTranslation) {
+        throw Exit{VoxTranscribeStatus::InvalidInput, "backend does not support translation"};
+    }
 
-    // ---- downmix to mono (finite check on the way) ----
+    // ---- downmix to mono straight from the input type (finite check on the way);
+    // no full-length float copy of the interleaved input is ever made ----
     std::vector<float> mono(frames);
     const std::size_t total = frames * channels;
     for (std::size_t i = 0, o = 0; i < total; i += channels, ++o) {
         float acc = 0.0f;
         for (std::size_t c = 0; c < channels; ++c) {
-            const float v = in[i + c];
-            if (!std::isfinite(v)) {
+            const Sample raw = in[i + c];
+            if (!sampleOk(raw)) {
                 throw Exit{VoxTranscribeStatus::InvalidInput, "NaN or Inf in input"};
             }
-            acc += v;
+            acc += sampleToFloat(raw);
         }
         mono[o] = channels == 2 ? acc * 0.5f : acc;
     }
@@ -359,16 +428,23 @@ void run(IVoxAsrBackend* backend, const float* in, std::size_t frames, VoxPcmFor
             }
         }
 
-        // Overlap de-duplication around the handover point.
+        // Overlap de-duplication around the handover point. The previous chunk's
+        // tail is replaced only when this chunk produced something past the
+        // handover; otherwise the old tail is kept (never lose text).
         const double handover = static_cast<double>(c.handover) / rateD;
-        if (c.handover > c.begin) {
-            while (!res.segments.empty() &&
-                   0.5 * (res.segments.back().startSec + res.segments.back().endSec) >= handover) {
+        const bool overlapped = c.handover > c.begin;
+        auto midpoint = [](const VoxSegment& s) { return 0.5 * (s.startSec + s.endSec); };
+        const bool hasNew = std::any_of(chunkSegs.begin(), chunkSegs.end(),
+                                        [&](const VoxSegment& s) { return midpoint(s) >= handover; });
+        if (overlapped && hasNew) {
+            while (!res.segments.empty() && midpoint(res.segments.back()) >= handover) {
                 res.segments.pop_back();
             }
         }
         for (VoxSegment& s : chunkSegs) {
-            if (c.handover > c.begin && 0.5 * (s.startSec + s.endSec) < handover) {
+            // Segments before the handover duplicate the previous chunk's tail,
+            // which is kept either way.
+            if (overlapped && midpoint(s) < handover) {
                 continue;
             }
             res.segments.push_back(std::move(s));
@@ -396,61 +472,47 @@ std::string VoxTranscript::fullText() const {
     return out;
 }
 
-VoxTranscript transcribe(IVoxAsrBackend* backend, const float* interleaved, std::size_t frames,
-                         VoxPcmFormat format, const VoxTranscribeOptions& options,
-                         const VoxCancelToken* cancel, const VoxProgressFn& progress) noexcept {
+namespace {
+
+template <typename Sample>
+VoxTranscript transcribeImpl(IVoxAsrBackend* backend, const Sample* interleaved, std::size_t frames,
+                             VoxPcmFormat format, const VoxTranscribeOptions& options,
+                             const VoxCancelToken* cancel, const VoxProgressFn& progress) noexcept {
     const auto t0 = std::chrono::steady_clock::now();
     VoxTranscript res;
     try {
         run(backend, interleaved, frames, format, options, cancel, progress, res);
     } catch (const Exit& e) {
         res.status = e.status;
-        res.detail = e.detail;
+        setDetail(res, e.detail);
     } catch (const std::bad_alloc&) {
         res.status = VoxTranscribeStatus::OutOfMemory;
-        res.detail = "out of memory";
+        setDetail(res, "out of memory");
     } catch (const std::exception& e) {
         res.status = VoxTranscribeStatus::InternalError;
-        try {
-            res.detail = e.what();
-        } catch (...) {
-        }
+        setDetail(res, e.what());
     } catch (...) {
         res.status = VoxTranscribeStatus::InternalError;
-        res.detail = "unknown exception";
+        setDetail(res, "unknown exception");
     }
     res.processingMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return res;
 }
 
+} // namespace
+
+VoxTranscript transcribe(IVoxAsrBackend* backend, const float* interleaved, std::size_t frames,
+                         VoxPcmFormat format, const VoxTranscribeOptions& options,
+                         const VoxCancelToken* cancel, const VoxProgressFn& progress) noexcept {
+    return transcribeImpl(backend, interleaved, frames, format, options, cancel, progress);
+}
+
 VoxTranscript transcribe(IVoxAsrBackend* backend, const std::int16_t* interleaved,
                          std::size_t frames, VoxPcmFormat format,
                          const VoxTranscribeOptions& options, const VoxCancelToken* cancel,
                          const VoxProgressFn& progress) noexcept {
-    try {
-        if (interleaved == nullptr || frames == 0 || !isSupportedFormat(format)) {
-            // Let the float path produce the right status without converting.
-            return transcribe(backend, static_cast<const float*>(nullptr), frames, format,
-                              options, cancel, progress);
-        }
-        if (frames > std::numeric_limits<std::size_t>::max() / (format.channels * sizeof(float)) / 2) {
-            VoxTranscript res;
-            res.status = VoxTranscribeStatus::TooLong;
-            res.detail = "input too large";
-            return res;
-        }
-        std::vector<float> pcm(frames * format.channels);
-        for (std::size_t i = 0; i < pcm.size(); ++i) {
-            pcm[i] = static_cast<float>(interleaved[i]) / 32768.0f;
-        }
-        return transcribe(backend, pcm.data(), frames, format, options, cancel, progress);
-    } catch (...) {
-        VoxTranscript res;
-        res.status = VoxTranscribeStatus::OutOfMemory;
-        res.detail = "out of memory converting int16 input";
-        return res;
-    }
+    return transcribeImpl(backend, interleaved, frames, format, options, cancel, progress);
 }
 
 } // namespace bgmedia::vox
