@@ -12,6 +12,7 @@ project(BGMedia
 # ---------------------------------------------------------------------------
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
+option(BGMEDIA_BUILD_VOX            "Build the BG Vox voice enhancement library (independent of core)" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
 option(BGMEDIA_BUILD_WAVE_OPUS      "Build the optional libopus BG Wave codec adapter" OFF)
 option(BGMEDIA_BUILD_WAVE_WEBRTC    "Build the optional libdatachannel BG Wave P2P transport adapter" OFF)
@@ -166,6 +167,61 @@ target_compile_features(bgmedia_rig PUBLIC cxx_std_20)
 target_compile_options(bgmedia_rig PRIVATE ${BGMEDIA_WARNING_FLAGS})
 
 # ---------------------------------------------------------------------------
+# BG Vox: offline voice enhancement for host-recorded PCM. Independent of
+# bgmedia_core (enhance-only builds); it carries its own copy of KissFFT.
+# ---------------------------------------------------------------------------
+if(BGMEDIA_BUILD_VOX)
+    add_library(bgmedia_vox STATIC
+        src/vox/VoxEnhance.cpp
+        src/vox/VoxDenoiser.cpp
+        src/vox/VoxDsp.cpp
+        src/vox/VoxCapi.cpp
+    )
+    add_library(BGMedia::Vox ALIAS bgmedia_vox)
+    target_include_directories(bgmedia_vox
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/vox
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
+    )
+    target_compile_features(bgmedia_vox PUBLIC cxx_std_20)
+    target_compile_options(bgmedia_vox PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    # BG Vox compiles its own KissFFT objects with prefixed symbol names, so
+    # bgmedia_core and bgmedia_vox can be linked into one image (static,
+    # whole-archive or a single shared library) without duplicate symbols.
+    set(BGMEDIA_VOX_KISSFFT_DEFS
+        kiss_fft=bgvox_kiss_fft
+        kiss_fft_alloc=bgvox_kiss_fft_alloc
+        kiss_fft_cleanup=bgvox_kiss_fft_cleanup
+        kiss_fft_next_fast_size=bgvox_kiss_fft_next_fast_size
+        kiss_fft_stride=bgvox_kiss_fft_stride
+        kiss_fftr=bgvox_kiss_fftr
+        kiss_fftr_alloc=bgvox_kiss_fftr_alloc
+        kiss_fftri=bgvox_kiss_fftri
+    )
+    add_library(bgmedia_vox_kissfft OBJECT
+        third_party/kissfft/kiss_fft.c
+        third_party/kissfft/kiss_fftr.c
+    )
+    target_include_directories(bgmedia_vox_kissfft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
+    target_compile_definitions(bgmedia_vox_kissfft PRIVATE ${BGMEDIA_VOX_KISSFFT_DEFS})
+    target_compile_features(bgmedia_vox_kissfft PRIVATE c_std_99)
+    set_target_properties(bgmedia_vox_kissfft PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MSVC)
+        target_compile_options(bgmedia_vox_kissfft PRIVATE /W0)
+    else()
+        target_compile_options(bgmedia_vox_kissfft PRIVATE -w)
+    endif()
+    target_compile_definitions(bgmedia_vox PRIVATE ${BGMEDIA_VOX_KISSFFT_DEFS})
+    target_sources(bgmedia_vox PRIVATE $<TARGET_OBJECTS:bgmedia_vox_kissfft>)
+    if(MSVC)
+        target_compile_definitions(bgmedia_vox PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Adapters: miniaudio decoding only. Playback belongs to the host application,
 # which keeps the engine independent from any particular audio output API.
 # ---------------------------------------------------------------------------
@@ -225,7 +281,11 @@ endif()
 # ---------------------------------------------------------------------------
 # Installation of the reusable core.
 # ---------------------------------------------------------------------------
-install(TARGETS bgmedia_core bgmedia_vrm bgmedia_rig EXPORT BGMediaTargets
+set(BGMEDIA_INSTALL_TARGETS bgmedia_core bgmedia_vrm bgmedia_rig)
+if(TARGET bgmedia_vox)
+    list(APPEND BGMEDIA_INSTALL_TARGETS bgmedia_vox)
+endif()
+install(TARGETS ${BGMEDIA_INSTALL_TARGETS} EXPORT BGMediaTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

@@ -110,3 +110,15 @@ if(BGMEDIA_BUILD_WAVE_WEBRTC)
     endif()
     target_compile_options(bgmedia_wave_p2p_peer PRIVATE ${BGMEDIA_WARNING_FLAGS})
 endif()
+
+if(TARGET bgmedia_vox)
+    add_executable(bgmedia_vox_enhance
+        vox_enhance/main.cpp
+    )
+    target_link_libraries(bgmedia_vox_enhance PRIVATE bgmedia_vox)
+    target_include_directories(bgmedia_vox_enhance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(bgmedia_vox_enhance PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(MSVC)
+        target_compile_definitions(bgmedia_vox_enhance PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
+endif()
