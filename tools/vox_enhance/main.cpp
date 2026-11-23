@@ -9,6 +9,7 @@
 
 #include "bgmedia/vox/VoxEnhance.hpp"
 #include "support/VoxSynthetic.hpp"
+#include "support/WavFile.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -22,99 +23,11 @@
 #include <vector>
 
 using namespace bgmedia::vox;
+using bgmedia::toolsupport::readWav;
+using bgmedia::toolsupport::WavFile;
+using bgmedia::toolsupport::writeWav;
 
 namespace {
-
-struct Wav {
-    std::uint32_t sampleRate = 0;
-    std::uint32_t channels = 0;
-    std::vector<std::int16_t> samples;  // interleaved
-};
-
-std::uint32_t rd32(const unsigned char* p) {
-    return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
-           (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
-}
-std::uint16_t rd16(const unsigned char* p) {
-    return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
-}
-
-bool readWav(const std::string& path, Wav& wav, std::string& error) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        error = "cannot open " + path;
-        return false;
-    }
-    std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (d.size() < 12 || std::memcmp(d.data(), "RIFF", 4) != 0 || std::memcmp(d.data() + 8, "WAVE", 4) != 0) {
-        error = "not a RIFF/WAVE file";
-        return false;
-    }
-    std::size_t pos = 12;
-    bool haveFmt = false;
-    std::uint16_t format = 0;
-    std::uint16_t bits = 0;
-    while (pos + 8 <= d.size()) {
-        const std::uint32_t size = rd32(&d[pos + 4]);
-        const std::size_t body = pos + 8;
-        if (std::memcmp(&d[pos], "fmt ", 4) == 0 && body + 16 <= d.size()) {
-            format = rd16(&d[body]);
-            wav.channels = rd16(&d[body + 2]);
-            wav.sampleRate = rd32(&d[body + 4]);
-            bits = rd16(&d[body + 14]);
-            haveFmt = true;
-        } else if (std::memcmp(&d[pos], "data", 4) == 0) {
-            if (!haveFmt || format != 1 || bits != 16 || wav.channels < 1 || wav.channels > 2) {
-                error = "only PCM16 mono/stereo WAV is supported";
-                return false;
-            }
-            const std::size_t avail = std::min<std::size_t>(size, d.size() - body);
-            wav.samples.resize(avail / 2);
-            for (std::size_t i = 0; i < wav.samples.size(); ++i) {
-                wav.samples[i] = static_cast<std::int16_t>(rd16(&d[body + i * 2]));
-            }
-            return true;
-        }
-        pos = body + size + (size & 1u);
-    }
-    error = "no data chunk";
-    return false;
-}
-
-void wr32(std::ofstream& f, std::uint32_t v) {
-    const unsigned char b[4] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8),
-                                static_cast<unsigned char>(v >> 16), static_cast<unsigned char>(v >> 24)};
-    f.write(reinterpret_cast<const char*>(b), 4);
-}
-void wr16(std::ofstream& f, std::uint16_t v) {
-    const unsigned char b[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
-    f.write(reinterpret_cast<const char*>(b), 2);
-}
-
-bool writeWav(const std::string& path, std::uint32_t sr, std::uint32_t ch,
-              const std::vector<std::int16_t>& s) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) {
-        return false;
-    }
-    const std::uint32_t bytes = static_cast<std::uint32_t>(s.size() * 2);
-    f.write("RIFF", 4);
-    wr32(f, 36 + bytes);
-    f.write("WAVEfmt ", 8);
-    wr32(f, 16);
-    wr16(f, 1);
-    wr16(f, static_cast<std::uint16_t>(ch));
-    wr32(f, sr);
-    wr32(f, sr * ch * 2);
-    wr16(f, static_cast<std::uint16_t>(ch * 2));
-    wr16(f, 16);
-    f.write("data", 4);
-    wr32(f, bytes);
-    for (std::int16_t v : s) {
-        wr16(f, static_cast<std::uint16_t>(v));
-    }
-    return static_cast<bool>(f);
-}
 
 std::string jsonReport(const char* label, const VoxEnhanceReport& r, std::uint32_t sr) {
     const double seconds = static_cast<double>(r.frames) / static_cast<double>(sr);
@@ -142,7 +55,7 @@ VoxEnhanceResult run(const std::vector<float>& pcm, std::uint32_t sr, std::uint3
 std::vector<std::int16_t> quantise(const std::vector<float>& pcm) { return toInt16(pcm); }
 
 int processFile(const std::string& in, const std::string& prefix, const std::string& modeArg) {
-    Wav wav;
+    WavFile wav;
     std::string error;
     if (!readWav(in, wav, error)) {
         std::cerr << "error: " << error << "\n";

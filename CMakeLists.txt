@@ -13,6 +13,8 @@ project(BGMedia
 option(BGMEDIA_BUILD_TESTS          "Build unit and integration tests" ON)
 option(BGMEDIA_BUILD_TOOLS          "Build command line tools" ON)
 option(BGMEDIA_BUILD_VOX            "Build the BG Vox voice enhancement library (independent of core)" ON)
+option(BGMEDIA_VOX_WHISPER          "Build the optional whisper.cpp backend for BG Vox Transcribe (needs BGMEDIA_BUILD_VOX)" OFF)
+option(BGMEDIA_FETCH_VOX_DEPS       "Download whisper.cpp with FetchContent when not installed" ON)
 option(BGMEDIA_BUILD_MINIAUDIO      "Build the miniaudio decoding adapter" ON)
 option(BGMEDIA_BUILD_WAVE_OPUS      "Build the optional libopus BG Wave codec adapter" OFF)
 option(BGMEDIA_BUILD_WAVE_WEBRTC    "Build the optional libdatachannel BG Wave P2P transport adapter" OFF)
@@ -176,6 +178,9 @@ if(BGMEDIA_BUILD_VOX)
         src/vox/VoxDenoiser.cpp
         src/vox/VoxDsp.cpp
         src/vox/VoxCapi.cpp
+        src/vox/VoxTranscribe.cpp
+        src/vox/VoxTranscribeCapi.cpp
+        src/vox/VoxResample.cpp
     )
     add_library(BGMedia::Vox ALIAS bgmedia_vox)
     target_include_directories(bgmedia_vox
@@ -219,6 +224,14 @@ if(BGMEDIA_BUILD_VOX)
     if(MSVC)
         target_compile_definitions(bgmedia_vox PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
+    # Optional ASR backend (off by default: no ASR dependency or model is shipped).
+    if(BGMEDIA_VOX_WHISPER)
+        target_compile_definitions(bgmedia_vox PRIVATE BGMEDIA_VOX_WHISPER_ADAPTER=1)
+        add_subdirectory(adapters/vox_whisper)
+    endif()
+endif()
+if(BGMEDIA_VOX_WHISPER AND NOT BGMEDIA_BUILD_VOX)
+    message(WARNING "BGMEDIA_VOX_WHISPER requires BGMEDIA_BUILD_VOX; ignoring it")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -285,6 +298,8 @@ set(BGMEDIA_INSTALL_TARGETS bgmedia_core bgmedia_vrm bgmedia_rig)
 if(TARGET bgmedia_vox)
     list(APPEND BGMEDIA_INSTALL_TARGETS bgmedia_vox)
 endif()
+# bgmedia_vox_whisper is deliberately not exported: it links a (possibly
+# FetchContent-built) whisper target. Hosts add adapters/vox_whisper directly.
 install(TARGETS ${BGMEDIA_INSTALL_TARGETS} EXPORT BGMediaTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

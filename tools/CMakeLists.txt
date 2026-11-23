@@ -111,6 +111,18 @@ if(BGMEDIA_BUILD_WAVE_WEBRTC)
     target_compile_options(bgmedia_wave_p2p_peer PRIVATE ${BGMEDIA_WARNING_FLAGS})
 endif()
 
+if(TARGET bgmedia_vox_whisper)
+    add_executable(bgmedia_vox_transcribe
+        vox_transcribe/main.cpp
+    )
+    target_link_libraries(bgmedia_vox_transcribe PRIVATE bgmedia_vox_whisper)
+    target_include_directories(bgmedia_vox_transcribe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(bgmedia_vox_transcribe PRIVATE ${BGMEDIA_WARNING_FLAGS})
+    if(MSVC)
+        target_compile_definitions(bgmedia_vox_transcribe PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
+endif()
+
 if(TARGET bgmedia_vox)
     add_executable(bgmedia_vox_enhance
         vox_enhance/main.cpp
