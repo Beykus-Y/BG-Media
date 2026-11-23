@@ -434,6 +434,12 @@ VoxTranscript transcribe(IVoxAsrBackend* backend, const std::int16_t* interleave
             return transcribe(backend, static_cast<const float*>(nullptr), frames, format,
                               options, cancel, progress);
         }
+        if (frames > std::numeric_limits<std::size_t>::max() / (format.channels * sizeof(float)) / 2) {
+            VoxTranscript res;
+            res.status = VoxTranscribeStatus::TooLong;
+            res.detail = "input too large";
+            return res;
+        }
         std::vector<float> pcm(frames * format.channels);
         for (std::size_t i = 0; i < pcm.size(); ++i) {
             pcm[i] = static_cast<float>(interleaved[i]) / 32768.0f;
