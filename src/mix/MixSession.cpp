@@ -126,6 +126,13 @@ void MixSession::clearQueue() {
 
 void MixSession::play() {
     autoPlay_ = true;
+    {
+        std::lock_guard lock(mutex_);
+        if (manual_.active) {
+            manual_.paused = false;  // applied with the pending switch
+            return;
+        }
+    }
     engine_.setPaused(false);
     MixSnapshot snap = engine_.snapshot();
     DeckId master = snap.master;
@@ -158,6 +165,14 @@ void MixSession::play() {
 }
 
 void MixSession::pause() {
+    {
+        std::lock_guard lock(mutex_);
+        if (manual_.active) {
+            manual_.paused = true;  // applied with the pending switch
+            status_ = "Paused";
+            return;
+        }
+    }
     engine_.setPaused(true);
     std::lock_guard lock(mutex_);
     status_ = "Paused";
@@ -167,6 +182,10 @@ void MixSession::stopAll() {
     // Engine-side stop settles the decks and any active transition before the
     // paused early-out; pausing here and only clearing targetPlay left the
     // snapshots stuck on "playing" and blocked Clear Queue.
+    {
+        std::lock_guard lock(mutex_);
+        manual_.active = false;
+    }
     engine_.stop();
     autoPlay_ = false;
     nextRequested_ = false;
@@ -960,6 +979,183 @@ void MixSession::promoteEndedMaster(const MixSnapshot& snap) {
     }
 }
 
+namespace {
+// How long a manual switch waits for the hard stop to settle (decks silent,
+// engine idle) before giving up. Loads are rejected while the old track is
+// audible, so the switch is never forced; the normal settle is a few blocks.
+constexpr auto kManualGiveUpTimeout = std::chrono::milliseconds(2000);
+}
+
+MixSession::ManualSelectResult MixSession::manualSelect(std::uint64_t queueItemId) {
+    {
+        std::lock_guard lock(mutex_);
+        const Item* item = findItem(queueItemId);
+        if (!item) {
+            return ManualSelectResult::NotFound;
+        }
+        if (item->state != QueueState::Ready || !item->audio) {
+            return ManualSelectResult::NotReady;
+        }
+        if (!manual_.active) {
+            // Read before stop(): the engine forces paused while stopping.
+            manual_.paused = engine_.paused();
+        }
+        manual_.active = true;
+        manual_.id = queueItemId;
+        manual_.since = std::chrono::steady_clock::now();
+        nextRequested_ = false;
+        planDirty_ = true;
+        preview_ = {};
+        previewIsExecution_ = false;
+        status_ = "Switching track";
+    }
+    // Drops an active or planned transition without a crossfade. The decks
+    // then fade out inside the callback; applyManualRequest() takes over once
+    // they have settled.
+    engine_.stop();
+    return ManualSelectResult::Accepted;
+}
+
+MixSession::ManualSelectResult MixSession::manualNext() {
+    std::uint64_t target = 0;
+    {
+        std::lock_guard lock(mutex_);
+        // Base on the logical target, not a possibly stale engine snapshot, so
+        // rapid repeated Next presses keep advancing through the queue.
+        if (manual_.active) {
+            target = manual_.id;
+        }
+    }
+    if (target == 0) {
+        target = loadedId(masterDeck());
+    }
+    std::uint64_t candidate = 0;
+    QueueState candidateState = QueueState::Pending;
+    {
+        std::lock_guard lock(mutex_);
+        bool afterBase = (target == 0);
+        for (const Item& item : items_) {
+            if (!afterBase) {
+                if (item.id == target) afterBase = true;
+                continue;
+            }
+            if (item.state == QueueState::Played || item.state == QueueState::Failed) {
+                continue;
+            }
+            candidate = item.id;
+            candidateState = item.state;
+            break;
+        }
+    }
+    if (candidate == 0) {
+        return ManualSelectResult::NotFound;
+    }
+    if (candidateState != QueueState::Ready && candidateState != QueueState::Playing) {
+        return ManualSelectResult::NotReady;
+    }
+    return manualSelect(candidate);
+}
+
+void MixSession::restoreAfterFailedSwitch(const ManualRequest& req,
+                                          DeckId outgoing,
+                                          const std::string& reason) {
+    // The hard stop already dropped the old track's play request. Resume it
+    // so a failed switch does not leave the engine silently paused.
+    const MixSnapshot snap = engine_.snapshot();
+    if (!req.paused && snap.decks[deckIndex(outgoing)].loaded) {
+        engine_.setMaster(outgoing);
+        engine_.play(outgoing);
+    }
+    engine_.setPaused(req.paused);
+    std::lock_guard lock(mutex_);
+    manual_.active = false;
+    lastError_ = reason;
+    status_ = reason;
+    planDirty_ = true;
+}
+
+void MixSession::applyManualRequest() {
+    ManualRequest req;
+    {
+        std::lock_guard lock(mutex_);
+        if (!manual_.active) {
+            return;
+        }
+        req = manual_;
+    }
+    const MixSnapshot snap = engine_.snapshot();
+    const DeckId outgoing = snap.master;
+    const bool settled = snap.phase == TransitionPhase::Idle &&
+                         !snap.decks[0].playing && !snap.decks[1].playing;
+    if (!settled) {
+        if (std::chrono::steady_clock::now() - req.since < kManualGiveUpTimeout) {
+            return;  // keep waiting; the engine rejects loads until it settles
+        }
+        restoreAfterFailedSwitch(req, outgoing,
+                                 "Manual track switch timed out; resumed the previous track");
+        return;
+    }
+
+    DeckId target = DeckId::A;
+    std::string failure;
+    {
+        std::lock_guard lock(mutex_);
+        if (snap.decks[0].loaded && snap.decks[0].trackId == req.id) {
+            target = DeckId::A;
+        } else if (snap.decks[1].loaded && snap.decks[1].trackId == req.id) {
+            target = DeckId::B;
+        } else {
+            // Load into the deck that is not the outgoing master, so the cut
+            // does not reload the deck that is still fading out.
+            target = otherDeck(outgoing);
+            Item* item = findItem(req.id);
+            if (!item || !item->audio) {
+                failure = "Manual switch target is no longer available";
+            } else {
+                // Direct engine load: installDeck() ignores a rejected load
+                // (busy deck) and would leave the previous track in place.
+                const double bpm = item->analysis ? item->analysis->bpm : 0.0;
+                if (!engine_.loadDeck(target, item->audio, item->id, bpm)) {
+                    failure = "Could not load " + item->name + " into a free deck";
+                } else {
+                    status_ = "Loaded " + item->name;
+                    planDirty_ = true;
+                }
+            }
+        }
+    }
+    if (!failure.empty()) {
+        restoreAfterFailedSwitch(req, outgoing, failure);
+        return;
+    }
+
+    const DeckId other = otherDeck(target);
+    engine_.seek(target, 0.0);
+    engine_.pause(other);
+    engine_.play(target);
+    engine_.setMaster(target);
+    engine_.setPaused(req.paused);
+    if (!req.paused) {
+        autoPlay_ = true;
+    }
+
+    std::lock_guard lock(mutex_);
+    const std::uint64_t outgoingId = snap.decks[deckIndex(outgoing)].trackId;
+    if (outgoingId != 0 && outgoingId != req.id) {
+        if (Item* old = findItem(outgoingId)) {
+            old->state = QueueState::Played;
+        }
+    }
+    if (Item* item = findItem(req.id)) {
+        item->state = QueueState::Playing;
+    }
+    currentId_ = req.id;
+    manual_.active = false;
+    lastError_.clear();
+    status_ = req.paused ? "Paused" : "Playing";
+    planDirty_ = true;
+}
+
 void MixSession::update() {
     engine_.reclaimRetired();
     if (stretchDirty_) {
@@ -967,6 +1163,18 @@ void MixSession::update() {
     }
     collectCompleted();
     startWorkerIfNeeded();
+    {
+        bool pending = false;
+        {
+            std::lock_guard lock(mutex_);
+            pending = manual_.active;
+        }
+        if (pending) {
+            // Auto scheduling and EOF promotion must not race a manual cut.
+            applyManualRequest();
+            return;
+        }
+    }
     handleTransitionCompletion();
     pruneFinishedItems();
     serviceDecks();

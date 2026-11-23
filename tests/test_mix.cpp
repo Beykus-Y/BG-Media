@@ -1244,6 +1244,85 @@ TEST_CASE("mix.session_next_starts_at_current_position") {
     CHECK(started < position + 2.5);
 }
 
+TEST_CASE("mix.session_manual_select_cuts_without_transition") {
+    // BG-Media#77: an explicit track selection is an immediate cut. It must not
+    // schedule a crossfade, and the target starts from the beginning.
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    REQUIRE(pump.waitForDecks(2));
+
+    session.setAdaptive(true);
+    session.setTransitionDuration(0.0);
+    session.play();
+    pump.forSeconds(2.0);
+
+    const bgmedia::mix::MixSnapshot before = engine.snapshot();
+    const DeckId outgoing = before.master;
+    const DeckId incoming = otherDeck(outgoing);
+    const std::uint64_t targetId = before.decks[deckIndex(incoming)].trackId;
+    REQUIRE(targetId != 0);
+
+    CHECK(session.manualSelect(targetId) ==
+          MixSession::ManualSelectResult::Accepted);
+    CHECK(session.manualSelect(0xFFFFFFFFu) ==
+          MixSession::ManualSelectResult::NotFound);
+    pump.forSeconds(0.3);
+
+    const bgmedia::mix::MixSnapshot after = engine.snapshot();
+    CHECK(after.phase == TransitionPhase::Idle);
+    CHECK(after.master == incoming);
+    CHECK(after.decks[deckIndex(incoming)].trackId == targetId);
+    CHECK(after.decks[deckIndex(incoming)].playing);
+    CHECK(!(after.decks[deckIndex(outgoing)].playing));
+    CHECK(after.decks[deckIndex(incoming)].positionSeconds < 0.45);
+}
+
+TEST_CASE("mix.session_manual_select_keeps_paused_intent") {
+    MixEngine engine(kRate);
+    MixSession session(engine, makeTestPrepare());
+    SessionPump pump{engine, session};
+    session.addTrack("long-alpha.wav");
+    session.addTrack("long-beta.wav");
+    REQUIRE(pump.waitForDecks(2));
+
+    session.setAdaptive(true);
+    session.setTransitionDuration(0.0);
+    session.play();
+    pump.forSeconds(1.0);
+    session.pause();
+    pump.forSeconds(0.1);
+
+    const bgmedia::mix::MixSnapshot before = engine.snapshot();
+    const DeckId incoming = otherDeck(before.master);
+    const std::uint64_t targetId = before.decks[deckIndex(incoming)].trackId;
+    REQUIRE(targetId != 0);
+    CHECK(session.manualSelect(targetId) ==
+          MixSession::ManualSelectResult::Accepted);
+    pump.forSeconds(0.3);
+
+    // Global pause freezes the transport: the target is cued and its position
+    // must not move while paused.
+    const bgmedia::mix::MixSnapshot paused = engine.snapshot();
+    CHECK(paused.paused);
+    CHECK(paused.master == incoming);
+    const double cued = paused.decks[deckIndex(incoming)].positionSeconds;
+    CHECK(cued < 0.45);
+    pump.forSeconds(0.3);
+    CHECK_NEAR(engine.snapshot().decks[deckIndex(incoming)].positionSeconds,
+               cued, 1e-6);
+
+    // A play request during the switch must resume without another cut.
+    session.play();
+    pump.forSeconds(0.3);
+    const bgmedia::mix::MixSnapshot resumed = engine.snapshot();
+    CHECK(!(resumed.paused));
+    CHECK(resumed.master == incoming);
+    CHECK(resumed.decks[deckIndex(incoming)].positionSeconds > cued + 0.1);
+}
+
 TEST_CASE("mix.session_stop_and_clear_queue_recover") {
     // Finding #3: Stop set paused before the callback settled the deck flags, so
     // snapshots kept reporting "playing" and Clear Queue never released them.
