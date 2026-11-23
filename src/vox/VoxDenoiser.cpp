@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <new>
+#include <vector>
 
 extern "C" {
 #include "kiss_fftr.h"
@@ -13,6 +14,8 @@ namespace bgmedia::vox::detail {
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr float kPowerEps = 1e-14f;
+constexpr double kSeedPauseRatio = 0.5;       // seed must be >= 3 dB below the median hop
+constexpr float kUntrustedSeedScale = 0.1f;   // -10 dB when no clear pause exists
 } // namespace
 
 std::size_t chooseFftSize(std::uint32_t sampleRate) noexcept {
@@ -146,6 +149,23 @@ void SpectralDenoiser::seedNoise(const float* data, std::size_t channels,
     if (hops < span) {
         bestStart = 0;
     }
+    // A recording without a clear pause (short message, continuous speech)
+    // would seed the noise PSD from speech and attenuate the speech itself.
+    // When the quietest span is not >= 3 dB below the median hop energy,
+    // trust it only as an upper bound and start 10 dB below it; minimum
+    // statistics then adapts from there.
+    float seedScale = 1.0f;
+    if (hops > 0) {
+        std::vector<double> sorted(energy);
+        const std::size_t mid = sorted.size() / 2;
+        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(mid),
+                         sorted.end());
+        const double median = sorted[mid];
+        const double seedMean = bestSum / static_cast<double>(std::min(span, hops));
+        if (!(seedMean < kSeedPauseRatio * median)) {
+            seedScale = kUntrustedSeedScale;
+        }
+    }
 
     std::fill(seed_.begin(), seed_.end(), 0.0f);
     const std::size_t count = std::min(span, hops);
@@ -165,7 +185,7 @@ void SpectralDenoiser::seedNoise(const float* data, std::size_t channels,
     }
     const float inv = 1.0f / static_cast<float>(std::max<std::size_t>(1, count));
     for (std::size_t b = 0; b < bins_; ++b) {
-        seed_[b] = std::max(seed_[b] * inv, kPowerEps);
+        seed_[b] = std::max(seed_[b] * inv * seedScale, kPowerEps);
     }
 }
 

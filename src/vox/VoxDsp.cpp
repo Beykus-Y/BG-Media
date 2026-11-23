@@ -220,20 +220,23 @@ bool limit(float* data, std::size_t frames, std::size_t channels, double sampleR
     };
     // Box average of the sliding minimum: guarantees gain <= required gain at
     // every sample while spreading the attack over the lookahead time.
-    std::vector<double> box(look + 1, 1.0);
-    double boxSum = static_cast<double>(look + 1);
-    std::size_t boxPos = 0;
-
-    for (std::size_t j = 0; j < look && j < frames; ++j) {
+    // Pre-fill the window [0, look] and seed the box with its minimum, so the
+    // gain <= required guarantee also holds for the first `look` samples (a
+    // box seeded with 1.0 would let a loud onset reach the hard clamp).
+    for (std::size_t j = 0; j <= look && j < frames; ++j) {
         push(j, required(j));
     }
+    const double firstMin = size > 0 ? dqVal[head] : 1.0;
+    std::vector<double> box(look + 1, firstMin);
+    double boxSum = firstMin * static_cast<double>(look + 1);
+    std::size_t boxPos = 0;
     double gain = 1.0;
     const float ceilF = static_cast<float>(ceiling);
     for (std::size_t i = 0; i < frames; ++i) {
         if ((i & kPollMask) == 0 && keep && !keep()) {
             return false;
         }
-        if (i + look < frames) {
+        if (i > 0 && i + look < frames) {
             push(i + look, required(i + look));
         }
         while (size > 0 && dqIdx[head] < i) {

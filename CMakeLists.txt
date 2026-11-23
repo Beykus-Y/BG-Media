@@ -188,7 +188,34 @@ if(BGMEDIA_BUILD_VOX)
     )
     target_compile_features(bgmedia_vox PUBLIC cxx_std_20)
     target_compile_options(bgmedia_vox PRIVATE ${BGMEDIA_WARNING_FLAGS})
-    target_sources(bgmedia_vox PRIVATE $<TARGET_OBJECTS:bgmedia_kissfft>)
+    # BG Vox compiles its own KissFFT objects with prefixed symbol names, so
+    # bgmedia_core and bgmedia_vox can be linked into one image (static,
+    # whole-archive or a single shared library) without duplicate symbols.
+    set(BGMEDIA_VOX_KISSFFT_DEFS
+        kiss_fft=bgvox_kiss_fft
+        kiss_fft_alloc=bgvox_kiss_fft_alloc
+        kiss_fft_cleanup=bgvox_kiss_fft_cleanup
+        kiss_fft_next_fast_size=bgvox_kiss_fft_next_fast_size
+        kiss_fft_stride=bgvox_kiss_fft_stride
+        kiss_fftr=bgvox_kiss_fftr
+        kiss_fftr_alloc=bgvox_kiss_fftr_alloc
+        kiss_fftri=bgvox_kiss_fftri
+    )
+    add_library(bgmedia_vox_kissfft OBJECT
+        third_party/kissfft/kiss_fft.c
+        third_party/kissfft/kiss_fftr.c
+    )
+    target_include_directories(bgmedia_vox_kissfft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
+    target_compile_definitions(bgmedia_vox_kissfft PRIVATE ${BGMEDIA_VOX_KISSFFT_DEFS})
+    target_compile_features(bgmedia_vox_kissfft PRIVATE c_std_99)
+    set_target_properties(bgmedia_vox_kissfft PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MSVC)
+        target_compile_options(bgmedia_vox_kissfft PRIVATE /W0)
+    else()
+        target_compile_options(bgmedia_vox_kissfft PRIVATE -w)
+    endif()
+    target_compile_definitions(bgmedia_vox PRIVATE ${BGMEDIA_VOX_KISSFFT_DEFS})
+    target_sources(bgmedia_vox PRIVATE $<TARGET_OBJECTS:bgmedia_vox_kissfft>)
     if(MSVC)
         target_compile_definitions(bgmedia_vox PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()

@@ -109,7 +109,10 @@ struct VoxEnhanceReport {
 };
 
 struct VoxEnhanceResult {
-    std::vector<float> pcm;  // interleaved, same frames/channels/rate as input
+    // Interleaved, same frames/channels/rate as input. On any fallback this is
+    // the original (as float); it is empty only when even that copy could not be
+    // made (FallbackOutOfMemory, or FallbackTooLong for size_t-overflowing input).
+    std::vector<float> pcm;
     VoxEnhanceReport report;
 
     [[nodiscard]] bool usedOriginal() const noexcept {

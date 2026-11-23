@@ -4,6 +4,7 @@
 #include "bgmedia/vox/vox_capi.h"
 #include "support/VoxSynthetic.hpp"
 #include "vox/VoxDenoiser.hpp"
+#include "vox/VoxDsp.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -413,4 +414,66 @@ TEST_CASE(vox.report_fields_are_consistent) {
     CHECK(r.report.estimatedNoiseFloorDbfs < r.report.inputSpeechRmsDbfs);
     CHECK(r.report.appliedMakeupGainDb >= -6.0 && r.report.appliedMakeupGainDb <= 12.0);
     CHECK(std::string(voxStatusName(VoxStatus::FallbackQualityGuard)) == "FallbackQualityGuard");
+}
+
+// A recording without any pause must not seed the noise estimate from the
+// speech itself (that would push the speech down to the gain floor).
+TEST_CASE(vox.continuous_speech_is_not_treated_as_noise) {
+    const std::uint32_t sr = 16000;
+    const std::size_t n = 3 * sr;
+    std::vector<float> x(n);
+    double phase = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double t = static_cast<double>(i) / sr;
+        const double f0 = 150.0 * (1.0 + 0.03 * std::sin(2.0 * kPi * 5.0 * t));
+        phase += 2.0 * kPi * f0 / sr;
+        double v = 0.0;
+        for (int h = 1; h <= 15; ++h) {
+            v += std::sin(h * phase) / static_cast<double>(h);
+        }
+        const double syl = 0.7 + 0.3 * std::sin(2.0 * kPi * 4.0 * t);
+        x[i] = static_cast<float>(v * syl);
+    }
+    scaleToRms(x, std::pow(10.0, -24.0 / 20.0));
+    const double inRms = rmsOf(x);
+    bgmedia::vox::detail::DenoiseParams dp;  // Natural defaults
+    bgmedia::vox::detail::SpectralDenoiser den(sr, 1, dp);
+    CHECK(den.process(x.data(), 1, n, {}));
+    const double dropDb = 20.0 * std::log10(rmsOf(x) / inRms);
+    // Without the untrusted-seed guard this drops by ~12 dB (the gain floor).
+    // The residual ~4 dB is minimum statistics adapting to a perfectly
+    // stationary synthetic tone; real speech is far less stationary.
+    CHECK(dropDb > -6.0);
+}
+
+// A loud onset at sample 0 must be limited, not flattened by the hard clamp.
+TEST_CASE(vox.limiter_handles_onset_at_start) {
+    const std::uint32_t sr = 16000;
+    const std::size_t n = sr / 10;
+    std::vector<float> x(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        x[i] = static_cast<float>(0.9 * std::sin(2.0 * kPi * 1000.0 * static_cast<double>(i) / sr));
+    }
+    bgmedia::vox::detail::LimiterParams lp;
+    lp.preGain = 4.0;
+    CHECK(bgmedia::vox::detail::limit(x.data(), n, 1, sr, lp, {}));
+    const double ceil = std::pow(10.0, lp.ceilingDb / 20.0);
+    int plateaus = 0;
+    for (std::size_t i = 1; i < sr / 100; ++i) {
+        if (std::abs(x[i]) >= 0.999 * ceil && std::abs(x[i - 1]) >= 0.999 * ceil) {
+            ++plateaus;
+        }
+    }
+    CHECK(plateaus == 0);
+}
+
+// The int16 path reports the real reason (not OOM) for a bogus format and
+// still returns the original.
+TEST_CASE(vox.int16_bad_format_reports_format) {
+    const std::vector<std::int16_t> in = int16Ramp(4000);
+    VoxEnhanceResult r = enhanceVoice(in.data(), in.size(), VoxPcmFormat{96000, 1},
+                                      cfgFor(VoxEnhanceMode::Natural));
+    CHECK(r.report.status == VoxStatus::FallbackUnsupportedFormat);
+    CHECK(r.pcm.size() == in.size());
+    CHECK(toInt16(r.pcm) == in);
 }

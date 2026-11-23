@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <utility>
 
 namespace bgmedia::vox {
 
@@ -332,25 +333,57 @@ VoxEnhanceResult enhanceVoice(const float* in, std::size_t frames, VoxPcmFormat 
 VoxEnhanceResult enhanceVoice(const std::int16_t* in, std::size_t frames, VoxPcmFormat format,
                               const VoxEnhanceConfig& config, const VoxCancelToken* cancel,
                               const VoxProgressFn& progress) noexcept {
+    const auto t0 = std::chrono::steady_clock::now();
+    VoxEnhanceResult res;
+    res.report.frames = frames;
+    const std::size_t channels = std::max<std::uint32_t>(1, format.channels);
+    if (in == nullptr || frames == 0) {
+        return enhanceVoice(static_cast<const float*>(nullptr), frames, format, config, cancel,
+                            progress);
+    }
+    if (frames > std::numeric_limits<std::size_t>::max() / channels / 8) {
+        // Cannot even hold a float copy of the original.
+        res.report.status = VoxStatus::FallbackTooLong;
+        res.report.detail = "input too large";
+        return res;
+    }
+
+    // Validate before converting, so a bogus format reports the right status
+    // instead of an allocation failure on frames * channels floats.
+    VoxStatus early = VoxStatus::Processed;
+    const char* earlyDetail = nullptr;
+    if (config.mode != VoxEnhanceMode::Off) {
+        if (!isSupportedFormat(format)) {
+            early = VoxStatus::FallbackUnsupportedFormat;
+            earlyDetail = "unsupported sample rate or channel count";
+        } else if (static_cast<double>(frames) / static_cast<double>(format.sampleRate) >
+                   config.maxDurationSeconds) {
+            early = VoxStatus::FallbackTooLong;
+            earlyDetail = "input longer than maxDurationSeconds";
+        }
+    }
+
+    std::vector<float> tmp;
     try {
-        const std::size_t channels = std::max<std::uint32_t>(1, format.channels);
-        if (in == nullptr || frames == 0 ||
-            frames > std::numeric_limits<std::size_t>::max() / channels / 8) {
-            return enhanceVoice(static_cast<const float*>(nullptr), frames, format, config,
-                                cancel, progress);
-        }
-        std::vector<float> tmp(frames * channels);
-        for (std::size_t i = 0; i < tmp.size(); ++i) {
-            tmp[i] = static_cast<float>(in[i]) / 32768.0f;
-        }
-        return enhanceVoice(tmp.data(), frames, format, config, cancel, progress);
+        tmp.resize(frames * channels);
     } catch (...) {
-        VoxEnhanceResult res;
-        res.report.frames = frames;
         res.report.status = VoxStatus::FallbackOutOfMemory;
         res.report.detail = "out of memory converting int16 input";
         return res;
     }
+    for (std::size_t i = 0; i < tmp.size(); ++i) {
+        tmp[i] = static_cast<float>(in[i]) / 32768.0f;
+    }
+    if (earlyDetail != nullptr) {
+        res.pcm = std::move(tmp);  // the original, as float
+        res.report.status = early;
+        res.report.detail = earlyDetail;
+        res.report.processingMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+        return res;
+    }
+    return enhanceVoice(tmp.data(), frames, format, config, cancel, progress);
 }
 
 void floatToInt16(const float* in, std::size_t count, std::int16_t* out) noexcept {
