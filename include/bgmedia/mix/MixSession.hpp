@@ -12,6 +12,7 @@
 #include "bgmedia/mix/PcmTrack.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -68,6 +69,20 @@ public:
     void startTransitionNow();    // same, but always uses the current plan
     void cancelTransition();
     void stopAll();
+
+    // Instant manual navigation (BG-Media#77). Unlike next(), these never
+    // schedule a crossfade: an active or planned transition is dropped at once,
+    // and the target starts from 0 with only a short technical de-click ramp.
+    // A paused session stays paused. The switch is applied by update() on the
+    // UI thread, usually within a few frames; until then the session is busy.
+    enum class ManualSelectResult : std::uint8_t {
+        Accepted,  // switch scheduled; applied by update()
+        NotFound,  // no such queue item (or no next item for manualNext)
+        NotReady   // item not prepared; the host should use its own player
+    };
+    ManualSelectResult manualSelect(std::uint64_t queueItemId);
+    // Next prepared-or-pending item after the logical target in queue order.
+    ManualSelectResult manualNext();
 
     void setTransitionType(TransitionType type);
     void setTransitionDuration(double seconds);  // 0 = automatic
@@ -151,6 +166,13 @@ private:
         std::string error;
     };
 
+    struct ManualRequest {
+        bool active = false;
+        std::uint64_t id = 0;
+        bool paused = false;  // play/pause intent captured before the hard stop
+        std::chrono::steady_clock::time_point since{};
+    };
+    void applyManualRequest();
     [[nodiscard]] Item* findItem(std::uint64_t id);
     [[nodiscard]] const Item* findItem(std::uint64_t id) const;
     void workerLoop();
@@ -203,6 +225,7 @@ private:
     bool autoQueue_ = true;
     bool autoPlay_ = false;
     bool nextRequested_ = false;
+    ManualRequest manual_;  // guarded by mutex_
     bool clearDecksRequested_ = false;
     std::string status_;
     std::string lastError_;
